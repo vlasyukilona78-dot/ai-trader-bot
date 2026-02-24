@@ -25,16 +25,17 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas numpy scikit-learn joblib pytest; fi
 
       - name: Run basic checks
+        shell: bash
         run: |
           mkdir -p logs || true
-          python - <<'PY'
+          python - <<EOF
 import os, joblib
 if os.path.exists("scaler.pkl"):
     scaler = joblib.load("scaler.pkl")
     print("Scaler features:", getattr(scaler, "n_features_in_", "?"))
 else:
     print("⚠️ scaler.pkl not found — skipping check")
-PY
+EOF
 
       - name: Run unit tests
         run: |
