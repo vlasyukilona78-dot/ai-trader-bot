@@ -1,0 +1,41 @@
+name: Train AI Model
+
+on:
+  workflow_dispatch:        # запуск вручную с GitHub
+  push:
+    branches: [ main ]      # либо при каждом пуше в main
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas numpy scikit-learn joblib; fi
+
+      - name: Run model training
+        run: |
+          mkdir -p logs
+          echo "🚀 Starting model training..."
+          python train_ai_fixed.py || (echo "⚠️ Training failed" && exit 1)
+          echo "✅ Training finished successfully"
+
+      - name: Upload trained models
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-models
+          path: |
+            ai_model_win.pkl
+            ai_model_horizon.pkl
+            scaler.pkl
+          if-no-files-found: warn
