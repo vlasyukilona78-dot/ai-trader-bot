@@ -1,4 +1,8 @@
-# игнорировать модели и бэкапы
-*.pkl
-backups/
+venv/
+.venv/
+__pycache__/
+*.pyc
+.env
 logs/
+.idea/
+.vscode/

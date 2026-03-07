@@ -1,26 +1,24 @@
-import joblib
-import numpy as np
-from sklearn.preprocessing import StandardScaler
+import pandas as pd
 
-# -------------------------------------------------
-# Загрузим старые обучающие данные для масштабирования
-# -------------------------------------------------
+print("🔄 Обновляем датасет teacher1_enriched.xlsx из signals_history.xlsx...")
 
-# ⚠️ Здесь нужно заменить путь на твои обучающие данные (features для моделей)
-# если у тебя сохранился numpy-файл с фичами, подставь его сюда:
-# X = np.load("features.npy")
+try:
+    base = pd.read_excel("teacher1_enriched.xlsx")
+    new = pd.read_excel("signals_history.xlsx")
 
-# Если исходных данных нет, создаём фиктивный набор 11-фичевых данных
-# (это безопасно — просто переобучим scaler на правильной размерности)
-X = np.random.rand(1000, 11)
+    # удаляем неполные или явно ошибочные записи
+    new = new.dropna(subset=["Win", "Symbol"])
+    new = new[new["Profit"].abs() < 50_000]
 
-# -------------------------------------------------
-# Обучаем новый StandardScaler
-# -------------------------------------------------
-scaler = StandardScaler()
-scaler.fit(X)
+    # добавляем отсутствующие столбцы
+    for col in new.columns:
+        if col not in base.columns:
+            base[col] = None
 
-# Сохраняем новый scaler
-joblib.dump(scaler, "scaler.pkl")
+    # объединяем по уникальным ключам Symbol + Time
+    merged = pd.concat([base, new], ignore_index=True).drop_duplicates(subset=["Symbol", "Time"])
 
-print("✅ Новый scaler.pkl обучен на 11 признаках и успешно сохранён.")
+    merged.to_excel("teacher1_enriched.xlsx", index=False)
+    print(f"✅ Датасет обновлён. Всего {len(merged)} записей.")
+except Exception as e:
+    print("⚠️ Ошибка обновления датасета:", e)

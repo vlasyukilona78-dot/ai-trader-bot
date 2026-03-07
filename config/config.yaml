@@ -1,0 +1,59 @@
+﻿bot:
+  scan_interval_sec: 30
+  timeframe: "1"
+  candles_limit: 320
+  symbols_limit: 0
+  progress_log_every: 10
+  fast_scan_in_dry_run: true
+  dry_run: true
+
+strategy:
+  rsi_high: 68
+  rsi_low: 32
+  volume_spike_threshold: 1.6
+  weakness_lookback: 4
+  sentiment_bullish_threshold: 68
+  sentiment_bearish_threshold: 32
+  risk_reward: 1.6
+  atr_sl_mult: 1.0
+  entry_tolerance_pct: 0.004
+  vwap_tolerance_pct: 0.0025
+  funding_tolerance: 0.0003
+  long_short_ratio_tolerance: 0.1
+  volume_profile_window: 120
+  volume_profile_bins: 48
+
+risk:
+  account_equity_usdt: 1000
+  max_risk_per_trade: 0.01
+  max_open_positions: 3
+  max_total_exposure_pct: 0.5
+  daily_loss_limit_pct: 0.05
+  max_consecutive_losses: 4
+  cooldown_minutes: 30
+  min_qty: 0.001
+  max_qty: 100
+  slippage_bps: 2
+
+ml:
+  min_probability: 0.25
+  model_dir: "ai/models"
+  use_regime_models: true
+  online_retrain_enabled: true
+  online_retrain_interval_sec: 21600
+  online_retrain_min_rows: 100
+  online_dataset_path: "data/processed/online_training_dataset.csv"
+
+alerts:
+  send_chart: true
+
+market_data:
+  bybit_base_url: "https://api.bybit.com"
+  sentiment_api_url: "https://api.alternative.me/fng/"
+  request_timeout_sec: 8
+  max_retries: 2
+
+
+
+
+

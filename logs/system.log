@@ -23193,3 +23193,191 @@ requests.exceptions.SSLError: HTTPSConnectionPool(host='149.154.166.110', port=4
 2026-02-24 19:47:06,773 [INFO] 19:47:06 | Working on 552 pairs...
 2026-02-24 19:47:08,404 [INFO] No open positions
 2026-02-24 19:47:12,402 [INFO] main loop cancelled
+2026-02-24 20:59:33,799 [INFO] AI models loaded
+2026-02-24 20:59:33,801 [INFO] Bot starting with AI + demo trading option.
+2026-02-24 20:59:33,801 [INFO] BybitClient init -> PRODUCTION | dry_run=True | key=lYRh...SX3n
+2026-02-24 20:59:35,059 [INFO] ✅ Authorized on Bybit mainnet
+2026-02-24 20:59:35,059 [INFO] Bybit demo trading enabled (dry_run=True).
+2026-02-24 20:59:35,096 [INFO] api.bybit.com -> 108.157.229.80 (cached)
+2026-02-24 20:59:35,104 [INFO] fetch pairs: https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000&status=Trading
+2026-02-24 20:59:35,105 [INFO] 🕒 Модель свежая (возраст 2151.7 сек) — переобучение не требуется
+2026-02-24 20:59:36,004 [INFO] monitor_entries task started
+2026-02-24 20:59:36,004 [INFO] show_positions_loop started
+2026-02-24 20:59:36,005 [INFO] Connecting to Bybit WS: wss://stream.bybit.com/v5/private
+2026-02-24 20:59:36,024 [WARNING] Network/DNS error during async POST: Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-02-24 20:59:36,038 [INFO] api.telegram.org -> 149.154.166.110 (cached)
+2026-02-24 20:59:36,646 [INFO] ✅ Pairs found: 552
+2026-02-24 20:59:36,647 [INFO] 20:59:36 | Working on 552 pairs...
+2026-02-24 20:59:36,895 [INFO] No open positions
+2026-02-24 20:59:37,796 [INFO] Bybit WS connected
+2026-02-24 20:59:38,718 [INFO] ✅ Fallback via IP (149.154.166.110) for api.telegram.org succeeded
+2026-02-24 20:59:52,805 [INFO] No open positions
+2026-02-24 21:00:00,751 [INFO] fetch pairs: https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000&status=Trading
+2026-02-24 21:00:00,751 [INFO] 🕒 Модель свежая (возраст 2177.3 сек) — переобучение не требуется
+2026-02-24 21:00:01,518 [INFO] ✅ Pairs found: 552
+2026-02-24 21:00:01,519 [INFO] 21:00:01 | Working on 552 pairs...
+2026-02-24 21:00:08,801 [INFO] No open positions
+2026-02-24 21:00:18,730 [INFO] Running AI quick diagnostics
+2026-02-24 21:00:19,918 [WARNING] send_telegram_photo_async failed (async attempt): Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-02-24 21:00:24,691 [INFO] No open positions
+2026-02-24 21:00:27,166 [INFO] fetch pairs: https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000&status=Trading
+2026-02-24 21:00:27,166 [INFO] 🕒 Модель свежая (возраст 2203.7 сек) — переобучение не требуется
+2026-02-24 21:00:28,365 [INFO] ✅ Pairs found: 552
+2026-02-24 21:00:28,366 [INFO] 21:00:28 | Working on 552 pairs...
+2026-02-24 21:00:31,657 [INFO] BybitClient init -> PRODUCTION | dry_run=True | key=lYRh...SX3n
+2026-02-24 21:00:31,661 [WARNING] Network/DNS error during async POST: Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-02-24 21:00:32,582 [INFO] ✅ Authorized on Bybit mainnet
+2026-02-24 21:00:32,583 [INFO] [DRY-RUN] Would place BUY order on SOLV/USDT qty=0.01
+2026-02-24 21:00:32,583 [INFO] Placed demo order on confirmation: {'dry_run': True, 'symbol': 'SOLV/USDT', 'side': 'buy', 'qty': 0.01}
+2026-02-24 21:00:33,619 [INFO] ✅ Fallback via IP (149.154.166.110) for api.telegram.org succeeded
+2026-02-24 21:00:41,666 [INFO] No open positions
+2026-02-24 21:00:52,968 [INFO] fetch pairs: https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000&status=Trading
+2026-02-24 21:00:52,968 [INFO] 🕒 Модель свежая (возраст 2229.5 сек) — переобучение не требуется
+2026-02-24 21:00:54,027 [INFO] ✅ Pairs found: 552
+2026-02-24 21:00:54,028 [INFO] 21:00:54 | Working on 552 pairs...
+2026-02-24 21:00:57,537 [INFO] No open positions
+2026-02-24 21:01:00,959 [WARNING] send_telegram_photo_async failed (async attempt): Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-02-24 21:01:04,090 [INFO] BybitClient init -> PRODUCTION | dry_run=True | key=lYRh...SX3n
+2026-02-24 21:01:04,119 [WARNING] Network/DNS error during async POST: Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-02-24 21:01:04,976 [INFO] ✅ Authorized on Bybit mainnet
+2026-02-24 21:01:04,977 [INFO] [DRY-RUN] Would place BUY order on ENSO/USDT qty=0.01
+2026-02-24 21:01:04,977 [INFO] Placed demo order on confirmation: {'dry_run': True, 'symbol': 'ENSO/USDT', 'side': 'buy', 'qty': 0.01}
+2026-02-24 21:01:05,277 [INFO] ✅ Fallback via IP (149.154.166.110) for api.telegram.org succeeded
+2026-02-24 21:01:13,413 [INFO] No open positions
+2026-02-24 21:01:19,535 [INFO] fetch pairs: https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000&status=Trading
+2026-02-24 21:01:19,535 [INFO] 🕒 Модель свежая (возраст 2256.1 сек) — переобучение не требуется
+2026-02-24 21:01:20,228 [INFO] ✅ Pairs found: 552
+2026-02-24 21:01:20,229 [INFO] 21:01:20 | Working on 552 pairs...
+2026-02-24 21:01:29,266 [INFO] No open positions
+2026-02-24 21:01:39,016 [WARNING] send_telegram_photo_async failed (async attempt): Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-02-24 21:01:45,167 [INFO] No open positions
+2026-02-24 21:01:46,272 [INFO] fetch pairs: https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000&status=Trading
+2026-02-24 21:01:46,273 [INFO] 🕒 Модель свежая (возраст 2282.8 сек) — переобучение не требуется
+2026-02-24 21:01:47,379 [INFO] ✅ Pairs found: 552
+2026-02-24 21:01:47,380 [INFO] 21:01:47 | Working on 552 pairs...
+2026-02-24 21:01:47,649 [INFO] BybitClient init -> PRODUCTION | dry_run=True | key=lYRh...SX3n
+2026-02-24 21:01:47,653 [WARNING] Network/DNS error during async POST: Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-02-24 21:01:48,524 [INFO] ✅ Fallback via IP (149.154.166.110) for api.telegram.org succeeded
+2026-02-24 21:01:48,534 [INFO] ✅ Authorized on Bybit mainnet
+2026-02-24 21:01:48,534 [INFO] [DRY-RUN] Would place BUY order on SOMI/USDT qty=0.01
+2026-02-24 21:01:48,534 [INFO] Placed demo order on confirmation: {'dry_run': True, 'symbol': 'SOMI/USDT', 'side': 'buy', 'qty': 0.01}
+2026-02-24 21:02:00,696 [WARNING] send_telegram_photo_async failed (async attempt): Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-02-24 21:02:01,938 [INFO] No open positions
+2026-02-24 21:02:12,729 [INFO] fetch pairs: https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000&status=Trading
+2026-02-24 21:02:12,729 [INFO] 🕒 Модель свежая (возраст 2309.3 сек) — переобучение не требуется
+2026-02-24 21:02:13,833 [INFO] ✅ Pairs found: 552
+2026-02-24 21:02:13,834 [INFO] 21:02:13 | Working on 552 pairs...
+2026-02-24 21:02:18,796 [INFO] No open positions
+2026-02-24 21:02:34,663 [INFO] No open positions
+2026-02-24 21:02:38,653 [INFO] fetch pairs: https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000&status=Trading
+2026-02-24 21:02:38,653 [INFO] 🕒 Модель свежая (возраст 2335.2 сек) — переобучение не требуется
+2026-02-24 21:02:39,862 [INFO] ✅ Pairs found: 552
+2026-02-24 21:02:39,862 [INFO] 21:02:39 | Working on 552 pairs...
+2026-02-24 21:02:50,559 [INFO] No open positions
+2026-02-24 21:03:03,838 [INFO] fetch pairs: https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000&status=Trading
+2026-02-24 21:03:03,838 [INFO] 🕒 Модель свежая (возраст 2360.4 сек) — переобучение не требуется
+2026-02-24 21:03:04,531 [INFO] ✅ Pairs found: 552
+2026-02-24 21:03:04,531 [INFO] 21:03:04 | Working on 552 pairs...
+2026-02-24 21:03:06,586 [INFO] No open positions
+2026-02-24 21:03:08,161 [ERROR] Bybit WS listen stopped
+Traceback (most recent call last):
+  File "C:\Users\Zephyrus\PycharmProjects\koteika_Ultra\main.py", line 1045, in listen
+    async for msg in self.ws:
+    ...<5 lines>...
+            logger.exception("WS message handling error")
+  File "C:\Users\Zephyrus\PycharmProjects\koteika_Ultra\.venv\Lib\site-packages\websockets\asyncio\connection.py", line 244, in __aiter__
+    yield await self.recv()
+          ^^^^^^^^^^^^^^^^^
+  File "C:\Users\Zephyrus\PycharmProjects\koteika_Ultra\.venv\Lib\site-packages\websockets\asyncio\connection.py", line 324, in recv
+    raise self.protocol.close_exc from self.recv_exc
+websockets.exceptions.ConnectionClosedError: no close frame received or sent
+2026-02-24 21:03:22,492 [INFO] No open positions
+2026-02-24 21:03:29,732 [INFO] fetch pairs: https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000&status=Trading
+2026-02-24 21:03:29,733 [INFO] 🕒 Модель свежая (возраст 2386.3 сек) — переобучение не требуется
+2026-02-24 21:03:30,446 [INFO] ✅ Pairs found: 552
+2026-02-24 21:03:30,447 [INFO] 21:03:30 | Working on 552 pairs...
+2026-02-24 21:03:31,091 [INFO] main loop cancelled
+2026-02-24 21:03:36,583 [INFO] AI models loaded
+2026-02-24 21:03:36,585 [INFO] Bot starting with AI + demo trading option.
+2026-02-24 21:03:36,585 [INFO] BybitClient init -> PRODUCTION | dry_run=True | key=lYRh...SX3n
+2026-02-24 21:03:37,810 [INFO] ✅ Authorized on Bybit mainnet
+2026-02-24 21:03:37,810 [INFO] Bybit demo trading enabled (dry_run=True).
+2026-02-24 21:03:37,820 [INFO] api.bybit.com -> 108.157.229.99 (cached)
+2026-02-24 21:03:37,829 [INFO] fetch pairs: https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000&status=Trading
+2026-02-24 21:03:37,829 [INFO] 🕒 Модель свежая (возраст 2394.4 сек) — переобучение не требуется
+2026-02-24 21:03:38,716 [INFO] monitor_entries task started
+2026-02-24 21:03:38,716 [INFO] show_positions_loop started
+2026-02-24 21:03:38,717 [INFO] Connecting to Bybit WS: wss://stream.bybit.com/v5/private
+2026-02-24 21:03:38,731 [WARNING] Network/DNS error during async POST: Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-02-24 21:03:38,743 [INFO] api.telegram.org -> 149.154.166.110 (cached)
+2026-02-24 21:03:39,454 [INFO] ✅ Fallback via IP (149.154.166.110) for api.telegram.org succeeded
+2026-02-24 21:03:39,564 [INFO] No open positions
+2026-02-24 21:03:39,690 [INFO] ✅ Pairs found: 552
+2026-02-24 21:03:39,690 [INFO] 21:03:39 | Working on 552 pairs...
+2026-02-24 21:03:40,551 [INFO] Bybit WS connected
+2026-02-24 21:03:55,414 [INFO] No open positions
+2026-02-24 21:04:05,491 [INFO] fetch pairs: https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000&status=Trading
+2026-02-24 21:04:05,492 [INFO] 🕒 Модель свежая (возраст 2422.1 сек) — переобучение не требуется
+2026-02-24 21:04:06,743 [INFO] ✅ Pairs found: 552
+2026-02-24 21:04:06,744 [INFO] 21:04:06 | Working on 552 pairs...
+2026-02-24 21:04:12,136 [INFO] No open positions
+2026-02-24 21:04:28,018 [INFO] No open positions
+2026-02-24 21:04:31,265 [INFO] fetch pairs: https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000&status=Trading
+2026-02-24 21:04:31,265 [INFO] 🕒 Модель свежая (возраст 2447.8 сек) — переобучение не требуется
+2026-02-24 21:04:33,524 [INFO] ✅ Pairs found: 552
+2026-02-24 21:04:33,524 [INFO] 21:04:33 | Working on 552 pairs...
+2026-02-24 21:04:44,377 [INFO] No open positions
+2026-02-24 21:04:55,694 [INFO] main loop cancelled
+2026-02-24 21:04:59,937 [INFO] AI models loaded
+2026-02-24 21:04:59,939 [INFO] Bot starting with AI + demo trading option.
+2026-02-24 21:04:59,939 [INFO] BybitClient init -> PRODUCTION | dry_run=True | key=lYRh...SX3n
+2026-02-24 21:05:00,829 [INFO] ✅ Authorized on Bybit mainnet
+2026-02-24 21:05:00,829 [INFO] Bybit demo trading enabled (dry_run=True).
+2026-02-24 21:05:00,841 [INFO] api.bybit.com -> 108.157.229.8 (cached)
+2026-02-24 21:05:00,849 [INFO] fetch pairs: https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000&status=Trading
+2026-02-24 21:05:00,849 [INFO] 🕒 Модель свежая (возраст 2477.4 сек) — переобучение не требуется
+2026-02-24 21:05:01,710 [INFO] monitor_entries task started
+2026-02-24 21:05:01,710 [INFO] show_positions_loop started
+2026-02-24 21:05:01,711 [INFO] Connecting to Bybit WS: wss://stream.bybit.com/v5/private
+2026-02-24 21:05:01,725 [WARNING] Network/DNS error during async POST: Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-02-24 21:05:01,864 [INFO] api.telegram.org -> 149.154.166.110 (cached)
+2026-02-24 21:05:02,462 [INFO] ✅ Pairs found: 552
+2026-02-24 21:05:02,462 [INFO] 21:05:02 | Working on 552 pairs...
+2026-02-24 21:05:02,661 [INFO] ✅ Fallback via IP (149.154.166.110) for api.telegram.org succeeded
+2026-02-24 21:05:02,708 [INFO] No open positions
+2026-02-24 21:05:03,991 [INFO] Bybit WS connected
+2026-02-24 21:05:18,585 [INFO] No open positions
+2026-02-24 21:05:20,043 [INFO] Running AI quick diagnostics
+2026-02-24 21:05:20,347 [WARNING] send_telegram_photo_async failed (async attempt): Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-02-24 21:05:23,794 [INFO] BybitClient init -> PRODUCTION | dry_run=True | key=lYRh...SX3n
+2026-02-24 21:05:23,839 [WARNING] Network/DNS error during async POST: Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-02-24 21:05:24,447 [INFO] ✅ Fallback via IP (149.154.166.110) for api.telegram.org succeeded
+2026-02-24 21:05:24,714 [INFO] ✅ Authorized on Bybit mainnet
+2026-02-24 21:05:24,714 [INFO] [DRY-RUN] Would place SELL order on RAVE/USDT qty=0.01
+2026-02-24 21:05:24,714 [INFO] Placed demo order on confirmation: {'dry_run': True, 'symbol': 'RAVE/USDT', 'side': 'sell', 'qty': 0.01}
+2026-02-24 21:05:30,502 [INFO] fetch pairs: https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000&status=Trading
+2026-02-24 21:05:30,503 [INFO] 🕒 Модель свежая (возраст 2507.1 сек) — переобучение не требуется
+2026-02-24 21:05:31,310 [INFO] ✅ Pairs found: 552
+2026-02-24 21:05:31,310 [INFO] 21:05:31 | Working on 552 pairs...
+2026-02-24 21:05:35,766 [INFO] No open positions
+2026-02-24 21:05:51,973 [INFO] No open positions
+2026-02-24 21:05:52,012 [WARNING] send_telegram_photo_async failed (async attempt): Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-02-24 21:06:12,312 [WARNING] send_telegram_photo_sync network error: HTTPSConnectionPool(host='api.telegram.org', port=443): Read timed out. (read timeout=20)
+2026-02-24 21:06:12,801 [WARNING] Fallback photo POST via IP failed: HTTPSConnectionPool(host='149.154.166.110', port=443): Max retries exceeded with url: /bot8500100061:AAEK_bf3eKin4sMxGS72fQO7ndo9J_ELPFI/sendPhoto (Caused by SSLError(SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: IP address mismatch, certificate is not valid for '149.154.166.110'. (_ssl.c:1077)")))
+2026-02-24 21:06:13,472 [ERROR] send_telegram_photo_sync: all attempts failed.
+2026-02-24 21:06:13,474 [WARNING] Network error on attempt 1 for STG/USDT: 
+2026-02-24 21:06:13,474 [WARNING] Network error on attempt 1 for STO/USDT: 
+2026-02-24 21:06:13,474 [WARNING] Network error on attempt 1 for STORJ/USDT: 
+2026-02-24 21:06:14,356 [WARNING] Network error on attempt 1 for SUI/USDT: 
+2026-02-24 21:06:14,356 [WARNING] Network error on attempt 1 for SUPER/USDT: 
+2026-02-24 21:06:14,356 [WARNING] Network error on attempt 1 for SUN/USDT: 
+2026-02-24 21:06:14,356 [WARNING] Network error on attempt 1 for STRK/USDT: 
+2026-02-24 21:06:14,357 [WARNING] Network error on attempt 1 for STX/USDT: 
+2026-02-24 21:06:15,486 [INFO] No open positions
+2026-02-24 21:06:21,898 [INFO] fetch pairs: https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000&status=Trading
+2026-02-24 21:06:21,898 [INFO] 🕒 Модель свежая (возраст 2558.5 сек) — переобучение не требуется
+2026-02-24 21:06:22,771 [INFO] ✅ Pairs found: 552
+2026-02-24 21:06:22,772 [INFO] 21:06:22 | Working on 552 pairs...
+2026-02-24 21:06:31,768 [INFO] No open positions
+2026-02-24 21:06:45,455 [WARNING] send_telegram_photo_async failed (async attempt): Cannot connect to host api.telegram.org:443 ssl:default [Could not contact DNS servers]
+2026-02-24 21:06:48,170 [INFO] main loop cancelled

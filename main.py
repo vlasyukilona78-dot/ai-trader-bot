@@ -1,1287 +1,531 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-main.py — стабилизированная полная версия (demo trading)
-Функции:
- - загрузка моделей (joblib)
- - построение графиков headless (matplotlib Agg)
- - устойчивые сетевые обращения с автоматическим IP-fallback
- - Telegram уведомления с fallback (sync + async)
- - анализ пар, публикация сигналов, лог-файлы
- - bybit demo trading через BybitClient (если доступен)
- - WebSocket монитор (опционально, если websockets установлен)
-"""
+﻿#!/usr/bin/env python3
 from __future__ import annotations
 
-import os
-import io
-import time
-import json
-import hmac
-import hashlib
-import socket
-import traceback
 import argparse
+from collections import Counter
+import os
+import time
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor
-from collections import deque
+from pathlib import Path
 
-# matplotlib headless
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
-
-import asyncio
-import numpy as np
 import pandas as pd
-import joblib
-import requests
-from requests.exceptions import RequestException, Timeout, ConnectionError, SSLError
 
-# aiohttp client primitives
-import aiohttp
-from aiohttp import ClientSession, TCPConnector
+from ai.retrain_online import OnlineRetrainConfig, OnlineRetrainer
+from ai.utils import load_model_bundle, predict_with_bundle
+from alerts.chart_generator import build_signal_chart
+from alerts.discord_client import DiscordClient
+from alerts.telegram_client import TelegramClient
+from backtesting.backtest import BacktestConfig, load_ohlcv_csv, run_backtest
+from bybit_client import BybitClient
+from core.feature_engineering import REQUIRED_MODEL_FEATURES, build_feature_row
+from core.indicators import compute_indicators
+from core.market_data import MarketDataClient
+from core.market_regime import MarketRegime, detect_market_regime
+from core.risk_engine import RiskConfig, RiskEngine
+from core.settings import load_settings
+from core.signal_generator import SignalConfig, SignalContext, SignalGenerator
+from core.volume_profile import compute_volume_profile
 
-# optional websockets for WS monitor
-try:
-    import websockets
-except Exception:
-    websockets = None
-
-# read .env
-from dotenv import load_dotenv
-load_dotenv()
-
-# try to import project logger and config if present
 try:
     from logger import logger
 except Exception:
-    # fallback simple logger
     import logging
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    logger = logging.getLogger("main")
+    logger = logging.getLogger("crypto_bot")
 
-# optional local modules (may be absent)
-try:
-    from bybit_client import BybitClient
-except Exception:
-    BybitClient = None
 
-try:
-    from trading_loop import TradingLoop
-except Exception:
-    TradingLoop = None
+SIGNALS_LOG = Path("logs/signals_log.csv")
+TRADES_LOG = Path("logs/trades_log.csv")
 
-try:
-    from codex_trainer import train_if_needed
-except Exception:
-    train_if_needed = None
 
-try:
-    from reinforce_trainer import append_trade_to_dataset, maybe_retrain_models
-except Exception:
-    append_trade_to_dataset = None
-    maybe_retrain_models = None
+def ensure_log_path(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-# ================= CONFIG =================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
-TIMEFRAME = os.getenv("TIMEFRAME", "1")
-CANDLES = int(os.getenv("CANDLES", "50"))
-CONCURRENT_TASKS = int(os.getenv("CONCURRENT_TASKS", "20"))
-PRICE_THRESHOLD = float(os.getenv("PRICE_THRESHOLD", "0.01"))
-VOLUME_THRESHOLD = float(os.getenv("VOLUME_THRESHOLD", "2.0"))
-RISK_REWARD = float(os.getenv("RISK_REWARD", "2.0"))
-LOG_PATH = os.getenv("LOG_PATH", "logs/signals_log.csv")
-MODEL_DIR = os.getenv("MODEL_DIR", ".")
-RETRAIN_INTERVAL = int(os.getenv("RETRAIN_INTERVAL", os.getenv("RETRAIN_INTERVAL", "3600")))
 
-BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
-BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
-# BYBIT_ENV: "mainnet" or "sandbox"
-BYBIT_ENV = os.getenv("BYBIT_ENV", "mainnet").lower()
-# default to demo mode / dry-run True unless explicitly set to "false"
-BYBIT_DRY_RUN = os.getenv("BYBIT_DRY_RUN", "True").lower() in ("1", "true", "yes")
-
-# globals
-ai_prob_history = deque(maxlen=200)
-active_signals = {}  # symbol -> dict
-executor = ThreadPoolExecutor(max_workers=8)
-
-# ================= utilities =================
-def ensure_dir(path: str):
-    d = os.path.dirname(path)
-    if d and not os.path.exists(d):
-        os.makedirs(d, exist_ok=True)
-
-def get_decimal_places_for_price(price: float):
-    if price is None or price <= 0 or not np.isfinite(price):
-        return 6
-    exp = int(np.floor(np.log10(abs(price))))
-    return 4 if exp >= 0 else min(8, 4 + abs(exp))
-
-def round_price(price, decimals=None):
-    if price is None or not np.isfinite(price):
-        return price
-    if decimals is None:
-        decimals = get_decimal_places_for_price(price)
-    return float(np.round(price, decimals))
-
-def compute_tp_sl(entry, atr=None, rr=RISK_REWARD, min_pct=0.0005):
-    if atr is None or not np.isfinite(atr) or atr <= 0:
-        sl_dist = max(entry * min_pct, entry * 0.01)
+def append_csv(path: Path, row: dict):
+    ensure_log_path(path)
+    df = pd.DataFrame([row])
+    if not path.exists():
+        df.to_csv(path, index=False)
     else:
-        sl_dist = float(atr) * 1.5
-        sl_dist = max(sl_dist, entry * min_pct)
-    tp = entry + sl_dist * rr
-    sl = entry - sl_dist
-    decimals = get_decimal_places_for_price(entry)
-    return round_price(tp, decimals), round_price(sl, decimals), sl_dist
+        df.to_csv(path, mode="a", index=False, header=False)
 
-def ensure_tp_sl_order(entry: float, tp: float, sl: float, direction: str):
-    dec = get_decimal_places_for_price(entry)
-    min_step = 10**(-dec)
-    min_step = max(min_step, entry * 0.0001)
-    if direction == "LONG":
-        if tp <= entry + min_step:
-            tp = round_price(entry + max(min_step, entry * 0.0005), dec)
-        if sl >= entry - min_step:
-            sl = round_price(entry - max(min_step, entry * 0.0005), dec)
+
+def _to_markdown_message(message_html: str) -> str:
+    return message_html.replace("<b>", "**").replace("</b>", "**")
+
+
+def format_signal_message(signal, regime: MarketRegime, ml_prob: float, horizon: float) -> str:
+    return (
+        f"<b>{signal.side} {signal.symbol}</b>\n"
+        f"Entry: <b>{signal.entry:.6f}</b>\n"
+        f"TP: <b>{signal.tp:.6f}</b> | SL: <b>{signal.sl:.6f}</b>\n"
+        f"Confidence: <b>{signal.confidence:.2f}</b>\n"
+        f"ML Probability: <b>{ml_prob * 100:.1f}%</b>\n"
+        f"Horizon: <b>{horizon:.1f}</b> bars\n"
+        f"Regime: <b>{regime.value}</b>"
+    )
+
+
+def format_close_message(trade: dict) -> str:
+    return (
+        f"<b>Trade closed {trade['symbol']}</b>\n"
+        f"Side: <b>{trade['side']}</b>\n"
+        f"Exit reason: <b>{trade['closed_reason']}</b>\n"
+        f"PnL: <b>{trade['pnl']:.4f} USDT</b>\n"
+        f"Duration: <b>{trade['duration_sec']:.1f}s</b>"
+    )
+
+
+def send_alerts(telegram: TelegramClient, discord: DiscordClient, message_html: str, chart: bytes | None = None):
+    telegram.send_text(message_html)
+    if chart:
+        telegram.send_photo(caption=message_html, image_bytes=chart)
+
+    msg_md = _to_markdown_message(message_html)
+    if chart:
+        ok = discord.send_image(msg_md, chart)
+        if not ok:
+            discord.send_text(msg_md)
     else:
-        if tp >= entry - min_step:
-            tp = round_price(entry - max(min_step, entry * 0.0005), dec)
-        if sl <= entry + min_step:
-            sl = round_price(entry + max(min_step, entry * 0.0005), dec)
-    return tp, sl
+        discord.send_text(msg_md)
 
-# safe CSV read with simple fixer
-def safe_read_csv_or_fix(path: str, expected_cols: int | None = None) -> pd.DataFrame | None:
-    if not os.path.exists(path):
-        return None
+
+def _load_models_for_regimes(model_dir: str, use_regime_models: bool):
+    bundles = {"default": load_model_bundle(model_dir=model_dir, regime=None)}
+    if not use_regime_models:
+        return bundles
+
+    for regime in ("TREND", "RANGE", "PUMP", "PANIC"):
+        bundles[regime] = load_model_bundle(model_dir=model_dir, regime=regime)
+    return bundles
+
+
+def _pick_bundle(bundles: dict, regime: MarketRegime):
+    bundle = bundles.get(regime.value)
+    if bundle and bundle.classifier is not None:
+        return bundle
+    return bundles["default"]
+
+
+def _current_open_exposure(risk_engine: RiskEngine) -> float:
+    exposure = 0.0
+    for pos in risk_engine.open_positions.values():
+        exposure += float(pos.get("entry", 0.0)) * float(pos.get("qty", 0.0))
+    return exposure
+
+
+def _timeframe_to_minutes(tf: str) -> int:
+    t = str(tf).strip().lower()
+    if t.isdigit():
+        return max(1, int(t))
+    if t == "d":
+        return 24 * 60
+    if t == "w":
+        return 7 * 24 * 60
+    return 1
+
+
+def append_online_training_row(dataset_path: Path, row: dict):
+    ensure_log_path(dataset_path)
+    df = pd.DataFrame([row])
+    if not dataset_path.exists():
+        df.to_csv(dataset_path, index=False)
+    else:
+        df.to_csv(dataset_path, mode="a", index=False, header=False)
+
+
+def run_backtest_mode(data_path: str, out_path: str):
     try:
-        # try modern pandas approach
-        try:
-            df = pd.read_csv(path, on_bad_lines="skip")
-            return df
-        except TypeError:
-            # older pandas
-            df = pd.read_csv(path, error_bad_lines=False, warn_bad_lines=True)  # type: ignore
-            return df
-    except Exception:
-        # fallback manual repair
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                lines = [ln.rstrip("\n") for ln in f if ln.strip()]
-            if not lines:
-                return None
-            header = lines[0].split(",")
-            expected = expected_cols or len(header)
-            rows = []
-            for ln in lines[1:]:
-                parts = ln.split(",")
-                if len(parts) < expected:
-                    parts += [""] * (expected - len(parts))
-                elif len(parts) > expected:
-                    parts = parts[:expected]
-                rows.append(parts)
-            df = pd.DataFrame(rows, columns=header[:expected])
-            return df
-        except Exception:
-            return None
-
-# ================= plotting =================
-def plot_candlestick_with_macd(df: pd.DataFrame, symbol: str, direction: str, entry: float, tp: float, sl: float) -> bytes | None:
-    try:
-        df_plot = df.copy()
-        df_plot.columns = [c.lower() for c in df_plot.columns]
-        if "time" in df_plot.columns and not isinstance(df_plot.index, pd.DatetimeIndex):
-            df_plot["datetime"] = pd.to_datetime(df_plot["time"], unit="ms", errors="coerce")
-            df_plot = df_plot.set_index("datetime")
-        required = {"open","high","low","close"}
-        if not required.issubset(set(df_plot.columns)):
-            return None
-        cols = ["open","high","low","close"]
-        if "volume" in df_plot.columns:
-            cols += ["volume"]
-        df_plot = df_plot[cols].astype(float).dropna().tail(150)
-        if len(df_plot) < 6:
-            return None
-        df_plot["ema20"] = df_plot["close"].ewm(span=20).mean()
-        df_plot["ema50"] = df_plot["close"].ewm(span=50).mean()
-        ema12 = df_plot["close"].ewm(span=12).mean()
-        ema26 = df_plot["close"].ewm(span=26).mean()
-        df_plot["macd"] = ema12 - ema26
-        df_plot["signal"] = df_plot["macd"].ewm(span=9).mean()
-        df_plot["hist"] = df_plot["macd"] - df_plot["signal"]
-        price_range = df_plot["high"].max() - df_plot["low"].min()
-        if price_range <= 0 or price_range < (df_plot["close"].mean() * 1e-7):
-            df_plot[["open","high","low","close"]] = df_plot[["open","high","low","close"]] * 1e6
-
-        plt.rcParams.update({'font.size': 10})
-        fig = plt.figure(figsize=(10,7), facecolor='#0b1220')
-        gs = fig.add_gridspec(3,1, height_ratios=[3,0.12,1], hspace=0.08)
-        ax_main = fig.add_subplot(gs[0])
-        ax_vol  = fig.add_subplot(gs[1], sharex=ax_main)
-        ax_macd = fig.add_subplot(gs[2], sharex=ax_main)
-        for ax in (ax_main, ax_vol, ax_macd):
-            ax.set_facecolor('#0b1220')
-            ax.grid(True, linestyle='--', color='#253043', linewidth=0.6, alpha=0.8)
-
-        dates = np.arange(len(df_plot))
-        width = 0.6
-        for i, (o,h,l,c) in enumerate(zip(df_plot['open'], df_plot['high'], df_plot['low'], df_plot['close'])):
-            color = '#26a69a' if c>=o else '#ef5350'
-            ax_main.vlines(dates[i], l, h, color='#888888', linewidth=0.8, zorder=1)
-            rect = Rectangle((dates[i]-width/2, min(o,c)), width, abs(c-o),
-                             facecolor=color, edgecolor='#222222', linewidth=0.3, zorder=2)
-            ax_main.add_patch(rect)
-
-        ax_main.plot(dates, df_plot['ema20'], linewidth=1.0)
-        ax_main.plot(dates, df_plot['ema50'], linewidth=1.0)
-        ax_main.hlines([entry, tp, sl], xmin=dates[0], xmax=dates[-1], linestyles='--', linewidth=1.0)
-        ax_main.scatter([dates[-1]], [entry], s=60, zorder=5)
-        ax_main.text(dates[-1], entry, ' ENTRY', va='bottom', fontsize=9, fontweight='bold')
-        ax_main.set_title(f"{symbol} {direction}", color='white', fontsize=14, pad=10)
-        ax_main.set_xlim(dates[0]-1, dates[-1]+1)
-        ax_main.set_xticks([])
-
-        if 'volume' in df_plot.columns:
-            ax_vol.bar(dates, df_plot['volume'], width=0.6)
-            ax_vol.axis('off')
-
-        ax_macd.plot(dates, df_plot['macd'], linewidth=1.0)
-        ax_macd.plot(dates, df_plot['signal'], linewidth=1.0)
-        ax_macd.bar(dates, df_plot['hist'], width=0.6)
-        ax_macd.set_xlim(dates[0]-1, dates[-1]+1)
-        ax_main.set_ylabel('Price')
-        ax_macd.set_ylabel('MACD')
-
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=160, bbox_inches='tight', facecolor=fig.get_facecolor())
-        plt.close(fig)
-        buf.seek(0)
-        return buf.read()
-    except Exception:
-        logger.exception("plot_candlestick failed for %s", symbol if 'symbol' in locals() else "")
-        return None
-
-# ================= AI models =================
-def load_models():
-    try:
-        model_win = joblib.load(os.path.join(MODEL_DIR, "ai_model_win.pkl"))
-        model_horizon = joblib.load(os.path.join(MODEL_DIR, "ai_model_horizon.pkl"))
-        scaler = joblib.load(os.path.join(MODEL_DIR, "scaler.pkl"))
-        logger.info("AI models loaded")
-        return model_win, model_horizon, scaler
-    except Exception as e:
-        logger.warning("Failed to load AI models: %s", e)
-        return None, None, None
-
-model_win, model_horizon, scaler = load_models()
-_ai_diagnostics_done = False
-
-def ai_predict(features):
-    """
-    Predicts (probability, horizon). Uses models if available, otherwise heuristic.
-    Input: list/array of numeric features.
-    """
-    global _ai_diagnostics_done
-    import numpy as _np
-    import pandas as _pd
-
-    try:
-        feats = _np.array([features], dtype=float)
-    except Exception as e:
-        logger.error("ai_predict: invalid features: %s", e)
-        return None, None
-
-    if model_win is None or model_horizon is None or scaler is None:
-        # heuristic fallback
-        rsi = float(feats[0][0]) if feats.shape[1] > 0 else 50.0
-        vol = float(feats[0][4]) if feats.shape[1] > 4 else 1.0
-        ema_diff = float(feats[0][9]) if feats.shape[1] > 9 else 0.0
-        prob = min(1.0, max(0.0, 0.3*(rsi/100) + 0.5*min(1.0, vol/5.0) + 0.2*abs(ema_diff)*10))
-        horizon = round(max(1.0, min(100.0, abs(ema_diff)*200.0)), 3)
-        return float(prob), float(horizon)
-
-    # build DataFrame if scaler expects feature names
-    try:
-        if hasattr(scaler, "feature_names_in_"):
-            df_features = _pd.DataFrame([feats[0]], columns=scaler.feature_names_in_)
-        else:
-            df_features = feats
-        feats_scaled = scaler.transform(df_features)
-    except Exception as e:
-        logger.warning("scaler.transform failed: %s", e)
-        feats_scaled = feats
-
-    prob = None
-    horizon = None
-    # predict probability
-    try:
-        if hasattr(model_win, "predict_proba"):
-            proba = model_win.predict_proba(feats_scaled)[0]
-            prob = float(proba[-1]) if len(proba) > 1 else float(proba[0])
-        else:
-            prob = float(model_win.predict(feats_scaled)[0])
-    except Exception as e:
-        logger.warning("model_win.predict failed: %s", e)
-        prob = None
-
-    # predict horizon
-    try:
-        hpred = model_horizon.predict(feats_scaled)[0]
-        if np.isfinite(hpred):
-            horizon = float(round(hpred, 3))
-    except Exception as e:
-        logger.warning("model_horizon.predict failed: %s", e)
-        horizon = None
-
-    # clamp prob
-    if prob is not None:
-        if not np.isfinite(prob):
-            prob = None
-        else:
-            prob = max(0.0, min(1.0, float(prob)))
-
-    # fallback heuristics
-    if prob is None:
-        rsi = float(feats[0][0]) if feats.shape[1] > 0 else 50.0
-        vol = float(feats[0][4]) if feats.shape[1] > 4 else 1.0
-        ema_diff = float(feats[0][9]) if feats.shape[1] > 9 else 0.0
-        prob = min(1.0, max(0.0, 0.3*(rsi/100) + 0.5*min(1.0, vol/5.0) + 0.2*abs(ema_diff)*10))
-    if horizon is None:
-        horizon = 8.5
-    # one-time diagnostics
-    if not _ai_diagnostics_done:
-        try:
-            logger.info("Running AI quick diagnostics")
-            _ai_diagnostics_done = True
-        except Exception:
-            pass
-    return float(prob), float(horizon)
-
-# ================= Network helpers & FixedHostResolver =================
-_dns_cache = {}  # host -> (ip, ts)
-
-def resolve_host(host: str) -> str:
-    """Resolve host to IP using socket.gethostbyname with caching (short TTL)."""
-    try:
-        now = time.time()
-        rec = _dns_cache.get(host)
-        if rec and now - rec[1] < 300:  # 5 min cache
-            return rec[0]
-        ip = socket.gethostbyname(host)
-        _dns_cache[host] = (ip, now)
-        logger.info("%s -> %s (cached)", host, ip)
-        return ip
-    except Exception as e:
-        logger.warning("DNS error: %s", e)
-        return host
-
-class FixedHostResolver(TCPConnector):
-    """
-    Connector that returns provided IP for a particular hostname.
-    Compatible with aiohttp >=3.9/3.10/3.11/3.13.
-    """
-    def __init__(self, hostname: str | None = None, ip: str | None = None, *args, **kwargs):
-        # accept ssl kw for aiohttp connector compatibility
-        super().__init__(*args, **kwargs)
-        self._hostname = hostname
-        self._ip = ip
-
-    # signature includes family default to avoid errors across aiohttp versions
-    async def _resolve_host(self, host, port, family=socket.AF_INET, **kwargs):
-        # aiohttp may pass family and other kwargs (traces etc.)
-        if self._hostname and self._ip and host == self._hostname:
-            return [{
-                'hostname': host,
-                'host': self._ip,
-                'port': port,
-                'family': family,
-                'proto': 0,
-                'flags': 0,
-            }]
-        return await super()._resolve_host(host, port, family=family, **kwargs)
-
-# high-level POST helper with fallback to direct IP (async)
-# ================= Improved Telegram and Fallback Networking =================
-import ssl
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-def send_telegram_sync(text: str, timeout: int = 8):
-    """
-    Надёжная синхронная отправка текстового сообщения в Telegram.
-    Попытки:
-      1) обычный requests.post к api.telegram.org
-      2) если DNS/TLS/сетевые ошибки — резолвим IP и постим на IP с заголовком Host
-      3) если и это не помогает — вторично пробуем на IP с verify=False (крайняя мера)
-    """
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.debug("Telegram not configured; skipping send_telegram_sync.")
-        return
-
-    base_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-    url = f"{base_url}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
-
-    # 1) Обычная попытка
-    try:
-        resp = requests.post(url, data=payload, timeout=timeout)
-        if resp.status_code == 200:
-            logger.debug("send_telegram_sync ok")
-            return
-        else:
-            logger.warning("send_telegram_sync HTTP %s: %s", resp.status_code, resp.text[:300])
-    except (RequestException, Timeout, ConnectionError, SSLError) as e:
-        logger.warning("Network/DNS/TLS error while send_telegram_sync: %s", e)
-
-    # 2) Попытка через IP (оставляем Host: api.telegram.org)
-    try:
-        ip = resolve_host("api.telegram.org")
-        if ip and ip != "api.telegram.org":
-            url_ip = f"https://{ip}/bot{TELEGRAM_TOKEN}/sendMessage"
-            headers = {"Host": "api.telegram.org"}
-            try:
-                resp2 = requests.post(url_ip, data=payload, headers=headers, timeout=timeout)
-                if resp2.status_code == 200:
-                    logger.info("Fallback POST via IP %s for api.telegram.org succeeded (status=%s)", ip, resp2.status_code)
-                    return
-                else:
-                    logger.warning("Fallback POST via IP %s HTTP %s: %s", ip, resp2.status_code, resp2.text[:300])
-            except (RequestException, Timeout, ConnectionError, SSLError) as e2:
-                logger.warning("Fallback POST via IP %s for api.telegram.org failed: %s", ip, e2)
-                # 3) крайняя мера -> отключаем верификацию сертификата (сертификат не совпадает с IP, поэтому это риск)
-                try:
-                    resp3 = requests.post(url_ip, data=payload, headers=headers, timeout=timeout, verify=False)
-                    if resp3.status_code == 200:
-                        logger.warning("Fallback via IP with verify=False succeeded (insecure).")
-                        return
-                    else:
-                        logger.warning("Fallback via IP verify=False HTTP %s: %s", resp3.status_code, resp3.text[:300])
-                except Exception as e3:
-                    logger.error("Fallback via IP verify=False also failed: %s", e3)
-    except Exception as e_all:
-        logger.exception("send_telegram_sync: unexpected error in fallback logic: %s", e_all)
-
-    logger.error("send_telegram_sync: all attempts to send Telegram message failed.")
-
-def send_telegram_photo_sync(caption: str, image_bytes: bytes, timeout: int = 20):
-    """
-    Синхронная отправка изображения в Telegram (requests).
-    Аналогичная политика fallback: обычный запрос -> пост на IP с Host -> крайняя мера verify=False.
-    """
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.debug("Telegram not configured; skipping send_telegram_photo_sync.")
-        return
-
-    if not image_bytes:
-        logger.warning("send_telegram_photo_sync: image_bytes empty")
-        return
-
-    base_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-    url = f"{base_url}/sendPhoto"
-    files = {"photo": ("chart.png", io.BytesIO(image_bytes), "image/png")}
-    data = {"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML"}
-
-    try:
-        resp = requests.post(url, data=data, files=files, timeout=timeout)
-        if resp.status_code == 200:
-            logger.debug("send_telegram_photo_sync ok")
-            return
-        else:
-            logger.warning("send_telegram_photo_sync HTTP %s: %s", resp.status_code, resp.text[:300])
-    except (RequestException, Timeout, ConnectionError, SSLError) as e:
-        logger.warning("send_telegram_photo_sync network error: %s", e)
-
-    # fallback via IP
-    try:
-        ip = resolve_host("api.telegram.org")
-        if ip and ip != "api.telegram.org":
-            url_ip = f"https://{ip}/bot{TELEGRAM_TOKEN}/sendPhoto"
-            headers = {"Host": "api.telegram.org"}
-            try:
-                resp2 = requests.post(url_ip, data=data, files=files, headers=headers, timeout=timeout)
-                if resp2.status_code == 200:
-                    logger.info("Fallback photo POST via IP %s succeeded", ip)
-                    return
-                else:
-                    logger.warning("Fallback photo POST via IP %s HTTP %s: %s", ip, resp2.status_code, resp2.text[:300])
-            except Exception as e2:
-                logger.warning("Fallback photo POST via IP failed: %s", e2)
-                try:
-                    resp3 = requests.post(url_ip, data=data, files=files, headers=headers, timeout=timeout, verify=False)
-                    if resp3.status_code == 200:
-                        logger.warning("Fallback photo via IP with verify=False succeeded (insecure).")
-                        return
-                except Exception as e3:
-                    logger.error("Fallback photo verify=False also failed: %s", e3)
-    except Exception as e_all:
-        logger.exception("send_telegram_photo_sync fallback unexpected error: %s", e_all)
-
-    logger.error("send_telegram_photo_sync: all attempts failed.")
-
-async def _post_with_fallback(session: ClientSession, url: str, data: dict | None = None,
-                              timeout: int = 10, host_for_fallback: str | None = None):
-    """
-    Усовершенствованный POST с тройным fallback:
-      1. aiohttp стандартный POST
-      2. aiohttp с IP через FixedHostResolver (с корректным _resolve_host)
-      3. requests (sync fallback) при полном отказе DNS или TLS
-    Возвращает aiohttp.Response-like object если шаг 1 или 2 успешен;
-    при fallback на requests — возвращает объект requests.Response.
-    """
-    try:
-        async with session.post(url, data=data, timeout=timeout) as resp:
-            return resp
-    except Exception as e1:
-        logger.warning("Network/DNS error during async POST: %s", e1)
-        if not host_for_fallback:
-            raise
-
-        # --- Fallback step 1: пробуем IP через FixedHostResolver ---
-        ip = resolve_host(host_for_fallback)
-        if not ip or ip == host_for_fallback:
-            logger.info("No IP resolved for fallback host %s", host_for_fallback)
-        else:
-            try:
-                # create SSLContext (default) — rely on connector to use SNI based on host header
-                ssl_ctx = ssl.create_default_context()
-                # Create connector that will return IP for host_for_fallback
-                connector = FixedHostResolver(host_for_fallback, ip, ssl=ssl_ctx, limit=CONCURRENT_TASKS)
-                async with ClientSession(connector=connector) as sess2:
-                    # keep url unchanged (uses host name in URL) — but FixedHostResolver will map host -> ip
-                    async with sess2.post(url, data=data, timeout=timeout) as resp2:
-                        if resp2.status == 200:
-                            logger.info("✅ Fallback via IP (%s) for %s succeeded", ip, host_for_fallback)
-                            return resp2
-                        else:
-                            txt = await resp2.text()
-                            logger.warning("Fallback via IP %s HTTP %s: %s", ip, resp2.status, txt[:200])
-            except Exception as e2:
-                logger.warning("Fallback via IP %s failed for %s: %s", ip, host_for_fallback, e2)
-
-        # --- Fallback step 2: requests (sync) ---
-        try:
-            logger.info("🌐 Final fallback via requests for %s (%s)", host_for_fallback, ip if 'ip' in locals() else None)
-            # Construct URL that uses ip instead of hostname to bypass DNS; set Host header to original host
-            url_replaced = url
-            if ip and host_for_fallback in url:
-                url_replaced = url.replace(host_for_fallback, ip)
-            headers = {"Host": host_for_fallback}
-            resp = requests.post(url_replaced, data=data, headers=headers, timeout=8, verify=True)
-            # return requests.Response so caller can inspect .status_code/.text
-            return resp
-        except Exception as e3:
-            logger.error("requests fallback failed for %s: %s", host_for_fallback, e3)
-            raise e3
-
-# === Telegram helpers with guaranteed fallback (async wrappers + sync fallbacks) ===
-async def send_telegram_async(session: ClientSession, text: str):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.debug("Telegram not configured; message skipped")
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
-
-    try:
-        resp = await _post_with_fallback(session, url, data=payload, timeout=10, host_for_fallback="api.telegram.org")
-        # resp may be aiohttp response or requests.Response (sync fallback)
-        if hasattr(resp, "status"):
-            try:
-                txt = await resp.text()
-                if resp.status != 200:
-                    logger.warning("send_telegram_async HTTP %s: %s", resp.status, txt[:300])
-            except Exception:
-                pass
-        else:
-            # requests.Response
-            if resp.status_code != 200:
-                logger.warning("send_telegram_async (requests fallback) HTTP %s: %s", resp.status_code, resp.text[:300])
-    except Exception as e:
-        logger.exception("send_telegram_async failed; falling back to sync: %s", e)
-        try:
-            send_telegram_sync(text)
-        except Exception:
-            logger.exception("send_telegram_sync also failed")
-
-def send_telegram(text: str):
-    """Convenience: try async by creating a short session, else fallback to sync."""
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.debug("Telegram not configured; skipping send_telegram.")
-        return
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # schedule (fire-and-forget) on background task using a fresh session
-            async def _fire(text):
-                async with ClientSession() as sess:
-                    await send_telegram_async(sess, text)
-            asyncio.create_task(_fire(text))
-            return
-    except Exception:
-        # if event loop not available or any error — fallback to sync
-        pass
-    send_telegram_sync(text)
-
-async def send_telegram_photo_async(session: ClientSession, caption: str, image_bytes: bytes):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.debug("Telegram not configured; photo skipped")
-        return
-    if not image_bytes:
-        logger.debug("send_telegram_photo_async: empty image")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-    data = {"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML"}
-    # aiohttp cannot post files easily with our _post_with_fallback helper; we try normal session post first
-    try:
-        async with session.post(url, data=data, timeout=20) as resp:
-            txt = await resp.text()
-            if resp.status != 200:
-                logger.warning("send_telegram_photo_async HTTP %s: %s", resp.status, txt[:300])
-            return
-    except Exception as e:
-        logger.warning("send_telegram_photo_async failed (async attempt): %s", e)
-        # fallback to sync requests which supports files and IP fallback inside send_telegram_photo_sync
-        try:
-            send_telegram_photo_sync(caption, image_bytes)
-        except Exception:
-            logger.exception("send_telegram_photo_sync failed as fallback")
-
-def send_telegram_photo(caption: str, image_bytes: bytes):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.debug("Telegram not configured; photo skipped")
-        return
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            async def _session_and_send():
-                async with ClientSession() as s:
-                    await send_telegram_photo_async(s, caption, image_bytes)
-            asyncio.create_task(_session_and_send())
-            return
-    except Exception:
-        pass
-    send_telegram_photo_sync(caption, image_bytes)
-
-# ================= indicators & fetcher =================
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean().replace(0, 0.00001)
-    df["rsi"] = 100 - (100 / (1 + gain / loss))
-    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
-    tr1 = df["high"] - df["low"]
-    tr2 = (df["high"] - df["close"].shift(1)).abs()
-    tr = pd.concat([tr1, tr2], axis=1).max(axis=1)
-    df["atr"] = tr.rolling(14).mean()
-    return df
-
-async def fetch_candles(session: ClientSession, symbol: str, max_attempts: int = 3) -> pd.DataFrame | None:
-    """
-    Robust fetcher for Bybit kline endpoint with DNS fallback.
-    symbol example: 'BTC/USDT'
-    """
-    base = symbol.split("/")[0]
-    api_host = "api.bybit.com"
-    path = f"/v5/market/kline?category=linear&symbol={base}USDT&interval={TIMEFRAME}&limit={CANDLES}"
-    url = f"https://{api_host}{path}"
-
-    last_exc = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            async with session.get(url, timeout=10) as resp:
-                if resp.status != 200:
-                    txt = await resp.text()
-                    logger.warning("fetch_candles HTTP %s for %s: %s", resp.status, symbol, txt[:200])
-                    return None
-                data = await resp.json()
-                if "result" not in data or "list" not in data["result"]:
-                    return None
-                candles = data["result"]["list"]
-                df = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume", "turnover"])
-                df = df[["time", "open", "high", "low", "close", "volume"]].astype(float)
-                df = df.sort_values("time", ascending=True).reset_index(drop=True)
-                df["datetime"] = pd.to_datetime(df["time"], unit="ms", errors="coerce")
-                df = df.set_index("datetime")
-                df = df.loc[~df.index.isna()]
-                return df
-        except aiohttp.client_exceptions.ClientConnectorDNSError as e:
-            last_exc = e
-            logger.warning("DNS error on attempt %d for %s: %s", attempt, symbol, e)
-            # fallback to direct IP
-            ip = resolve_host("api.bybit.com")
-            if ip and ip != "api.bybit.com":
-                try:
-                    tmp_conn = FixedHostResolver("api.bybit.com", ip, limit=CONCURRENT_TASKS)
-                    async with ClientSession(connector=tmp_conn) as tmp_s:
-                        url_direct = f"https://api.bybit.com{path}"
-                        async with tmp_s.get(url_direct, timeout=10) as resp2:
-                            if resp2.status != 200:
-                                txt2 = await resp2.text()
-                                logger.warning("fetch_candles (direct) HTTP %s for %s: %s", resp2.status, symbol, txt2[:200])
-                                return None
-                            data2 = await resp2.json()
-                            if "result" not in data2 or "list" not in data2["result"]:
-                                return None
-                            candles2 = data2["result"]["list"]
-                            df = pd.DataFrame(candles2, columns=["time", "open", "high", "low", "close", "volume", "turnover"])
-                            df = df[["time", "open", "high", "low", "close", "volume"]].astype(float)
-                            df = df.sort_values("time", ascending=True).reset_index(drop=True)
-                            df["datetime"] = pd.to_datetime(df["time"], unit="ms", errors="coerce")
-                            df = df.set_index("datetime")
-                            df = df.loc[~df.index.isna()]
-                            logger.info("Fallback via IP successful for %s", symbol)
-                            return df
-                except Exception as inner:
-                    last_exc = inner
-                    logger.warning("fetch_candles direct IP attempt failed for %s: %s", symbol, inner)
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as net_e:
-            last_exc = net_e
-            logger.warning("Network error on attempt %d for %s: %s", attempt, symbol, net_e)
-        # backoff
-        await asyncio.sleep(1.5 ** attempt)
-    logger.error("fetch_candles failed for %s after %d attempts: %s", symbol, max_attempts, last_exc)
-    return None
-
-# ================= core analyze_pair =================
-async def analyze_pair(symbol: str, semaphore: asyncio.Semaphore, last_alerts: dict, session: ClientSession,
-                       bybit_client=None, trading_loop=None):
-    async with semaphore:
-        try:
-            df = await fetch_candles(session, symbol)
-            if df is None or len(df) < 30:
-                return
-            df = compute_indicators(df)
-            last, prev = df.iloc[-1], df.iloc[-2]
-            price_change = (last["close"] - prev["close"]) / prev["close"] if prev["close"] else 0
-            avg_vol = df["volume"].iloc[:-1].mean() if len(df) > 1 else 0
-            vol_change = last["volume"] / avg_vol if avg_vol > 0 else 0
-            now = time.time()
-            if symbol in last_alerts and now - last_alerts[symbol] < 60:
-                return
-
-            long_ok = price_change >= PRICE_THRESHOLD and vol_change >= VOLUME_THRESHOLD and last["ema20"] > last["ema50"]
-            short_ok = price_change <= -PRICE_THRESHOLD and vol_change >= VOLUME_THRESHOLD and last["ema20"] < last["ema50"]
-
-            # pump detection -> prefer short (reversion)
-            is_pump = (price_change >= 0.04 and vol_change >= 8.0 and last["rsi"] >= 80.0)
-            strategy_type = "trend"
-            if is_pump:
-                short_ok = True
-                long_ok = False
-                strategy_type = "reversion"
-
-            if not (long_ok or short_ok):
-                return
-
-            direction = "LONG" if long_ok else "SHORT"
-            last_alerts[symbol] = now
-            entry = float(last["close"])
-
-            atr_val = None
-            try:
-                atr_val = float(last.get("atr")) if not pd.isna(last.get("atr")) else None
-            except Exception:
-                atr_val = None
-
-            tp_calc, sl_calc, sl_dist = compute_tp_sl(entry, atr=atr_val, rr=RISK_REWARD)
-            if direction == "LONG":
-                tp, sl = tp_calc, sl_calc
-            else:
-                tp = round_price(entry - sl_dist * RISK_REWARD, get_decimal_places_for_price(entry))
-                sl = round_price(entry + sl_dist, get_decimal_places_for_price(entry))
-            tp, sl = ensure_tp_sl_order(entry, tp, sl, direction)
-
-            # features for AI
-            features = [
-                float(last.get("rsi", 0)),
-                float(df["rsi"].iloc[-5:].mean()) if len(df) >= 5 else float(last.get("rsi", 0)),
-                float(df["rsi"].iloc[-20:].mean()) if len(df) >= 20 else float(last.get("rsi", 0)),
-                float(price_change),
-                float(vol_change),
-                float(last.get("ema20", 0)),
-                float(last.get("ema50", 0)),
-                float(last.get("atr", 0)),
-                float(last.get("close", 0)),
-                float((last["ema20"] - last["ema50"]) / max(last.get("close", 1), 1e-9)),
-                float(last["atr"] / max(last.get("close", 1), 1e-9))
-            ]
-
-            ai_prob, ai_horizon = ai_predict(features)
-            if ai_prob is not None and np.isfinite(ai_prob):
-                ai_prob_history.append(ai_prob)
-
-            # short 5-candle price change text
-            try:
-                if len(df) >= 6:
-                    change_5 = (df['close'].iloc[-1] - df['close'].iloc[-6]) / df['close'].iloc[-6] * 100
-                    change_text = f"📈 Изменение цены: {change_5:+.2f}%"
-                else:
-                    change_text = ""
-            except Exception:
-                change_text = ""
-
-            # build message
-            emoji = "🚀" if direction == "LONG" else "🔻"
-            base = symbol.split("/")[0]
-            msg = (
-                f"{emoji} <b>{direction}: {symbol}</b>\n"
-                f"Вход: <b>{entry:.{get_decimal_places_for_price(entry)}f}</b>\n"
-                f"TP: <b>{tp:.{get_decimal_places_for_price(tp)}f}</b> | "
-                f"SL: <b>{sl:.{get_decimal_places_for_price(sl)}f}</b>\n"
-                f"RSI: {last['rsi']:.1f} | Vol: {vol_change:.2f}x\n"
-                f"{change_text}\n"
-                f"<a href='https://www.bybit.com/trade/usdt/{base}'>График</a>"
-            )
-            if ai_prob is not None:
-                msg += f"\n\n🤖 <b>Вероятность успеха:</b> {ai_prob * 100:.1f}%"
-            if ai_horizon is not None:
-                msg += f"\n🕒 <b>Ожидаемая отработка:</b> {round(ai_horizon, 2)}"
-
-            # chart
-            chart_bytes = plot_candlestick_with_macd(df, symbol, direction, entry, tp, sl)
-            try:
-                if chart_bytes:
-                    send_telegram_photo(msg, chart_bytes)
-                else:
-                    send_telegram(msg)
-            except Exception:
-                logger.exception("Telegram send failed for %s", symbol)
-
-            # save to CSV
-            ensure_dir(LOG_PATH)
-            save_dict = {
-                "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                "symbol": symbol,
-                "direction": direction,
-                "entry": entry,
-                "tp": tp,
-                "sl": sl,
-                "rsi": last.get("rsi", float("nan")),
-                "vol_change": vol_change,
-                "ai_prob": ai_prob,
-                "ai_horizon": ai_horizon,
-                "strategy": strategy_type
-            }
-            try:
-                df_save = pd.DataFrame([save_dict])
-                if not os.path.exists(LOG_PATH):
-                    df_save.to_csv(LOG_PATH, index=False)
-                else:
-                    df_save.to_csv(LOG_PATH, mode="a", index=False, header=False)
-            except Exception:
-                logger.exception("Failed to save signal for %s", symbol)
-
-            # store active signal for confirmation monitor
-            active_signals[symbol] = {
-                "direction": direction,
-                "entry": entry,
-                "tp": tp,
-                "sl": sl,
-                "timestamp": time.time(),
-                "confirmed": False,
-                "ai_prob": ai_prob,
-                "strategy": strategy_type
-            }
-
-            # optional demo trading order (offloaded to thread) — demo mode only if BYBIT_DRY_RUN True
-            if BYBIT_API_KEY and BYBIT_API_SECRET and BybitClient is not None and BYBIT_DRY_RUN:
-                try:
-                    if ai_prob is not None and ai_prob >= 0.6:
-                        amount = 0.01
-                        side = 'buy' if direction == 'LONG' else 'sell'
-                        loop = asyncio.get_running_loop()
-                        def place():
-                            # create client with right env and dry_run True
-                            client = BybitClient(api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET,
-                                                 sandbox=(BYBIT_ENV != "mainnet"), dry_run=BYBIT_DRY_RUN)
-                            return client.place_order_market(symbol, side, amount)
-                        res = await loop.run_in_executor(executor, place)
-                        logger.info("Demo order result: %s", res)
-                except Exception:
-                    logger.exception("Demo order failed for %s", symbol)
-
-        except Exception:
-            logger.exception("analyze_pair error for %s", symbol)
-            return
-
-# ================= monitor_entries (background) =================
-async def monitor_entries(session: ClientSession, bybit_client=None, trading_loop=None):
-    logger.info("monitor_entries task started")
-    while True:
-        try:
-            if not active_signals:
-                await asyncio.sleep(10)
-                continue
-            for symbol, sig in list(active_signals.items()):
-                try:
-                    df = await fetch_candles(session, symbol)
-                    if df is None or len(df) < 2:
-                        continue
-                    last_price = float(df["close"].iloc[-1])
-                    direction = sig["direction"]
-                    entry = sig["entry"]
-                    confirmed = False
-                    if direction == "LONG" and last_price >= entry:
-                        confirmed = True
-                    elif direction == "SHORT" and last_price <= entry:
-                        confirmed = True
-                    if confirmed and not sig.get("confirmed", False):
-                        sig["confirmed"] = True
-                        ai_prob = sig.get("ai_prob", None)
-                        prob_text = f"{ai_prob * 100:.1f}%" if ai_prob is not None else "n/a"
-                        send_telegram(
-                            f"🎯 <b>Подтверждён вход: {symbol}</b>\n"
-                            f"Направление: <b>{direction}</b>\n"
-                            f"Цена достигнута: <b>{last_price:.6f}</b>\n"
-                            f"AI вероятность: <b>{prob_text}</b>\n"
-                            f"Стратегия: {sig.get('strategy','')}"
-                        )
-                        # demo order on confirmation if requested (demo only)
-                        if BYBIT_API_KEY and BYBIT_API_SECRET and BybitClient is not None and BYBIT_DRY_RUN:
-                            try:
-                                side = 'buy' if direction == 'LONG' else 'sell'
-                                amount = 0.01
-                                loop = asyncio.get_running_loop()
-                                def place():
-                                    client = BybitClient(api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET,
-                                                         sandbox=(BYBIT_ENV != "mainnet"), dry_run=BYBIT_DRY_RUN)
-                                    return client.place_order_market(symbol, side, amount)
-                                res = await loop.run_in_executor(executor, place)
-                                logger.info("Placed demo order on confirmation: %s", res)
-                            except Exception:
-                                logger.exception("Failed to place demo order on confirmation")
-                        active_signals.pop(symbol, None)
-                    # expiry: remove old signals after 30 minutes
-                    if time.time() - sig["timestamp"] > 1800:
-                        active_signals.pop(symbol, None)
-                except Exception:
-                    logger.exception("monitor_entries loop error for %s", symbol)
-                    continue
-            await asyncio.sleep(10)
-        except Exception:
-            logger.exception("monitor_entries outer loop")
-            await asyncio.sleep(5)
-
-# ================= show_positions_loop =================
-async def show_positions_loop(bybit_client):
-    logger.info("show_positions_loop started")
-    while True:
-        try:
-            if bybit_client is None:
-                await asyncio.sleep(5)
-                continue
-            loop = asyncio.get_running_loop()
-            def get_pos():
-                try:
-                    return bybit_client.get_open_positions()
-                except Exception as e:
-                    return {"error": str(e)}
-            res = await loop.run_in_executor(executor, get_pos)
-            if not res:
-                logger.info("No open positions")
-            elif isinstance(res, dict) and res.get("error"):
-                logger.warning("get_open_positions error: %s", res.get("error"))
-            else:
-                logger.info("Active positions:")
-                try:
-                    for p in res:
-                        symbol = p.get("symbol")
-                        side = p.get("side")
-                        entry = float(p.get("entry_price", 0))
-                        pnl = float(p.get("unrealised_pnl", 0))
-                        logger.info("  %s | %s | entry=%s | PnL=%s", symbol, side, entry, pnl)
-                except Exception:
-                    logger.exception("show_positions_loop unexpected format")
-            await asyncio.sleep(15)
-        except Exception:
-            logger.exception("show_positions_loop error")
-            await asyncio.sleep(5)
-
-# ================= WebSocket monitor class (optional) =================
-class BybitWSMonitor:
-    def __init__(self, api_key, api_secret, send_func=None, sandbox: bool = False):
-        self.api_key = api_key
-        self.api_secret = api_secret.encode() if isinstance(api_secret, str) else api_secret
-        self.sandbox = sandbox
-        self.send_func = send_func
-        self.ws = None
-        self.connected = False
-        if self.sandbox:
-            self.endpoint = "wss://stream-testnet.bybit.com/v5/private"
-        else:
-            self.endpoint = "wss://stream.bybit.com/v5/private"
-
-    async def connect(self):
-        if websockets is None:
-            logger.warning("websockets library not available — skipping WS monitor.")
-            return
-        try:
-            logger.info("Connecting to Bybit WS: %s", self.endpoint)
-            self.ws = await websockets.connect(self.endpoint)
-            await self.authenticate()
-            self.connected = True
-            asyncio.create_task(self.listen())
-            logger.info("Bybit WS connected")
-        except Exception:
-            logger.exception("Bybit WS connect failed")
-
-    async def authenticate(self):
-        ts = int(time.time() * 1000)
-        payload = f"GET/realtime{ts}"
-        sign = hmac.new(self.api_secret, payload.encode(), hashlib.sha256).hexdigest()
-        auth_msg = {"op": "auth", "args": [self.api_key, ts, sign]}
-        await self.ws.send(json.dumps(auth_msg))
-        await asyncio.sleep(0.3)
-        await self.ws.send(json.dumps({"op": "subscribe", "args": ["position"]}))
-
-    async def listen(self):
-        try:
-            async for msg in self.ws:
-                try:
-                    data = json.loads(msg)
-                    if data.get("topic") == "position":
-                        self.handle_position_update(data)
-                except Exception:
-                    logger.exception("WS message handling error")
-        except Exception:
-            logger.exception("Bybit WS listen stopped")
-            self.connected = False
-
-    def handle_position_update(self, data):
-        try:
-            rows = data.get("data", [])
-            for pos in rows:
-                symbol = pos.get("symbol")
-                side = pos.get("side")
-                size = float(pos.get("size", 0))
-                entry = float(pos.get("avgPrice", 0))
-                pnl = float(pos.get("unrealisedPnl", 0))
-                ts = datetime.utcnow().strftime("%H:%M:%S")
-                if size > 0:
-                    msg = f"🟢 [{ts}] {symbol} {side} | size={size} | entry={entry:.6f} | PnL={pnl:.4f}"
-                    logger.info(msg)
-                    if self.send_func:
-                        try: self.send_func(msg)
-                        except Exception: pass
-                else:
-                    msg = f"⚪ [{ts}] {symbol} position closed"
-                    logger.info(msg)
-                    if self.send_func:
-                        try: self.send_func(msg)
-                        except Exception: pass
-        except Exception:
-            logger.exception("handle_position_update failed")
-
-# ================= fetch pairs (instruments list) =================
-async def fetch_pairs(session: ClientSession, url: str, attempts: int = 3) -> list[str]:
-    logger.info("fetch pairs: %s", url)
-    last_exc = None
-    for attempt in range(1, attempts + 1):
-        try:
-            async with session.get(url, timeout=10) as resp:
-                if resp.status != 200:
-                    txt = await resp.text()
-                    logger.warning("fetch_pairs HTTP %s: %s", resp.status, txt[:300])
-                    return []
-                data = await resp.json()
-                instruments = data.get("result", {}).get("list", [])
-                symbols = []
-                for item in instruments:
-                    if (
-                        item.get("contractType") in ("LinearPerpetual", "LinearPerpetualContract", "LinearPerpetual")
-                        and item.get("quoteCoin") == "USDT"
-                        and item.get("status") == "Trading"
-                    ):
-                        base = item.get("baseCoin")
-                        if base:
-                            symbols.append(f"{base}/USDT")
-                logger.info("✅ Pairs found: %s", len(symbols))
-                return sorted(set(symbols))
-        except aiohttp.client_exceptions.ClientConnectorDNSError as e:
-            last_exc = e
-            logger.warning("fetch_pairs attempt %d failed: %s", attempt, e)
-            ip = resolve_host("api.bybit.com")
-            if ip and ip != "api.bybit.com":
-                try:
-                    tmp_conn = FixedHostResolver("api.bybit.com", ip, limit=CONCURRENT_TASKS)
-                    async with ClientSession(connector=tmp_conn) as tmp_s:
-                        async with tmp_s.get(url, timeout=10) as resp2:
-                            if resp2.status != 200:
-                                txt = await resp2.text()
-                                logger.warning("fetch_pairs direct HTTP %s: %s", resp2.status, txt[:300])
-                                return []
-                            data2 = await resp2.json()
-                            instruments = data2.get("result", {}).get("list", [])
-                            symbols = []
-                            for item in instruments:
-                                if (
-                                    item.get("contractType") in ("LinearPerpetual", "LinearPerpetualContract")
-                                    and item.get("quoteCoin") == "USDT"
-                                    and item.get("status") == "Trading"
-                                ):
-                                    base = item.get("baseCoin")
-                                    if base:
-                                        symbols.append(f"{base}/USDT")
-                            logger.info("fetch_pairs direct success: %s", len(symbols))
-                            return sorted(set(symbols))
-                except Exception as inner:
-                    last_exc = inner
-                    logger.warning("fetch_pairs direct IP attempt failed: %s", inner)
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as net_e:
-            last_exc = net_e
-            logger.warning("fetch_pairs attempt %d failed: %s", attempt, net_e)
-        await asyncio.sleep(1.5 ** attempt)
-    logger.error("fetch_pairs failed after retries: %s", last_exc)
-    return []
-
-# ================= main loop =================
-async def main(retrain_interval: int = RETRAIN_INTERVAL, enable_demo_trading: bool = True):
-    logger.info("Bot starting with AI + demo trading option.")
-    try:
-        send_telegram("⚡ <b>Bot with AI started (demo mode)</b> — scanning market...")
-    except Exception:
-        pass
-
-    # optionally initialize bybit client/trading loop
-    bybit_client = None
-    trading_loop = None
-    if enable_demo_trading and BybitClient is not None:
-        try:
-            bybit_client = BybitClient(api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET,
-                                       sandbox=(BYBIT_ENV != "mainnet"), dry_run=BYBIT_DRY_RUN)
-            if TradingLoop is not None:
-                trading_loop = TradingLoop(bybit_client)
-                try:
-                    # start monitor in background if implemented
-                    asyncio.create_task(trading_loop.monitor_loop(on_trade_closed_callback=_on_trade_closed))
-                except Exception:
-                    logger.debug("TradingLoop monitor not started or not implemented")
-            logger.info("Bybit demo trading enabled (dry_run=%s).", BYBIT_DRY_RUN)
-        except Exception:
-            logger.exception("Bybit client init failed")
-            bybit_client = None
-            trading_loop = None
-
-    # create connector with default hostname resolution (we may override per-request)
-    resolved_ip = resolve_host("api.bybit.com")
-    connector = FixedHostResolver("api.bybit.com", resolved_ip, limit=CONCURRENT_TASKS)
-
-    last_alerts = {}
-    sem = asyncio.Semaphore(CONCURRENT_TASKS)
-    url_pairs = "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000&status=Trading"
-
-    async with ClientSession(connector=connector) as session:
-        # start background tasks
-        task_monitor = asyncio.create_task(monitor_entries(session, bybit_client=bybit_client, trading_loop=trading_loop))
-        task_positions = None
-        if bybit_client is not None:
-            task_positions = asyncio.create_task(show_positions_loop(bybit_client))
-        # websocket monitor
-        if BYBIT_API_KEY and BYBIT_API_SECRET and websockets is not None:
-            ws = BybitWSMonitor(BYBIT_API_KEY, BYBIT_API_SECRET, send_func=send_telegram, sandbox=(BYBIT_ENV != "mainnet"))
-            asyncio.create_task(ws.connect())
-
-        # non-blocking retrain runner via executor
-        background_executor = ThreadPoolExecutor(max_workers=1)
-
-        try:
-            while True:
-                # trigger optional training in background
-                if train_if_needed:
-                    try:
-                        # schedule asynchronously on executor (non-blocking)
-                        asyncio.get_running_loop().run_in_executor(background_executor, train_if_needed, retrain_interval, False, MODEL_DIR)
-                    except Exception:
-                        logger.exception("train_if_needed schedule failed")
-
-                # fetch pairs
-                symbols = await fetch_pairs(session, url_pairs)
-                now_str = datetime.now().strftime("%H:%M:%S")
-                logger.info("%s | Working on %d pairs...", now_str, len(symbols))
-                if not symbols:
-                    await asyncio.sleep(5)
-                    continue
-
-                # create tasks for pairs
-                tasks = [analyze_pair(s, sem, last_alerts, session, bybit_client=bybit_client, trading_loop=trading_loop) for s in symbols]
-                # gather with concurrency control (we already use semaphore inside analyze_pair)
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-                # print AI stats occasionally
-                if len(ai_prob_history) >= 10:
-                    avg_prob = np.mean(ai_prob_history)
-                    med_prob = np.median(ai_prob_history)
-                    min_prob = np.min(ai_prob_history)
-                    max_prob = np.max(ai_prob_history)
-                    logger.info("AI stats (last %d): avg=%.1f%% med=%.1f%% min=%.1f%% max=%.1f%%",
-                                len(ai_prob_history), avg_prob*100, med_prob*100, min_prob*100, max_prob*100)
-                await asyncio.sleep(2)
-        except asyncio.CancelledError:
-            logger.info("main loop cancelled")
-        except Exception:
-            logger.exception("main loop crashed")
-        finally:
-            # cancel background tasks gracefully
-            try:
-                task_monitor.cancel()
-            except Exception:
-                pass
-            if task_positions:
-                try:
-                    task_positions.cancel()
-                except Exception:
-                    pass
-            await asyncio.sleep(0.5)
-
-# ---- callback for closed trades ----------------------------------------------------------------
-def _on_trade_closed(trade_res: dict):
-    try:
-        logger.info("Trade closed: %s", trade_res)
-        if append_trade_to_dataset:
-            try:
-                append_trade_to_dataset(trade_res)
-            except Exception:
-                logger.exception("append_trade_to_dataset failed")
-        symbol = trade_res.get("symbol", "?")
-        side = trade_res.get("side", "?")
-        profit = trade_res.get("profit") or 0.0
-        reason = trade_res.get("reason", "")
-        closed_at = trade_res.get("closed_at", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
-        duration = trade_res.get("duration", 0)
-        emoji = "✅" if profit and profit > 0 else "❌"
-        msg = (
-            f"{emoji} <b>Trade closed {side} {symbol}</b>\n"
-            f"📊 Result: <b>{profit:.4f}</b> USDT\n"
-            f"⏱ Duration: {duration:.1f} sec\n"
-            f"📅 Closed at: {closed_at}\n"
+        df = load_ohlcv_csv(data_path)
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc))
+    trades_df, stats = run_backtest(
+        df,
+        cfg=BacktestConfig(
+            initial_equity=float(os.getenv("BT_EQUITY", "1000")),
+            risk_per_trade=float(os.getenv("BT_RISK", "0.01")),
+            max_hold_bars=int(os.getenv("BT_MAX_HOLD", "120")),
+            fee_bps_per_side=float(os.getenv("BT_FEE_BPS", "5")),
+            slippage_bps_per_side=float(os.getenv("BT_SLIPPAGE_BPS", "2")),
+        ),
+    )
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    trades_df.to_csv(out, index=False)
+
+    logger.info("Backtest complete -> %s", out)
+    for k, v in stats.items():
+        logger.info("%s = %s", k, v)
+
+
+def run_live_or_paper(mode: str):
+    settings = load_settings()
+
+    bybit_env = os.getenv("BYBIT_ENV", "mainnet").lower()
+    bybit_key = os.getenv("BYBIT_API_KEY", "")
+    bybit_secret = os.getenv("BYBIT_API_SECRET", "")
+
+    dry_run = settings.bot.dry_run if mode == "paper" else False
+    if os.getenv("BOT_DRY_RUN"):
+        dry_run = os.getenv("BOT_DRY_RUN", "true").lower() in ("1", "true", "yes")
+
+    telegram = TelegramClient(
+        token=os.getenv("TELEGRAM_TOKEN", ""),
+        chat_id=os.getenv("TELEGRAM_CHAT_ID", os.getenv("CHAT_ID", "")),
+    )
+    discord = DiscordClient(webhook_url=os.getenv("DISCORD_WEBHOOK_URL", ""))
+
+    market = MarketDataClient(
+        base_url=settings.market_data.bybit_base_url,
+        sentiment_url=settings.market_data.sentiment_api_url,
+        timeout=int(settings.market_data.request_timeout_sec),
+        max_retries=int(settings.market_data.max_retries),
+    )
+
+    bybit = None
+    if mode == "live" or (mode == "paper" and not dry_run):
+        bybit = BybitClient(
+            api_key=bybit_key,
+            api_secret=bybit_secret,
+            sandbox=(bybit_env != "mainnet"),
+            dry_run=dry_run,
         )
-        if reason:
-            msg += f"📎 Reason: {reason}\n"
-        send_telegram(msg)
-        if maybe_retrain_models and train_if_needed:
-            try:
-                maybe_retrain_models(lambda force=True: train_if_needed(force=force), min_trades=20)
-            except Exception:
-                logger.exception("maybe_retrain_models failed")
-    except Exception:
-        logger.exception("_on_trade_closed failed")
 
-# ---------------- entrypoint ----------------
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--retrain-interval', type=int, default=RETRAIN_INTERVAL, help='retrain interval seconds')
-    parser.add_argument('--no-demo', action='store_true', help='disable demo trading')
-    args = parser.parse_args()
+    from core.execution import ExecutionEngine
+
+    execution = ExecutionEngine(bybit_client=bybit, dry_run=dry_run)
+
+    signal_cfg = SignalConfig(
+        rsi_high=settings.strategy.rsi_high,
+        rsi_low=settings.strategy.rsi_low,
+        volume_spike_threshold=settings.strategy.volume_spike_threshold,
+        weakness_lookback=settings.strategy.weakness_lookback,
+        sentiment_bullish_threshold=settings.strategy.sentiment_bullish_threshold,
+        sentiment_bearish_threshold=settings.strategy.sentiment_bearish_threshold,
+        risk_reward=settings.strategy.risk_reward,
+        atr_sl_mult=settings.strategy.atr_sl_mult,
+        entry_tolerance_pct=settings.strategy.entry_tolerance_pct,
+        vwap_tolerance_pct=settings.strategy.vwap_tolerance_pct,
+        funding_tolerance=settings.strategy.funding_tolerance,
+        long_short_ratio_tolerance=settings.strategy.long_short_ratio_tolerance,
+    )
+    signal_gen = SignalGenerator(signal_cfg)
+
+    risk_cfg = RiskConfig(
+        account_equity_usdt=settings.risk.account_equity_usdt,
+        max_risk_per_trade=settings.risk.max_risk_per_trade,
+        max_open_positions=settings.risk.max_open_positions,
+        max_total_exposure_pct=settings.risk.max_total_exposure_pct,
+        daily_loss_limit_pct=settings.risk.daily_loss_limit_pct,
+        max_consecutive_losses=settings.risk.max_consecutive_losses,
+        cooldown_minutes=settings.risk.cooldown_minutes,
+        min_qty=settings.risk.min_qty,
+        max_qty=settings.risk.max_qty,
+        slippage_bps=settings.risk.slippage_bps,
+    )
+    risk_engine = RiskEngine(risk_cfg)
+
+    bundles = _load_models_for_regimes(settings.ml.model_dir, settings.ml.use_regime_models)
+
+    online_dataset = Path(settings.ml.online_dataset_path)
+    online_retrainer = OnlineRetrainer(
+        OnlineRetrainConfig(
+            dataset_path=str(online_dataset),
+            model_dir=settings.ml.model_dir,
+            retrain_interval_sec=settings.ml.online_retrain_interval_sec,
+            min_new_rows=settings.ml.online_retrain_min_rows,
+        )
+    )
+
+    open_signal_features: dict[str, dict] = {}
+
+    symbol_override = os.getenv("BOT_SYMBOLS", "").strip()
+    if symbol_override:
+        symbols = [s.strip() for s in symbol_override.split(",") if s.strip()]
+    else:
+        symbols = market.fetch_symbols(quote=None, categories=("linear", "inverse"))
+        if int(settings.bot.symbols_limit) > 0:
+            symbols = symbols[: int(settings.bot.symbols_limit)]
+
+    if not symbols:
+        logger.warning("No symbols found. Check connectivity or BOT_SYMBOLS override.")
+        return
+
+    fast_scan = bool(settings.bot.fast_scan_in_dry_run and mode == "paper" and dry_run)
+    progress_every = max(1, int(settings.bot.progress_log_every))
+    diagnose_filters = os.getenv("BOT_DIAG_FILTERS", "true").lower() in ("1", "true", "yes")
+    ml_threshold = float(settings.ml.min_probability)
+    if fast_scan:
+        ml_threshold = min(ml_threshold, 0.25)
+
+    logger.info("Starting bot mode=%s dry_run=%s symbols=%d limit=%d universe=all_futures", mode, dry_run, len(symbols), int(settings.bot.symbols_limit))
+    logger.info(
+        "Scan profile fast_scan=%s progress_every=%d md_timeout=%ss md_retries=%d ml_threshold=%.3f",
+        fast_scan,
+        progress_every,
+        int(settings.market_data.request_timeout_sec),
+        int(settings.market_data.max_retries),
+        ml_threshold,
+    )
+    telegram.send_text(f"<b>Bot started</b> mode={mode} dry_run={dry_run} symbols={len(symbols)}")
+
+    tf_min = _timeframe_to_minutes(settings.bot.timeframe)
+
     try:
-        # main runs demo trading by default (dry_run=True); pass --no-demo to disable demo features
-        asyncio.run(main(retrain_interval=args.retrain_interval, enable_demo_trading=not args.no_demo))
+        while True:
+            cycle_started = time.monotonic()
+            cycle_signals = 0
+            cycle_errors = 0
+            cycle_filter_stats: Counter[str] = Counter()
+
+            global_sentiment = market.fetch_sentiment_index()
+            if global_sentiment is None:
+                global_sentiment = 50.0
+            logger.info("cycle start symbols=%d sentiment=%.1f", len(symbols), float(global_sentiment))
+
+            for idx, symbol in enumerate(symbols, start=1):
+                symbol_started = time.monotonic()
+                try:
+                    snap = market.fetch_snapshot(
+                        symbol=symbol,
+                        interval=settings.bot.timeframe,
+                        limit=settings.bot.candles_limit,
+                        include_orderbook=not fast_scan,
+                        include_funding_rate=not fast_scan,
+                        include_open_interest=not fast_scan,
+                        include_long_short_ratio=not fast_scan,
+                        include_liquidations=not fast_scan,
+                        include_sentiment=False,
+                        sentiment_index=float(global_sentiment),
+                    )
+                    if snap.ohlcv.empty or len(snap.ohlcv) < 80:
+                        continue
+
+                    df = compute_indicators(snap.ohlcv)
+                    vp = compute_volume_profile(
+                        df,
+                        window=settings.strategy.volume_profile_window,
+                        bins=settings.strategy.volume_profile_bins,
+                    )
+                    regime = detect_market_regime(df)
+
+                    # Update paper positions on every new bar, even without new signals.
+                    closes = execution.update_paper_positions(symbol=symbol, last_price=float(df.iloc[-1]["close"]))
+                    for trade in closes:
+                        risk_engine.close_position(trade["signal_id"], pnl_usdt=trade["pnl"])
+                        append_csv(
+                            TRADES_LOG,
+                            {
+                                "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                                **trade,
+                            },
+                        )
+                        close_msg = format_close_message(trade)
+                        send_alerts(telegram, discord, close_msg)
+
+                        # Online supervised row: features at entry + realized outcome.
+                        meta = open_signal_features.pop(trade["signal_id"], None)
+                        if meta:
+                            target_horizon = max(1.0, float(trade.get("duration_sec", 0.0)) / max(1.0, tf_min * 60.0))
+                            ds_row = {
+                                "timestamp": meta.get("timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")),
+                                "market_regime": meta.get("market_regime", regime.value),
+                                "target_win": 1 if float(trade.get("pnl", 0.0)) > 0 else 0,
+                                "target_horizon": target_horizon,
+                                "future_return": float(trade.get("pnl", 0.0)) / max(settings.risk.account_equity_usdt, 1e-9),
+                            }
+                            for name in REQUIRED_MODEL_FEATURES:
+                                ds_row[name] = float(meta.get(name, 0.0))
+                            append_online_training_row(online_dataset, ds_row)
+
+                    context = SignalContext(
+                        symbol=symbol,
+                        df=df,
+                        volume_profile=vp,
+                        regime=regime,
+                        sentiment_index=float(snap.sentiment_index) if snap.sentiment_index is not None else float(global_sentiment),
+                        funding_rate=float(snap.funding_rate) if snap.funding_rate is not None else None,
+                        long_short_ratio=float(snap.long_short_ratio) if snap.long_short_ratio is not None else None,
+                    )
+                    signal = signal_gen.generate(context)
+                    if signal is None:
+                        if diagnose_filters:
+                            side, _l1 = signal_gen._layer1_pump_or_panic(df)
+                            if side is None:
+                                cycle_filter_stats["fail_l1"] += 1
+                            else:
+                                l2_ok, _l2 = signal_gen._layer2_weakness_confirmation(df, side)
+                                if not l2_ok:
+                                    cycle_filter_stats["fail_l2"] += 1
+                                else:
+                                    l3_ok, _l3 = signal_gen._layer3_entry_level(df, side, vp)
+                                    if not l3_ok:
+                                        cycle_filter_stats["fail_l3"] += 1
+                                    else:
+                                        l4_ok, _l4 = signal_gen._layer4_fake_filter(
+                                            df=df,
+                                            side=side,
+                                            sentiment_index=context.sentiment_index,
+                                            funding_rate=context.funding_rate,
+                                            long_short_ratio=context.long_short_ratio,
+                                        )
+                                        if not l4_ok:
+                                            cycle_filter_stats["fail_l4"] += 1
+                                        else:
+                                            cycle_filter_stats["fail_unknown"] += 1
+                        continue
+
+                    feature_row = build_feature_row(
+                        symbol=symbol,
+                        df=df,
+                        volume_profile=vp,
+                        regime=regime,
+                        extras={
+                            "funding_rate": snap.funding_rate,
+                            "open_interest": snap.open_interest,
+                            "long_short_ratio": snap.long_short_ratio,
+                            "sentiment_index": snap.sentiment_index,
+                            "liquidation_cluster_high": snap.liquidation_cluster_high,
+                            "liquidation_cluster_low": snap.liquidation_cluster_low,
+                        },
+                    )
+                    if feature_row is None:
+                        continue
+
+                    bundle = _pick_bundle(bundles, regime)
+                    prob, horizon = predict_with_bundle(bundle, feature_row.values)
+                    if prob < ml_threshold:
+                        cycle_filter_stats["ml_reject"] += 1
+                        continue
+
+                    open_exposure = _current_open_exposure(risk_engine)
+                    sizing = risk_engine.evaluate_order(
+                        signal_id=signal.signal_id,
+                        side=signal.side,
+                        entry=signal.entry,
+                        sl=signal.sl,
+                        open_exposure_usdt=open_exposure,
+                    )
+                    if not sizing.approved:
+                        logger.info("Risk rejected %s: %s", signal.symbol, sizing.reason)
+                        continue
+
+                    exec_res = execution.execute(signal, qty=sizing.qty, fill_price=sizing.expected_fill)
+                    if not exec_res.success:
+                        risk_engine.open_positions.pop(signal.signal_id, None)
+                        logger.warning("Execution failed for %s: %s", symbol, exec_res.error)
+                        continue
+
+                    open_signal_features[signal.signal_id] = {
+                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                        "market_regime": regime.value,
+                        **feature_row.values,
+                    }
+
+                    chart = None
+                    if settings.alerts.send_chart:
+                        chart = build_signal_chart(
+                            symbol=symbol,
+                            df=df,
+                            side=signal.side,
+                            entry=signal.entry,
+                            tp=signal.tp,
+                            sl=signal.sl,
+                            volume_profile=vp,
+                        )
+
+                    msg = format_signal_message(signal=signal, regime=regime, ml_prob=prob, horizon=horizon)
+                    send_alerts(telegram, discord, msg, chart=chart)
+
+                    append_csv(
+                        SIGNALS_LOG,
+                        {
+                            "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                            "signal_id": signal.signal_id,
+                            "symbol": signal.symbol,
+                            "side": signal.side,
+                            "entry": signal.entry,
+                            "tp": signal.tp,
+                            "sl": signal.sl,
+                            "partial_tps": "|".join(f"{x:.8f}" for x in signal.partial_tps),
+                            "confidence": signal.confidence,
+                            "regime": regime.value,
+                            "ml_prob": prob,
+                            "ml_horizon": horizon,
+                            **feature_row.values,
+                        },
+                    )
+                    cycle_signals += 1
+
+                except Exception as symbol_exc:
+                    cycle_errors += 1
+                    logger.exception("Error processing %s: %s", symbol, symbol_exc)
+                finally:
+                    if idx % progress_every == 0 or idx == len(symbols):
+                        elapsed = time.monotonic() - cycle_started
+                        symbol_elapsed = time.monotonic() - symbol_started
+                        logger.info(
+                            "scan progress %d/%d elapsed=%.1fs symbol=%.2fs signals=%d errors=%d",
+                            idx,
+                            len(symbols),
+                            elapsed,
+                            symbol_elapsed,
+                            cycle_signals,
+                            cycle_errors,
+                        )
+
+            if settings.ml.online_retrain_enabled:
+                try:
+                    if online_retrainer.maybe_retrain(model_type="auto"):
+                        bundles = _load_models_for_regimes(settings.ml.model_dir, settings.ml.use_regime_models)
+                        send_alerts(telegram, discord, "<b>ML models reloaded after online retrain</b>")
+                except Exception:
+                    logger.exception("online retrain failed")
+
+            cycle_elapsed = time.monotonic() - cycle_started
+            logger.info(
+                "loop complete in %.1fs | signals=%d errors=%d | risk=%s",
+                cycle_elapsed,
+                cycle_signals,
+                cycle_errors,
+                risk_engine.snapshot(),
+            )
+            if diagnose_filters:
+                logger.info("filter stats: %s", dict(cycle_filter_stats))
+            time.sleep(max(2, int(settings.bot.scan_interval_sec)))
+
     except KeyboardInterrupt:
-        logger.info("Stopped by user.")
-    except Exception:
-        logger.exception("Unhandled exception in __main__")
+        logger.info("Stopped by user")
+    finally:
+        market.close()
+        if bybit is not None:
+            try:
+                bybit.close()
+            except Exception:
+                pass
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Professional layered crypto AI bot")
+    parser.add_argument("--mode", default="paper", choices=["paper", "live", "backtest"])
+    parser.add_argument("--backtest-data", default="", help="OHLCV CSV path for backtest mode")
+    parser.add_argument("--backtest-out", default="logs/backtest_trades.csv")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    if args.mode == "backtest":
+        if not args.backtest_data:
+            raise SystemExit("--backtest-data is required in backtest mode")
+        run_backtest_mode(args.backtest_data, args.backtest_out)
+    else:
+        run_live_or_paper(args.mode)
+
+
+
+
+

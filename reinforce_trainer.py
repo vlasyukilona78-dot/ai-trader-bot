@@ -1,4 +1,4 @@
-# reinforce_trainer.py (updated)
+﻿# reinforce_trainer.py (updated)
 import pandas as pd
 import os
 import joblib
@@ -8,7 +8,7 @@ from logger import logger
 from config import *
 from codex_trainer import backup_model_files
 
-TRADE_LOG = 'logs/trades_log.csv'
+TRADE_LOG = TRADE_LOG_PATH
 BACKUP_DIR = 'backups'
 MIN_TRADES_TO_RETRAIN = int(os.getenv("MIN_TRADES_TO_RETRAIN", "20"))
 RETRAIN_HISTORY = "logs/retrain_history.csv"

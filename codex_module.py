@@ -1,117 +1,192 @@
-# PATCH: обновлённые модули для асинхронного торгового сканера
-# Содержит три файла в одном документе для простого применения патча.
-# 1) codex_module.py  (оптимизированные промпты + gpt-4o для объяснений, gpt-4o-code для генерации кода)
-# 2) codex_trainer.py (интеграция с main: функция train_if_needed(), валидация данных, безопасный бэкап)
-# 3) main.py (неблокирующий запуск auto-retrain в фоне через asyncio.to_thread, улучшённая обработка AI вызовов, опция --retrain-interval)
-
-# --- codex_module.py ---
-import os
+﻿import os
 import time
-import openai
-from typing import Dict, Optional
+from functools import lru_cache
+from typing import Dict
 
-openai.api_key = os.getenv("openai.api_key")  # обязательное окружение
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
-# Универсальные параметры retry
-_MAX_RETRIES = 3
-_RETRY_DELAY = 1.0
+try:
+    import openai as legacy_openai
+except ImportError:
+    legacy_openai = None
+
+_EXPLAIN_MODEL = os.getenv("OPENAI_EXPLAIN_MODEL", "gpt-5-mini")
+_CODE_MODEL = os.getenv("OPENAI_CODE_MODEL", "gpt-5-codex")
+_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
+_RETRY_DELAY = float(os.getenv("OPENAI_RETRY_DELAY", "1.0"))
 
 
-def _call_openai_chat(model: str, messages: list, max_tokens: int = 512, temperature: float = 0.4):
-    """Надёжный обёртка с повторами и базовой обработкой ошибок."""
+def _get_api_key() -> str:
+    return (
+        os.getenv("OPENAI_API_KEY")
+        or os.getenv("openai.api_key")
+        or os.getenv("OPENAI_APIKEY")
+        or ""
+    )
+
+
+@lru_cache(maxsize=1)
+def _get_client():
+    api_key = _get_api_key()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+
+    if OpenAI is not None:
+        return OpenAI(api_key=api_key)
+
+    if legacy_openai is not None:
+        legacy_openai.api_key = api_key
+        return legacy_openai
+
+    raise RuntimeError("OpenAI SDK is not installed")
+
+
+def _extract_response_text(response) -> str:
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    output = getattr(response, "output", None)
+    if isinstance(output, list):
+        parts: list[str] = []
+        for item in output:
+            content = getattr(item, "content", None)
+            if not isinstance(content, list):
+                continue
+            for chunk in content:
+                text = getattr(chunk, "text", None)
+                if isinstance(text, str) and text:
+                    parts.append(text)
+        if parts:
+            return "\n".join(parts).strip()
+
+    raise RuntimeError("Model response did not contain text output")
+
+
+def _call_responses_api(model: str, instructions: str, prompt: str, max_output_tokens: int) -> str:
+    client = _get_client()
+    if not hasattr(client, "responses"):
+        raise RuntimeError("Installed OpenAI SDK does not support Responses API")
+
+    response = client.responses.create(
+        model=model,
+        instructions=instructions,
+        input=prompt,
+        max_output_tokens=max_output_tokens,
+    )
+    return _extract_response_text(response)
+
+
+def _call_legacy_chat_api(model: str, instructions: str, prompt: str, max_output_tokens: int) -> str:
+    client = _get_client()
+    if legacy_openai is None:
+        raise RuntimeError("Legacy OpenAI SDK is unavailable")
+
+    if hasattr(client, "chat") and hasattr(client.chat, "completions"):
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": instructions},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=max_output_tokens,
+        )
+        return response.choices[0].message.content.strip()
+
+    response = legacy_openai.ChatCompletion.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=max_output_tokens,
+    )
+    return response.choices[0].message["content"].strip()
+
+
+def _call_openai_text(model: str, instructions: str, prompt: str, max_output_tokens: int = 512) -> str:
     last_exc = None
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
-            resp = openai.ChatCompletion.create(
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
-            return resp.choices[0].message["content"].strip()
-        except Exception as e:
-            last_exc = e
-            time.sleep(_RETRY_DELAY * attempt)
+            return _call_responses_api(model, instructions, prompt, max_output_tokens)
+        except Exception as exc:
+            last_exc = exc
+            try:
+                return _call_legacy_chat_api(model, instructions, prompt, max_output_tokens)
+            except Exception as legacy_exc:
+                last_exc = legacy_exc
+                time.sleep(_RETRY_DELAY * attempt)
     raise last_exc
 
 
-# -----------------------------------------
-# 1) Explain signal — используем gpt-4o (лучше для "аналитики")
-# -----------------------------------------
-
 def explain_signal(symbol: str, indicators: Dict[str, float], probability: float, direction: str) -> str:
-    """Возвращает краткое, понятное объяснение сигнала на русском.
-    Использует gpt-4o — модель общего назначения, более сильна в аналитике и natural language.
-    """
-    indicators_text = ", ".join([f"{k}={v:.4g}" for k, v in indicators.items()])
-
-    system = (
-        "Ты — профессиональный криптоаналитик и трейдер. Объясняй сигналы коротко и практично, "
-        "давай торговую интуицию и возможные риски (1-2 пункта).")
-
-    user = (
-        f"Сигнал: {direction} по инструменту {symbol}. Вероятность успеха (оценка ИИ): {probability:.3f}. "
-        f"Индикаторы: {indicators_text}. "
-        "Дай ровно 2–3 коротких предложения на русском: 1) почему сигнал выглядит сильным/слабым; 2) какие ключевые риски; 3) одно практическое действие (например, подтвердить на таймфрейме H1)."
+    """Return a short explanation of a trading signal."""
+    indicators_text = ", ".join(f"{key}={value:.4g}" for key, value in indicators.items()) or "no data"
+    instructions = (
+        "You are a crypto analyst and trader. Reply in Russian, keep it short, practical, and direct. "
+        "Give 2-3 short sentences covering signal strength, key risks, and one confirmation step."
+    )
+    prompt = (
+        f"Signal: {direction} on {symbol}. "
+        f"Estimated win probability: {probability:.3f}. "
+        f"Indicators: {indicators_text}."
     )
 
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
-
     try:
-        return _call_openai_chat(model="gpt-4o", messages=messages, max_tokens=150, temperature=0.25)
-    except Exception as e:
-        return f"(Неудалось получить объяснение от модели: {e})"
+        return _call_openai_text(
+            model=_EXPLAIN_MODEL,
+            instructions=instructions,
+            prompt=prompt,
+            max_output_tokens=180,
+        )
+    except Exception as exc:
+        return f"(Failed to get model explanation: {exc})"
 
-
-# -----------------------------------------
-# 2) Improve strategy optimization (use code-optimized model but stricter prompt + tests)
-# -----------------------------------------
 
 def optimize_strategy(current_code: str, feedback: str) -> str:
-    """Запрос к модели кода: вернуть новый валидный Python-код. В ответе допускается только код.
-    Мы просим включить короткие автоматические тесты внутри кода (в блоке if __name__ == '__main__')
-    чтобы быстро проверить базовую работоспособность стратегии.
-    """
-    system = "Ты — Codex: эксперт по рефакторингу и улучшению Python кода для торговых стратегий."
-
-    user = (
-        "Ниже — текущий код стратегии на Python. Задача: исправить логические ошибки, улучшить стабильность вычислений индикаторов, "
-        "защитить от деления на ноль, добавить проверку на минимальную длину данных, и добавить небольшой тест при запуске файла, "
-        "который создаёт искусственный DataFrame с минимальными данными и выводит 'TEST_OK' при успешной работе. "
-        f"Текущий код:\n\n{current_code}\n\nТребуемые правки: {feedback}\n\nВерни ТОЛЬКО чистый исправленный Python код, без объяснений."
+    """Request an updated strategy implementation and return code only."""
+    instructions = (
+        "You are a senior Python engineer. Return only valid Python code, with no markdown and no explanation. "
+        "Fix logic issues, guard against divide-by-zero, check for minimum data length, and add a short self-test."
+    )
+    prompt = (
+        "Below is a trading strategy file and the requested changes. "
+        "Return only the full corrected Python file.\n\n"
+        f"Requested changes:\n{feedback}\n\n"
+        f"Current code:\n{current_code}"
     )
 
-    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-
     try:
-        return _call_openai_chat(model="gpt-4o-code", messages=messages, max_tokens=3500, temperature=0.15)
-    except Exception as e:
-        # Возвращаем оригинал в случае ошибки, чтобы не ломать пайплайн
+        return _call_openai_text(
+            model=_CODE_MODEL,
+            instructions=instructions,
+            prompt=prompt,
+            max_output_tokens=4000,
+        )
+    except Exception:
         return current_code
 
 
-# -----------------------------------------
-# 3) Generate new strategy (guidelines + safety checks)
-# -----------------------------------------
-
 def generate_strategy(description: str) -> str:
-    """Генерирует стратегию: просим понятную структуру функций, тест и пример использования.
-    Делаем модель более детерминистичной (низкая температура).
-    """
-    system = "Ты — Codex: пиши качественный, безопасный и стилизованный Python-код для анализа свечных данных."
-    user = (
-        f"Сгенерируй стратегию по описанию: {description}. "
-        "Код должен использовать pandas (или чистые numpy/pandas операции), возвращать функции: compute_indicators(df), generate_signals(df), backtest(df). "
-        "Добавь тестовый блок if __name__ == '__main__' который генерирует синтетические свечи и запускает backtest. "
-        "Верни только код Python."
+    """Generate a strategy implementation and return code only."""
+    instructions = (
+        "You are a senior Python engineer. Return only valid Python code, with no markdown and no explanation. "
+        "Include compute_indicators(df), generate_signals(df), backtest(df), and a small self-test block."
     )
-    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    prompt = (
+        f"Generate a trading strategy from this description: {description}. "
+        "Use pandas or numpy, keep calculations safe, and include a simple self-test on synthetic data."
+    )
 
     try:
-        return _call_openai_chat(model="gpt-4o-code", messages=messages, max_tokens=3500, temperature=0.2)
-    except Exception as e:
-        return f"# Ошибка генерации стратегии: {e}\n"
-
+        return _call_openai_text(
+            model=_CODE_MODEL,
+            instructions=instructions,
+            prompt=prompt,
+            max_output_tokens=4000,
+        )
+    except Exception as exc:
+        return f"# Strategy generation error: {exc}\n"
