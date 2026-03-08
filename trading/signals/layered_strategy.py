@@ -14,10 +14,23 @@ class LayeredPumpStrategy(StrategyInterface):
     def __init__(self, config: SignalConfig | None = None):
         self._generator = SignalGenerator(config or SignalConfig())
 
+    def _trace_meta(self) -> dict:
+        trace = self._generator.last_diagnostics if isinstance(self._generator.last_diagnostics, dict) else {}
+        failed_layer = str(trace.get("failed_layer") or "") if trace else ""
+        return {
+            "layer_trace": trace,
+            "layer_failed": failed_layer,
+        }
+
     def generate(self, context: StrategyContext) -> StrategyIntent:
         df = context.market_ohlcv
         if df.empty or len(df) < 80:
-            return StrategyIntent(symbol=context.symbol, action=IntentAction.HOLD, reason="insufficient_history")
+            return StrategyIntent(
+                symbol=context.symbol,
+                action=IntentAction.HOLD,
+                reason="insufficient_history",
+                metadata={"layer_failed": "layer0_input", "layer_trace": {}},
+            )
 
         enriched = df
         if "rsi" not in enriched.columns:
@@ -34,12 +47,20 @@ class LayeredPumpStrategy(StrategyInterface):
                 volume_profile=vp,
                 regime=regime,
                 sentiment_index=context.sentiment_index,
-                funding_rate=None,
-                long_short_ratio=None,
+                sentiment_source=context.sentiment_source,
+                funding_rate=context.funding_rate,
+                long_short_ratio=context.long_short_ratio,
             )
         )
+        trace_meta = self._trace_meta()
         if signal is None:
-            return StrategyIntent(symbol=context.symbol, action=IntentAction.HOLD, reason="no_signal")
+            failed_layer = trace_meta.get("layer_failed") or "unknown"
+            return StrategyIntent(
+                symbol=context.symbol,
+                action=IntentAction.HOLD,
+                reason=f"no_signal_{failed_layer}",
+                metadata=trace_meta,
+            )
 
         if context.synced_state in (TradeState.LONG, TradeState.PENDING_EXIT_LONG) and signal.side == "SHORT":
             return StrategyIntent(
@@ -47,7 +68,7 @@ class LayeredPumpStrategy(StrategyInterface):
                 action=IntentAction.EXIT_LONG,
                 reason="opposite_signal_close_long",
                 confidence=float(signal.confidence),
-                metadata={"legacy_signal_id": signal.signal_id},
+                metadata={"legacy_signal_id": signal.signal_id, **trace_meta},
             )
 
         if context.synced_state in (TradeState.SHORT, TradeState.PENDING_EXIT_SHORT) and signal.side == "LONG":
@@ -56,11 +77,16 @@ class LayeredPumpStrategy(StrategyInterface):
                 action=IntentAction.EXIT_SHORT,
                 reason="opposite_signal_close_short",
                 confidence=float(signal.confidence),
-                metadata={"legacy_signal_id": signal.signal_id},
+                metadata={"legacy_signal_id": signal.signal_id, **trace_meta},
             )
 
         if context.synced_state != TradeState.FLAT:
-            return StrategyIntent(symbol=context.symbol, action=IntentAction.HOLD, reason="state_not_flat")
+            return StrategyIntent(
+                symbol=context.symbol,
+                action=IntentAction.HOLD,
+                reason="state_not_flat",
+                metadata=trace_meta,
+            )
 
         if signal.side == "LONG":
             return StrategyIntent(
@@ -70,7 +96,7 @@ class LayeredPumpStrategy(StrategyInterface):
                 stop_loss=float(signal.sl),
                 take_profit=float(signal.tp),
                 confidence=float(signal.confidence),
-                metadata={"legacy_signal_id": signal.signal_id},
+                metadata={"legacy_signal_id": signal.signal_id, **trace_meta},
             )
 
         return StrategyIntent(
@@ -80,5 +106,5 @@ class LayeredPumpStrategy(StrategyInterface):
             stop_loss=float(signal.sl),
             take_profit=float(signal.tp),
             confidence=float(signal.confidence),
-            metadata={"legacy_signal_id": signal.signal_id},
+            metadata={"legacy_signal_id": signal.signal_id, **trace_meta},
         )

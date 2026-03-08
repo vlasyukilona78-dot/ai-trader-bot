@@ -18,6 +18,9 @@ class StrategyContext:
     exchange: ExchangeSnapshot
     synced_state: TradeState
     sentiment_index: float | None = None
+    sentiment_source: str | None = None
+    funding_rate: float | None = None
+    long_short_ratio: float | None = None
 
 
 class StrategyInterface(Protocol):

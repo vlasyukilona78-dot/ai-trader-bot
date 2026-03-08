@@ -37,6 +37,7 @@ class SignalContext:
     volume_profile: VolumeProfileLevels | None
     regime: MarketRegime
     sentiment_index: float | None
+    sentiment_source: str | None
     funding_rate: float | None
     long_short_ratio: float | None
 
@@ -60,6 +61,7 @@ class SignalResult:
 class SignalGenerator:
     def __init__(self, config: SignalConfig | None = None):
         self.config = config or SignalConfig()
+        self.last_diagnostics: dict[str, Any] = {}
 
     @staticmethod
     def _safe(value: Any, default: float = 0.0) -> float:
@@ -68,9 +70,10 @@ class SignalGenerator:
         except (TypeError, ValueError):
             return default
 
-    def _layer1_pump_or_panic(self, df: pd.DataFrame) -> tuple[str | None, dict[str, float]]:
+    def _layer1_pump_detection(self, df: pd.DataFrame) -> tuple[str | None, dict[str, float | str]]:
+        """Layer 1: Pump/Panic detection via RSI + Volume + Bollinger/Keltner breakout."""
         last = df.iloc[-1]
-        metrics = {
+        metrics: dict[str, float | str] = {
             "rsi": self._safe(last.get("rsi"), 50.0),
             "volume_spike": self._safe(last.get("volume_spike"), 1.0),
             "close": self._safe(last.get("close"), 0.0),
@@ -80,27 +83,47 @@ class SignalGenerator:
             "kc_lower": self._safe(last.get("kc_lower"), -np.inf),
         }
 
-        band_up = metrics["close"] > metrics["bb_upper"] or metrics["close"] > metrics["kc_upper"]
-        band_down = metrics["close"] < metrics["bb_lower"] or metrics["close"] < metrics["kc_lower"]
+        bb_breakout_up = float(metrics["close"]) > float(metrics["bb_upper"])
+        kc_breakout_up = float(metrics["close"]) > float(metrics["kc_upper"])
+        band_up = bb_breakout_up or kc_breakout_up
+
+        bb_breakout_down = float(metrics["close"]) < float(metrics["bb_lower"])
+        kc_breakout_down = float(metrics["close"]) < float(metrics["kc_lower"])
+        band_down = bb_breakout_down or kc_breakout_down
 
         pump_points = 0
-        if metrics["rsi"] >= self.config.rsi_high:
+        if float(metrics["rsi"]) >= self.config.rsi_high:
             pump_points += 1
-        if metrics["volume_spike"] >= self.config.volume_spike_threshold:
+        if float(metrics["volume_spike"]) >= self.config.volume_spike_threshold:
             pump_points += 1
         if band_up:
             pump_points += 1
 
         panic_points = 0
-        if metrics["rsi"] <= self.config.rsi_low:
+        if float(metrics["rsi"]) <= self.config.rsi_low:
             panic_points += 1
-        if metrics["volume_spike"] >= self.config.volume_spike_threshold:
+        if float(metrics["volume_spike"]) >= self.config.volume_spike_threshold:
             panic_points += 1
         if band_down:
             panic_points += 1
 
         pump = band_up and pump_points >= 2
         panic = band_down and panic_points >= 2
+
+        metrics.update(
+            {
+                "rsi_threshold": float(self.config.rsi_high),
+                "volume_spike_threshold": float(self.config.volume_spike_threshold),
+                "bb_breakout_up": 1.0 if bb_breakout_up else 0.0,
+                "kc_breakout_up": 1.0 if kc_breakout_up else 0.0,
+                "bb_breakout_down": 1.0 if bb_breakout_down else 0.0,
+                "kc_breakout_down": 1.0 if kc_breakout_down else 0.0,
+                "pump_points": float(pump_points),
+                "panic_points": float(panic_points),
+                "pump_detected": 1.0 if pump else 0.0,
+                "panic_detected": 1.0 if panic else 0.0,
+            }
+        )
 
         if pump:
             return "SHORT", metrics
@@ -109,9 +132,10 @@ class SignalGenerator:
         return None, metrics
 
     def _layer2_weakness_confirmation(self, df: pd.DataFrame, side: str) -> tuple[bool, dict[str, float]]:
+        """Layer 2: Weakness confirmation via price-vs-OBV/CVD divergence."""
         lookback = self.config.weakness_lookback
         if len(df) < lookback + 2:
-            return False, {"reason": 1.0}
+            return False, {"reason": 1.0, "insufficient_history": 1.0}
 
         last = df.iloc[-1]
         ref = df.iloc[-1 - lookback]
@@ -137,6 +161,7 @@ class SignalGenerator:
             "obv_up": 1.0 if obv_up else 0.0,
             "cvd_down": 1.0 if cvd_down else 0.0,
             "cvd_up": 1.0 if cvd_up else 0.0,
+            "lookback": float(lookback),
         }
         return ok, details
 
@@ -191,7 +216,8 @@ class SignalGenerator:
         }
         return ok, details
 
-    def _layer3_entry_level(self, df: pd.DataFrame, side: str, vp: VolumeProfileLevels | None) -> tuple[bool, dict[str, float]]:
+    def _layer3_entry_location(self, df: pd.DataFrame, side: str, vp: VolumeProfileLevels | None) -> tuple[bool, dict[str, float]]:
+        """Layer 3: Entry location via Volume Profile levels + MSB."""
         if vp is None or len(df) < 2:
             return False, {"vp_missing": 1.0}
 
@@ -217,6 +243,8 @@ class SignalGenerator:
             "val": vp.val,
             "entry_tolerance_pct": tol,
             "entry_ok": 1.0 if entry_ok else 0.0,
+            "vp_levels_available": 1.0,
+            "entry_reference": 1.0 if side == "SHORT" else -1.0,
         }
         details.update(msb)
         return ok, details
@@ -226,16 +254,24 @@ class SignalGenerator:
         df: pd.DataFrame,
         side: str,
         sentiment_index: float | None,
+        sentiment_source: str | None,
         funding_rate: float | None,
         long_short_ratio: float | None,
-    ) -> tuple[bool, dict[str, float]]:
+    ) -> tuple[bool, dict[str, float | str]]:
+        """Layer 4: Fake-signal filter via Sentiment + VWAP with explicit graceful fallback."""
         last = df.iloc[-1]
         close = self._safe(last.get("close"))
         vwap = self._safe(last.get("vwap"), close)
 
-        sentiment = sentiment_index
-        if sentiment is None:
-            return False, {"sentiment_missing": 1.0}
+        sentiment_missing = sentiment_index is None
+        sentiment = 50.0 if sentiment_missing else float(sentiment_index)
+
+        source = (sentiment_source or "").strip().lower()
+        if not source:
+            source = "fallback_neutral_50" if sentiment_missing else "provided"
+
+        source_unavailable = 1.0 if source in ("unavailable", "missing", "none") else 0.0
+        fallback_used = 1.0 if (sentiment_missing or source.startswith("fallback")) else 0.0
 
         vwap_tol = max(0.0, self.config.vwap_tolerance_pct)
         funding_tol = max(0.0, self.config.funding_tolerance)
@@ -269,9 +305,14 @@ class SignalGenerator:
             "vwap_tolerance_pct": vwap_tol,
             "funding_tolerance": funding_tol,
             "ratio_tolerance": ratio_tol,
+            "sentiment_fallback_used": fallback_used,
+            "sentiment_source_unavailable": source_unavailable,
+            "degraded_mode": 1.0 if (fallback_used or source_unavailable) else 0.0,
+            "sentiment_source": source,
         }
 
-    def _layer5_risk_levels(self, df: pd.DataFrame, side: str, vp: VolumeProfileLevels | None) -> tuple[float, float, list[float]]:
+    def _layer5_tp_sl_levels(self, df: pd.DataFrame, side: str, vp: VolumeProfileLevels | None) -> tuple[float, float, list[float]]:
+        """Layer 5: TP/SL levels via ATR + Volume Profile (with RR fallback)."""
         last = df.iloc[-1]
         close = self._safe(last.get("close"))
         atr = self._safe(last.get("atr"), close * 0.01)
@@ -317,39 +358,73 @@ class SignalGenerator:
 
     def generate(self, context: SignalContext) -> SignalResult | None:
         df = context.df
+        trace: dict[str, Any] = {
+            "strategy_model": "layered_table_5_softened",
+            "failed_layer": None,
+            "layers": {},
+        }
+
         if df.empty or len(df) < 40:
+            trace["failed_layer"] = "layer0_input"
+            trace["layers"]["layer0_input"] = {"passed": False, "details": {"insufficient_history": 1.0}}
+            self.last_diagnostics = trace
             return None
 
-        side, layer1 = self._layer1_pump_or_panic(df)
+        side, layer1 = self._layer1_pump_detection(df)
+        trace["layers"]["layer1_pump_detection"] = {"passed": side is not None, "side": side or "", "details": layer1}
         if side is None:
+            trace["failed_layer"] = "layer1_pump_detection"
+            self.last_diagnostics = trace
             return None
 
         layer2_ok, layer2 = self._layer2_weakness_confirmation(df, side)
+        trace["layers"]["layer2_weakness_confirmation"] = {"passed": layer2_ok, "details": layer2}
         if not layer2_ok:
+            trace["failed_layer"] = "layer2_weakness_confirmation"
+            self.last_diagnostics = trace
             return None
 
-        layer3_ok, layer3 = self._layer3_entry_level(df, side, context.volume_profile)
+        layer3_ok, layer3 = self._layer3_entry_location(df, side, context.volume_profile)
+        trace["layers"]["layer3_entry_location"] = {"passed": layer3_ok, "details": layer3}
         if not layer3_ok:
+            trace["failed_layer"] = "layer3_entry_location"
+            self.last_diagnostics = trace
             return None
 
         layer4_ok, layer4 = self._layer4_fake_filter(
             df=df,
             side=side,
             sentiment_index=context.sentiment_index,
+            sentiment_source=context.sentiment_source,
             funding_rate=context.funding_rate,
             long_short_ratio=context.long_short_ratio,
         )
+        trace["layers"]["layer4_fake_filter"] = {"passed": layer4_ok, "details": layer4}
         if not layer4_ok:
+            trace["failed_layer"] = "layer4_fake_filter"
+            self.last_diagnostics = trace
             return None
 
         entry = float(df.iloc[-1]["close"])
-        tp, sl, partial_tps = self._layer5_risk_levels(df, side, context.volume_profile)
+        tp, sl, partial_tps = self._layer5_tp_sl_levels(df, side, context.volume_profile)
         tp, sl = self._normalize_levels(entry=entry, tp=tp, sl=sl, side=side)
 
+        layer5 = {
+            "entry": float(entry),
+            "tp": float(tp),
+            "sl": float(sl),
+            "partial_tps": [float(x) for x in partial_tps],
+            "atr_sl_mult": float(self.config.atr_sl_mult),
+            "risk_reward": float(self.config.risk_reward),
+            "vp_available": 1.0 if context.volume_profile is not None else 0.0,
+        }
+        trace["layers"]["layer5_tp_sl"] = {"passed": True, "details": layer5}
+        self.last_diagnostics = trace
+
         confidence = 0.45
-        confidence += 0.20 * min(layer1.get("volume_spike", 1.0) / self.config.volume_spike_threshold, 2.0)
-        confidence += 0.10 * abs(layer4.get("sentiment", 50.0) - 50.0) / 50.0
-        confidence += 0.10 * layer4.get("crowd_extreme", 0.0)
+        confidence += 0.20 * min(float(layer1.get("volume_spike", 1.0)) / self.config.volume_spike_threshold, 2.0)
+        confidence += 0.10 * abs(float(layer4.get("sentiment", 50.0)) - 50.0) / 50.0
+        confidence += 0.10 * float(layer4.get("crowd_extreme", 0.0))
         confidence += 0.20 if context.regime in (MarketRegime.PUMP, MarketRegime.PANIC, MarketRegime.TREND) else 0.05
         confidence = float(max(0.0, min(confidence, 0.99)))
 
@@ -368,6 +443,8 @@ class SignalGenerator:
                 "layer2": layer2,
                 "layer3": layer3,
                 "layer4": layer4,
+                "layer5": layer5,
+                "layer_trace": trace,
                 "regime": context.regime.value,
             },
         )

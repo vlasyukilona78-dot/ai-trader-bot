@@ -153,7 +153,12 @@ def run_cycle(
                 continue
 
             as_of = frame.ohlcv.index[-1]
-            extras = {"sentiment_index": 50.0}
+            extras = {
+                "sentiment_index": 50.0,
+                "sentiment_source": "fallback_neutral_50",
+                "funding_rate": None,
+                "long_short_ratio": None,
+            }
             features = pipeline.build(symbol=symbol, ohlcv=frame.ohlcv, as_of=as_of, extras=extras)
 
             mark_price = frame.mark_price if frame.mark_price > 0 else float(features.enriched.iloc[-1]["close"])
@@ -165,6 +170,9 @@ def run_cycle(
                     exchange=snapshot,
                     synced_state=rec_state.state,
                     sentiment_index=extras.get("sentiment_index"),
+                    sentiment_source=extras.get("sentiment_source"),
+                    funding_rate=extras.get("funding_rate"),
+                    long_short_ratio=extras.get("long_short_ratio"),
                 )
             )
 
@@ -193,14 +201,31 @@ def run_cycle(
             counters.inc("signals_total")
             counters.inc(f"intent_{intent.action.value.lower()}")
             counters.inc(f"exec_{outcome.status.lower()}")
+            layer_trace = intent.metadata.get("layer_trace", {}) if isinstance(intent.metadata, dict) else {}
+            layer_failed = intent.metadata.get("layer_failed", "") if isinstance(intent.metadata, dict) else ""
+            layer4 = {}
+            if isinstance(layer_trace, dict):
+                layer4 = (
+                    layer_trace.get("layers", {})
+                    .get("layer4_fake_filter", {})
+                    .get("details", {})
+                )
+            sentiment_mode = layer4.get("sentiment_source", "n/a") if isinstance(layer4, dict) else "n/a"
+            sentiment_degraded = False
+            if isinstance(layer4, dict):
+                sentiment_degraded = bool(float(layer4.get("degraded_mode", 0.0) or 0.0))
+
             logger.info(
-                "symbol=%s state=%s intent=%s risk=%s exec=%s reason=%s",
+                "symbol=%s state=%s intent=%s risk=%s exec=%s reason=%s layer_failed=%s sentiment_mode=%s sentiment_degraded=%s",
                 symbol,
                 rec_state.state.value,
                 intent.action.value,
                 decision.reason,
                 outcome.status,
                 outcome.reason,
+                layer_failed,
+                sentiment_mode,
+                sentiment_degraded,
                 extra={"event": "decision"},
             )
 
@@ -355,4 +380,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
 
