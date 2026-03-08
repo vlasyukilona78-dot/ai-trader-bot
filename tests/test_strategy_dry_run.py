@@ -49,6 +49,8 @@ class SignalGeneratorTests(unittest.TestCase):
         df.iloc[-1, df.columns.get_loc("cvd")] = 850.0
         df["vwap"] = 104.0
         df["atr"] = 1.8
+        # MSB helper: force bearish EMA20 cross on the last bar.
+        df["ema20"] = 108.5
 
         signal_gen = SignalGenerator(SignalConfig())
         ctx = SignalContext(

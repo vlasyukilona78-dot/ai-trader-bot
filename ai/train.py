@@ -1,7 +1,9 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
+import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 
@@ -19,6 +21,7 @@ if __package__ in (None, ""):
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
 
+from ai.inference.governance import compute_feature_schema_hash, load_registry, save_registry
 from ai.utils import DEFAULT_FEATURE_NAMES, save_feature_names
 
 try:
@@ -130,6 +133,45 @@ def _temporal_split(X: pd.DataFrame, y: pd.Series, y_h: pd.Series):
     return X_train, X_test, y_train, y_test, h_train, h_test
 
 
+def _write_artifact_manifest(
+    *,
+    model_dir: str,
+    version: str,
+    selected_model_type: str,
+    dataset_path: str,
+    features: list[str],
+    rows: int,
+):
+    manifest = {
+        "version": version,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "model_type": selected_model_type,
+        "dataset_path": str(dataset_path),
+        "rows": int(rows),
+        "feature_names": list(features),
+        "feature_schema_hash": compute_feature_schema_hash(list(features)),
+    }
+    path = Path(model_dir) / ("manifest.json" if version == "default" else f"manifest_{version}.json")
+    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    registry = load_registry(model_dir)
+    registry.setdefault("auto_promotion", False)
+    registry.setdefault("history", [])
+    if version == "default" and not registry.get("champion"):
+        registry["champion"] = "default"
+    elif version != registry.get("champion"):
+        registry["challenger"] = version
+    registry["history"].append(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "action": "register_artifact",
+            "version": version,
+            "model_type": selected_model_type,
+        }
+    )
+    save_registry(model_dir, registry)
+
+
 def train_models(
     dataset_path: str,
     model_dir: str = "ai/models",
@@ -199,8 +241,15 @@ def train_models(
         joblib.dump(calibrator, Path(model_dir) / f"calibrator{suffix}.pkl")
 
     save_feature_names(features, model_dir=model_dir, regime=regime)
+    _write_artifact_manifest(
+        model_dir=model_dir,
+        version=(regime.lower() if regime else "default"),
+        selected_model_type=selected_model_type,
+        dataset_path=dataset_path,
+        features=features,
+        rows=len(df),
+    )
 
-    # walk-forward diagnostics
     tscv = TimeSeriesSplit(n_splits=min(5, max(2, len(X) // 80)))
     wf_rows: list[dict[str, float]] = []
     for fold_idx, (tr_idx, te_idx) in enumerate(tscv.split(X), start=1):
@@ -251,6 +300,3 @@ if __name__ == "__main__":
         raise SystemExit(str(exc))
     except ValueError as exc:
         raise SystemExit(str(exc))
-
-
-

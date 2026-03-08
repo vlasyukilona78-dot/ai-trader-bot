@@ -20,6 +20,9 @@ strategy:
   vwap_tolerance_pct: 0.0025
   funding_tolerance: 0.0003
   long_short_ratio_tolerance: 0.1
+  msb_lookback: 20
+  msb_recent_bars: 6
+  msb_break_buffer_pct: 0.0005
   volume_profile_window: 120
   volume_profile_bins: 48
 
@@ -28,6 +31,11 @@ risk:
   max_risk_per_trade: 0.01
   max_open_positions: 3
   max_total_exposure_pct: 0.5
+  max_single_symbol_exposure_pct: 0.25
+  max_notional_per_trade_pct: 0.25
+  max_leverage: 3.0
+  min_stop_distance_pct: 0.0015
+  min_liquidation_buffer_pct: 0.003
   daily_loss_limit_pct: 0.05
   max_consecutive_losses: 4
   cooldown_minutes: 30
@@ -39,7 +47,7 @@ ml:
   min_probability: 0.25
   model_dir: "ai/models"
   use_regime_models: true
-  online_retrain_enabled: true
+  online_retrain_enabled: false
   online_retrain_interval_sec: 21600
   online_retrain_min_rows: 100
   online_dataset_path: "data/processed/online_training_dataset.csv"
@@ -52,8 +60,4 @@ market_data:
   sentiment_api_url: "https://api.alternative.me/fng/"
   request_timeout_sec: 8
   max_retries: 2
-
-
-
-
 

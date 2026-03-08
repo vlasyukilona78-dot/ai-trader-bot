@@ -1,7 +1,4 @@
 ﻿import os
-from dotenv import load_dotenv
-
-load_dotenv()
 
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
@@ -21,7 +18,6 @@ LOG_PATH = os.getenv("LOG_PATH", "logs/signals_log.csv")
 MODEL_DIR = os.getenv("MODEL_DIR", ".")
 BYBIT_DRY_RUN = os.getenv("BYBIT_DRY_RUN", "True").lower() in ("true", "1", "yes")
 
-# Pump-short strategy thresholds.
 RSI_PUMP_THRESHOLD = float(os.getenv("RSI_PUMP_THRESHOLD", "80"))
 SENTIMENT_EUPHORIA_THRESHOLD = float(os.getenv("SENTIMENT_EUPHORIA_THRESHOLD", "70"))
 PROFILE_WINDOW = int(os.getenv("PROFILE_WINDOW", "80"))
@@ -29,7 +25,6 @@ PROFILE_BINS = int(os.getenv("PROFILE_BINS", "24"))
 KELTNER_MULTIPLIER = float(os.getenv("KELTNER_MULTIPLIER", "1.5"))
 SENTIMENT_API_URL = os.getenv("SENTIMENT_API_URL", "https://api.alternative.me/fng/")
 
-# Execution and risk parameters.
 MIN_AI_PROB_TO_ORDER = float(os.getenv("MIN_AI_PROB_TO_ORDER", "0.60"))
 TRADE_LOG_PATH = os.getenv("TRADE_LOG_PATH", "logs/trades_log.csv")
 

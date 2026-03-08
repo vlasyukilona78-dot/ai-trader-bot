@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
-
 try:
     import yaml
 except Exception:
@@ -38,6 +36,9 @@ class StrategySettings:
     vwap_tolerance_pct: float = 0.0025
     funding_tolerance: float = 0.0003
     long_short_ratio_tolerance: float = 0.10
+    msb_lookback: int = 20
+    msb_recent_bars: int = 6
+    msb_break_buffer_pct: float = 0.0005
     volume_profile_window: int = 120
     volume_profile_bins: int = 48
 
@@ -48,6 +49,11 @@ class RiskSettings:
     max_risk_per_trade: float = 0.01
     max_open_positions: int = 3
     max_total_exposure_pct: float = 0.5
+    max_single_symbol_exposure_pct: float = 0.25
+    max_notional_per_trade_pct: float = 0.25
+    max_leverage: float = 3.0
+    min_stop_distance_pct: float = 0.0015
+    min_liquidation_buffer_pct: float = 0.003
     daily_loss_limit_pct: float = 0.05
     max_consecutive_losses: int = 4
     cooldown_minutes: int = 30
@@ -61,7 +67,7 @@ class MLSettings:
     min_probability: float = 0.25
     model_dir: str = "ai/models"
     use_regime_models: bool = True
-    online_retrain_enabled: bool = True
+    online_retrain_enabled: bool = False
     online_retrain_interval_sec: int = 6 * 3600
     online_retrain_min_rows: int = 100
     online_dataset_path: str = "data/processed/online_training_dataset.csv"
@@ -113,12 +119,7 @@ def _merge_dataclass(dc_obj, payload: dict[str, Any] | None):
     return dc_obj
 
 
-def load_settings(config_path: str = "config/config.yaml", env_path: str = "config/secrets.env") -> AppSettings:
-    if Path(env_path).exists():
-        load_dotenv(env_path)
-    else:
-        load_dotenv()
-
+def load_settings(config_path: str = "config/config.yaml") -> AppSettings:
     raw: dict[str, Any] = {}
     if yaml is not None and Path(config_path).exists():
         try:
@@ -136,7 +137,6 @@ def load_settings(config_path: str = "config/config.yaml", env_path: str = "conf
     alerts = _merge_dataclass(AlertSettings(), raw.get("alerts"))
     market_data = _merge_dataclass(MarketDataSettings(), raw.get("market_data"))
 
-    # env overrides
     bot.scan_interval_sec = int(os.getenv("BOT_SCAN_INTERVAL_SEC", bot.scan_interval_sec))
     bot.timeframe = str(os.getenv("BOT_TIMEFRAME", bot.timeframe))
     bot.candles_limit = int(os.getenv("BOT_CANDLES_LIMIT", bot.candles_limit))
@@ -149,6 +149,18 @@ def load_settings(config_path: str = "config/config.yaml", env_path: str = "conf
     market_data.bybit_base_url = os.getenv("BYBIT_BASE_URL", market_data.bybit_base_url)
     market_data.request_timeout_sec = int(os.getenv("MD_TIMEOUT_SEC", market_data.request_timeout_sec))
     market_data.max_retries = int(os.getenv("MD_MAX_RETRIES", market_data.max_retries))
+
+    risk.max_single_symbol_exposure_pct = float(
+        os.getenv("RISK_MAX_SINGLE_SYMBOL_EXPOSURE_PCT", risk.max_single_symbol_exposure_pct)
+    )
+    risk.max_notional_per_trade_pct = float(
+        os.getenv("RISK_MAX_NOTIONAL_PER_TRADE_PCT", risk.max_notional_per_trade_pct)
+    )
+    risk.max_leverage = float(os.getenv("RISK_MAX_LEVERAGE", risk.max_leverage))
+    risk.min_stop_distance_pct = float(os.getenv("RISK_MIN_STOP_DISTANCE_PCT", risk.min_stop_distance_pct))
+    risk.min_liquidation_buffer_pct = float(
+        os.getenv("RISK_MIN_LIQUIDATION_BUFFER_PCT", risk.min_liquidation_buffer_pct)
+    )
 
     ml.online_retrain_enabled = _as_bool(os.getenv("ML_ONLINE_RETRAIN_ENABLED"), ml.online_retrain_enabled)
     ml.online_retrain_interval_sec = int(os.getenv("ML_ONLINE_RETRAIN_INTERVAL_SEC", ml.online_retrain_interval_sec))
@@ -164,8 +176,3 @@ def load_settings(config_path: str = "config/config.yaml", env_path: str = "conf
         alerts=alerts,
         market_data=market_data,
     )
-
-
-
-
-

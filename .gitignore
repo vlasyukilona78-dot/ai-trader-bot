@@ -1,8 +1,41 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Virtual envs
 venv/
 .venv/
-__pycache__/
-*.pyc
-.env
-logs/
+
+# IDE
 .idea/
 .vscode/
+
+# Secrets and env
+.env
+.env.*
+config/secrets.env
+
+# Logs
+logs/
+*.log
+
+# Data / artifacts
+backups/
+charts/
+data/
+*.csv
+*.xlsx
+*.xls
+*.pkl
+*.joblib
+*.parquet
+
+# OS
+.DS_Store
+Thumbs.db
+.runtime_env/
+

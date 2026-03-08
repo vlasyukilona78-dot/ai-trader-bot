@@ -1,4 +1,9 @@
-﻿from __future__ import annotations
+from __future__ import annotations
+
+import os
+
+if os.getenv("ALLOW_LEGACY_RUNTIME", "false").strip().lower() not in ("1", "true", "yes"):
+    raise RuntimeError("Legacy runtime is quarantined. Use V2 entrypoint app/main.py and trading/* modules.")
 
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -97,3 +102,4 @@ class RiskEngine:
             "consecutive_losses": self.consecutive_losses,
             "circuit_breaker_until": self.circuit_breaker_until.isoformat() if self.circuit_breaker_until else None,
         }
+

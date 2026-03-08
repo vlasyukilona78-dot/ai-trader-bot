@@ -1,4 +1,9 @@
-﻿from __future__ import annotations
+from __future__ import annotations
+
+import os
+
+if os.getenv("ALLOW_LEGACY_RUNTIME", "false").strip().lower() not in ("1", "true", "yes"):
+    raise RuntimeError("Legacy runtime is quarantined. Use V2 entrypoint app/main.py and trading/* modules.")
 
 import time
 
@@ -26,3 +31,4 @@ def extract_order_avg_price(order_result: dict | None, fallback: float) -> float
         except (TypeError, ValueError):
             pass
     return float(fallback)
+

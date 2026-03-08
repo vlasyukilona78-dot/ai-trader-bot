@@ -1,4 +1,9 @@
-﻿from __future__ import annotations
+from __future__ import annotations
+
+import os
+
+if os.getenv("ALLOW_LEGACY_RUNTIME", "false").strip().lower() not in ("1", "true", "yes"):
+    raise RuntimeError("Legacy runtime is quarantined. Use V2 entrypoint app/main.py and trading/* modules.")
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -51,3 +56,4 @@ def transition_state(record: SignalRecord, target: SignalState) -> bool:
     record.state = target
     record.updated_at = datetime.now(timezone.utc).timestamp()
     return True
+

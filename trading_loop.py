@@ -1,3 +1,7 @@
+import os
+
+if os.getenv("ALLOW_LEGACY_RUNTIME", "false").strip().lower() not in ("1", "true", "yes"):
+    raise RuntimeError("Legacy runtime is quarantined. Use V2 entrypoint app/main.py and trading/* modules.")
 import asyncio
 import time
 import traceback
@@ -219,3 +223,4 @@ def log_trade_to_history(result: dict, indicators: dict | None = None):
         logger.info("Trade appended to %s", log_path)
     except Exception as exc:
         logger.error("Failed to append trade history: %s", exc)
+

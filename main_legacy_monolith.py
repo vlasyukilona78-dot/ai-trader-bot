@@ -1,17 +1,22 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-main.py вЂ” СЃС‚Р°Р±РёР»РёР·РёСЂРѕРІР°РЅРЅР°СЏ РїРѕР»РЅР°СЏ РІРµСЂСЃРёСЏ (demo trading)
-Р¤СѓРЅРєС†РёРё:
- - Р·Р°РіСЂСѓР·РєР° РјРѕРґРµР»РµР№ (joblib)
- - РїРѕСЃС‚СЂРѕРµРЅРёРµ РіСЂР°С„РёРєРѕРІ headless (matplotlib Agg)
- - СѓСЃС‚РѕР№С‡РёРІС‹Рµ СЃРµС‚РµРІС‹Рµ РѕР±СЂР°С‰РµРЅРёСЏ СЃ Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРёРј IP-fallback
- - Telegram СѓРІРµРґРѕРјР»РµРЅРёСЏ СЃ fallback (sync + async)
- - Р°РЅР°Р»РёР· РїР°СЂ, РїСѓР±Р»РёРєР°С†РёСЏ СЃРёРіРЅР°Р»РѕРІ, Р»РѕРі-С„Р°Р№Р»С‹
- - bybit demo trading С‡РµСЂРµР· BybitClient (РµСЃР»Рё РґРѕСЃС‚СѓРїРµРЅ)
- - WebSocket РјРѕРЅРёС‚РѕСЂ (РѕРїС†РёРѕРЅР°Р»СЊРЅРѕ, РµСЃР»Рё websockets СѓСЃС‚Р°РЅРѕРІР»РµРЅ)
+main.py — стабилизированная полная версия (demo trading)
+Функции:
+ - загрузка моделей (joblib)
+ - построение графиков headless (matplotlib Agg)
+ - устойчивые сетевые обращения с автоматическим IP-fallback
+ - Telegram уведомления с fallback (sync + async)
+ - анализ пар, публикация сигналов, лог-файлы
+ - bybit demo trading через BybitClient (если доступен)
+ - WebSocket монитор (опционально, если websockets установлен)
 """
 from __future__ import annotations
+
+import os
+
+if os.getenv("ALLOW_LEGACY_RUNTIME", "false").strip().lower() not in ("1", "true", "yes"):
+    raise RuntimeError("Legacy runtime is quarantined. Use V2 entrypoint app/main.py and trading/* modules.")
 
 import os
 import io
@@ -190,12 +195,12 @@ def round_price(price, decimals=None):
 
 def compute_tp_sl(entry, atr=None, rr=RISK_REWARD, df: pd.DataFrame | None = None, direction: str | None = None):
     """
-    Р’С‹С‡РёСЃР»СЏРµС‚ TP Рё SL СЃ СѓС‡С‘С‚РѕРј ATR Рё Р±Р»РёР¶Р°Р№С€РёС… СЌРєСЃС‚СЂРµРјСѓРјРѕРІ.
-    - Р”Р»СЏ SHORT: SL СЃС‚Р°РІРёС‚СЃСЏ С‡СѓС‚СЊ РІС‹С€Рµ Р»РѕРєР°Р»СЊРЅРѕРіРѕ high, TP = entry - RR*(entry - SL)
-    - Р”Р»СЏ LONG: SL СЃС‚Р°РІРёС‚СЃСЏ С‡СѓС‚СЊ РЅРёР¶Рµ Р»РѕРєР°Р»СЊРЅРѕРіРѕ low, TP = entry + RR*(entry - SL)
+    Вычисляет TP и SL с учётом ATR и ближайших экстремумов.
+    - Для SHORT: SL ставится чуть выше локального high, TP = entry - RR*(entry - SL)
+    - Для LONG: SL ставится чуть ниже локального low, TP = entry + RR*(entry - SL)
     """
     try:
-        # Р±Р°Р·РѕРІС‹Рµ Р·РЅР°С‡РµРЅРёСЏ РїРѕ ATR
+        # базовые значения по ATR
         if atr is None or not np.isfinite(atr) or atr <= 0:
             sl_dist = entry * 0.01
         else:
@@ -204,17 +209,17 @@ def compute_tp_sl(entry, atr=None, rr=RISK_REWARD, df: pd.DataFrame | None = Non
         tp = entry + sl_dist * rr
         sl = entry - sl_dist
 
-        # РµСЃР»Рё РµСЃС‚СЊ df Рё РЅР°РїСЂР°РІР»РµРЅРёРµ вЂ” РёСЃРїРѕР»СЊР·СѓРµРј Р»РѕРєР°Р»СЊРЅС‹Рµ СЌРєСЃС‚СЂРµРјСѓРјС‹
+        # если есть df и направление — используем локальные экстремумы
         if df is not None and direction:
-            window = 10  # РјРѕР¶РЅРѕ 8вЂ“20
+            window = 10  # можно 8–20
             recent_high = df["high"].iloc[-window:].max()
             recent_low = df["low"].iloc[-window:].min()
 
             if direction == "LONG":
-                sl = min(sl, recent_low * 0.999)  # С‡СѓС‚СЊ РЅРёР¶Рµ Р»РѕРєР°Р»СЊРЅРѕРіРѕ РјРёРЅРёРјСѓРјР°
+                sl = min(sl, recent_low * 0.999)  # чуть ниже локального минимума
                 tp = entry + (entry - sl) * rr
             else:  # SHORT
-                sl = max(sl, recent_high * 1.001)  # С‡СѓС‚СЊ РІС‹С€Рµ Р»РѕРєР°Р»СЊРЅРѕРіРѕ РјР°РєСЃРёРјСѓРјР°
+                sl = max(sl, recent_high * 1.001)  # чуть выше локального максимума
                 tp = entry - (sl - entry) * rr
 
         dec = get_decimal_places_for_price(entry)
@@ -386,7 +391,7 @@ _ai_diagnostics_done = False
 def ai_predict(features):
     """
     Predicts (probability, horizon). Uses models if available, otherwise heuristic fallback.
-    'features' вЂ” list/array-like matching scaler/model feature order:
+    'features' — list/array-like matching scaler/model feature order:
       [rsi, rsi_5mean, rsi_20mean, price_change, vol_change,
        ema20, ema50, atr, close, ema_diff_norm, atr_norm]
     Returns: (probability: float in [0,1], horizon: float in days/units)
@@ -437,7 +442,7 @@ def ai_predict(features):
             if horizon is None or not _np.isfinite(horizon):
                 horizon = None
         except Exception as e:
-            logger.warning("AI model prediction failed: %s вЂ” falling back to heuristic", e)
+            logger.warning("AI model prediction failed: %s — falling back to heuristic", e)
             prob = None
             horizon = None
     else:
@@ -562,11 +567,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def send_telegram_sync(text: str, timeout: int = 8):
     """
-    РќР°РґС‘Р¶РЅР°СЏ СЃРёРЅС…СЂРѕРЅРЅР°СЏ РѕС‚РїСЂР°РІРєР° С‚РµРєСЃС‚РѕРІРѕРіРѕ СЃРѕРѕР±С‰РµРЅРёСЏ РІ Telegram.
-    РџРѕРїС‹С‚РєРё:
-      1) РѕР±С‹С‡РЅС‹Р№ requests.post Рє api.telegram.org
-      2) РµСЃР»Рё DNS/TLS/СЃРµС‚РµРІС‹Рµ РѕС€РёР±РєРё вЂ” СЂРµР·РѕР»РІРёРј IP Рё РїРѕСЃС‚РёРј РЅР° IP СЃ Р·Р°РіРѕР»РѕРІРєРѕРј Host
-      3) РµСЃР»Рё Рё СЌС‚Рѕ РЅРµ РїРѕРјРѕРіР°РµС‚ вЂ” РІС‚РѕСЂРёС‡РЅРѕ РїСЂРѕР±СѓРµРј РЅР° IP СЃ verify=False (РєСЂР°Р№РЅСЏСЏ РјРµСЂР°)
+    Надёжная синхронная отправка текстового сообщения в Telegram.
+    Попытки:
+      1) обычный requests.post к api.telegram.org
+      2) если DNS/TLS/сетевые ошибки — резолвим IP и постим на IP с заголовком Host
+      3) если и это не помогает — вторично пробуем на IP с verify=False (крайняя мера)
     """
     if not TELEGRAM_TOKEN or not CHAT_ID:
         logger.debug("Telegram not configured; skipping send_telegram_sync.")
@@ -576,7 +581,7 @@ def send_telegram_sync(text: str, timeout: int = 8):
     url = f"{base_url}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
 
-    # 1) РћР±С‹С‡РЅР°СЏ РїРѕРїС‹С‚РєР°
+    # 1) Обычная попытка
     try:
         resp = requests.post(url, data=payload, timeout=timeout)
         if resp.status_code == 200:
@@ -587,7 +592,7 @@ def send_telegram_sync(text: str, timeout: int = 8):
     except (RequestException, Timeout, ConnectionError, SSLError) as e:
         logger.warning("Network/DNS/TLS error while send_telegram_sync: %s", e)
 
-    # 2) РџРѕРїС‹С‚РєР° С‡РµСЂРµР· IP (РѕСЃС‚Р°РІР»СЏРµРј Host: api.telegram.org)
+    # 2) Попытка через IP (оставляем Host: api.telegram.org)
     try:
         ip = resolve_host("api.telegram.org")
         if ip and ip != "api.telegram.org":
@@ -602,7 +607,7 @@ def send_telegram_sync(text: str, timeout: int = 8):
                     logger.warning("Fallback POST via IP %s HTTP %s: %s", ip, resp2.status_code, resp2.text[:300])
             except (RequestException, Timeout, ConnectionError, SSLError) as e2:
                 logger.warning("Fallback POST via IP %s for api.telegram.org failed: %s", ip, e2)
-                # 3) РєСЂР°Р№РЅСЏСЏ РјРµСЂР° -> РѕС‚РєР»СЋС‡Р°РµРј РІРµСЂРёС„РёРєР°С†РёСЋ СЃРµСЂС‚РёС„РёРєР°С‚Р° (СЃРµСЂС‚РёС„РёРєР°С‚ РЅРµ СЃРѕРІРїР°РґР°РµС‚ СЃ IP, РїРѕСЌС‚РѕРјСѓ СЌС‚Рѕ СЂРёСЃРє)
+                # 3) крайняя мера -> отключаем верификацию сертификата (сертификат не совпадает с IP, поэтому это риск)
                 try:
                     resp3 = requests.post(url_ip, data=payload, headers=headers, timeout=timeout, verify=False)
                     if resp3.status_code == 200:
@@ -619,8 +624,8 @@ def send_telegram_sync(text: str, timeout: int = 8):
 
 def send_telegram_photo_sync(caption: str, image_bytes: bytes, timeout: int = 20):
     """
-    РЎРёРЅС…СЂРѕРЅРЅР°СЏ РѕС‚РїСЂР°РІРєР° РёР·РѕР±СЂР°Р¶РµРЅРёСЏ РІ Telegram (requests).
-    РђРЅР°Р»РѕРіРёС‡РЅР°СЏ РїРѕР»РёС‚РёРєР° fallback: РѕР±С‹С‡РЅС‹Р№ Р·Р°РїСЂРѕСЃ -> РїРѕСЃС‚ РЅР° IP СЃ Host -> РєСЂР°Р№РЅСЏСЏ РјРµСЂР° verify=False.
+    Синхронная отправка изображения в Telegram (requests).
+    Аналогичная политика fallback: обычный запрос -> пост на IP с Host -> крайняя мера verify=False.
     """
     if not TELEGRAM_TOKEN or not CHAT_ID:
         logger.debug("Telegram not configured; skipping send_telegram_photo_sync.")
@@ -680,12 +685,12 @@ async def _post_with_fallback(
     host_for_fallback: str | None = None
 ):
     """
-    РЈСЃРѕРІРµСЂС€РµРЅСЃС‚РІРѕРІР°РЅРЅС‹Р№ POST СЃ С‚СЂРѕР№РЅС‹Рј fallback:
-      1. aiohttp СЃС‚Р°РЅРґР°СЂС‚РЅС‹Р№ POST
-      2. aiohttp СЃ IP С‡РµСЂРµР· FixedHostResolver
-      3. requests (sync fallback) РїСЂРё РїРѕР»РЅРѕРј РѕС‚РєР°Р·Рµ DNS РёР»Рё TLS
+    Усовершенствованный POST с тройным fallback:
+      1. aiohttp стандартный POST
+      2. aiohttp с IP через FixedHostResolver
+      3. requests (sync fallback) при полном отказе DNS или TLS
 
-    Р’РѕР·РІСЂР°С‰Р°РµС‚ aiohttp.Response-like РѕР±СЉРµРєС‚, Р»РёР±Рѕ requests.Response РїСЂРё sync fallback.
+    Возвращает aiohttp.Response-like объект, либо requests.Response при sync fallback.
     """
     try:
         async with session.post(url, data=data, timeout=timeout) as resp:
@@ -695,7 +700,7 @@ async def _post_with_fallback(
         if not host_for_fallback:
             raise
 
-        # --- Fallback step 1: РїСЂРѕР±СѓРµРј IP С‡РµСЂРµР· FixedHostResolver ---
+        # --- Fallback step 1: пробуем IP через FixedHostResolver ---
         ip = resolve_host(host_for_fallback)
         if not ip or ip == host_for_fallback:
             logger.info("No IP resolved for fallback host %s", host_for_fallback)
@@ -711,7 +716,7 @@ async def _post_with_fallback(
                 async with ClientSession(connector=connector) as sess2:
                     async with sess2.post(url, data=data, timeout=timeout) as resp2:
                         if resp2.status == 200:
-                            logger.info("вњ… Fallback via IP (%s) for %s succeeded", ip, host_for_fallback)
+                            logger.info("✅ Fallback via IP (%s) for %s succeeded", ip, host_for_fallback)
                             return resp2
                         else:
                             txt = await resp2.text()
@@ -721,13 +726,13 @@ async def _post_with_fallback(
 
         # --- Fallback step 2: requests (sync) ---
         try:
-            logger.info("рџЊђ Final fallback via requests for %s (%s)", host_for_fallback, ip if 'ip' in locals() else None)
+            logger.info("🌐 Final fallback via requests for %s (%s)", host_for_fallback, ip if 'ip' in locals() else None)
             url_replaced = url
             if ip and host_for_fallback in url:
                 url_replaced = url.replace(host_for_fallback, ip)
             headers = {"Host": host_for_fallback}
 
-            # вњ… РµСЃР»Рё РІ fallback РёСЃРїРѕР»СЊР·СѓРµС‚СЃСЏ IP, РѕС‚РєР»СЋС‡Р°РµРј РїСЂРѕРІРµСЂРєСѓ SSL
+            # ✅ если в fallback используется IP, отключаем проверку SSL
             verify_ssl = not host_for_fallback.replace('.', '').isdigit()
 
             resp = requests.post(
@@ -787,7 +792,7 @@ def send_telegram(text: str):
             asyncio.create_task(_fire(text))
             return
     except Exception:
-        # if event loop not available or any error вЂ” fallback to sync
+        # if event loop not available or any error — fallback to sync
         pass
     send_telegram_sync(text)
 
@@ -1441,7 +1446,7 @@ class BybitWSMonitor:
 
     async def connect(self):
         if websockets is None:
-            logger.warning("websockets library not available вЂ” skipping WS monitor.")
+            logger.warning("websockets library not available — skipping WS monitor.")
             return
         try:
             logger.info("Connecting to Bybit WS: %s", self.endpoint)
@@ -1486,13 +1491,13 @@ class BybitWSMonitor:
                 pnl = float(pos.get("unrealisedPnl", 0))
                 ts = datetime.utcnow().strftime("%H:%M:%S")
                 if size > 0:
-                    msg = f"рџџў [{ts}] {symbol} {side} | size={size} | entry={entry:.6f} | PnL={pnl:.4f}"
+                    msg = f"🟢 [{ts}] {symbol} {side} | size={size} | entry={entry:.6f} | PnL={pnl:.4f}"
                     logger.info(msg)
                     if self.send_func:
                         try: self.send_func(msg)
                         except Exception: pass
                 else:
-                    msg = f"вљЄ [{ts}] {symbol} position closed"
+                    msg = f"⚪ [{ts}] {symbol} position closed"
                     logger.info(msg)
                     if self.send_func:
                         try: self.send_func(msg)
@@ -1763,3 +1768,4 @@ if __name__ == "__main__":
         logger.info("Stopped by user.")
     except Exception:
         logger.exception("Unhandled exception in __main__")
+

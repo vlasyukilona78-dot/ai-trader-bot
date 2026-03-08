@@ -1,3 +1,4 @@
-﻿"""AI modules for model training and inference."""
+"""AI package.
 
-from .utils import ModelBundle, load_model_bundle, predict_with_bundle
+Heavy ML dependencies are imported lazily in submodules.
+"""

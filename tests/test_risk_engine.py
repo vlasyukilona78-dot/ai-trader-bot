@@ -1,4 +1,8 @@
-﻿import unittest
+import os
+import unittest
+
+if os.getenv("ALLOW_LEGACY_RUNTIME", "false").strip().lower() not in ("1", "true", "yes"):
+    raise unittest.SkipTest("legacy runtime tests are quarantined; run V2 tests instead")
 
 from engine.risk import RiskConfig, RiskEngine
 
@@ -24,3 +28,4 @@ class RiskEngineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

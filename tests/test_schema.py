@@ -1,4 +1,9 @@
-﻿import tempfile
+import os
+import unittest
+
+if os.getenv("ALLOW_LEGACY_RUNTIME", "false").strip().lower() not in ("1", "true", "yes"):
+    raise unittest.SkipTest("legacy runtime tests are quarantined; run V2 tests instead")
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -50,3 +55,4 @@ class SchemaTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
