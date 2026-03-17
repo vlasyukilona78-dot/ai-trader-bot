@@ -73,8 +73,217 @@ def _collect_runtime_payload(frame) -> dict[str, object]:
 
 
 def _strategy_audit_log_payload(strategy) -> dict[str, object]:
+    numeric_regime_keys = (
+        "htf_trend_metric_used",
+        "htf_trend_threshold_used",
+        "vwap_distance_metric_used",
+        "vwap_stretch_threshold_used",
+        "atr_norm",
+        "volatility_threshold_used",
+        "degraded_mode",
+        "fail_due_to_degraded_mode_only",
+        "soft_pass_candidate",
+        "soft_pass_used",
+    )
+    numeric_layer1_keys = (
+        "rsi",
+        "rsi_high_threshold_used",
+        "volume_spike",
+        "volume_spike_high",
+        "volume_spike_threshold_used",
+        "close_metric_used",
+        "bollinger_upper_metric_used",
+        "keltner_upper_metric_used",
+        "above_bollinger_upper",
+        "above_keltner_upper",
+        "upper_band_breakout",
+        "pump_context_strength",
+        "soft_pass_candidate",
+        "soft_pass_used",
+        "pump_bar_offset",
+    )
+    numeric_layer2_keys = (
+        "price_up_or_near_high",
+        "price_up",
+        "near_high_context",
+        "obv_bearish_divergence",
+        "cvd_bearish_divergence",
+        "close_last_used",
+        "close_ref_used",
+        "obv_last_used",
+        "obv_ref_used",
+        "cvd_last_used",
+        "cvd_ref_used",
+        "weakness_lookback_used",
+        "weakness_strength",
+    )
+    regime_diag_defaults: dict[str, object] = {
+        "htf_trend_metric_used": None,
+        "htf_trend_threshold_used": None,
+        "htf_trend_direction_context": "",
+        "vwap_distance_metric_used": None,
+        "vwap_stretch_threshold_used": None,
+        "atr_norm": None,
+        "volatility_threshold_used": None,
+        "failed_reason": "",
+        "missing_conditions": "",
+        "degraded_mode": 0.0,
+        "fail_due_to_degraded_mode_only": 0.0,
+        "soft_pass_candidate": 0.0,
+        "soft_pass_used": 0.0,
+        "soft_pass_reason": "",
+        "source_flags": {},
+        "regime_filter_subconditions_state": {},
+    }
+    layer1_diag_defaults: dict[str, object] = {
+        "rsi": None,
+        "rsi_high_threshold_used": None,
+        "volume_spike": None,
+        "volume_spike_high": 0.0,
+        "volume_spike_threshold_used": None,
+        "close_metric_used": None,
+        "bollinger_upper_metric_used": None,
+        "keltner_upper_metric_used": None,
+        "above_bollinger_upper": 0.0,
+        "above_keltner_upper": 0.0,
+        "upper_band_breakout": 0.0,
+        "pump_context_strength": 0.0,
+        "failed_reason": "",
+        "missing_conditions": "",
+        "soft_pass_candidate": 0.0,
+        "soft_pass_used": 0.0,
+        "soft_pass_reason": "",
+        "pump_bar_offset": None,
+        "layer1_subconditions_state": {},
+    }
+    layer2_diag_defaults: dict[str, object] = {
+        "price_up_or_near_high": 0.0,
+        "price_up": 0.0,
+        "near_high_context": 0.0,
+        "obv_bearish_divergence": 0.0,
+        "cvd_bearish_divergence": 0.0,
+        "close_last_used": None,
+        "close_ref_used": None,
+        "obv_last_used": None,
+        "obv_ref_used": None,
+        "cvd_last_used": None,
+        "cvd_ref_used": None,
+        "weakness_lookback_used": None,
+        "weakness_strength": 0.0,
+        "failed_reason": "",
+        "missing_conditions": "",
+        "layer2_subconditions_state": {},
+    }
+
+    def _normalize_bool_state_map(source: object, keys: tuple[str, ...]) -> dict[str, bool]:
+        if not isinstance(source, Mapping):
+            return {}
+        out: dict[str, bool] = {}
+        for key in keys:
+            if key not in source:
+                continue
+            value = source.get(key)
+            if isinstance(value, bool):
+                out[key] = value
+            elif isinstance(value, (int, float)):
+                out[key] = float(value) != 0.0
+            elif isinstance(value, str):
+                text = value.strip().lower()
+                if text in ("1", "true", "yes", "y", "on"):
+                    out[key] = True
+                elif text in ("0", "false", "no", "n", "off", ""):
+                    out[key] = False
+        return out
+
+    def _extract_regime_diag(source: Mapping[str, object] | object) -> dict[str, object]:
+        out = dict(regime_diag_defaults)
+        if not isinstance(source, Mapping):
+            return out
+        for key in numeric_regime_keys:
+            if key not in source:
+                continue
+            value = source.get(key)
+            try:
+                out[key] = float(value) if value is not None else None
+            except (TypeError, ValueError):
+                out[key] = None
+        direction = source.get("htf_trend_direction_context")
+        out["htf_trend_direction_context"] = str(direction) if direction is not None else ""
+        out["failed_reason"] = str(source.get("failed_reason") or "")
+        out["missing_conditions"] = str(source.get("missing_conditions") or "")
+        out["soft_pass_reason"] = str(source.get("soft_pass_reason") or "")
+        source_flags = source.get("source_flags", {})
+        out["source_flags"] = dict(source_flags) if isinstance(source_flags, Mapping) else {}
+        subconditions = source.get("regime_filter_subconditions_state", {})
+        out["regime_filter_subconditions_state"] = _normalize_bool_state_map(
+            subconditions,
+            ("htf_trend_ok", "stretched_from_vwap", "volatility_regime_ok", "news_veto"),
+        )
+        return out
+
+    def _extract_layer1_diag(source: Mapping[str, object] | object) -> dict[str, object]:
+        out = dict(layer1_diag_defaults)
+        if not isinstance(source, Mapping):
+            return out
+        for key in numeric_layer1_keys:
+            if key not in source:
+                continue
+            value = source.get(key)
+            try:
+                out[key] = float(value) if value is not None else None
+            except (TypeError, ValueError):
+                out[key] = None
+        out["failed_reason"] = str(source.get("failed_reason") or "")
+        out["missing_conditions"] = str(source.get("missing_conditions") or "")
+        out["soft_pass_reason"] = str(source.get("soft_pass_reason") or "")
+        subconditions = source.get("layer1_subconditions_state", {})
+        out["layer1_subconditions_state"] = _normalize_bool_state_map(
+            subconditions,
+            (
+                "rsi_high",
+                "volume_spike_high",
+                "upper_band_breakout",
+                "above_bollinger_upper",
+                "above_keltner_upper",
+            ),
+        )
+        return out
+
+    def _extract_layer2_diag(source: Mapping[str, object] | object) -> dict[str, object]:
+        out = dict(layer2_diag_defaults)
+        if not isinstance(source, Mapping):
+            return out
+        for key in numeric_layer2_keys:
+            if key not in source:
+                continue
+            value = source.get(key)
+            try:
+                out[key] = float(value) if value is not None else None
+            except (TypeError, ValueError):
+                out[key] = None
+        out["failed_reason"] = str(source.get("failed_reason") or "")
+        out["missing_conditions"] = str(source.get("missing_conditions") or "")
+        subconditions = source.get("layer2_subconditions_state", {})
+        out["layer2_subconditions_state"] = _normalize_bool_state_map(
+            subconditions,
+            (
+                "price_up_or_near_high",
+                "price_up",
+                "near_high_context",
+                "obv_bearish_divergence",
+                "cvd_bearish_divergence",
+            ),
+        )
+        return out
+
     full_snapshot = {}
     compact_snapshot = {}
+    regime_filter_snapshot = {}
+    regime_diagnostics_snapshot = {}
+    layer1_snapshot = {}
+    layer1_diagnostics_snapshot = {}
+    layer2_snapshot = {}
+    layer2_diagnostics_snapshot = {}
     layer4_snapshot = {}
     source_quality_snapshot = {}
 
@@ -86,6 +295,18 @@ def _strategy_audit_log_payload(strategy) -> dict[str, object]:
         if isinstance(observation, Mapping):
             if isinstance(observation.get("strategy_audit_compact"), Mapping):
                 compact_snapshot = dict(observation.get("strategy_audit_compact", {}))
+            if isinstance(observation.get("strategy_audit_regime_filter"), Mapping):
+                regime_filter_snapshot = dict(observation.get("strategy_audit_regime_filter", {}))
+            if isinstance(observation.get("strategy_audit_regime_diagnostics"), Mapping):
+                regime_diagnostics_snapshot = _extract_regime_diag(observation.get("strategy_audit_regime_diagnostics", {}))
+            if isinstance(observation.get("strategy_audit_layer1"), Mapping):
+                layer1_snapshot = dict(observation.get("strategy_audit_layer1", {}))
+            if isinstance(observation.get("strategy_audit_layer1_diagnostics"), Mapping):
+                layer1_diagnostics_snapshot = _extract_layer1_diag(observation.get("strategy_audit_layer1_diagnostics", {}))
+            if isinstance(observation.get("strategy_audit_layer2"), Mapping):
+                layer2_snapshot = dict(observation.get("strategy_audit_layer2", {}))
+            if isinstance(observation.get("strategy_audit_layer2_diagnostics"), Mapping):
+                layer2_diagnostics_snapshot = _extract_layer2_diag(observation.get("strategy_audit_layer2_diagnostics", {}))
             if isinstance(observation.get("strategy_audit_layer4"), Mapping):
                 layer4_snapshot = dict(observation.get("strategy_audit_layer4", {}))
             if isinstance(observation.get("strategy_audit_source_quality"), Mapping):
@@ -110,6 +331,34 @@ def _strategy_audit_log_payload(strategy) -> dict[str, object]:
         if not compact_snapshot:
             compact_snapshot = dict(full_snapshot)
 
+    if not regime_filter_snapshot:
+        regime_filter_snapshot = {
+            "regime_filter_pass_count": int(full_snapshot.get("regime_filter_pass_count", 0)),
+            "regime_filter_fail_count": int(full_snapshot.get("regime_filter_fail_count", 0)),
+            "regime_filter_htf_trend_blocker_count": int(full_snapshot.get("regime_filter_htf_trend_blocker_count", 0)),
+            "regime_filter_vwap_stretch_blocker_count": int(full_snapshot.get("regime_filter_vwap_stretch_blocker_count", 0)),
+            "regime_filter_volatility_blocker_count": int(full_snapshot.get("regime_filter_volatility_blocker_count", 0)),
+            "regime_filter_news_blocker_count": int(full_snapshot.get("regime_filter_news_blocker_count", 0)),
+            "regime_filter_degraded_mode_count": int(full_snapshot.get("regime_filter_degraded_mode_count", 0)),
+            "regime_filter_degraded_only_count": int(full_snapshot.get("regime_filter_degraded_only_count", 0)),
+            "regime_filter_soft_pass_candidate_count": int(full_snapshot.get("regime_filter_soft_pass_candidate_count", 0)),
+            "regime_filter_soft_pass_used_count": int(full_snapshot.get("regime_filter_soft_pass_used_count", 0)),
+            "top_regime_filter_blocker": str(compact_snapshot.get("top_regime_filter_blocker", "")),
+            "top_regime_filter_blocker_count": int(compact_snapshot.get("top_regime_filter_blocker_count", 0)),
+        }
+
+    if not layer1_snapshot:
+        layer1_snapshot = {
+            "layer1_pass_count": int(full_snapshot.get("layer1_pass_count", 0)),
+            "layer1_fail_count": int(full_snapshot.get("layer1_fail_count", 0)),
+            "layer1_rsi_high_blocker_count": int(full_snapshot.get("layer1_rsi_high_blocker_count", 0)),
+            "layer1_volume_spike_blocker_count": int(full_snapshot.get("layer1_volume_spike_blocker_count", 0)),
+            "layer1_above_bollinger_upper_blocker_count": int(full_snapshot.get("layer1_above_bollinger_upper_blocker_count", 0)),
+            "layer1_above_keltner_upper_blocker_count": int(full_snapshot.get("layer1_above_keltner_upper_blocker_count", 0)),
+            "layer1_soft_pass_candidate_count": int(full_snapshot.get("layer1_soft_pass_candidate_count", 0)),
+            "top_layer1_blocker": str(compact_snapshot.get("top_layer1_blocker", "")),
+            "top_layer1_blocker_count": int(compact_snapshot.get("top_layer1_blocker_count", 0)),
+        }
     if not layer4_snapshot:
         layer4_snapshot = {
             "layer4_fail_count": int(full_snapshot.get("layer4_fail_count", 0)),
@@ -121,17 +370,47 @@ def _strategy_audit_log_payload(strategy) -> dict[str, object]:
             "layer4_degraded_mode_count": int(full_snapshot.get("layer4_degraded_mode_count", 0)),
             "layer4_soft_pass_candidate_count": int(full_snapshot.get("layer4_soft_pass_candidate_count", 0)),
         }
+    if not layer2_snapshot:
+        layer2_snapshot = {
+            "reached_layer2_count": int(full_snapshot.get("reached_layer2_count", 0)),
+            "passed_layer2_count": int(full_snapshot.get("passed_layer2_count", 0)),
+            "layer2_fail_count": int(full_snapshot.get("layer2_fail_count", 0)),
+        }
+    else:
+        layer2_snapshot.setdefault("reached_layer2_count", int(full_snapshot.get("reached_layer2_count", 0)))
+        layer2_snapshot.setdefault("passed_layer2_count", int(full_snapshot.get("passed_layer2_count", 0)))
+        layer2_snapshot.setdefault("layer2_fail_count", int(full_snapshot.get("layer2_fail_count", 0)))
 
     if not source_quality_snapshot and isinstance(full_snapshot.get("source_quality_summary"), Mapping):
         source_quality_snapshot = dict(full_snapshot.get("source_quality_summary", {}))
 
+    if not regime_diagnostics_snapshot:
+        regime_diagnostics_snapshot = _extract_regime_diag(regime_filter_snapshot)
+    for key, value in regime_diagnostics_snapshot.items():
+        regime_filter_snapshot.setdefault(key, value)
+
+    if not layer1_diagnostics_snapshot:
+        layer1_diagnostics_snapshot = _extract_layer1_diag(layer1_snapshot)
+    for key, value in layer1_diagnostics_snapshot.items():
+        layer1_snapshot.setdefault(key, value)
+
+    if not layer2_diagnostics_snapshot:
+        layer2_diagnostics_snapshot = _extract_layer2_diag(layer2_snapshot)
+    for key, value in layer2_diagnostics_snapshot.items():
+        layer2_snapshot.setdefault(key, value)
+
     return {
         "strategy_audit_compact": compact_snapshot,
+        "strategy_audit_regime_filter": regime_filter_snapshot,
+        "strategy_audit_regime_diagnostics": regime_diagnostics_snapshot,
+        "strategy_audit_layer1": layer1_snapshot,
+        "strategy_audit_layer1_diagnostics": layer1_diagnostics_snapshot,
+        "strategy_audit_layer2": layer2_snapshot,
+        "strategy_audit_layer2_diagnostics": layer2_diagnostics_snapshot,
         "strategy_audit_layer4": layer4_snapshot,
         "strategy_audit_source_quality": source_quality_snapshot,
         "strategy_audit": full_snapshot,
     }
-
 
 def _startup_reconcile(
     *,
@@ -468,7 +747,7 @@ def main() -> int:
             health = sync.health()
             strategy_audit_payload = _strategy_audit_log_payload(strategy)
             logger.info(
-                "metrics=%s risk=%s sync=%s metadata=%s strategy_audit_compact=%s strategy_audit_layer4=%s strategy_audit_source_quality=%s strategy_audit=%s",
+                "metrics=%s risk=%s sync=%s metadata=%s strategy_audit_compact=%s strategy_audit_regime_filter=%s strategy_audit_regime_diagnostics=%s strategy_audit_layer1=%s strategy_audit_layer1_diagnostics=%s strategy_audit_layer2=%s strategy_audit_layer2_diagnostics=%s strategy_audit_layer4=%s strategy_audit_source_quality=%s strategy_audit=%s",
                 counters.snapshot(),
                 risk.health_snapshot(),
                 {
@@ -479,6 +758,12 @@ def main() -> int:
                 },
                 adapter.metadata_health(),
                 strategy_audit_payload.get("strategy_audit_compact", {}),
+                strategy_audit_payload.get("strategy_audit_regime_filter", {}),
+                strategy_audit_payload.get("strategy_audit_regime_diagnostics", {}),
+                strategy_audit_payload.get("strategy_audit_layer1", {}),
+                strategy_audit_payload.get("strategy_audit_layer1_diagnostics", {}),
+                strategy_audit_payload.get("strategy_audit_layer2", {}),
+                strategy_audit_payload.get("strategy_audit_layer2_diagnostics", {}),
                 strategy_audit_payload.get("strategy_audit_layer4", {}),
                 strategy_audit_payload.get("strategy_audit_source_quality", {}),
                 strategy_audit_payload.get("strategy_audit", {}),
@@ -498,12 +783,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
-
-
-
-
 

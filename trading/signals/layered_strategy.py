@@ -13,7 +13,16 @@ class LayeredPumpStrategy(StrategyInterface):
     """Adapter around migrated layered strategy that returns intents only."""
 
     def __init__(self, config: SignalConfig | None = None, audit_collector: StrategyAuditCollector | None = None):
-        self._generator = SignalGenerator(config or SignalConfig())
+        runtime_config = config or SignalConfig(
+            regime_volatility_threshold_override=0.0006,
+            regime_soft_pass_enabled=True,
+            layer1_pump_lookback_bars=12,
+            layer1_soft_pass_enabled=True,
+            layer1_rsi_soft=50.0,
+            layer1_volume_spike_soft=1.4,
+            layer1_upper_band_proximity_pct=0.001,
+        )
+        self._generator = SignalGenerator(runtime_config)
         self._audit = audit_collector or StrategyAuditCollector()
 
     def _trace_meta(self) -> dict:
@@ -37,6 +46,7 @@ class LayeredPumpStrategy(StrategyInterface):
         return {
             "layer_trace": trace,
             "layer_failed": failed_layer,
+            "regime_diagnostics": self._latest_regime_diagnostics(),
             "source_quality": {
                 "regime_filter": regime_source,
                 "layer4_fake_filter": layer4_source,
@@ -50,17 +60,310 @@ class LayeredPumpStrategy(StrategyInterface):
                 return value
         return None
 
+    @staticmethod
+    def _regime_condition_state(value: object) -> bool | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return float(value) != 0.0
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in ("1", "true", "yes", "y", "on"):
+                return True
+            if text in ("0", "false", "no", "n", "off", ""):
+                return False
+        return None
+
     def audit_snapshot(self) -> dict:
         return self._audit.snapshot()
 
     def audit_compact_snapshot(self) -> dict:
         return self._audit.compact_snapshot()
 
+    def _latest_regime_details(self) -> dict[str, object]:
+        trace = self._generator.last_diagnostics if isinstance(self._generator.last_diagnostics, dict) else {}
+        layers = trace.get("layers", {}) if isinstance(trace, dict) else {}
+        regime_details = (
+            layers.get("regime_filter", {})
+            .get("details", {})
+            if isinstance(layers, dict)
+            else {}
+        )
+        return regime_details if isinstance(regime_details, dict) else {}
+
+    def _latest_layer1_details(self) -> dict[str, object]:
+        trace = self._generator.last_diagnostics if isinstance(self._generator.last_diagnostics, dict) else {}
+        layers = trace.get("layers", {}) if isinstance(trace, dict) else {}
+        layer1_details = (
+            layers.get("layer1_pump_detection", {})
+            .get("details", {})
+            if isinstance(layers, dict)
+            else {}
+        )
+        return layer1_details if isinstance(layer1_details, dict) else {}
+
+    def _latest_layer2_details(self) -> dict[str, object]:
+        trace = self._generator.last_diagnostics if isinstance(self._generator.last_diagnostics, dict) else {}
+        layers = trace.get("layers", {}) if isinstance(trace, dict) else {}
+        layer2_details = (
+            layers.get("layer2_weakness_confirmation", {})
+            .get("details", {})
+            if isinstance(layers, dict)
+            else {}
+        )
+        return layer2_details if isinstance(layer2_details, dict) else {}
+
+    def _latest_regime_diagnostics(self) -> dict[str, object]:
+        regime_details = self._latest_regime_details()
+
+        out: dict[str, object] = {
+            "htf_trend_metric_used": None,
+            "htf_trend_threshold_used": None,
+            "htf_trend_direction_context": "",
+            "vwap_distance_metric_used": None,
+            "vwap_stretch_threshold_used": None,
+            "atr_norm": None,
+            "volatility_threshold_used": None,
+            "failed_reason": "",
+            "missing_conditions": "",
+            "degraded_mode": 0.0,
+            "fail_due_to_degraded_mode_only": 0.0,
+            "soft_pass_candidate": 0.0,
+            "soft_pass_used": 0.0,
+            "soft_pass_reason": "",
+            "source_flags": {},
+            "regime_filter_subconditions_state": {},
+        }
+        for key in (
+            "htf_trend_metric_used",
+            "htf_trend_threshold_used",
+            "vwap_distance_metric_used",
+            "vwap_stretch_threshold_used",
+            "atr_norm",
+            "volatility_threshold_used",
+            "fail_due_to_degraded_mode_only",
+            "soft_pass_candidate",
+            "soft_pass_used",
+        ):
+            if key not in regime_details:
+                continue
+            value = regime_details.get(key)
+            try:
+                out[key] = float(value) if value is not None else None
+            except (TypeError, ValueError):
+                out[key] = None
+
+        direction = regime_details.get("htf_trend_direction_context")
+        out["htf_trend_direction_context"] = str(direction) if direction is not None else ""
+        out["failed_reason"] = str(regime_details.get("failed_reason") or "")
+        out["missing_conditions"] = str(regime_details.get("missing_conditions") or "")
+        out["soft_pass_reason"] = str(regime_details.get("soft_pass_reason") or "")
+        try:
+            out["degraded_mode"] = float(regime_details.get("degraded_mode", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            out["degraded_mode"] = 0.0
+
+        source_flags = regime_details.get("source_flags", {})
+        out["source_flags"] = dict(source_flags) if isinstance(source_flags, dict) else {}
+
+        subconditions: dict[str, bool] = {}
+        for key in ("htf_trend_ok", "stretched_from_vwap", "volatility_regime_ok", "news_veto"):
+            state = self._regime_condition_state(regime_details.get(key))
+            if state is not None:
+                subconditions[key] = state
+        out["regime_filter_subconditions_state"] = subconditions
+        return out
+
+    def _latest_layer1_diagnostics(self) -> dict[str, object]:
+        layer1_details = self._latest_layer1_details()
+
+        out: dict[str, object] = {
+            "rsi": None,
+            "rsi_high_threshold_used": None,
+            "volume_spike": None,
+            "volume_spike_high": 0.0,
+            "volume_spike_threshold_used": None,
+            "close_metric_used": None,
+            "bollinger_upper_metric_used": None,
+            "keltner_upper_metric_used": None,
+            "above_bollinger_upper": 0.0,
+            "above_keltner_upper": 0.0,
+            "upper_band_breakout": 0.0,
+            "pump_context_strength": 0.0,
+            "failed_reason": "",
+            "missing_conditions": "",
+            "soft_pass_candidate": 0.0,
+            "soft_pass_used": 0.0,
+            "soft_pass_reason": "",
+            "pump_bar_offset": None,
+            "layer1_subconditions_state": {},
+        }
+        for key in (
+            "rsi",
+            "rsi_high_threshold_used",
+            "volume_spike",
+            "volume_spike_high",
+            "volume_spike_threshold_used",
+            "close_metric_used",
+            "bollinger_upper_metric_used",
+            "keltner_upper_metric_used",
+            "above_bollinger_upper",
+            "above_keltner_upper",
+            "upper_band_breakout",
+            "pump_context_strength",
+            "soft_pass_candidate",
+            "soft_pass_used",
+            "pump_bar_offset",
+        ):
+            if key not in layer1_details:
+                continue
+            value = layer1_details.get(key)
+            try:
+                out[key] = float(value) if value is not None else None
+            except (TypeError, ValueError):
+                out[key] = None
+
+        out["failed_reason"] = str(layer1_details.get("failed_reason") or "")
+        out["missing_conditions"] = str(layer1_details.get("missing_conditions") or "")
+        out["soft_pass_reason"] = str(layer1_details.get("soft_pass_reason") or "")
+
+        subconditions: dict[str, bool] = {}
+        raw_subconditions = layer1_details.get("layer1_subconditions_state")
+        if isinstance(raw_subconditions, dict):
+            for key in (
+                "rsi_high",
+                "volume_spike_high",
+                "upper_band_breakout",
+                "above_bollinger_upper",
+                "above_keltner_upper",
+            ):
+                state = self._regime_condition_state(raw_subconditions.get(key))
+                if state is not None:
+                    subconditions[key] = state
+        else:
+            for key in (
+                "rsi_high",
+                "volume_spike_high",
+                "upper_band_breakout",
+                "above_bollinger_upper",
+                "above_keltner_upper",
+            ):
+                state = self._regime_condition_state(layer1_details.get(key))
+                if state is not None:
+                    subconditions[key] = state
+        out["layer1_subconditions_state"] = subconditions
+        return out
+
+    def _latest_layer2_diagnostics(self) -> dict[str, object]:
+        layer2_details = self._latest_layer2_details()
+
+        out: dict[str, object] = {
+            "price_up_or_near_high": 0.0,
+            "price_up": 0.0,
+            "near_high_context": 0.0,
+            "obv_bearish_divergence": 0.0,
+            "cvd_bearish_divergence": 0.0,
+            "close_last_used": None,
+            "close_ref_used": None,
+            "obv_last_used": None,
+            "obv_ref_used": None,
+            "cvd_last_used": None,
+            "cvd_ref_used": None,
+            "weakness_lookback_used": None,
+            "weakness_strength": 0.0,
+            "failed_reason": "",
+            "missing_conditions": "",
+            "layer2_subconditions_state": {},
+        }
+        for key in (
+            "price_up_or_near_high",
+            "price_up",
+            "near_high_context",
+            "obv_bearish_divergence",
+            "cvd_bearish_divergence",
+            "close_last_used",
+            "close_ref_used",
+            "obv_last_used",
+            "obv_ref_used",
+            "cvd_last_used",
+            "cvd_ref_used",
+            "weakness_lookback_used",
+            "weakness_strength",
+        ):
+            if key not in layer2_details:
+                continue
+            value = layer2_details.get(key)
+            try:
+                out[key] = float(value) if value is not None else None
+            except (TypeError, ValueError):
+                out[key] = None
+
+        out["failed_reason"] = str(layer2_details.get("failed_reason") or "")
+        out["missing_conditions"] = str(layer2_details.get("missing_conditions") or "")
+
+        subconditions: dict[str, bool] = {}
+        raw_subconditions = layer2_details.get("layer2_subconditions_state")
+        if isinstance(raw_subconditions, dict):
+            for key in (
+                "price_up_or_near_high",
+                "price_up",
+                "near_high_context",
+                "obv_bearish_divergence",
+                "cvd_bearish_divergence",
+            ):
+                state = self._regime_condition_state(raw_subconditions.get(key))
+                if state is not None:
+                    subconditions[key] = state
+        out["layer2_subconditions_state"] = subconditions
+        return out
+
     def audit_observation_snapshot(self) -> dict:
         snapshot = self._audit.snapshot()
         compact = self._audit.compact_snapshot()
+        regime_diag = self._latest_regime_diagnostics()
+        layer1_diag = self._latest_layer1_diagnostics()
+        layer2_diag = self._latest_layer2_diagnostics()
         return {
             "strategy_audit_compact": compact,
+            "strategy_audit_regime_filter": {
+                "regime_filter_pass_count": int(snapshot.get("regime_filter_pass_count", 0)),
+                "regime_filter_fail_count": int(snapshot.get("regime_filter_fail_count", 0)),
+                "regime_filter_htf_trend_blocker_count": int(snapshot.get("regime_filter_htf_trend_blocker_count", 0)),
+                "regime_filter_vwap_stretch_blocker_count": int(snapshot.get("regime_filter_vwap_stretch_blocker_count", 0)),
+                "regime_filter_volatility_blocker_count": int(snapshot.get("regime_filter_volatility_blocker_count", 0)),
+                "regime_filter_news_blocker_count": int(snapshot.get("regime_filter_news_blocker_count", 0)),
+                "regime_filter_degraded_mode_count": int(snapshot.get("regime_filter_degraded_mode_count", 0)),
+                "regime_filter_degraded_only_count": int(snapshot.get("regime_filter_degraded_only_count", 0)),
+                "regime_filter_soft_pass_candidate_count": int(snapshot.get("regime_filter_soft_pass_candidate_count", 0)),
+                "regime_filter_soft_pass_used_count": int(snapshot.get("regime_filter_soft_pass_used_count", 0)),
+                "top_regime_filter_blocker": str(compact.get("top_regime_filter_blocker", "")),
+                "top_regime_filter_blocker_count": int(compact.get("top_regime_filter_blocker_count", 0)),
+                **regime_diag,
+            },
+            "strategy_audit_regime_diagnostics": regime_diag,
+            "strategy_audit_layer1": {
+                "layer1_pass_count": int(snapshot.get("layer1_pass_count", 0)),
+                "layer1_fail_count": int(snapshot.get("layer1_fail_count", 0)),
+                "layer1_rsi_high_blocker_count": int(snapshot.get("layer1_rsi_high_blocker_count", 0)),
+                "layer1_volume_spike_blocker_count": int(snapshot.get("layer1_volume_spike_blocker_count", 0)),
+                "layer1_above_bollinger_upper_blocker_count": int(snapshot.get("layer1_above_bollinger_upper_blocker_count", 0)),
+                "layer1_above_keltner_upper_blocker_count": int(snapshot.get("layer1_above_keltner_upper_blocker_count", 0)),
+                "layer1_soft_pass_candidate_count": int(snapshot.get("layer1_soft_pass_candidate_count", 0)),
+                "layer1_soft_pass_used_count": int(snapshot.get("layer1_soft_pass_used_count", 0)),
+                "top_layer1_blocker": str(compact.get("top_layer1_blocker", "")),
+                "top_layer1_blocker_count": int(compact.get("top_layer1_blocker_count", 0)),
+                **layer1_diag,
+            },
+            "strategy_audit_layer1_diagnostics": layer1_diag,
+            "strategy_audit_layer2": {
+                "reached_layer2_count": int(snapshot.get("reached_layer2_count", 0)),
+                "passed_layer2_count": int(snapshot.get("passed_layer2_count", 0)),
+                "layer2_fail_count": int(snapshot.get("layer2_fail_count", 0)),
+                **layer2_diag,
+            },
+            "strategy_audit_layer2_diagnostics": layer2_diag,
             "strategy_audit_layer4": {
                 "layer4_fail_count": int(snapshot.get("layer4_fail_count", 0)),
                 "layer4_sentiment_blocker_count": int(snapshot.get("layer4_sentiment_blocker_count", 0)),

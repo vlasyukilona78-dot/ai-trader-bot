@@ -16,6 +16,11 @@ class SignalConfig:
     rsi_high: float = 68.0
     rsi_low: float = 32.0
     volume_spike_threshold: float = 1.6
+    layer1_pump_lookback_bars: int = 1
+    layer1_soft_pass_enabled: bool = False
+    layer1_rsi_soft: float = 50.0
+    layer1_volume_spike_soft: float = 1.4
+    layer1_upper_band_proximity_pct: float = 0.001
     weakness_lookback: int = 4
     sentiment_bullish_threshold: float = 68.0
     fake_filter_sentiment_euphoric_soft: float = 66.0
@@ -30,9 +35,12 @@ class SignalConfig:
     msb_lookback: int = 20
     msb_recent_bars: int = 6
     msb_break_buffer_pct: float = 0.0005
-    regime_vwap_stretch_soft: float = 0.0015
-    regime_min_atr_norm: float = 0.0010
-    regime_strong_trend_adx: float = 28.0
+    regime_vwap_stretch_soft: float = 0.0012
+    regime_min_atr_norm: float = 0.0008
+    regime_volatility_entry_tolerance_mult: float = 0.25
+    regime_volatility_threshold_override: float | None = None
+    regime_soft_pass_enabled: bool = False
+    regime_strong_trend_adx: float = 30.0
     fake_filter_lsr_extreme_soft: float = 1.01
     fake_filter_oi_volume_spike_soft: float = 1.2
 
@@ -129,8 +137,29 @@ class SignalGenerator:
         news_degraded: bool | None = None,
     ) -> tuple[bool, dict[str, Any]]:
         if df.empty:
-            src = {"news_source": "unavailable", "news_available": 0.0, "vwap_available": 0.0, **self._quality_flags("news", "unavailable"), **self._quality_flags("vwap", "unavailable")}
-            return False, {"passed": 0.0, "htf_trend_ok": 0.0, "stretched_from_vwap": 0.0, "volatility_regime_ok": 0.0, "news_veto": 1.0, "missing_conditions": "history", "failed_reason": "insufficient_history", "degraded_mode": 1.0, "source_flags": src}
+            src = {
+                "news_source": "unavailable",
+                "news_available": 0.0,
+                "vwap_available": 0.0,
+                **self._quality_flags("news", "unavailable"),
+                **self._quality_flags("vwap", "unavailable"),
+            }
+            return False, {
+                "passed": 0.0,
+                "htf_trend_ok": 0.0,
+                "stretched_from_vwap": 0.0,
+                "volatility_regime_ok": 0.0,
+                "news_veto": 1.0,
+                "htf_trend_metric_used": 0.0,
+                "htf_trend_threshold_used": float(self.config.regime_strong_trend_adx),
+                "htf_trend_direction_context": "unavailable",
+                "volatility_threshold_used": 0.0,
+                "atr_norm": 0.0,
+                "missing_conditions": "history",
+                "failed_reason": "insufficient_history",
+                "degraded_mode": 1.0,
+                "source_flags": src,
+            }
 
         last = df.iloc[-1]
         close = self._safe(last.get("close"), 0.0)
@@ -143,69 +172,305 @@ class SignalGenerator:
         ema50 = self._safe(last.get("ema50"), close)
         vwap_dist = self._safe(last.get("vwap_dist"), (close - vwap) / max(vwap, 1e-9))
 
-        htf_trend_ok = not (ema20 >= ema50 and adx >= float(self.config.regime_strong_trend_adx) and close >= ema20) and regime != MarketRegime.PANIC
-        stretched = vwap_dist >= max(float(self.config.regime_vwap_stretch_soft), float(self.config.vwap_tolerance_pct) * 0.5)
-        vol_ok = atr_norm >= max(float(self.config.regime_min_atr_norm), float(self.config.entry_tolerance_pct) * 0.5)
+        htf_trend_threshold = float(self.config.regime_strong_trend_adx)
+        htf_uptrend_structure = ema20 >= ema50 and close >= ema20
+        htf_strong_uptrend = htf_uptrend_structure and adx >= htf_trend_threshold
+        if regime == MarketRegime.PANIC:
+            htf_direction_context = "panic_regime"
+            htf_trend_ok = False
+        elif htf_strong_uptrend:
+            htf_direction_context = "strong_uptrend"
+            htf_trend_ok = False
+        else:
+            htf_direction_context = "not_strong_uptrend"
+            htf_trend_ok = True
+        vwap_stretch_threshold = max(
+            float(self.config.regime_vwap_stretch_soft),
+            float(self.config.vwap_tolerance_pct) * 0.5,
+        )
+        stretched = vwap_dist >= vwap_stretch_threshold
+        volatility_threshold_override = self.config.regime_volatility_threshold_override
+        if volatility_threshold_override is None:
+            volatility_threshold = max(
+                float(self.config.regime_min_atr_norm),
+                float(self.config.entry_tolerance_pct) * float(self.config.regime_volatility_entry_tolerance_mult),
+            )
+        else:
+            volatility_threshold = max(0.0, float(volatility_threshold_override))
+        vol_ok = atr_norm >= volatility_threshold
 
-        news_source_tag = self._source_tag(news_source, fallback="provided" if news_veto is not None else "unavailable")
-        news_quality = self._source_quality(news_source_tag, value_present=news_veto is not None, degraded=news_degraded)
+        news_participates = news_veto is not None
+        news_source_tag = self._source_tag(news_source, fallback="provided" if news_participates else "unavailable")
+        news_quality = self._source_quality(news_source_tag, value_present=news_participates, degraded=news_degraded)
         news_ok = True if news_veto is None else (not bool(news_veto))
 
         vwap_quality = "live" if vwap_available else "fallback"
-        degraded = news_quality != "live" or vwap_quality != "live"
+        # Missing optional news should not mark the whole regime gate as degraded.
+        degraded = vwap_quality != "live" or (news_participates and news_quality != "live")
 
-        missing = []
-        if not htf_trend_ok: missing.append("htf_trend_ok")
-        if not stretched: missing.append("stretched_from_vwap")
-        if not vol_ok: missing.append("volatility_regime_ok")
-        if not news_ok: missing.append("news_veto")
-        passed = htf_trend_ok and stretched and vol_ok and news_ok
+        missing: list[str] = []
+        if not htf_trend_ok:
+            missing.append("htf_trend_ok")
+        if not stretched:
+            missing.append("stretched_from_vwap")
+        if not vol_ok:
+            missing.append("volatility_regime_ok")
+        if not news_ok:
+            missing.append("news_veto")
+        strict_passed = htf_trend_ok and stretched and vol_ok and news_ok
+        soft_pass_candidate = bool(
+            (not strict_passed)
+            and (not degraded)
+            and (
+                (htf_trend_ok and (int(stretched) + int(vol_ok) + int(news_ok) >= 2))
+                or ((not htf_trend_ok) and stretched and vol_ok and news_ok)
+            )
+        )
+        soft_pass_used = bool(
+            self.config.regime_soft_pass_enabled
+            and (not strict_passed)
+            and (not degraded)
+            and len(missing) == 1
+            and missing[0] in ("stretched_from_vwap", "htf_trend_ok")
+        )
+        passed = strict_passed or soft_pass_used
+        fail_due_to_degraded_only = (not strict_passed) and degraded and not missing
 
-        src = {"news_source": news_source_tag, "news_available": 1.0 if news_quality == "live" else 0.0, "vwap_available": 1.0 if vwap_available else 0.0, **self._quality_flags("news", news_quality), **self._quality_flags("vwap", vwap_quality)}
-        return passed, {"passed": 1.0 if passed else 0.0, "htf_trend_ok": 1.0 if htf_trend_ok else 0.0, "stretched_from_vwap": 1.0 if stretched else 0.0, "volatility_regime_ok": 1.0 if vol_ok else 0.0, "news_veto": 1.0 if news_ok else 0.0, "degraded_mode": 1.0 if degraded else 0.0, "missing_conditions": ",".join(missing), "failed_reason": "none" if passed else f"missing:{','.join(missing)}", "source_flags": src}
+        src = {
+            "news_source": news_source_tag,
+            "news_available": 1.0 if news_quality == "live" else 0.0,
+            "vwap_available": 1.0 if vwap_available else 0.0,
+            **self._quality_flags("news", news_quality),
+            **self._quality_flags("vwap", vwap_quality),
+        }
+        return passed, {
+            "passed": 1.0 if passed else 0.0,
+            "htf_trend_ok": 1.0 if htf_trend_ok else 0.0,
+            "stretched_from_vwap": 1.0 if stretched else 0.0,
+            "volatility_regime_ok": 1.0 if vol_ok else 0.0,
+            "news_veto": 1.0 if news_ok else 0.0,
+            "htf_trend_metric_used": float(adx),
+            "htf_trend_threshold_used": float(htf_trend_threshold),
+            "htf_trend_direction_context": str(htf_direction_context),
+            "vwap_distance_metric_used": float(vwap_dist),
+            "vwap_stretch_threshold_used": float(vwap_stretch_threshold),
+            "volatility_threshold_used": float(volatility_threshold),
+            "atr_norm": float(atr_norm),
+            "degraded_mode": 1.0 if degraded else 0.0,
+            "fail_due_to_degraded_mode_only": 1.0 if fail_due_to_degraded_only else 0.0,
+            "soft_pass_candidate": 1.0 if soft_pass_candidate else 0.0,
+            "soft_pass_used": 1.0 if soft_pass_used else 0.0,
+            "soft_pass_reason": missing[0] if soft_pass_used and len(missing) == 1 else "",
+            "missing_conditions": "" if passed else ",".join(missing),
+            "failed_reason": "none" if passed else f"missing:{','.join(missing)}",
+            "source_flags": src,
+        }
 
     def _layer1_pump_detection(self, df: pd.DataFrame) -> tuple[str | None, dict[str, Any]]:
         if df.empty:
-            return None, {"passed": 0.0, "failed_reason": "insufficient_history", "missing_conditions": "history", "pump_context_strength": 0.0}
-        last = df.iloc[-1]
-        rsi = self._safe(last.get("rsi"), 50.0)
-        vol = self._safe(last.get("volume_spike"), 1.0)
-        close = self._safe(last.get("close"), 0.0)
-        bb_u = self._safe(last.get("bb_upper"), np.inf)
-        kc_u = self._safe(last.get("kc_upper"), np.inf)
+            return None, {
+                "passed": 0.0,
+                "failed_reason": "insufficient_history",
+                "missing_conditions": "history",
+                "rsi": None,
+                "rsi_high": 0.0,
+                "rsi_high_threshold_used": float(self.config.rsi_high),
+                "volume_spike": None,
+                "volume_spike_high": 0.0,
+                "volume_spike_threshold_used": float(self.config.volume_spike_threshold),
+                "close_metric_used": None,
+                "bollinger_upper_metric_used": None,
+                "keltner_upper_metric_used": None,
+                "above_bollinger_upper": 0.0,
+                "above_keltner_upper": 0.0,
+                "upper_band_breakout": 0.0,
+                "pump_context_strength": 0.0,
+                "soft_pass_candidate": 0.0,
+                "soft_pass_used": 0.0,
+                "soft_pass_reason": "",
+                "pump_bar_offset": None,
+                "layer1_subconditions_state": {},
+            }
+        rsi_high_threshold = float(self.config.rsi_high)
+        volume_spike_threshold = float(self.config.volume_spike_threshold)
+        rsi_soft_threshold = float(self.config.layer1_rsi_soft)
+        volume_spike_soft_threshold = float(self.config.layer1_volume_spike_soft)
+        upper_band_proximity_pct = max(0.0, float(self.config.layer1_upper_band_proximity_pct))
+        lookback = max(1, int(self.config.layer1_pump_lookback_bars))
+        window = df.tail(lookback)
 
-        rsi_high = rsi >= float(self.config.rsi_high)
-        vol_high = vol >= float(self.config.volume_spike_threshold)
-        above_bb = bool(np.isfinite(bb_u) and close > bb_u)
-        above_kc = bool(np.isfinite(kc_u) and close > kc_u)
-        band_break = above_bb or above_kc
+        def _details_from_row(row: pd.Series, *, pump_bar_offset: int) -> tuple[bool, dict[str, Any]]:
+            rsi = self._safe(row.get("rsi"), 50.0)
+            vol = self._safe(row.get("volume_spike"), 1.0)
+            close = self._safe(row.get("close"), 0.0)
+            bb_u = self._safe(row.get("bb_upper"), np.inf)
+            kc_u = self._safe(row.get("kc_upper"), np.inf)
 
-        pts = int(rsi_high) + int(vol_high) + int(band_break)
-        passed = band_break and pts >= 2
-        missing = []
-        if not rsi_high: missing.append("rsi_high")
-        if not vol_high: missing.append("volume_spike")
-        if not band_break: missing.append("upper_band_breakout")
-        details = {
-            "passed": 1.0 if passed else 0.0,
-            "failed_reason": "none" if passed else f"missing:{','.join(missing)}",
-            "missing_conditions": ",".join(missing),
-            "rsi": float(rsi),
-            "rsi_high": 1.0 if rsi_high else 0.0,
-            "volume_spike": float(vol),
-            "above_bollinger_upper": 1.0 if above_bb else 0.0,
-            "above_keltner_upper": 1.0 if above_kc else 0.0,
-            "upper_band_breakout": 1.0 if band_break else 0.0,
-            "pump_context_strength": float(pts / 3.0),
-        }
-        return ("SHORT", details) if passed else (None, details)
+            rsi_high = rsi >= rsi_high_threshold
+            vol_high = vol >= volume_spike_threshold
+            above_bb = bool(np.isfinite(bb_u) and close > bb_u)
+            above_kc = bool(np.isfinite(kc_u) and close > kc_u)
+            band_break = above_bb or above_kc
+            near_bb = bool(np.isfinite(bb_u) and close >= bb_u * (1.0 - upper_band_proximity_pct))
+            near_kc = bool(np.isfinite(kc_u) and close >= kc_u * (1.0 - upper_band_proximity_pct))
+            near_upper_band = near_bb or near_kc
+            rsi_soft = rsi >= rsi_soft_threshold
+            vol_soft = vol >= volume_spike_soft_threshold
+
+            pts = int(rsi_high) + int(vol_high) + int(band_break)
+            passed = band_break and pts >= 2
+            soft_pass_candidate = (not passed) and pts >= 2
+            fade_soft_candidate = (not passed) and near_upper_band and rsi_soft and vol_soft
+            missing = []
+            if not rsi_high:
+                missing.append("rsi_high")
+            if not vol_high:
+                missing.append("volume_spike")
+            if not band_break:
+                missing.append("upper_band_breakout")
+            subconditions = {
+                "rsi_high": bool(rsi_high),
+                "volume_spike_high": bool(vol_high),
+                "upper_band_breakout": bool(band_break),
+                "above_bollinger_upper": bool(above_bb),
+                "above_keltner_upper": bool(above_kc),
+            }
+            return passed, {
+                "passed": 1.0 if passed else 0.0,
+                "failed_reason": "none" if passed else f"missing:{','.join(missing)}",
+                "missing_conditions": "" if passed else ",".join(missing),
+                "rsi": float(rsi),
+                "rsi_high": 1.0 if rsi_high else 0.0,
+                "rsi_high_threshold_used": float(rsi_high_threshold),
+                "volume_spike": float(vol),
+                "volume_spike_high": 1.0 if vol_high else 0.0,
+                "volume_spike_threshold_used": float(volume_spike_threshold),
+                "close_metric_used": float(close),
+                "bollinger_upper_metric_used": float(bb_u) if np.isfinite(bb_u) else None,
+                "keltner_upper_metric_used": float(kc_u) if np.isfinite(kc_u) else None,
+                "above_bollinger_upper": 1.0 if above_bb else 0.0,
+                "above_keltner_upper": 1.0 if above_kc else 0.0,
+                "upper_band_breakout": 1.0 if band_break else 0.0,
+                "pump_context_strength": float(pts / 3.0),
+                "soft_pass_candidate": 1.0 if soft_pass_candidate else 0.0,
+                "soft_pass_used": 0.0,
+                "soft_pass_reason": "",
+                "_soft_pass_reason_candidate": (
+                    "upper_band_breakout"
+                    if soft_pass_candidate
+                    else ("near_upper_band_context" if fade_soft_candidate else "")
+                ),
+                "pump_bar_offset": int(pump_bar_offset),
+                "layer1_subconditions_state": subconditions,
+            }
+
+        fallback_details: dict[str, Any] | None = None
+        soft_pass_details: dict[str, Any] | None = None
+        window_details: list[dict[str, Any]] = []
+        for idx in range(len(window) - 1, -1, -1):
+            pump_bar_offset = len(window) - 1 - idx
+            passed, details = _details_from_row(window.iloc[idx], pump_bar_offset=pump_bar_offset)
+            window_details.append(details)
+            if pump_bar_offset == 0:
+                fallback_details = details
+            if passed:
+                return "SHORT", details
+            if soft_pass_details is None and str(details.get("_soft_pass_reason_candidate") or ""):
+                soft_pass_details = details
+
+        if self.config.layer1_soft_pass_enabled and soft_pass_details is not None:
+            used_details = dict(soft_pass_details)
+            used_details["passed"] = 1.0
+            used_details["failed_reason"] = "none"
+            used_details["missing_conditions"] = ""
+            used_details["soft_pass_used"] = 1.0
+            used_details["soft_pass_reason"] = str(used_details.get("_soft_pass_reason_candidate") or "upper_band_breakout")
+            return "SHORT", used_details
+
+        if self.config.layer1_soft_pass_enabled and window_details:
+            recent_rsi_high = any(bool(float(details.get("rsi_high", 0.0) or 0.0)) for details in window_details)
+            recent_volume_spike = any(bool(float(details.get("volume_spike_high", 0.0) or 0.0)) for details in window_details)
+            recent_upper_band_break = any(bool(float(details.get("upper_band_breakout", 0.0) or 0.0)) for details in window_details)
+            recent_above_bb = any(bool(float(details.get("above_bollinger_upper", 0.0) or 0.0)) for details in window_details)
+            recent_above_kc = any(bool(float(details.get("above_keltner_upper", 0.0) or 0.0)) for details in window_details)
+            if recent_upper_band_break and (recent_rsi_high or recent_volume_spike):
+                reference_details = next(
+                    (
+                        details
+                        for details in window_details
+                        if bool(float(details.get("upper_band_breakout", 0.0) or 0.0))
+                    ),
+                    max(
+                        window_details,
+                        key=lambda details: (
+                            float(details.get("pump_context_strength", 0.0) or 0.0),
+                            -int(details.get("pump_bar_offset", 0) or 0),
+                        ),
+                    ),
+                )
+                used_details = dict(reference_details)
+                used_details["passed"] = 1.0
+                used_details["failed_reason"] = "none"
+                used_details["missing_conditions"] = ""
+                used_details["soft_pass_candidate"] = 1.0
+                used_details["soft_pass_used"] = 1.0
+                used_details["soft_pass_reason"] = "window_pump_context"
+                used_details["pump_context_strength"] = float(
+                    (int(recent_rsi_high) + int(recent_volume_spike) + int(recent_upper_band_break)) / 3.0
+                )
+                used_details["layer1_subconditions_state"] = {
+                    "rsi_high": bool(recent_rsi_high),
+                    "volume_spike_high": bool(recent_volume_spike),
+                    "upper_band_breakout": bool(recent_upper_band_break),
+                    "above_bollinger_upper": bool(recent_above_bb),
+                    "above_keltner_upper": bool(recent_above_kc),
+                }
+                return "SHORT", used_details
+
+        return None, (fallback_details or _details_from_row(window.iloc[-1], pump_bar_offset=0)[1])
 
     def _layer2_weakness_confirmation(self, df: pd.DataFrame, side: str) -> tuple[bool, dict[str, Any]]:
         if side != "SHORT":
-            return False, {"passed": 0.0, "price_up_or_near_high": 0.0, "obv_bearish_divergence": 0.0, "cvd_bearish_divergence": 0.0, "weakness_strength": 0.0, "missing_conditions": "short_context_required", "failed_reason": "unsupported_side_not_short"}
+            return False, {
+                "passed": 0.0,
+                "price_up_or_near_high": 0.0,
+                "price_up": 0.0,
+                "near_high_context": 0.0,
+                "obv_bearish_divergence": 0.0,
+                "cvd_bearish_divergence": 0.0,
+                "close_last_used": None,
+                "close_ref_used": None,
+                "obv_last_used": None,
+                "obv_ref_used": None,
+                "cvd_last_used": None,
+                "cvd_ref_used": None,
+                "weakness_lookback_used": float(self.config.weakness_lookback),
+                "weakness_strength": 0.0,
+                "missing_conditions": "short_context_required",
+                "failed_reason": "unsupported_side_not_short",
+                "layer2_subconditions_state": {},
+            }
         lb = int(self.config.weakness_lookback)
         if len(df) < lb + 2:
-            return False, {"passed": 0.0, "price_up_or_near_high": 0.0, "obv_bearish_divergence": 0.0, "cvd_bearish_divergence": 0.0, "weakness_strength": 0.0, "missing_conditions": "history", "failed_reason": "insufficient_history"}
+            return False, {
+                "passed": 0.0,
+                "price_up_or_near_high": 0.0,
+                "price_up": 0.0,
+                "near_high_context": 0.0,
+                "obv_bearish_divergence": 0.0,
+                "cvd_bearish_divergence": 0.0,
+                "close_last_used": None,
+                "close_ref_used": None,
+                "obv_last_used": None,
+                "obv_ref_used": None,
+                "cvd_last_used": None,
+                "cvd_ref_used": None,
+                "weakness_lookback_used": float(lb),
+                "weakness_strength": 0.0,
+                "missing_conditions": "history",
+                "failed_reason": "insufficient_history",
+                "layer2_subconditions_state": {},
+            }
 
         last = df.iloc[-1]
         ref = df.iloc[-1 - lb]
@@ -224,7 +489,31 @@ class SignalGenerator:
         if not obv_div: missing.append("obv_bearish_divergence")
         if not cvd_div: missing.append("cvd_bearish_divergence")
 
-        return passed, {"passed": 1.0 if passed else 0.0, "price_up_or_near_high": 1.0 if price_ctx else 0.0, "obv_bearish_divergence": 1.0 if obv_div else 0.0, "cvd_bearish_divergence": 1.0 if cvd_div else 0.0, "weakness_strength": float(strength), "missing_conditions": ",".join(missing), "failed_reason": "none" if passed else f"missing:{','.join(missing)}"}
+        return passed, {
+            "passed": 1.0 if passed else 0.0,
+            "price_up_or_near_high": 1.0 if price_ctx else 0.0,
+            "price_up": 1.0 if price_up else 0.0,
+            "near_high_context": 1.0 if near else 0.0,
+            "obv_bearish_divergence": 1.0 if obv_div else 0.0,
+            "cvd_bearish_divergence": 1.0 if cvd_div else 0.0,
+            "close_last_used": float(close_last),
+            "close_ref_used": float(close_ref),
+            "obv_last_used": float(self._safe(last.get("obv"), 0.0)),
+            "obv_ref_used": float(self._safe(ref.get("obv"), 0.0)),
+            "cvd_last_used": float(self._safe(last.get("cvd"), 0.0)),
+            "cvd_ref_used": float(self._safe(ref.get("cvd"), 0.0)),
+            "weakness_lookback_used": float(lb),
+            "weakness_strength": float(strength),
+            "missing_conditions": ",".join(missing),
+            "failed_reason": "none" if passed else f"missing:{','.join(missing)}",
+            "layer2_subconditions_state": {
+                "price_up_or_near_high": bool(price_ctx),
+                "price_up": bool(price_up),
+                "near_high_context": bool(near),
+                "obv_bearish_divergence": bool(obv_div),
+                "cvd_bearish_divergence": bool(cvd_div),
+            },
+        }
 
     def _layer3_msb_confirmation(self, df: pd.DataFrame, side: str) -> tuple[bool, dict[str, float]]:
         lb = max(5, int(self.config.msb_lookback))
@@ -578,6 +867,12 @@ class SignalGenerator:
             confidence=confidence,
             details={"regime_filter": regime_filter, "layer1": layer1, "layer2": layer2, "layer3": layer3, "layer4": layer4, "layer5": layer5, "layer_trace": trace, "regime": context.regime.value},
         )
+
+
+
+
+
+
 
 
 

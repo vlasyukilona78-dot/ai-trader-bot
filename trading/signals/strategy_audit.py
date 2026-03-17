@@ -11,6 +11,21 @@ _LAYER_ORDER: tuple[str, ...] = (
     "layer4_fake_filter",
     "layer5_tp_sl",
 )
+
+_REGIME_FILTER_BLOCKERS: tuple[str, ...] = (
+    "htf_trend_ok",
+    "stretched_from_vwap",
+    "volatility_regime_ok",
+    "news_veto",
+)
+
+_LAYER1_BLOCKERS: tuple[str, ...] = (
+    "rsi_high",
+    "volume_spike",
+    "above_bollinger_upper",
+    "above_keltner_upper",
+)
+
 _LAYER4_BLOCKERS: tuple[str, ...] = (
     "price_above_vwap",
     "sentiment_euphoric",
@@ -18,6 +33,7 @@ _LAYER4_BLOCKERS: tuple[str, ...] = (
     "long_short_ratio_extreme",
     "oi_overheated",
 )
+
 _QUALITY_BUCKETS: tuple[str, ...] = ("live", "fallback", "unavailable")
 
 
@@ -44,14 +60,22 @@ class StrategyAuditCollector:
         self.regime_source_quality_summary = {name: 0 for name in _QUALITY_BUCKETS}
         self.layer4_source_quality_summary = {name: 0 for name in _QUALITY_BUCKETS}
 
+        self.regime_filter_blocker_counts = {name: 0 for name in _REGIME_FILTER_BLOCKERS}
+        self.regime_filter_degraded_only_count = 0
+        self.regime_filter_soft_pass_candidate_count = 0
+        self.regime_filter_soft_pass_used_count = 0
+        self.regime_filter_degraded_mode_count = 0
+
+        self.layer1_blocker_counts = {name: 0 for name in _LAYER1_BLOCKERS}
+        self.layer1_soft_pass_candidate_count = 0
+        self.layer1_soft_pass_used_count = 0
+
         self.layer5_fallback_rr_used_count = 0
         self.layer5_vp_based_count = 0
         self.layer5_fail_missing_atr_count = 0
         self.layer5_fail_missing_volume_profile_count = 0
 
-        self.regime_filter_degraded_mode_count = 0
         self.layer4_fake_filter_degraded_mode_count = 0
-
         self.layer4_blocker_counts = {name: 0 for name in _LAYER4_BLOCKERS}
         self.layer4_fail_due_to_price_structure_count = 0
         self.layer4_fail_due_to_sentiment_count = 0
@@ -124,15 +148,15 @@ class StrategyAuditCollector:
             bucket = self._quality_bucket(quality)
             summary_store[bucket] = int(summary_store.get(bucket, 0)) + 1
 
-    def _layer4_blocker_value(self, details: Mapping[str, Any], layer4_passed: bool, condition_name: str, missing_set: set[str]) -> bool:
+    def _condition_blocker_value(self, details: Mapping[str, Any], passed: bool, condition_name: str, missing_set: set[str]) -> bool:
         explicit_key = f"blocker_{condition_name}"
         if explicit_key in details:
             return self._as_bool(details.get(explicit_key))
-        if layer4_passed:
+        if passed:
             return False
         return condition_name in missing_set
 
-    def _layer4_fail_value(self, details: Mapping[str, Any], key: str, default: bool) -> bool:
+    def _detail_bool_or_default(self, details: Mapping[str, Any], key: str, default: bool) -> bool:
         if key in details:
             return self._as_bool(details.get(key))
         return default
@@ -175,23 +199,111 @@ class StrategyAuditCollector:
         else:
             self.no_signal_count += 1
 
-        regime_details = (
-            layers.get("regime_filter", {}).get("details", {})
-            if isinstance(layers.get("regime_filter"), Mapping)
-            else {}
-        )
+        regime_data = layers.get("regime_filter", {}) if isinstance(layers.get("regime_filter"), Mapping) else {}
+        regime_details = regime_data.get("details", {}) if isinstance(regime_data, Mapping) else {}
         if isinstance(regime_details, Mapping):
             self._record_layer_source_quality(
                 regime_details,
                 self.regime_source_quality_counts,
                 self.regime_source_quality_summary,
             )
-            if self._as_bool(regime_details.get("degraded_mode")):
+
+            regime_passed = self._as_bool(regime_details.get("passed", regime_data.get("passed")))
+            regime_missing_set = self._missing_condition_set(regime_details)
+            regime_degraded = self._as_bool(regime_details.get("degraded_mode"))
+            if regime_degraded:
                 self.regime_filter_degraded_mode_count += 1
 
-        layer4_data = layers.get("layer4_fake_filter", {}) if isinstance(layers.get("layer4_fake_filter"), Mapping) else {}
+            regime_blockers = {
+                blocker: self._condition_blocker_value(regime_details, regime_passed, blocker, regime_missing_set)
+                for blocker in _REGIME_FILTER_BLOCKERS
+            }
+            for blocker, blocked in regime_blockers.items():
+                if blocked:
+                    self.regime_filter_blocker_counts[blocker] += 1
+
+            degraded_only_default = (not regime_passed) and regime_degraded and not any(regime_blockers.values())
+            degraded_only = self._detail_bool_or_default(
+                regime_details,
+                "fail_due_to_degraded_mode_only",
+                degraded_only_default,
+            )
+            if degraded_only:
+                self.regime_filter_degraded_only_count += 1
+
+            soft_candidate_default = False
+            if not regime_passed and self._as_bool(regime_details.get("htf_trend_ok")):
+                support_count = (
+                    int(self._as_bool(regime_details.get("stretched_from_vwap")))
+                    + int(self._as_bool(regime_details.get("volatility_regime_ok")))
+                    + int(self._as_bool(regime_details.get("news_veto")))
+                )
+                soft_candidate_default = support_count >= 2
+            soft_candidate = self._detail_bool_or_default(
+                regime_details,
+                "soft_pass_candidate",
+                soft_candidate_default,
+            )
+            if soft_candidate:
+                self.regime_filter_soft_pass_candidate_count += 1
+
+            soft_pass_used = self._detail_bool_or_default(
+                regime_details,
+                "soft_pass_used",
+                False,
+            )
+            if soft_pass_used:
+                self.regime_filter_soft_pass_used_count += 1
+
+        layer1_entry = layers.get("layer1_pump_detection")
+        if isinstance(layer1_entry, Mapping):
+            layer1_data = layer1_entry
+            layer1_details_raw = layer1_data.get("details", {})
+            layer1_details = layer1_details_raw if isinstance(layer1_details_raw, Mapping) else {}
+            layer1_passed = self._as_bool(layer1_details.get("passed", layer1_data.get("passed")))
+            layer1_missing_set = self._missing_condition_set(layer1_details)
+
+            layer1_rsi_high = self._as_bool(layer1_details.get("rsi_high"))
+            layer1_volume_spike = self._as_bool(layer1_details.get("volume_spike_high"))
+            if "volume_spike_high" not in layer1_details:
+                layer1_volume_spike = "volume_spike" not in layer1_missing_set
+
+            layer1_above_bb = self._as_bool(layer1_details.get("above_bollinger_upper"))
+            layer1_above_kc = self._as_bool(layer1_details.get("above_keltner_upper"))
+            layer1_upper_band_breakout = self._as_bool(layer1_details.get("upper_band_breakout"))
+            if "upper_band_breakout" not in layer1_details:
+                layer1_upper_band_breakout = "upper_band_breakout" not in layer1_missing_set
+
+            layer1_blockers = {
+                "rsi_high": (not layer1_passed) and (not layer1_rsi_high),
+                "volume_spike": (not layer1_passed) and (not layer1_volume_spike),
+                "above_bollinger_upper": (not layer1_passed) and (not layer1_above_bb) and (not layer1_upper_band_breakout),
+                "above_keltner_upper": (not layer1_passed) and (not layer1_above_kc) and (not layer1_upper_band_breakout),
+            }
+            for blocker, blocked in layer1_blockers.items():
+                if blocked:
+                    self.layer1_blocker_counts[blocker] += 1
+
+            layer1_soft_candidate = self._detail_bool_or_default(
+                layer1_details,
+                "soft_pass_candidate",
+                False,
+            )
+            if layer1_soft_candidate:
+                self.layer1_soft_pass_candidate_count += 1
+
+            layer1_soft_pass_used = self._detail_bool_or_default(
+                layer1_details,
+                "soft_pass_used",
+                False,
+            )
+            if layer1_soft_pass_used:
+                self.layer1_soft_pass_used_count += 1
+
+        layer4_entry = layers.get("layer4_fake_filter")
+        layer4_data = layer4_entry if isinstance(layer4_entry, Mapping) else {}
         layer4_details = layer4_data.get("details", {}) if isinstance(layer4_data, Mapping) else {}
-        if isinstance(layer4_details, Mapping):
+        if isinstance(layer4_entry, Mapping) and isinstance(layer4_details, Mapping):
             self._record_layer_source_quality(
                 layer4_details,
                 self.layer4_source_quality_counts,
@@ -205,24 +317,24 @@ class StrategyAuditCollector:
                 self.layer4_fake_filter_degraded_mode_count += 1
 
             blocker_values = {
-                blocker: self._layer4_blocker_value(layer4_details, layer4_passed, blocker, missing_set)
+                blocker: self._condition_blocker_value(layer4_details, layer4_passed, blocker, missing_set)
                 for blocker in _LAYER4_BLOCKERS
             }
             for blocker, blocked in blocker_values.items():
                 if blocked:
                     self.layer4_blocker_counts[blocker] += 1
 
-            fail_due_to_price_structure = self._layer4_fail_value(
+            fail_due_to_price_structure = self._detail_bool_or_default(
                 layer4_details,
                 "fail_due_to_price_structure",
                 (not layer4_passed) and blocker_values["price_above_vwap"],
             )
-            fail_due_to_sentiment = self._layer4_fail_value(
+            fail_due_to_sentiment = self._detail_bool_or_default(
                 layer4_details,
                 "fail_due_to_sentiment",
                 (not layer4_passed) and blocker_values["sentiment_euphoric"],
             )
-            fail_due_to_derivatives_context = self._layer4_fail_value(
+            fail_due_to_derivatives_context = self._detail_bool_or_default(
                 layer4_details,
                 "fail_due_to_derivatives_context",
                 (not layer4_passed)
@@ -232,7 +344,7 @@ class StrategyAuditCollector:
                     or blocker_values["oi_overheated"]
                 ),
             )
-            fail_due_to_degraded_mode_only = self._layer4_fail_value(
+            fail_due_to_degraded_mode_only = self._detail_bool_or_default(
                 layer4_details,
                 "fail_due_to_degraded_mode_only",
                 (not layer4_passed)
@@ -244,17 +356,17 @@ class StrategyAuditCollector:
                 ),
             )
 
-            hard_fail = self._layer4_fail_value(
+            hard_fail = self._detail_bool_or_default(
                 layer4_details,
                 "hard_fail",
                 (not layer4_passed) and not degraded_mode,
             )
-            degraded_data_fail = self._layer4_fail_value(
+            degraded_data_fail = self._detail_bool_or_default(
                 layer4_details,
                 "degraded_data_fail",
                 (not layer4_passed) and fail_due_to_degraded_mode_only,
             )
-            soft_fail = self._layer4_fail_value(
+            soft_fail = self._detail_bool_or_default(
                 layer4_details,
                 "soft_fail",
                 (not layer4_passed) and not hard_fail and not degraded_data_fail,
@@ -284,7 +396,7 @@ class StrategyAuditCollector:
                     "oi_overheated",
                 )
             )
-            soft_pass_candidate = self._layer4_fail_value(
+            soft_pass_candidate = self._detail_bool_or_default(
                 layer4_details,
                 "soft_pass_candidate",
                 default_soft_pass_candidate,
@@ -321,8 +433,11 @@ class StrategyAuditCollector:
                     self.layer5_fail_missing_volume_profile_count += 1
 
     def snapshot(self) -> dict[str, Any]:
+        regime_filter_blockers = dict(sorted(self.regime_filter_blocker_counts.items()))
+        layer1_blockers = dict(sorted(self.layer1_blocker_counts.items()))
         layer4_blockers = dict(sorted(self.layer4_blocker_counts.items()))
         failed_layer_counts = dict(sorted(self.failed_layer_counts.items()))
+
         source_quality_counts = {
             "regime_filter": {
                 key: dict(sorted(values.items()))
@@ -334,23 +449,29 @@ class StrategyAuditCollector:
             },
         }
 
+        reached_regime_filter_count = int(self.reached_layer_counts["regime_filter"])
+        passed_regime_filter_count = int(self.passed_layer_counts["regime_filter"])
+        regime_filter_fail_count = max(reached_regime_filter_count - passed_regime_filter_count, 0)
+
         return {
             "evaluations_total": int(self.evaluated_count),
             "evaluated_count": int(self.evaluated_count),
             "insufficient_history_count": int(self.insufficient_history_count),
-            "reached_regime_filter_count": int(self.reached_layer_counts["regime_filter"]),
+            "reached_regime_filter_count": reached_regime_filter_count,
             "reached_layer1_count": int(self.reached_layer_counts["layer1_pump_detection"]),
             "reached_layer2_count": int(self.reached_layer_counts["layer2_weakness_confirmation"]),
             "reached_layer3_count": int(self.reached_layer_counts["layer3_entry_location"]),
             "reached_layer4_count": int(self.reached_layer_counts["layer4_fake_filter"]),
             "reached_layer5_count": int(self.reached_layer_counts["layer5_tp_sl"]),
-            "passed_regime_filter_count": int(self.passed_layer_counts["regime_filter"]),
+            "passed_regime_filter_count": passed_regime_filter_count,
             "passed_layer1_count": int(self.passed_layer_counts["layer1_pump_detection"]),
             "passed_layer2_count": int(self.passed_layer_counts["layer2_weakness_confirmation"]),
             "passed_layer3_count": int(self.passed_layer_counts["layer3_entry_location"]),
             "passed_layer4_count": int(self.passed_layer_counts["layer4_fake_filter"]),
             "passed_layer5_count": int(self.passed_layer_counts["layer5_tp_sl"]),
-            "regime_filter_fail_count": int(failed_layer_counts.get("regime_filter", 0)),
+            "regime_filter_pass_count": passed_regime_filter_count,
+            "regime_filter_fail_count": regime_filter_fail_count,
+            "layer1_pass_count": int(self.passed_layer_counts["layer1_pump_detection"]),
             "layer1_fail_count": int(failed_layer_counts.get("layer1_pump_detection", 0)),
             "layer2_fail_count": int(failed_layer_counts.get("layer2_weakness_confirmation", 0)),
             "layer3_fail_count": int(failed_layer_counts.get("layer3_entry_location", 0)),
@@ -360,6 +481,21 @@ class StrategyAuditCollector:
             "short_signal_count": int(self.short_signal_count),
             "long_signal_count": int(self.long_signal_count),
             "failed_layer_counts": failed_layer_counts,
+            "regime_filter_blocker_counts": regime_filter_blockers,
+            "regime_filter_htf_trend_blocker_count": int(regime_filter_blockers.get("htf_trend_ok", 0)),
+            "regime_filter_vwap_stretch_blocker_count": int(regime_filter_blockers.get("stretched_from_vwap", 0)),
+            "regime_filter_volatility_blocker_count": int(regime_filter_blockers.get("volatility_regime_ok", 0)),
+            "regime_filter_news_blocker_count": int(regime_filter_blockers.get("news_veto", 0)),
+            "regime_filter_degraded_only_count": int(self.regime_filter_degraded_only_count),
+            "regime_filter_soft_pass_candidate_count": int(self.regime_filter_soft_pass_candidate_count),
+            "regime_filter_soft_pass_used_count": int(self.regime_filter_soft_pass_used_count),
+            "layer1_blocker_counts": layer1_blockers,
+            "layer1_rsi_high_blocker_count": int(layer1_blockers.get("rsi_high", 0)),
+            "layer1_volume_spike_blocker_count": int(layer1_blockers.get("volume_spike", 0)),
+            "layer1_above_bollinger_upper_blocker_count": int(layer1_blockers.get("above_bollinger_upper", 0)),
+            "layer1_above_keltner_upper_blocker_count": int(layer1_blockers.get("above_keltner_upper", 0)),
+            "layer1_soft_pass_candidate_count": int(self.layer1_soft_pass_candidate_count),
+            "layer1_soft_pass_used_count": int(self.layer1_soft_pass_used_count),
             "layer4_sentiment_blocker_count": int(layer4_blockers.get("sentiment_euphoric", 0)),
             "layer4_funding_blocker_count": int(layer4_blockers.get("funding_supports_short", 0)),
             "layer4_lsr_blocker_count": int(layer4_blockers.get("long_short_ratio_extreme", 0)),
@@ -392,6 +528,18 @@ class StrategyAuditCollector:
 
     def compact_snapshot(self) -> dict[str, Any]:
         snapshot = self.snapshot()
+
+        def _top_nonzero_blocker(source: object) -> tuple[str, int]:
+            if not isinstance(source, Mapping) or not source:
+                return "", 0
+            top_name, top_count = max(
+                ((str(k), int(v)) for k, v in source.items()),
+                key=lambda item: item[1],
+            )
+            if top_count <= 0:
+                return "", 0
+            return top_name, top_count
+
         failed_layer_counts = snapshot.get("failed_layer_counts", {})
         top_failed_layer = ""
         top_failed_count = 0
@@ -401,14 +549,14 @@ class StrategyAuditCollector:
                 key=lambda item: item[1],
             )
 
-        blocker_counts = snapshot.get("layer4_blocker_counts", {})
-        top_layer4_blocker = ""
-        top_layer4_blocker_count = 0
-        if isinstance(blocker_counts, Mapping) and blocker_counts:
-            top_layer4_blocker, top_layer4_blocker_count = max(
-                ((str(k), int(v)) for k, v in blocker_counts.items()),
-                key=lambda item: item[1],
-            )
+        regime_blocker_counts = snapshot.get("regime_filter_blocker_counts", {})
+        top_regime_filter_blocker, top_regime_filter_blocker_count = _top_nonzero_blocker(regime_blocker_counts)
+
+        layer1_blocker_counts = snapshot.get("layer1_blocker_counts", {})
+        top_layer1_blocker, top_layer1_blocker_count = _top_nonzero_blocker(layer1_blocker_counts)
+
+        layer4_blocker_counts = snapshot.get("layer4_blocker_counts", {})
+        top_layer4_blocker, top_layer4_blocker_count = _top_nonzero_blocker(layer4_blocker_counts)
 
         evaluations_total = int(snapshot.get("evaluations_total", 0))
         no_signal_count = int(snapshot.get("no_signal_count", 0))
@@ -420,8 +568,23 @@ class StrategyAuditCollector:
             "evaluations_total": evaluations_total,
             "evaluated_count": evaluations_total,
             "insufficient_history_count": snapshot["insufficient_history_count"],
+            "regime_filter_pass_count": snapshot["regime_filter_pass_count"],
             "regime_filter_fail_count": snapshot["regime_filter_fail_count"],
+            "regime_filter_htf_trend_blocker_count": snapshot["regime_filter_htf_trend_blocker_count"],
+            "regime_filter_vwap_stretch_blocker_count": snapshot["regime_filter_vwap_stretch_blocker_count"],
+            "regime_filter_volatility_blocker_count": snapshot["regime_filter_volatility_blocker_count"],
+            "regime_filter_news_blocker_count": snapshot["regime_filter_news_blocker_count"],
+            "regime_filter_degraded_only_count": snapshot["regime_filter_degraded_only_count"],
+            "regime_filter_soft_pass_candidate_count": snapshot["regime_filter_soft_pass_candidate_count"],
+            "regime_filter_soft_pass_used_count": snapshot["regime_filter_soft_pass_used_count"],
+            "layer1_pass_count": snapshot["layer1_pass_count"],
             "layer1_fail_count": snapshot["layer1_fail_count"],
+            "layer1_rsi_high_blocker_count": snapshot["layer1_rsi_high_blocker_count"],
+            "layer1_volume_spike_blocker_count": snapshot["layer1_volume_spike_blocker_count"],
+            "layer1_above_bollinger_upper_blocker_count": snapshot["layer1_above_bollinger_upper_blocker_count"],
+            "layer1_above_keltner_upper_blocker_count": snapshot["layer1_above_keltner_upper_blocker_count"],
+            "layer1_soft_pass_candidate_count": snapshot["layer1_soft_pass_candidate_count"],
+            "layer1_soft_pass_used_count": snapshot["layer1_soft_pass_used_count"],
             "layer2_fail_count": snapshot["layer2_fail_count"],
             "layer3_fail_count": snapshot["layer3_fail_count"],
             "layer4_fail_count": snapshot["layer4_fail_count"],
@@ -447,6 +610,12 @@ class StrategyAuditCollector:
             "layer4_fake_filter_degraded_mode_count": snapshot["layer4_fake_filter_degraded_mode_count"],
             "top_failed_layer": top_failed_layer,
             "top_failed_count": int(top_failed_count),
+            "top_regime_filter_blocker": top_regime_filter_blocker,
+            "top_regime_filter_blocker_count": int(top_regime_filter_blocker_count),
+            "top_layer1_blocker": top_layer1_blocker,
+            "top_layer1_blocker_count": int(top_layer1_blocker_count),
             "top_layer4_blocker": top_layer4_blocker,
             "top_layer4_blocker_count": int(top_layer4_blocker_count),
         }
+
+
