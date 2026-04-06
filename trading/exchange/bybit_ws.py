@@ -23,6 +23,7 @@ except Exception:
 @dataclass
 class BybitWebSocketConfig:
     testnet: bool = True
+    demo: bool = False
     api_key: str = ""
     api_secret: str = ""
     symbols: list[str] = field(default_factory=list)
@@ -166,6 +167,8 @@ class BybitWebSocketStream:
     def _private_endpoint(self) -> str:
         if self.config.testnet:
             return "wss://stream-testnet.bybit.com/v5/private"
+        if self.config.demo:
+            return "wss://stream-demo.bybit.com/v5/private"
         return "wss://stream.bybit.com/v5/private"
 
     def _auth_payload(self) -> dict:
@@ -178,12 +181,13 @@ class BybitWebSocketStream:
         ).hexdigest()
         return {"op": "auth", "args": [self.config.api_key, expires, sign]}
 
-    def _public_subscribe_payload(self) -> dict:
+    def _public_subscribe_payloads(self) -> list[dict]:
         topics = [f"tickers.{self._norm_symbol(symbol)}" for symbol in self.config.symbols if symbol]
         topics = sorted(set(topics))
         if not topics:
             topics = ["tickers.BTCUSDT"]
-        return {"op": "subscribe", "args": topics}
+        batch_size = 80
+        return [{"op": "subscribe", "args": topics[i : i + batch_size]} for i in range(0, len(topics), batch_size)]
 
     @staticmethod
     def _private_subscribe_payload() -> dict:
@@ -209,7 +213,8 @@ class BybitWebSocketStream:
                         ws.send(json.dumps(self._auth_payload(), separators=(",", ":")))
                         ws.send(json.dumps(self._private_subscribe_payload(), separators=(",", ":")))
                     else:
-                        ws.send(json.dumps(self._public_subscribe_payload(), separators=(",", ":")))
+                        for payload in self._public_subscribe_payloads():
+                            ws.send(json.dumps(payload, separators=(",", ":")))
 
                     while self._running and not self._stop_evt.is_set():
                         try:

@@ -220,6 +220,8 @@ class RiskEngine:
 
         qty_cap_by_notional = max_notional_allowed / mark_price
         qty = min(raw_qty, qty_cap_by_notional)
+        if rules.max_qty > 0:
+            qty = min(qty, rules.max_qty)
         qty = int(qty / rules.qty_step) * rules.qty_step if rules.qty_step > 0 else qty
         if qty < rules.min_qty:
             return RiskDecision(approved=False, reason="below_min_qty_after_limits")

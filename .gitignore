@@ -39,3 +39,4 @@ data/
 Thumbs.db
 .runtime_env/
 
+.env

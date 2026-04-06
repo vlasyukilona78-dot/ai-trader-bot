@@ -19,19 +19,27 @@ class BybitClient:
         api_key: str | None = None,
         api_secret: str | None = None,
         sandbox: bool = False,
+        demo: bool = False,
         dry_run: bool = True,
         timeout: int = 12,
-        recv_window: int = 5000,
+        recv_window: int = 20000,
         category: str = "linear",
     ):
-        self.api_key = api_key or ""
-        self.api_secret = api_secret or ""
+        self.api_key = str(api_key or "").strip()
+        self.api_secret = str(api_secret or "").strip()
         self.sandbox = sandbox
+        self.demo = demo
         self.dry_run = dry_run
         self.timeout = timeout
         self.recv_window = str(recv_window)
         self.category = category
-        self.base_url = "https://api-testnet.bybit.com" if sandbox else "https://api.bybit.com"
+        self.base_url = "https://api-testnet.bybit.com" if sandbox else ("https://api-demo.bybit.com" if demo else "https://api.bybit.com")
+        self.public_base_url = "https://api-testnet.bybit.com" if sandbox else "https://api.bybit.com"
+        self._private_auth_invalid = False
+        self._private_auth_invalid_reason = ""
+        self._private_auth_invalid_logged = False
+        self._time_offset_ms = 0
+        self._last_time_sync_monotonic = 0.0
 
         self._sess = requests.Session()
         self._sess.headers.update(
@@ -43,13 +51,51 @@ class BybitClient:
         )
         logger.info(
             "BybitClient init -> %s | dry_run=%s | key=%s",
-            "SANDBOX" if sandbox else "PRODUCTION",
+            "SANDBOX" if sandbox else ("DEMO" if demo else "PRODUCTION"),
             dry_run,
             (self.api_key[:4] + "...") if self.api_key else None,
         )
 
+    def _refresh_time_offset(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and (now - self._last_time_sync_monotonic) < 30:
+            return
+        try:
+            response = self._sess.get(f"{self.public_base_url}/v5/market/time", timeout=self.timeout)
+            response.raise_for_status()
+            data = response.json()
+            result = data.get("result", {}) if isinstance(data, dict) else {}
+            server_ms = 0
+            if isinstance(result, dict):
+                time_nano = result.get("timeNano")
+                time_second = result.get("timeSecond")
+                if time_nano not in (None, "", 0, "0"):
+                    server_ms = int(int(time_nano) / 1_000_000)
+                elif time_second not in (None, "", 0, "0"):
+                    server_ms = int(time_second) * 1000
+            if server_ms > 0:
+                self._time_offset_ms = server_ms - int(time.time() * 1000)
+                self._last_time_sync_monotonic = now
+        except Exception as exc:
+            logger.debug("Bybit time sync skipped: %s", exc)
+
     def close(self):
         self._sess.close()
+
+    @property
+    def private_auth_invalid(self) -> bool:
+        return bool(self._private_auth_invalid)
+
+    @property
+    def private_auth_invalid_reason(self) -> str:
+        return str(self._private_auth_invalid_reason or "")
+
+    def _runtime_label(self) -> str:
+        if self.sandbox:
+            return "testnet"
+        if self.demo:
+            return "demo"
+        return "mainnet"
 
     def _normalize_symbol(self, symbol: str) -> str:
         return symbol.replace("/", "").upper()
@@ -79,7 +125,8 @@ class BybitClient:
         if not self.api_key or not self.api_secret:
             raise RuntimeError("Private call requires API key/secret")
 
-        timestamp = str(int(time.time() * 1000))
+        self._refresh_time_offset()
+        timestamp = str(int(time.time() * 1000 + self._time_offset_ms))
         query = query_string if query_string is not None else self._canonical_query(params)
         body = body_string if body_string is not None else self._canonical_json_body(json_body)
         sign_payload = query if method.upper() == "GET" else body
@@ -132,8 +179,16 @@ class BybitClient:
         json_body: dict[str, Any] | None = None,
         max_retries: int = 3,
     ) -> dict[str, Any]:
-        url = f"{self.base_url}{path}"
+        base_url = self.base_url if private else self.public_base_url
+        url = f"{base_url}{path}"
         method = method.upper()
+
+        if private and self._private_auth_invalid:
+            return {
+                "retCode": 10003,
+                "retMsg": self._private_auth_invalid_reason or "private_auth_invalid",
+                "result": {},
+            }
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -176,6 +231,31 @@ class BybitClient:
                 response = self._sess.request(method, url, **request_kwargs)
                 response.raise_for_status()
                 data = response.json()
+                if isinstance(data, dict) and data.get("retCode") == 10002 and private:
+                    self._refresh_time_offset(force=True)
+                    logger.warning(
+                        "Bybit timestamp drift detected mode=%s path=%s recv_window=%s offset_ms=%s attempt=%d",
+                        self._runtime_label(),
+                        path,
+                        self.recv_window,
+                        self._time_offset_ms,
+                        attempt,
+                    )
+                    continue
+                if isinstance(data, dict) and data.get("retCode") == 10003 and private:
+                    ret_msg = str(data.get("retMsg") or "API key is invalid.")
+                    self._private_auth_invalid = True
+                    self._private_auth_invalid_reason = f"{ret_msg} mode={self._runtime_label()} base_url={base_url}"
+                    if not self._private_auth_invalid_logged:
+                        logger.error(
+                            "Bybit private auth disabled mode=%s base_url=%s path=%s retMsg=%s",
+                            self._runtime_label(),
+                            base_url,
+                            path,
+                            ret_msg,
+                        )
+                        self._private_auth_invalid_logged = True
+                    return data
                 if isinstance(data, dict) and data.get("retCode") not in (None, 0):
                     logger.warning(
                         "Bybit API returned retCode=%s retMsg=%s for %s",
@@ -365,6 +445,35 @@ class BybitClient:
         if self.dry_run:
             return {"retCode": 0, "retMsg": "dry_run_simulation", "result": {"unifiedMarginStatus": 0}}
         return self._request("GET", "/v5/account/info", params={}, private=True)
+
+    def apply_demo_funds(self, *, usdt_amount: str = "100000") -> dict[str, Any]:
+        if self.dry_run:
+            return {
+                "retCode": 0,
+                "retMsg": "dry_run_simulation",
+                "result": {"utaDemoApplyMoney": [{"coin": "USDT", "amountStr": str(usdt_amount)}]},
+            }
+        if not self.demo:
+            return {"retCode": 10001, "retMsg": "demo_mode_required", "result": {}}
+
+        body = {
+            "utaDemoApplyMoney": [
+                {
+                    "coin": "USDT",
+                    "amountStr": str(usdt_amount),
+                }
+            ]
+        }
+        response = self._request("POST", "/v5/account/demo-apply-money", private=True, json_body=body)
+        if isinstance(response, dict) and response.get("retCode") == 0:
+            logger.info("Bybit demo funds applied usdt=%s", usdt_amount)
+        else:
+            logger.warning(
+                "Bybit demo funds request failed retCode=%s retMsg=%s",
+                response.get("retCode") if isinstance(response, dict) else None,
+                response.get("retMsg") if isinstance(response, dict) else None,
+            )
+        return response
 
     def get_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         if self.dry_run:

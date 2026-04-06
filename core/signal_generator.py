@@ -15,11 +15,17 @@ from .volume_profile import VolumeProfileLevels
 class SignalConfig:
     rsi_high: float = 68.0
     rsi_low: float = 32.0
-    volume_spike_threshold: float = 1.6
+    volume_spike_threshold: float = 2.0
     layer1_pump_lookback_bars: int = 1
+    layer1_clean_pump_lookback_bars: int = 48
+    layer1_clean_pump_min_pct: float = 0.05
+    early_watch_clean_pump_min_pct: float = 0.04
+    early_watch_volume_spike_min: float = 1.15
+    early_watch_rsi_min: float = 52.0
+    early_watch_quality_min: float = 4.5
     layer1_soft_pass_enabled: bool = False
     layer1_rsi_soft: float = 50.0
-    layer1_volume_spike_soft: float = 1.4
+    layer1_volume_spike_soft: float = 1.35
     layer1_upper_band_proximity_pct: float = 0.001
     weakness_lookback: int = 4
     sentiment_bullish_threshold: float = 68.0
@@ -33,12 +39,14 @@ class SignalConfig:
     fake_filter_funding_supports_short_soft: float = 0.0005
     long_short_ratio_tolerance: float = 0.10
     msb_lookback: int = 20
-    msb_recent_bars: int = 6
+    msb_recent_bars: int = 8
     msb_break_buffer_pct: float = 0.0005
     regime_vwap_stretch_soft: float = 0.0012
     regime_min_atr_norm: float = 0.0008
     regime_volatility_entry_tolerance_mult: float = 0.25
     regime_volatility_threshold_override: float | None = None
+    regime_volatility_dynamic_floor_mult: float = 1.0
+    regime_volatility_baseline_lookback: int = 96
     regime_soft_pass_enabled: bool = False
     regime_strong_trend_adx: float = 30.0
     fake_filter_lsr_extreme_soft: float = 1.01
@@ -191,12 +199,27 @@ class SignalGenerator:
         stretched = vwap_dist >= vwap_stretch_threshold
         volatility_threshold_override = self.config.regime_volatility_threshold_override
         if volatility_threshold_override is None:
-            volatility_threshold = max(
+            base_volatility_threshold = max(
                 float(self.config.regime_min_atr_norm),
                 float(self.config.entry_tolerance_pct) * float(self.config.regime_volatility_entry_tolerance_mult),
             )
         else:
-            volatility_threshold = max(0.0, float(volatility_threshold_override))
+            base_volatility_threshold = max(0.0, float(volatility_threshold_override))
+        baseline_lookback = max(24, int(self.config.regime_volatility_baseline_lookback))
+        dynamic_floor_mult = min(max(float(self.config.regime_volatility_dynamic_floor_mult), 0.5), 1.0)
+        atr_series = pd.to_numeric(df.get("atr"), errors="coerce")
+        close_series = pd.to_numeric(df.get("close"), errors="coerce").replace(0.0, np.nan)
+        atr_norm_series = (atr_series / close_series).replace([np.inf, -np.inf], np.nan).dropna()
+        atr_norm_baseline = (
+            float(atr_norm_series.tail(baseline_lookback).median())
+            if not atr_norm_series.empty
+            else float(atr_norm)
+        )
+        dynamic_floor = float(base_volatility_threshold) * dynamic_floor_mult
+        if np.isfinite(atr_norm_baseline) and atr_norm_baseline > 0:
+            volatility_threshold = max(dynamic_floor, min(float(base_volatility_threshold), atr_norm_baseline * 0.95))
+        else:
+            volatility_threshold = float(base_volatility_threshold)
         vol_ok = atr_norm >= volatility_threshold
 
         news_participates = news_veto is not None
@@ -255,6 +278,9 @@ class SignalGenerator:
             "vwap_distance_metric_used": float(vwap_dist),
             "vwap_stretch_threshold_used": float(vwap_stretch_threshold),
             "volatility_threshold_used": float(volatility_threshold),
+            "volatility_threshold_base_used": float(base_volatility_threshold),
+            "volatility_baseline_atr_norm_used": float(atr_norm_baseline),
+            "volatility_dynamic_floor_mult_used": float(dynamic_floor_mult),
             "atr_norm": float(atr_norm),
             "degraded_mode": 1.0 if degraded else 0.0,
             "fail_due_to_degraded_mode_only": 1.0 if fail_due_to_degraded_only else 0.0,
@@ -285,6 +311,9 @@ class SignalGenerator:
                 "above_keltner_upper": 0.0,
                 "upper_band_breakout": 0.0,
                 "pump_context_strength": 0.0,
+                "clean_pump_pct": 0.0,
+                "clean_pump_min_pct_used": float(self.config.layer1_clean_pump_min_pct),
+                "clean_pump_ok": 0.0,
                 "soft_pass_candidate": 0.0,
                 "soft_pass_used": 0.0,
                 "soft_pass_reason": "",
@@ -297,7 +326,18 @@ class SignalGenerator:
         volume_spike_soft_threshold = float(self.config.layer1_volume_spike_soft)
         upper_band_proximity_pct = max(0.0, float(self.config.layer1_upper_band_proximity_pct))
         lookback = max(1, int(self.config.layer1_pump_lookback_bars))
+        clean_lookback = max(lookback, int(self.config.layer1_clean_pump_lookback_bars))
+        clean_pump_threshold = max(0.0, float(self.config.layer1_clean_pump_min_pct))
         window = df.tail(lookback)
+        clean_window = df.tail(clean_lookback)
+        clean_close = pd.to_numeric(clean_window.get("close"), errors="coerce").dropna()
+        clean_pump_pct = 0.0
+        if len(clean_close) >= 2:
+            rolling_min = clean_close.cummin().replace(0.0, np.nan)
+            pump_track = ((clean_close - rolling_min) / rolling_min).replace([np.inf, -np.inf], np.nan).dropna()
+            if not pump_track.empty:
+                clean_pump_pct = float(max(0.0, pump_track.max()))
+        clean_pump_ok = clean_pump_pct >= clean_pump_threshold
 
         def _details_from_row(row: pd.Series, *, pump_bar_offset: int) -> tuple[bool, dict[str, Any]]:
             rsi = self._safe(row.get("rsi"), 50.0)
@@ -318,9 +358,9 @@ class SignalGenerator:
             vol_soft = vol >= volume_spike_soft_threshold
 
             pts = int(rsi_high) + int(vol_high) + int(band_break)
-            passed = band_break and pts >= 2
-            soft_pass_candidate = (not passed) and pts >= 2
-            fade_soft_candidate = (not passed) and near_upper_band and rsi_soft and vol_soft
+            passed = clean_pump_ok and band_break and pts >= 2
+            soft_pass_candidate = clean_pump_ok and (not passed) and pts >= 2
+            fade_soft_candidate = clean_pump_ok and (not passed) and near_upper_band and rsi_soft and vol_soft
             missing = []
             if not rsi_high:
                 missing.append("rsi_high")
@@ -328,12 +368,15 @@ class SignalGenerator:
                 missing.append("volume_spike")
             if not band_break:
                 missing.append("upper_band_breakout")
+            if not clean_pump_ok:
+                missing.append("clean_pump_pct")
             subconditions = {
                 "rsi_high": bool(rsi_high),
                 "volume_spike_high": bool(vol_high),
                 "upper_band_breakout": bool(band_break),
                 "above_bollinger_upper": bool(above_bb),
                 "above_keltner_upper": bool(above_kc),
+                "clean_pump_ok": bool(clean_pump_ok),
             }
             return passed, {
                 "passed": 1.0 if passed else 0.0,
@@ -352,6 +395,9 @@ class SignalGenerator:
                 "above_keltner_upper": 1.0 if above_kc else 0.0,
                 "upper_band_breakout": 1.0 if band_break else 0.0,
                 "pump_context_strength": float(pts / 3.0),
+                "clean_pump_pct": float(clean_pump_pct),
+                "clean_pump_min_pct_used": float(clean_pump_threshold),
+                "clean_pump_ok": 1.0 if clean_pump_ok else 0.0,
                 "soft_pass_candidate": 1.0 if soft_pass_candidate else 0.0,
                 "soft_pass_used": 0.0,
                 "soft_pass_reason": "",
@@ -378,16 +424,7 @@ class SignalGenerator:
             if soft_pass_details is None and str(details.get("_soft_pass_reason_candidate") or ""):
                 soft_pass_details = details
 
-        if self.config.layer1_soft_pass_enabled and soft_pass_details is not None:
-            used_details = dict(soft_pass_details)
-            used_details["passed"] = 1.0
-            used_details["failed_reason"] = "none"
-            used_details["missing_conditions"] = ""
-            used_details["soft_pass_used"] = 1.0
-            used_details["soft_pass_reason"] = str(used_details.get("_soft_pass_reason_candidate") or "upper_band_breakout")
-            return "SHORT", used_details
-
-        if self.config.layer1_soft_pass_enabled and window_details:
+        if self.config.layer1_soft_pass_enabled and clean_pump_ok and window_details:
             recent_rsi_high = any(bool(float(details.get("rsi_high", 0.0) or 0.0)) for details in window_details)
             recent_volume_spike = any(bool(float(details.get("volume_spike_high", 0.0) or 0.0)) for details in window_details)
             recent_upper_band_break = any(bool(float(details.get("upper_band_breakout", 0.0) or 0.0)) for details in window_details)
@@ -426,6 +463,15 @@ class SignalGenerator:
                     "above_keltner_upper": bool(recent_above_kc),
                 }
                 return "SHORT", used_details
+
+        if self.config.layer1_soft_pass_enabled and soft_pass_details is not None:
+            used_details = dict(soft_pass_details)
+            used_details["passed"] = 1.0
+            used_details["failed_reason"] = "none"
+            used_details["missing_conditions"] = ""
+            used_details["soft_pass_used"] = 1.0
+            used_details["soft_pass_reason"] = str(used_details.get("_soft_pass_reason_candidate") or "upper_band_breakout")
+            return "SHORT", used_details
 
         return None, (fallback_details or _details_from_row(window.iloc[-1], pump_bar_offset=0)[1])
 
@@ -559,9 +605,9 @@ class SignalGenerator:
 
         below_vah = close <= vp.vah * (1.0 + tol)
         rejected = prev_close >= vp.vah * (1.0 - tol) and close <= vp.vah * (1.0 + tol)
-        below_or_rej = rejected
-        near_poc = abs(close - vp.poc) <= max(vp.poc * max(0.006, tol * 1.5), 1e-8)
-        inside_va = close >= vp.val * (1.0 - tol) and close <= vp.vah * (1.0 + tol)
+        below_or_rej = below_vah or rejected
+        near_poc = abs(close - vp.poc) <= max(vp.poc * max(0.010, tol * 2.0), 1e-8)
+        inside_va = close >= vp.val * (1.0 - tol * 1.5) and close <= vp.vah * (1.0 + tol * 1.1)
         poc_ctx = near_poc or inside_va
         msb_ok, msb = self._layer3_msb_confirmation(df=df, side="SHORT")
 
@@ -750,26 +796,114 @@ class SignalGenerator:
         rr = max(float(self.config.risk_reward), 0.1)
         rr_floor = 0.02
         tol = max(float(self.config.entry_tolerance_pct), 0.0)
-        base_inv = entry + atr * atr_sl
+        base_inv = entry + atr * max(atr_sl * 0.92, 0.98)
         inv_ref = base_inv
-        tp_ref = "rr_fallback"
+        tp_ref = "rr_projection"
         fallback_rr = vp is None
-        tp = entry - max(atr, entry * 0.0001) * rr
-        if vp is not None:
-            inv_ref = max(float(vp.vah), base_inv)
-            vp_poc = float(vp.poc)
-            if np.isfinite(vp_poc) and vp_poc > 0 and vp_poc < entry:
-                tp = vp_poc
-                tp_ref = "vp_poc"
-                fallback_rr = False
 
-        sl = max(inv_ref, base_inv)
+        recent_highs = pd.to_numeric(df.tail(min(len(df), 24))["high"], errors="coerce").dropna()
+        recent_lows = pd.to_numeric(df.tail(min(len(df), 30))["low"], errors="coerce").dropna()
+        recent_high_ref = (
+            max(
+                float(recent_highs.quantile(0.86)),
+                float(recent_highs.tail(min(len(recent_highs), 12)).quantile(0.90)),
+            )
+            if not recent_highs.empty
+            else base_inv
+        )
+        recent_support = float(recent_lows.quantile(0.16)) if not recent_lows.empty else 0.0
+        deep_support = float(recent_lows.quantile(0.08)) if not recent_lows.empty else recent_support
+
+        local_recent_high_ref = (
+            max(
+                float(recent_highs.tail(min(len(recent_highs), 8)).max()),
+                float(recent_highs.tail(min(len(recent_highs), 12)).quantile(0.84)),
+            )
+            if not recent_highs.empty
+            else recent_high_ref
+        )
+        structural_inv_ref = max(local_recent_high_ref, recent_high_ref, base_inv)
+        vp_cap = max(
+            structural_inv_ref + atr * 0.72,
+            entry + atr * max(atr_sl * 0.74, 0.92),
+        )
+        if vp is not None:
+            inv_ref = max(structural_inv_ref, min(float(vp.vah), vp_cap))
+        else:
+            inv_ref = structural_inv_ref
+
+        stop_buffer = max(atr * 0.10, entry * max(tol * 0.34, 0.00045))
+        sl = max(inv_ref + stop_buffer, base_inv)
+        provisional_tp = entry - max(atr, entry * 0.0001) * rr
+        provisional_tp, sl = self._normalize_levels(entry=entry, tp=provisional_tp, sl=sl, side="SHORT")
+
+        risk_distance = max(sl - entry, max(atr, entry * 0.0001))
+        structure_depth_pct = max(0.0, (entry - deep_support) / max(entry, 1e-8)) if np.isfinite(deep_support) and deep_support > 0 else 0.0
+        recent_depth_pct = max(0.0, (entry - recent_support) / max(entry, 1e-8)) if np.isfinite(recent_support) and recent_support > 0 else 0.0
+        depth_bonus = min(0.92, max(structure_depth_pct, recent_depth_pct) * 6.2)
+        rr_target = max(rr + 0.95, 3.05 + depth_bonus)
+        rr_cap = max(rr_target * 2.15, 6.4)
+        rr_projection = entry - risk_distance * rr_target
+        rr_cap_target = entry - risk_distance * rr_cap
+
+        structural_candidates: list[tuple[float, str]] = []
+        if vp is not None:
+            vp_poc = float(vp.poc)
+            vp_val = float(vp.val)
+            if np.isfinite(vp_poc) and 0 < vp_poc < entry:
+                structural_candidates.append((vp_poc, "vp_poc"))
+            if np.isfinite(vp_val) and 0 < vp_val < entry:
+                if np.isfinite(vp_poc) and 0 < vp_poc < entry and vp_val < vp_poc:
+                    structural_candidates.append((vp_poc - (vp_poc - vp_val) * 0.55, "vp_balance"))
+                structural_candidates.append((vp_val, "vp_val"))
+                structural_candidates.append((vp_val - max((vp_poc - vp_val) * 0.28, atr * 0.35), "vp_extension"))
+        if np.isfinite(recent_support) and 0 < recent_support < entry:
+            structural_candidates.append((recent_support, "recent_support"))
+        if np.isfinite(deep_support) and 0 < deep_support < entry:
+            structural_candidates.append((deep_support, "deep_support"))
+
+        if structural_candidates:
+            deeper_refs = {"vp_extension", "vp_val", "recent_support", "deep_support"}
+            has_deeper_candidate = any(ref in deeper_refs for _, ref in structural_candidates)
+            ranked_targets: list[tuple[float, float, str]] = []
+            for structural_target, structural_ref in structural_candidates:
+                if structural_ref == "vp_poc" and has_deeper_candidate:
+                    continue
+                bounded_target = max(float(structural_target), rr_cap_target)
+                rr_candidate = (entry - bounded_target) / max(risk_distance, 1e-9)
+                if rr_candidate < 1.45:
+                    continue
+                ref_bonus = {
+                    "vp_extension": 1.02,
+                    "deep_support": 0.90,
+                    "recent_support": 0.66,
+                    "vp_val": 0.56,
+                    "vp_balance": 0.24,
+                    "vp_poc": -0.15,
+                }.get(structural_ref, 0.12)
+                score = rr_candidate + ref_bonus
+                ranked_targets.append((score, bounded_target, structural_ref))
+
+            if ranked_targets:
+                _, best_target, best_ref = max(ranked_targets, key=lambda item: item[0])
+                tp = min(best_target, rr_projection) if best_ref == "vp_poc" else best_target
+                tp_ref = best_ref if tp != rr_projection else "rr_projection"
+                fallback_rr = False
+            else:
+                tp = rr_projection
+                tp_ref = "rr_projection"
+                fallback_rr = True
+        else:
+            tp = rr_projection
+            tp_ref = "rr_projection"
+            fallback_rr = True
+
         tp, sl = self._normalize_levels(entry=entry, tp=tp, sl=sl, side="SHORT")
         stop_pct = (sl - entry) / max(entry, 1e-9)
         tp_pct = (entry - tp) / max(entry, 1e-9)
         rr_val = (tp_pct / max(stop_pct, 1e-9)) if stop_pct > 0 else 0.0
         stop_ok = sl >= inv_ref and sl > entry
-        tp_ok = tp <= float(vp.poc) * (1.0 + tol) if (tp_ref == "vp_poc" and vp is not None) else tp < entry
+        tp_ok = tp <= float(vp.poc) * (1.0 + tol) if (tp_ref in {"vp_poc", "vp_balance"} and vp is not None) else tp < entry
         rr_ok = rr_val >= rr_floor
         passed = stop_ok and tp_ok and rr_ok
 
@@ -778,7 +912,15 @@ class SignalGenerator:
         if not tp_ok: missing.append("tp_at_poc_or_better")
         if not rr_ok: missing.append("risk_reward_ratio_soft_min")
         strength = (int(stop_ok) + int(tp_ok) + int(rr_ok)) / 3.0
-        return passed, {"passed": 1.0 if passed else 0.0, "entry": float(entry), "tp": float(tp), "sl": float(sl), "partial_tps": [float(entry - atr), float((entry + tp) / 2.0)], "stop_above_invalidation": 1.0 if stop_ok else 0.0, "tp_at_poc_or_better": 1.0 if tp_ok else 0.0, "atr_available": 1.0 if atr_available else 0.0, "volume_profile_available": 1.0 if vp is not None else 0.0, "fallback_rr_used": 1.0 if fallback_rr else 0.0, "invalidation_reference": float(inv_ref), "tp_reference": str(tp_ref), "stop_distance_pct": float(stop_pct), "take_profit_distance_pct": float(tp_pct), "risk_reward_ratio": float(rr_val), "missing_conditions": ",".join(missing), "failed_reason": "none" if passed else f"missing:{','.join(missing)}", "tp_sl_strength": float(strength)}
+        partial_candidates: list[float] = []
+        if vp is not None and np.isfinite(float(vp.poc)) and 0 < float(vp.poc) < entry:
+            partial_candidates.append(float(vp.poc))
+        if np.isfinite(recent_support) and 0 < recent_support < entry:
+            partial_candidates.append(float(recent_support))
+        partial_candidates.append(float((entry + tp) / 2.0))
+        partial_candidates.append(float(tp))
+        partial_tps = sorted({round(float(x), 10) for x in partial_candidates if 0 < float(x) < entry}, reverse=True)
+        return passed, {"passed": 1.0 if passed else 0.0, "entry": float(entry), "tp": float(tp), "sl": float(sl), "partial_tps": partial_tps, "stop_above_invalidation": 1.0 if stop_ok else 0.0, "tp_at_poc_or_better": 1.0 if tp_ok else 0.0, "atr_available": 1.0 if atr_available else 0.0, "volume_profile_available": 1.0 if vp is not None else 0.0, "fallback_rr_used": 1.0 if fallback_rr else 0.0, "invalidation_reference": float(inv_ref), "tp_reference": str(tp_ref), "stop_distance_pct": float(stop_pct), "take_profit_distance_pct": float(tp_pct), "risk_reward_ratio": float(rr_val), "missing_conditions": ",".join(missing), "failed_reason": "none" if passed else f"missing:{','.join(missing)}", "tp_sl_strength": float(strength)}
 
     @staticmethod
     def _normalize_levels(entry: float, tp: float, sl: float, side: str) -> tuple[float, float]:

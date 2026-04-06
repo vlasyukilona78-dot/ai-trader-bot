@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 from tests.v2.fakes import FakeAdapter
 from trading.execution.engine import ExecutionEngine
@@ -197,6 +198,29 @@ class ExecutionEngineV2Tests(unittest.TestCase):
         self.assertIn("external_position_without_intent", issues)
         self.assertEqual(self.sm.get("BTCUSDT").state, TradeState.RECOVERING)
 
+    def test_demo_mode_auto_closes_unprotected_external_position(self):
+        self.adapter.config = SimpleNamespace(demo=True, testnet=False, dry_run=False)
+        self.adapter.positions = [
+            PositionSnapshot(
+                symbol="BTCUSDT",
+                side=PositionSide.LONG,
+                qty=1.0,
+                entry_price=100.0,
+                liq_price=0.0,
+                leverage=1.0,
+                position_idx=0,
+                stop_loss=None,
+            )
+        ]
+        self.sm.transition("BTCUSDT", TradeState.FLAT, "init")
+
+        issues = self.exec.detect_external_intervention("BTCUSDT", self._snapshot("BTCUSDT"))
+
+        self.assertEqual(issues, [])
+        self.assertEqual(self.sm.get("BTCUSDT").state, TradeState.FLAT)
+        self.assertEqual(len(self.adapter.positions), 0)
+        self.assertTrue(self.adapter.placed_orders[-1].reduce_only)
+
     def test_zero_size_placeholder_position_does_not_trigger_intervention(self):
         self.sm.transition("BTCUSDT", TradeState.FLAT, "init")
         snapshot = ExchangeSnapshot(
@@ -252,6 +276,29 @@ class ExecutionEngineV2Tests(unittest.TestCase):
         issues = self.exec.detect_external_intervention("BTCUSDT", self._snapshot("BTCUSDT"))
         self.assertIn("external_non_reduce_open_order", issues)
         self.assertEqual(self.sm.get("BTCUSDT").state, TradeState.RECOVERING)
+
+    def test_demo_mode_auto_cancels_external_orders(self):
+        self.adapter.config = SimpleNamespace(demo=True, testnet=False, dry_run=False)
+        self.adapter.open_orders = [
+            OpenOrderSnapshot(
+                symbol="BTCUSDT",
+                order_id="o1",
+                order_link_id="ext",
+                side=OrderSide.BUY,
+                qty=1.0,
+                reduce_only=False,
+                position_idx=0,
+                status="New",
+            )
+        ]
+        self.sm.transition("BTCUSDT", TradeState.FLAT, "init")
+
+        issues = self.exec.detect_external_intervention("BTCUSDT", self._snapshot("BTCUSDT"))
+
+        self.assertEqual(issues, [])
+        self.assertEqual(self.sm.get("BTCUSDT").state, TradeState.FLAT)
+        self.assertEqual(len(self.adapter.open_orders), 0)
+        self.assertGreaterEqual(len(self.adapter.canceled_orders), 1)
 
     def test_entry_rejected_when_recovering_state(self):
         self.sm.transition("BTCUSDT", TradeState.RECOVERING, "manual_check")

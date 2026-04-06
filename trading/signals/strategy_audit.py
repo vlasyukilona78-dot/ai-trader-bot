@@ -24,6 +24,7 @@ _LAYER1_BLOCKERS: tuple[str, ...] = (
     "volume_spike",
     "above_bollinger_upper",
     "above_keltner_upper",
+    "clean_pump_pct",
 )
 
 _LAYER4_BLOCKERS: tuple[str, ...] = (
@@ -279,6 +280,7 @@ class StrategyAuditCollector:
                 "volume_spike": (not layer1_passed) and (not layer1_volume_spike),
                 "above_bollinger_upper": (not layer1_passed) and (not layer1_above_bb) and (not layer1_upper_band_breakout),
                 "above_keltner_upper": (not layer1_passed) and (not layer1_above_kc) and (not layer1_upper_band_breakout),
+                "clean_pump_pct": (not layer1_passed) and (not self._as_bool(layer1_details.get("clean_pump_ok"))),
             }
             for blocker, blocked in layer1_blockers.items():
                 if blocked:
@@ -494,6 +496,7 @@ class StrategyAuditCollector:
             "layer1_volume_spike_blocker_count": int(layer1_blockers.get("volume_spike", 0)),
             "layer1_above_bollinger_upper_blocker_count": int(layer1_blockers.get("above_bollinger_upper", 0)),
             "layer1_above_keltner_upper_blocker_count": int(layer1_blockers.get("above_keltner_upper", 0)),
+            "layer1_clean_pump_pct_blocker_count": int(layer1_blockers.get("clean_pump_pct", 0)),
             "layer1_soft_pass_candidate_count": int(self.layer1_soft_pass_candidate_count),
             "layer1_soft_pass_used_count": int(self.layer1_soft_pass_used_count),
             "layer4_sentiment_blocker_count": int(layer4_blockers.get("sentiment_euphoric", 0)),
@@ -583,6 +586,7 @@ class StrategyAuditCollector:
             "layer1_volume_spike_blocker_count": snapshot["layer1_volume_spike_blocker_count"],
             "layer1_above_bollinger_upper_blocker_count": snapshot["layer1_above_bollinger_upper_blocker_count"],
             "layer1_above_keltner_upper_blocker_count": snapshot["layer1_above_keltner_upper_blocker_count"],
+            "layer1_clean_pump_pct_blocker_count": snapshot["layer1_clean_pump_pct_blocker_count"],
             "layer1_soft_pass_candidate_count": snapshot["layer1_soft_pass_candidate_count"],
             "layer1_soft_pass_used_count": snapshot["layer1_soft_pass_used_count"],
             "layer2_fail_count": snapshot["layer2_fail_count"],

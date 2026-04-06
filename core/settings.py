@@ -24,21 +24,29 @@ class BotSettings:
 
 @dataclass
 class StrategySettings:
-    rsi_high: float = 68.0
+    rsi_high: float = 67.0
     rsi_low: float = 32.0
-    volume_spike_threshold: float = 1.6
-    weakness_lookback: int = 4
+    volume_spike_threshold: float = 2.0
+    layer1_clean_pump_lookback_bars: int = 48
+    layer1_clean_pump_min_pct: float = 0.05
+    early_watch_clean_pump_min_pct: float = 0.04
+    early_watch_volume_spike_min: float = 1.15
+    early_watch_rsi_min: float = 52.0
+    early_watch_quality_min: float = 4.5
+    weakness_lookback: int = 3
     sentiment_bullish_threshold: float = 68.0
     sentiment_bearish_threshold: float = 32.0
     risk_reward: float = 1.6
     atr_sl_mult: float = 1.0
-    entry_tolerance_pct: float = 0.004
+    entry_tolerance_pct: float = 0.0065
     vwap_tolerance_pct: float = 0.0025
     funding_tolerance: float = 0.0003
     long_short_ratio_tolerance: float = 0.10
-    msb_lookback: int = 20
-    msb_recent_bars: int = 6
-    msb_break_buffer_pct: float = 0.0005
+    msb_lookback: int = 14
+    msb_recent_bars: int = 10
+    msb_break_buffer_pct: float = 0.0002
+    regime_volatility_dynamic_floor_mult: float = 0.72
+    regime_volatility_baseline_lookback: int = 96
     volume_profile_window: int = 120
     volume_profile_bins: int = 48
 
@@ -166,6 +174,7 @@ def load_settings(config_path: str = "config/config.yaml") -> AppSettings:
     ml.online_retrain_interval_sec = int(os.getenv("ML_ONLINE_RETRAIN_INTERVAL_SEC", ml.online_retrain_interval_sec))
     ml.online_retrain_min_rows = int(os.getenv("ML_ONLINE_RETRAIN_MIN_ROWS", ml.online_retrain_min_rows))
     ml.online_dataset_path = str(os.getenv("ML_ONLINE_DATASET_PATH", ml.online_dataset_path))
+    ml.model_dir = str(os.getenv("ML_MODEL_DIR", ml.model_dir))
     ml.min_probability = float(os.getenv("ML_MIN_PROBABILITY", ml.min_probability))
 
     return AppSettings(

@@ -8,21 +8,29 @@
   dry_run: true
 
 strategy:
-  rsi_high: 68
+  rsi_high: 67
   rsi_low: 32
-  volume_spike_threshold: 1.6
-  weakness_lookback: 4
+  volume_spike_threshold: 2.0
+  layer1_clean_pump_lookback_bars: 48
+  layer1_clean_pump_min_pct: 0.05
+  early_watch_clean_pump_min_pct: 0.04
+  early_watch_volume_spike_min: 1.15
+  early_watch_rsi_min: 52
+  early_watch_quality_min: 4.5
+  weakness_lookback: 3
   sentiment_bullish_threshold: 68
   sentiment_bearish_threshold: 32
   risk_reward: 1.6
   atr_sl_mult: 1.0
-  entry_tolerance_pct: 0.004
+  entry_tolerance_pct: 0.0065
   vwap_tolerance_pct: 0.0025
   funding_tolerance: 0.0003
   long_short_ratio_tolerance: 0.1
-  msb_lookback: 20
-  msb_recent_bars: 6
-  msb_break_buffer_pct: 0.0005
+  msb_lookback: 14
+  msb_recent_bars: 10
+  msb_break_buffer_pct: 0.0002
+  regime_volatility_dynamic_floor_mult: 0.72
+  regime_volatility_baseline_lookback: 96
   volume_profile_window: 120
   volume_profile_bins: 48
 

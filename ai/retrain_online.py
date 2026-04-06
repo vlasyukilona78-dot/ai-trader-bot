@@ -18,17 +18,17 @@ from ai.train import train_models
 
 @dataclass
 class OnlineRetrainConfig:
-    dataset_path: str = "data/processed/training_dataset.csv"
+    dataset_path: str = "data/processed/online_training_dataset.csv"
     model_dir: str = "ai/models"
     retrain_interval_sec: int = 6 * 3600
-    min_new_rows: int = 200
+    min_new_rows: int = 100
 
 
 class OnlineRetrainer:
     def __init__(self, config: OnlineRetrainConfig):
         self.config = config
         self.last_train_ts: float = 0.0
-        self.last_row_count: int = 0
+        self.last_row_count: int = self._row_count()
 
     def _row_count(self) -> int:
         if not os.path.exists(self.config.dataset_path):

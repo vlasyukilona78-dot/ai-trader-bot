@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import time
 from dataclasses import dataclass, field
@@ -20,6 +21,8 @@ from .schemas import (
     PositionSnapshot,
     ProtectiveOrderResult,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ExchangeAdapter(Protocol):
@@ -53,8 +56,9 @@ class BybitAdapterConfig:
     api_key: str = ""
     api_secret: str = ""
     testnet: bool = True
+    demo: bool = False
     dry_run: bool = True
-    recv_window: int = 5000
+    recv_window: int = 20000
     hedge_mode: bool = False
     instrument_rules_ttl_sec: int = 900
     instrument_rules_max_age_sec: int = 3600
@@ -84,11 +88,13 @@ class BybitAdapter:
             api_key=config.api_key,
             api_secret=config.api_secret,
             testnet=config.testnet,
+            demo=config.demo,
             dry_run=config.dry_run,
             recv_window=config.recv_window,
         )
         self._rules_cache: dict[str, _RulesCacheEntry] = {}
         self._ws_stream: BybitWebSocketStream | None = None
+        self._demo_auto_fund_attempted = False
         self._init_ws()
 
     def _init_ws(self):
@@ -96,6 +102,7 @@ class BybitAdapter:
             return
         ws_cfg = BybitWebSocketConfig(
             testnet=bool(self.config.testnet),
+            demo=bool(self.config.demo),
             api_key=self.config.api_key,
             api_secret=self.config.api_secret,
             symbols=[self.normalize_symbol(s) for s in (self.config.ws_symbols or ["BTCUSDT"])],
@@ -105,6 +112,14 @@ class BybitAdapter:
         )
         self._ws_stream = BybitWebSocketStream(ws_cfg)
         self._ws_stream.start()
+
+    @property
+    def private_auth_invalid(self) -> bool:
+        return bool(getattr(self.client, "private_auth_invalid", False))
+
+    @property
+    def private_auth_invalid_reason(self) -> str:
+        return str(getattr(self.client, "private_auth_invalid_reason", "") or "")
 
     @staticmethod
     def normalize_symbol(symbol: str) -> str:
@@ -140,7 +155,7 @@ class BybitAdapter:
         result = payload.get("result", {}) if isinstance(payload, dict) else {}
         items = result.get("list", []) if isinstance(result, dict) else []
         if not items:
-            return InstrumentRules(symbol=symbol, tick_size=0.0, qty_step=0.0, min_qty=0.0, min_notional=0.0)
+            return InstrumentRules(symbol=symbol, tick_size=0.0, qty_step=0.0, min_qty=0.0, min_notional=0.0, max_qty=0.0)
 
         item = items[0]
         lot = item.get("lotSizeFilter", {}) if isinstance(item, dict) else {}
@@ -150,6 +165,9 @@ class BybitAdapter:
         qty_step = cls._safe_float(lot.get("qtyStep"), 0.0)
         min_qty = cls._safe_float(lot.get("minOrderQty"), 0.0)
         min_notional = cls._safe_float(lot.get("minNotionalValue"), 0.0)
+        max_qty = cls._safe_float(lot.get("maxOrderQty"), 0.0)
+        if max_qty <= 0:
+            max_qty = cls._safe_float(lot.get("maxMktOrderQty"), 0.0)
 
         return InstrumentRules(
             symbol=symbol,
@@ -157,6 +175,7 @@ class BybitAdapter:
             qty_step=qty_step,
             min_qty=min_qty,
             min_notional=min_notional,
+            max_qty=max_qty,
         )
 
     @staticmethod
@@ -246,19 +265,68 @@ class BybitAdapter:
             "/v5/account/wallet-balance",
             params={"accountType": "UNIFIED", "coin": "USDT"},
         )
+        snapshot = self._extract_account_snapshot(payload)
+        if (
+            self.config.demo
+            and not self.config.dry_run
+            and snapshot.equity_usdt <= 0
+            and not self.private_auth_invalid
+            and not self._demo_auto_fund_attempted
+        ):
+            self._demo_auto_fund_attempted = True
+            try:
+                fund_payload = self.client.apply_demo_funds(usdt_amount="100000")
+                ret_code = int(fund_payload.get("retCode", 1)) if isinstance(fund_payload, dict) else 1
+                if ret_code == 0:
+                    logger.info("demo_auto_fund ok amount=100000USDT")
+                    time.sleep(0.8)
+                    payload = self.client.request_private(
+                        "GET",
+                        "/v5/account/wallet-balance",
+                        params={"accountType": "UNIFIED", "coin": "USDT"},
+                    )
+                    snapshot = self._extract_account_snapshot(payload)
+                else:
+                    logger.warning(
+                        "demo_auto_fund failed retCode=%s retMsg=%s",
+                        fund_payload.get("retCode") if isinstance(fund_payload, dict) else None,
+                        fund_payload.get("retMsg") if isinstance(fund_payload, dict) else None,
+                    )
+            except Exception as exc:
+                logger.warning("demo_auto_fund exception: %s", exc)
+        return snapshot
+
+    def _extract_account_snapshot(self, payload: dict[str, Any] | None) -> AccountSnapshot:
         result = payload.get("result", {}) if isinstance(payload, dict) else {}
         items = result.get("list", []) if isinstance(result, dict) else []
         if not items:
             return AccountSnapshot(equity_usdt=0.0, available_balance_usdt=0.0)
 
-        coins = items[0].get("coin", []) if isinstance(items[0], dict) else []
+        primary = items[0] if isinstance(items[0], dict) else {}
+        coins = primary.get("coin", []) if isinstance(primary, dict) else []
+
+        usdt_equity = 0.0
+        usdt_available = 0.0
         for coin in coins:
             if str(coin.get("coin", "")).upper() != "USDT":
                 continue
-            equity = self._safe_float(coin.get("equity"), 0.0)
-            available = self._safe_float(coin.get("availableToWithdraw"), equity)
-            return AccountSnapshot(equity_usdt=equity, available_balance_usdt=available)
-        return AccountSnapshot(equity_usdt=0.0, available_balance_usdt=0.0)
+            usdt_equity = self._safe_float(coin.get("equity"), 0.0)
+            usdt_available = self._safe_float(coin.get("availableToWithdraw"), 0.0)
+            if usdt_available <= 0:
+                usdt_available = self._safe_float(coin.get("walletBalance"), usdt_equity)
+            break
+
+        total_equity = self._safe_float(primary.get("totalEquity"), 0.0)
+        total_available = self._safe_float(primary.get("totalAvailableBalance"), 0.0)
+        if total_available <= 0:
+            total_available = self._safe_float(primary.get("totalWalletBalance"), total_equity)
+
+        equity = total_equity if total_equity > 0 else usdt_equity
+        available = total_available if total_available > 0 else usdt_available
+        if available <= 0:
+            available = equity
+
+        return AccountSnapshot(equity_usdt=max(equity, 0.0), available_balance_usdt=max(available, 0.0))
 
     def get_positions(self, symbol: str | None = None) -> list[PositionSnapshot]:
         rows = self.client.get_open_positions(symbol=self.normalize_symbol(symbol) if symbol else None)

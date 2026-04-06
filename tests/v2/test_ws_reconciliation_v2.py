@@ -277,6 +277,27 @@ class WebsocketReconciliationV2Tests(unittest.TestCase):
         self.sync.handle_event(NormalizedExchangeEvent(event_type=ExchangeEventType.RECONNECTING, ts=time.time()))
         self.assertTrue(self.sync.health().fallback_polling)
 
+    def test_stale_ws_triggers_forced_reconnect(self):
+        calls: list[str] = []
+
+        def _force_reconnect():
+            calls.append("reconnect")
+
+        self.adapter.force_ws_reconnect = _force_reconnect
+        self.sync.handle_event(NormalizedExchangeEvent(event_type=ExchangeEventType.CONNECTED, ts=time.time() - 10))
+        self.sync.handle_event(
+            NormalizedExchangeEvent(
+                event_type=ExchangeEventType.ACCOUNT,
+                payload={"account": AccountSnapshot(equity_usdt=1000.0, available_balance_usdt=1000.0)},
+                ts=time.time() - 10,
+            )
+        )
+
+        reason = self.sync.maybe_recover_ws(self.adapter)
+
+        self.assertEqual(reason, "stale")
+        self.assertEqual(calls, ["reconnect"])
+
 
 if __name__ == "__main__":
     unittest.main()

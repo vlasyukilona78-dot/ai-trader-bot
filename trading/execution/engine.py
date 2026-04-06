@@ -48,6 +48,7 @@ class ExecutionEngine:
         stop_attach_grace_sec: int = 8,
         stale_open_order_sec: int = 120,
         max_exchange_retries: int = 2,
+        external_recovery_grace_sec: int = 45,
         persistence: RuntimeStore | None = None,
     ):
         self.adapter = adapter
@@ -58,9 +59,11 @@ class ExecutionEngine:
         self.stop_attach_grace_sec = max(1, int(stop_attach_grace_sec))
         self.stale_open_order_sec = max(10, int(stale_open_order_sec))
         self.max_exchange_retries = max(1, int(max_exchange_retries))
+        self.external_recovery_grace_sec = max(10, int(external_recovery_grace_sec))
         self.persistence = persistence
         self._lock = threading.Lock()
         self._idempotency = IdempotencyStore(ttl_sec=idempotency_ttl_sec)
+        self._external_recovery_until: dict[str, float] = {}
         if self.persistence is not None:
             self._idempotency.restore(self.persistence.load_live_idempotency_keys())
 
@@ -84,6 +87,137 @@ class ExecutionEngine:
         except Exception:
             return None
         return first_effective_position_for_symbol(positions, symbol)
+
+    def _external_recovery_active(self, symbol: str) -> bool:
+        deadline = float(self._external_recovery_until.get(self._norm_symbol(symbol), 0.0))
+        return deadline > time.time()
+
+    def _remember_external_recovery(self, symbol: str):
+        self._external_recovery_until[self._norm_symbol(symbol)] = time.time() + self.external_recovery_grace_sec
+
+    def _clear_external_recovery(self, symbol: str):
+        self._external_recovery_until.pop(self._norm_symbol(symbol), None)
+
+    def _can_auto_remediate_external(self) -> bool:
+        config = getattr(self.adapter, "config", None)
+        if config is None:
+            return False
+        if bool(getattr(config, "dry_run", True)):
+            return False
+        return bool(getattr(config, "demo", False) or getattr(config, "testnet", False))
+
+    def _cancel_unexpected_orders(self, symbol: str, orders: list[OpenOrderSnapshot]) -> bool:
+        ok = True
+        for order in orders:
+            cancelled = self.adapter.cancel_order(
+                symbol=symbol,
+                order_id=order.order_id,
+                order_link_id=order.order_link_id,
+            )
+            ok = ok and bool(cancelled)
+        return ok
+
+    def _auto_close_external_position(self, symbol: str, position: PositionSnapshot) -> OrderResult:
+        close_side = OrderSide.SELL if position.side == PositionSide.LONG else OrderSide.BUY
+        return self._place_order_with_retry(
+            OrderIntent(
+                symbol=symbol,
+                side=close_side,
+                qty=float(position.qty),
+                reduce_only=True,
+                position_idx=int(position.position_idx),
+                close_on_trigger=True,
+            )
+        )
+
+    def _collect_external_intervention_issues(
+        self,
+        *,
+        symbol: str,
+        snapshot: ExchangeSnapshot,
+        rec,
+        position: PositionSnapshot | None,
+        open_orders: list[OpenOrderSnapshot],
+        inflight: list[Any],
+    ) -> list[str]:
+        suppress_orphan_checks = self._external_recovery_active(symbol)
+        issues: list[str] = []
+
+        if position is not None and rec.state == TradeState.FLAT and not inflight and not suppress_orphan_checks:
+            issues.append("external_position_without_intent")
+
+        if open_orders and rec.state == TradeState.FLAT and not inflight and not suppress_orphan_checks:
+            issues.append("external_open_order_without_intent")
+
+        if open_orders and not inflight and not suppress_orphan_checks:
+            unexpected_non_reduce = [o for o in open_orders if not o.reduce_only]
+            if unexpected_non_reduce:
+                issues.append("external_non_reduce_open_order")
+
+        if rec.state in (TradeState.PENDING_ENTRY_LONG, TradeState.PENDING_ENTRY_SHORT, TradeState.PENDING_EXIT_LONG, TradeState.PENDING_EXIT_SHORT):
+            if position is None and not open_orders and not inflight:
+                issues.append("stale_pending_without_exchange_truth")
+
+        if position is not None and rec.state in (TradeState.LONG, TradeState.SHORT):
+            expected_side = PositionSide.LONG if rec.state == TradeState.LONG else PositionSide.SHORT
+            if position.side != expected_side:
+                issues.append("state_exchange_side_mismatch")
+
+        if self.stop_loss_required and position is not None and not inflight and not suppress_orphan_checks:
+            if position.stop_loss is None or position.stop_loss <= 0:
+                issues.append("unprotected_position_without_intent")
+
+        return issues
+
+    def _attempt_auto_remediate_external(
+        self,
+        *,
+        symbol: str,
+        rec,
+        position: PositionSnapshot | None,
+        open_orders: list[OpenOrderSnapshot],
+        inflight: list[Any],
+        issues: list[str],
+    ) -> bool:
+        if not issues or not self._can_auto_remediate_external() or inflight:
+            return False
+
+        norm_symbol = self._norm_symbol(symbol)
+        remediated = False
+
+        if any(
+            issue in issues
+            for issue in ("external_open_order_without_intent", "external_non_reduce_open_order")
+        ) and open_orders:
+            if self._cancel_unexpected_orders(norm_symbol, open_orders):
+                remediated = True
+
+        if any(
+            issue in issues
+            for issue in ("external_position_without_intent", "unprotected_position_without_intent")
+        ) and position is not None:
+            close_result = self._auto_close_external_position(norm_symbol, position)
+            if close_result.success:
+                remediated = True
+                fully_closed = (
+                    float(close_result.remaining_qty or 0.0) <= 1e-9
+                    and float(close_result.filled_qty or 0.0) + 1e-9 >= float(position.qty)
+                )
+                if fully_closed:
+                    self._clear_external_recovery(norm_symbol)
+                    self.state_machine.transition(norm_symbol, TradeState.FLAT, "auto_recovered_external_position")
+                else:
+                    self._remember_external_recovery(norm_symbol)
+                    self.state_machine.transition(norm_symbol, TradeState.RECOVERING, "auto_recovering_external_position")
+                return True
+
+        if remediated:
+            self._remember_external_recovery(norm_symbol)
+            target_state = TradeState.FLAT if position is None else TradeState.RECOVERING
+            self.state_machine.transition(norm_symbol, target_state, "auto_recovered_external_orders")
+            return True
+
+        return False
 
     @staticmethod
     def _is_position_protected(position: PositionSnapshot | None, expected_stop: float) -> bool:
@@ -226,37 +360,32 @@ class ExecutionEngine:
         open_orders = [o for o in snapshot.open_orders if self._norm_symbol(o.symbol) == norm_symbol]
         inflight = self._symbol_inflight_entries(norm_symbol)
 
-        issues: list[str] = []
+        issues = self._collect_external_intervention_issues(
+            symbol=norm_symbol,
+            snapshot=snapshot,
+            rec=rec,
+            position=position,
+            open_orders=open_orders,
+            inflight=inflight,
+        )
 
-        if position is not None and rec.state == TradeState.FLAT and not inflight:
-            issues.append("external_position_without_intent")
-
-        if open_orders and rec.state == TradeState.FLAT and not inflight:
-            issues.append("external_open_order_without_intent")
-
-        if open_orders and not inflight:
-            unexpected_non_reduce = [o for o in open_orders if not o.reduce_only]
-            if unexpected_non_reduce:
-                issues.append("external_non_reduce_open_order")
-
-        if rec.state in (TradeState.PENDING_ENTRY_LONG, TradeState.PENDING_ENTRY_SHORT, TradeState.PENDING_EXIT_LONG, TradeState.PENDING_EXIT_SHORT):
-            if position is None and not open_orders and not inflight:
-                issues.append("stale_pending_without_exchange_truth")
-
-        if position is not None and rec.state in (TradeState.LONG, TradeState.SHORT):
-            expected_side = PositionSide.LONG if rec.state == TradeState.LONG else PositionSide.SHORT
-            if position.side != expected_side:
-                issues.append("state_exchange_side_mismatch")
-
-        if self.stop_loss_required and position is not None and not inflight:
-            if position.stop_loss is None or position.stop_loss <= 0:
-                issues.append("unprotected_position_without_intent")
+        if self._attempt_auto_remediate_external(
+            symbol=norm_symbol,
+            rec=rec,
+            position=position,
+            open_orders=open_orders,
+            inflight=inflight,
+            issues=issues,
+        ):
+            return []
 
         if issues:
             if "unprotected_position_without_intent" in issues:
                 self.state_machine.transition(norm_symbol, TradeState.HALTED, "external_unprotected_position")
             else:
                 self.state_machine.transition(norm_symbol, TradeState.RECOVERING, "external_intervention_detected")
+        else:
+            self._clear_external_recovery(norm_symbol)
 
         return issues
 

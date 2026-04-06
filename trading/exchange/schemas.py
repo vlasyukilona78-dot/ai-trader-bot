@@ -23,6 +23,7 @@ class InstrumentRules:
     qty_step: float = 0.001
     min_qty: float = 0.001
     min_notional: float = 5.0
+    max_qty: float = 0.0
 
 
 @dataclass

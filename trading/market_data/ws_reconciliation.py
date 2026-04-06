@@ -32,10 +32,12 @@ class ExchangeSyncService:
         *,
         poll_interval_sec: int = 10,
         max_event_staleness_sec: int = 20,
+        forced_reconnect_cooldown_sec: int = 20,
     ):
         self.reconciler = reconciler
         self.poll_interval_sec = max(1, int(poll_interval_sec))
         self.max_event_staleness_sec = max(1, int(max_event_staleness_sec))
+        self.forced_reconnect_cooldown_sec = max(5, int(forced_reconnect_cooldown_sec))
 
         self._ws_connected = False
         self._last_event_ts = 0.0
@@ -46,6 +48,7 @@ class ExchangeSyncService:
 
         self._snapshot_required_global = False
         self._snapshot_required_symbols: set[str] = set()
+        self._last_forced_reconnect_ts = 0.0
 
         self._polled_snapshots: dict[str, ExchangeSnapshot] = {}
         self._last_poll_ts: dict[str, float] = {}
@@ -210,6 +213,27 @@ class ExchangeSyncService:
             fallback_polling=(not self._ws_is_fresh()) or snapshot_required,
             snapshot_required=snapshot_required,
         )
+
+    def maybe_recover_ws(self, adapter) -> str | None:
+        reconnect = getattr(adapter, "force_ws_reconnect", None)
+        if not callable(reconnect):
+            return None
+
+        health = self.health()
+        now = time.time()
+        disconnected = (not health.ws_connected) and self._last_event_ts > 0
+        if not health.ws_stale and not disconnected:
+            return None
+        if (now - self._last_forced_reconnect_ts) < self.forced_reconnect_cooldown_sec:
+            return None
+
+        reconnect()
+        self._last_forced_reconnect_ts = now
+        self._require_snapshot()
+        self._ws_connected = False
+        if health.ws_stale:
+            return "stale"
+        return "disconnected"
 
     def snapshot(self, symbol: str) -> ExchangeSnapshot:
         norm_symbol = self._norm_symbol(symbol)

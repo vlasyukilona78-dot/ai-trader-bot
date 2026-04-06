@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from core.market_regime import detect_market_regime
 from core.signal_generator import SignalConfig, SignalContext, SignalGenerator
 from core.volume_profile import compute_volume_profile
@@ -13,14 +15,30 @@ class LayeredPumpStrategy(StrategyInterface):
     """Adapter around migrated layered strategy that returns intents only."""
 
     def __init__(self, config: SignalConfig | None = None, audit_collector: StrategyAuditCollector | None = None):
+        env_volume_threshold = max(1.0, float(os.getenv("VOLUME_THRESHOLD", "2.0")))
         runtime_config = config or SignalConfig(
             regime_volatility_threshold_override=0.0006,
+            regime_volatility_dynamic_floor_mult=0.60,
+            regime_volatility_baseline_lookback=96,
             regime_soft_pass_enabled=True,
             layer1_pump_lookback_bars=12,
+            layer1_clean_pump_lookback_bars=48,
+            layer1_clean_pump_min_pct=0.0435,
+            early_watch_clean_pump_min_pct=0.0295,
+            early_watch_volume_spike_min=max(0.06, env_volume_threshold * 0.06),
+            early_watch_rsi_min=45.5,
+            early_watch_quality_min=2.20,
             layer1_soft_pass_enabled=True,
-            layer1_rsi_soft=50.0,
-            layer1_volume_spike_soft=1.4,
-            layer1_upper_band_proximity_pct=0.001,
+            rsi_high=63.5,
+            volume_spike_threshold=max(1.45, env_volume_threshold * 0.75),
+            layer1_rsi_soft=48.5,
+            layer1_volume_spike_soft=max(0.85, env_volume_threshold * 0.45),
+            layer1_upper_band_proximity_pct=0.0018,
+            weakness_lookback=3,
+            entry_tolerance_pct=0.0085,
+            msb_lookback=14,
+            msb_recent_bars=11,
+            msb_break_buffer_pct=0.0002,
         )
         self._generator = SignalGenerator(runtime_config)
         self._audit = audit_collector or StrategyAuditCollector()
@@ -192,6 +210,9 @@ class LayeredPumpStrategy(StrategyInterface):
             "above_keltner_upper": 0.0,
             "upper_band_breakout": 0.0,
             "pump_context_strength": 0.0,
+            "clean_pump_pct": 0.0,
+            "clean_pump_min_pct_used": 0.0,
+            "clean_pump_ok": 0.0,
             "failed_reason": "",
             "missing_conditions": "",
             "soft_pass_candidate": 0.0,
@@ -213,6 +234,9 @@ class LayeredPumpStrategy(StrategyInterface):
             "above_keltner_upper",
             "upper_band_breakout",
             "pump_context_strength",
+            "clean_pump_pct",
+            "clean_pump_min_pct_used",
+            "clean_pump_ok",
             "soft_pass_candidate",
             "soft_pass_used",
             "pump_bar_offset",
@@ -238,6 +262,7 @@ class LayeredPumpStrategy(StrategyInterface):
                 "upper_band_breakout",
                 "above_bollinger_upper",
                 "above_keltner_upper",
+                "clean_pump_ok",
             ):
                 state = self._regime_condition_state(raw_subconditions.get(key))
                 if state is not None:
@@ -249,6 +274,7 @@ class LayeredPumpStrategy(StrategyInterface):
                 "upper_band_breakout",
                 "above_bollinger_upper",
                 "above_keltner_upper",
+                "clean_pump_ok",
             ):
                 state = self._regime_condition_state(layer1_details.get(key))
                 if state is not None:
@@ -350,6 +376,7 @@ class LayeredPumpStrategy(StrategyInterface):
                 "layer1_volume_spike_blocker_count": int(snapshot.get("layer1_volume_spike_blocker_count", 0)),
                 "layer1_above_bollinger_upper_blocker_count": int(snapshot.get("layer1_above_bollinger_upper_blocker_count", 0)),
                 "layer1_above_keltner_upper_blocker_count": int(snapshot.get("layer1_above_keltner_upper_blocker_count", 0)),
+                "layer1_clean_pump_pct_blocker_count": int(snapshot.get("layer1_clean_pump_pct_blocker_count", 0)),
                 "layer1_soft_pass_candidate_count": int(snapshot.get("layer1_soft_pass_candidate_count", 0)),
                 "layer1_soft_pass_used_count": int(snapshot.get("layer1_soft_pass_used_count", 0)),
                 "top_layer1_blocker": str(compact.get("top_layer1_blocker", "")),

@@ -1,0 +1,260 @@
+                        reply_markup=reply_markup,
+                    )
+                    attempted += a2
+                    sent += s2
+                _log_alert_delivery(
+                    logger,
+                    event="signal_alert_delivery",
+                    attempted=attempted,
+                    sent=sent,
+                    skip_reason="no_alerters_configured" if attempted == 0 else "",
+                )
+
+        except Exception as exc:
+            counters.inc("cycle_errors")
+            logger.exception("cycle_error symbol=%s err=%s", symbol, exc, extra={"event": "cycle_error"})
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Bybit Futures Bot V2")
+    parser.add_argument("--strategy", choices=["layered", "hold"], default="layered")
+    parser.add_argument("--loop", action="store_true", help="Run continuous loop")
+    return parser.parse_args()
+
+
+
+def main() -> int:
+    args = parse_args()
+    logger = setup_logging("INFO")
+    _load_dotenv_file()
+
+    try:
+        cfg = load_runtime_config()
+    except ConfigError as exc:
+        logger.error("startup_config_error=%s", exc, extra={"event": "config_error"})
+        return 2
+
+    try:
+        from trading.features.pipeline import FeaturePipeline
+        from trading.market_data.feed import MarketDataFeed
+        from trading.market_data.reconciliation import ExchangeReconciler
+        from trading.market_data.ws_reconciliation import ExchangeSyncService
+        from ai.online_demo_learning import TradeExecutionLearner
+        from ai.retrain_online import OnlineRetrainConfig, OnlineRetrainer
+        from core.settings import load_settings
+    except Exception as exc:
+        logger.error("startup_dependency_error=%s", exc, extra={"event": "dependency_error"})
+        return 2
+
+    adapter = BybitAdapter(cfg.adapter)
+    adapter.set_ws_symbols(cfg.symbols)
+
+    feed = MarketDataFeed(base_url="https://api.bybit.com")
+    reconciler = ExchangeReconciler(adapter)
+    sync = ExchangeSyncService(
+        reconciler,
+        poll_interval_sec=cfg.ws_poll_interval_sec,
+        max_event_staleness_sec=cfg.ws_event_staleness_sec,
+    )
+    runtime_store = RuntimeStore(cfg.runtime_db_path)
+
+    state_machine = StateMachine(persistence=runtime_store)
+    risk = RiskEngine(cfg.risk_limits, persistence=runtime_store)
+    execution = ExecutionEngine(
+        adapter=adapter,
+        state_machine=state_machine,
+        hedge_mode=cfg.adapter.hedge_mode,
+        stop_loss_required=cfg.risk_limits.require_stop_loss,
+        require_reconciliation=cfg.flags.reconciliation_required,
+        stop_attach_grace_sec=cfg.stop_attach_grace_sec,
+        stale_open_order_sec=cfg.stale_open_order_sec,
+        max_exchange_retries=cfg.max_exchange_retries,
+        persistence=runtime_store,
+    )
+    pipeline = FeaturePipeline()
+    strategy = _build_strategy(args.strategy)
+    counters = MetricsCounter()
+    alerters = _build_alerters(cfg)
+    app_settings = load_settings()
+    trade_learner = None
+    online_retrainer = None
+    learning_supported_mode = cfg.mode in ("demo", "testnet", "live")
+    if learning_supported_mode and app_settings.ml.online_retrain_enabled:
+        pending_default = f"data/runtime/{cfg.mode}_online_pending.json"
+        trade_learner = TradeExecutionLearner(
+            dataset_path=app_settings.ml.online_dataset_path,
+            pending_path=str(os.getenv("ML_ONLINE_PENDING_PATH", pending_default)),
+            timeframe_minutes=_timeframe_to_minutes(cfg.timeframe),
+        )
+        online_retrainer = OnlineRetrainer(
+            OnlineRetrainConfig(
+                dataset_path=app_settings.ml.online_dataset_path,
+                model_dir=app_settings.ml.model_dir,
+                retrain_interval_sec=app_settings.ml.online_retrain_interval_sec,
+                min_new_rows=app_settings.ml.online_retrain_min_rows,
+            )
+        )
+
+    startup_state = _startup_reconcile(
+        symbols=cfg.symbols,
+        sync=sync,
+        state_machine=state_machine,
+        execution=execution,
+    )
+    maintenance = runtime_store.maintenance()
+    inflight = runtime_store.load_open_inflight_intents()
+    logger.info(
+        "startup_safety mode=%s testnet=%s demo=%s dry_run=%s symbols=%d db=%s inflight=%d states=%s maintenance=%s live_cap=%s",
+        cfg.mode,
+        cfg.adapter.testnet,
+        cfg.adapter.demo,
+        cfg.adapter.dry_run,
+        len(cfg.symbols),
+        cfg.runtime_db_path,
+        len(inflight),
+        startup_state,
+        maintenance,
+        cfg.live_startup_max_notional_usdt,
+        extra={"event": "startup_safety"},
+    )
+    auth_key_source = "missing"
+    if (
+        os.getenv("BYBIT_DEMO_API_KEY")
+        or os.getenv("BYBIT_DEMO_KEY")
+        or os.getenv("DEMO_BYBIT_API_KEY")
+        or os.getenv("DEMO_API_KEY")
+        or os.getenv("DEMO_KEY")
+        or os.getenv("BYBIT_API_KEY_DEMO")
+        or os.getenv("API_KEY_DEMO")
+    ):
+        auth_key_source = "demo_specific"
+    elif os.getenv("BYBIT_TESTNET_API_KEY") or os.getenv("BYBIT_TESTNET_KEY") or os.getenv("TESTNET_BYBIT_API_KEY"):
+        auth_key_source = "testnet_specific"
+    elif os.getenv("BYBIT_MAINNET_API_KEY") or os.getenv("BYBIT_MAINNET_KEY") or os.getenv("MAINNET_BYBIT_API_KEY"):
+        auth_key_source = "mainnet_specific"
+    elif os.getenv("BYBIT_API_KEY") or os.getenv("BYBIT_KEY") or os.getenv("API_KEY"):
+        auth_key_source = "generic_for_demo" if cfg.mode == "demo" else "generic"
+    logger.info(
+        "trade_learning mode=%s enabled=%s learner_active=%s api_keys_present=%s key_source=%s dataset=%s",
+        cfg.mode,
+        bool(app_settings.ml.online_retrain_enabled),
+        bool(trade_learner is not None),
+        bool(cfg.adapter.api_key and cfg.adapter.api_secret),
+        auth_key_source,
+        app_settings.ml.online_dataset_path,
+        extra={"event": "trade_learning"},
+    )
+    if learning_supported_mode and trade_learner is not None and getattr(adapter, "private_auth_invalid", False):
+        logger.error(
+            "trade_learning_disabled reason=private_auth_invalid mode=%s detail=%s",
+            cfg.mode,
+            getattr(adapter, "private_auth_invalid_reason", ""),
+            extra={"event": "trade_learning_disabled"},
+        )
+        trade_learner = None
+        online_retrainer = None
+    if app_settings.ml.online_retrain_enabled and cfg.mode == "paper":
+        logger.warning(
+            "trade_learning_disabled reason=paper_mode requires=demo_or_testnet_or_live",
+            extra={"event": "trade_learning_disabled"},
+        )
+
+    startup_text = (
+        f"<b>СТАРТ БОТА</b>\n"
+        f"Режим: {cfg.mode}\n"
+        f"Demo: {'да' if cfg.adapter.demo else 'нет'}\n"
+        f"Testnet: {'да' if cfg.adapter.testnet else 'нет'}\n"
+        f"Dry run: {'да' if cfg.adapter.dry_run else 'нет'}\n"
+        f"Символов: {len(cfg.symbols)}"
+    )
+    attempted, sent = _send_alerts(alerters, startup_text)
+    _log_alert_delivery(
+        logger,
+        event="startup_alert_delivery",
+        attempted=attempted,
+        sent=sent,
+        skip_reason="no_alerters_configured" if attempted == 0 else "",
+    )
+
+    last_maintenance_ts = time.time()
+    state_alert_cache: dict[str, str] = {}
+    intervention_alert_cache: dict[str, str] = {}
+    early_signal_state: dict[str, dict[str, object]] = {}
+    early_signal_stats: dict[str, int] = {
+        "watch_sent": 0,
+        "setup_sent": 0,
+        "watch_to_setup_promoted": 0,
+        "entry_confirmed": 0,
+        "invalidated": 0,
+        "suppressed_by_cooldown": 0,
+    }
+    try:
+        while True:
+            run_cycle(
+                symbols=cfg.symbols,
+                adapter=adapter,
+                feed=feed,
+                sync=sync,
+                pipeline=pipeline,
+                strategy=strategy,
+                risk=risk,
+                execution=execution,
+                logger=logger,
+                counters=counters,
+                timeframe=cfg.timeframe,
+                candles_limit=cfg.candles_limit,
+                alerters=alerters,
+                state_alert_cache=state_alert_cache,
+                intervention_alert_cache=intervention_alert_cache,
+                early_signal_state=early_signal_state,
+                early_signal_stats=early_signal_stats,
+                mode=cfg.mode,
+                trade_learner=trade_learner,
+                online_retrainer=online_retrainer,
+            )
+
+            now = time.time()
+            if now - last_maintenance_ts >= cfg.maintenance_interval_sec:
+                runtime_store.maintenance()
+                last_maintenance_ts = now
+
+            health = sync.health()
+            strategy_audit_payload = _strategy_audit_log_payload(strategy)
+            logger.info(
+                "metrics=%s risk=%s sync=%s metadata=%s early_signal_stats=%s strategy_audit_compact=%s strategy_audit_regime_filter=%s strategy_audit_regime_diagnostics=%s strategy_audit_layer1=%s strategy_audit_layer1_diagnostics=%s strategy_audit_layer2=%s strategy_audit_layer2_diagnostics=%s strategy_audit_layer4=%s strategy_audit_source_quality=%s strategy_audit=%s",
+                counters.snapshot(),
+                risk.health_snapshot(),
+                {
+                    "ws_connected": health.ws_connected,
+                    "ws_stale": health.ws_stale,
+                    "fallback_polling": health.fallback_polling,
+                    "snapshot_required": health.snapshot_required,
+                },
+                adapter.metadata_health(),
+                dict(early_signal_stats),
+                strategy_audit_payload.get("strategy_audit_compact", {}),
+                strategy_audit_payload.get("strategy_audit_regime_filter", {}),
+                strategy_audit_payload.get("strategy_audit_regime_diagnostics", {}),
+                strategy_audit_payload.get("strategy_audit_layer1", {}),
+                strategy_audit_payload.get("strategy_audit_layer1_diagnostics", {}),
+                strategy_audit_payload.get("strategy_audit_layer2", {}),
+                strategy_audit_payload.get("strategy_audit_layer2_diagnostics", {}),
+                strategy_audit_payload.get("strategy_audit_layer4", {}),
+                strategy_audit_payload.get("strategy_audit_source_quality", {}),
+                strategy_audit_payload.get("strategy_audit", {}),
+                extra={"event": "health"},
+            )
+
+            if not args.loop:
+                break
+            time.sleep(max(1, cfg.scan_interval_sec))
+    finally:
+        feed.close()
+        adapter.close()
+        runtime_store.close()
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

@@ -17,8 +17,9 @@ class BybitHttpClient:
         api_secret: str,
         *,
         testnet: bool,
+        demo: bool = False,
         dry_run: bool,
-        recv_window: int = 5000,
+        recv_window: int = 20000,
         category: str = "linear",
     ):
         if _BybitClient is None:
@@ -27,6 +28,7 @@ class BybitHttpClient:
             api_key=api_key,
             api_secret=api_secret,
             sandbox=bool(testnet),
+            demo=bool(demo),
             dry_run=bool(dry_run),
             recv_window=recv_window,
             category=category,
@@ -34,6 +36,14 @@ class BybitHttpClient:
 
     def close(self):
         self._client.close()
+
+    @property
+    def private_auth_invalid(self) -> bool:
+        return bool(getattr(self._client, "private_auth_invalid", False))
+
+    @property
+    def private_auth_invalid_reason(self) -> str:
+        return str(getattr(self._client, "private_auth_invalid_reason", "") or "")
 
     def request_public(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         return self._client._request("GET", path, params=params, private=False)
@@ -65,3 +75,6 @@ class BybitHttpClient:
 
     def get_account_info(self) -> dict[str, Any]:
         return self._client.get_account_info()
+
+    def apply_demo_funds(self, *, usdt_amount: str = "100000") -> dict[str, Any]:
+        return self._client.apply_demo_funds(usdt_amount=usdt_amount)

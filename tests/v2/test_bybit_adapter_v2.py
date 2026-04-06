@@ -42,6 +42,75 @@ class BybitAdapterV2Tests(unittest.TestCase):
         with self.assertRaises(InstrumentMetadataError):
             BybitAdapter._validate_rules(InstrumentRules(symbol="BTCUSDT", tick_size=0.0, qty_step=0.01, min_qty=0.01, min_notional=5.0))
 
+    def test_extract_account_snapshot_prefers_positive_totals(self):
+        adapter = object.__new__(BybitAdapter)
+        payload = {
+            "result": {
+                "list": [
+                    {
+                        "totalEquity": "125.5",
+                        "totalAvailableBalance": "111.25",
+                        "coin": [
+                            {
+                                "coin": "USDT",
+                                "equity": "0",
+                                "availableToWithdraw": "",
+                                "walletBalance": "0",
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+        snapshot = BybitAdapter._extract_account_snapshot(adapter, payload)
+        self.assertAlmostEqual(snapshot.equity_usdt, 125.5)
+        self.assertAlmostEqual(snapshot.available_balance_usdt, 111.25)
+
+    def test_get_account_demo_auto_funds_and_retries_wallet_balance(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+                self.private_auth_invalid = False
+                self.private_auth_invalid_reason = ""
+
+            def request_private(self, method, path, params=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return {
+                        "result": {
+                            "list": [
+                                {
+                                    "totalEquity": "0",
+                                    "totalAvailableBalance": "0",
+                                    "coin": [{"coin": "USDT", "equity": "0", "walletBalance": "0"}],
+                                }
+                            ]
+                        }
+                    }
+                return {
+                    "result": {
+                        "list": [
+                            {
+                                "totalEquity": "100000",
+                                "totalAvailableBalance": "99950",
+                                "coin": [{"coin": "USDT", "equity": "100000", "walletBalance": "100000"}],
+                            }
+                        ]
+                    }
+                }
+
+            def apply_demo_funds(self, *, usdt_amount="100000"):
+                return {"retCode": 0, "retMsg": "OK"}
+
+        adapter = object.__new__(BybitAdapter)
+        adapter.config = type("Cfg", (), {"dry_run": False, "demo": True})()
+        adapter.client = FakeClient()
+        adapter._demo_auto_fund_attempted = False
+        snapshot = BybitAdapter.get_account(adapter)
+        self.assertGreater(snapshot.equity_usdt, 0.0)
+        self.assertGreater(snapshot.available_balance_usdt, 0.0)
+        self.assertTrue(adapter._demo_auto_fund_attempted)
+
 
 if __name__ == "__main__":
     unittest.main()

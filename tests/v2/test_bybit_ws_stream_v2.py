@@ -10,6 +10,13 @@ class BybitWebSocketStreamV2Tests(unittest.TestCase):
     def setUp(self):
         self.stream = BybitWebSocketStream(BybitWebSocketConfig(testnet=True, symbols=["BTCUSDT"]))
 
+    def test_demo_private_endpoint_uses_demo_host_and_mainnet_public(self):
+        stream = BybitWebSocketStream(
+            BybitWebSocketConfig(testnet=False, demo=True, symbols=["BTCUSDT"])
+        )
+        self.assertEqual(stream._public_endpoint(), "wss://stream.bybit.com/v5/public/linear")
+        self.assertEqual(stream._private_endpoint(), "wss://stream-demo.bybit.com/v5/private")
+
     def test_normalize_public_ticker(self):
         payload = {
             "topic": "tickers.BTCUSDT",

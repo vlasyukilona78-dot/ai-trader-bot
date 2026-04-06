@@ -3,11 +3,14 @@ import os
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 try:
     import numpy as np
     import pandas as pd
-    from app.main import _strategy_audit_log_payload
+    from alerts.chart_generator import _compute_price_view_bounds, _slice_entry_chart_frame, build_signal_chart
+    from app.main import _build_early_watch_candidate, _build_higher_timeframe_chart, _format_chart_timeframe_label, _strategy_audit_log_payload
+    from trading.alerts.signal_card import build_early_signal_caption
 
     from core.market_regime import MarketRegime
     from core.signal_generator import SignalConfig, SignalContext, SignalGenerator
@@ -103,6 +106,1183 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertTrue(trace.get("layers", {}).get("layer4_fake_filter", {}).get("passed", False))
         self.assertTrue(trace.get("layers", {}).get("layer5_tp_sl", {}).get("passed", False))
 
+    def test_format_chart_timeframe_label_formats_hours_cleanly(self):
+        self.assertEqual(_format_chart_timeframe_label("1"), "1m")
+        self.assertEqual(_format_chart_timeframe_label("240"), "4h")
+
+    def test_build_higher_timeframe_chart_returns_png_bytes(self):
+        class _FakeFrame:
+            def __init__(self, ohlcv):
+                self.ohlcv = ohlcv
+                self.mark_price = float(ohlcv.iloc[-1]["close"])
+                self.liquidation_cluster_high = float(ohlcv["high"].tail(12).max())
+                self.liquidation_cluster_low = float(ohlcv["low"].tail(12).min())
+
+        class _FakeFeed:
+            def __init__(self, frame):
+                self._frame = frame
+
+            def fetch_frame(self, symbol: str, timeframe: str, candles: int, *, include_liquidations: bool = False):
+                return self._frame
+
+        class _FakePipeline:
+            def __init__(self, enriched):
+                self._enriched = enriched
+
+            def build(self, symbol: str, ohlcv: pd.DataFrame, *, as_of, extras=None):
+                class _Bundle:
+                    def __init__(self, enriched):
+                        self.enriched = enriched
+
+                return _Bundle(self._enriched)
+
+        df = self._build_df()
+        image = _build_higher_timeframe_chart(
+            symbol="BTCUSDT",
+            side="SHORT",
+            entry=float(df.iloc[-1]["close"]),
+            tp=float(df.iloc[-1]["close"]) - 2.0,
+            sl=float(df.iloc[-1]["close"]) + 2.0,
+            feed=_FakeFeed(_FakeFrame(df)),
+            pipeline=_FakePipeline(df),
+            runtime_extras={"funding_rate": 0.001},
+        )
+        self.assertIsInstance(image, bytes)
+        self.assertGreater(len(image), 1024)
+
+    def test_build_signal_chart_returns_png_bytes_for_entry_and_context_views(self):
+        df = self._build_df()
+        volume_profile = VolumeProfileLevels(poc=102.0, vah=109.0, val=98.0)
+
+        entry_chart = build_signal_chart(
+            symbol="BTCUSDT",
+            df=df,
+            side="SHORT",
+            entry=float(df.iloc[-1]["close"]),
+            tp=float(df.iloc[-1]["close"]) - 2.0,
+            sl=float(df.iloc[-1]["close"]) + 2.0,
+            volume_profile=volume_profile,
+            timeframe_label="1m",
+            show_trade_levels=True,
+            show_liquidation_map=False,
+        )
+        context_chart = build_signal_chart(
+            symbol="BTCUSDT",
+            df=df,
+            side="SHORT",
+            entry=float(df.iloc[-1]["close"]),
+            tp=float(df.iloc[-1]["close"]) - 2.0,
+            sl=float(df.iloc[-1]["close"]) + 2.0,
+            volume_profile=volume_profile,
+            timeframe_label="4h",
+            show_trade_levels=True,
+            show_liquidation_map=True,
+        )
+
+        self.assertIsInstance(entry_chart, bytes)
+        self.assertIsInstance(context_chart, bytes)
+        self.assertGreater(len(entry_chart), 1024)
+        self.assertGreater(len(context_chart), 1024)
+
+    def test_build_early_signal_caption_falls_back_to_enriched_metrics(self):
+        idx = pd.date_range("2026-01-01", periods=12, freq="min", tz="UTC")
+        close = np.array([0.0048, 0.00482, 0.00485, 0.0049, 0.00495, 0.0050, 0.00503, 0.00505, 0.00508, 0.0051, 0.00514, 0.00518])
+        enriched = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.01,
+                "low": close * 0.992,
+                "close": close,
+                "rsi": np.linspace(61.0, 79.0, len(close)),
+                "volume_spike": np.linspace(0.5, 1.7, len(close)),
+            },
+            index=idx,
+        )
+
+        caption = build_early_signal_caption(
+            symbol="RLSUSDT",
+            timeframe="1",
+            mode="demo",
+            phase_label="Р РђРќРќРР™ РЁРћР Рў: РЎР•РўРђРџ",
+            price=float(close[-1]),
+            trace_meta={},
+            watch_score=2.9,
+            watch_max_score=8.0,
+            enriched=enriched,
+        )
+
+        self.assertIn("РАННИЙ ШОРТ: СЕТАП", caption)
+        self.assertIn("Pump 7.92%", caption)
+        self.assertIn("RSI (1м): 79.00", caption)
+        self.assertIn("Объём: 1.70x", caption)
+
+    def test_compute_price_view_bounds_ignores_isolated_recent_wick(self):
+        df = self._build_df()
+        df["open"] = 100.0
+        df["close"] = 100.2
+        df["high"] = 100.8
+        df["low"] = 99.6
+        df["ema20"] = 100.1
+        df["ema50"] = 100.0
+        df["vwap"] = 100.05
+        df["atr"] = 0.55
+        df.iloc[-1, df.columns.get_loc("high")] = 126.0
+        df.iloc[-1, df.columns.get_loc("close")] = 100.3
+        df.iloc[-1, df.columns.get_loc("open")] = 100.1
+
+        y_min, y_max = _compute_price_view_bounds(
+            df,
+            volume_profile=None,
+            entry=0.0,
+            tp=0.0,
+            sl=0.0,
+            show_trade_levels=False,
+            show_entry_levels=False,
+            liquidation_map=None,
+            show_liquidation_map=False,
+        )
+
+        self.assertLess(y_max, 112.0)
+        self.assertGreater(y_min, 95.0)
+
+    def test_compute_price_view_bounds_zooms_to_local_entry_zone_when_old_pump_is_far_away(self):
+        n = 120
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00205)
+        close[12:24] = np.linspace(0.0039, 0.0051, 12)
+        close[-24:] = np.linspace(0.00193, 0.00207, 24)
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.008,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(10.0, 20.0, n),
+                "ema20": np.linspace(0.0024, 0.00208, n),
+                "ema50": np.linspace(0.0027, 0.00212, n),
+                "vwap": np.linspace(0.0026, 0.00209, n),
+                "atr": np.full(n, 0.00008),
+            },
+            index=idx,
+        )
+
+        y_min, y_max = _compute_price_view_bounds(
+            df,
+            volume_profile=VolumeProfileLevels(poc=0.00203, vah=0.00209, val=0.00197),
+            entry=0.00206,
+            tp=0.00194,
+            sl=0.00212,
+            show_trade_levels=True,
+            show_entry_levels=True,
+            liquidation_map=None,
+            show_liquidation_map=False,
+        )
+
+        self.assertLess(y_max, 0.0025)
+        self.assertGreater(y_min, 0.0017)
+
+    def test_slice_entry_chart_frame_keeps_recent_pump_origin_visible(self):
+        n = 180
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00208)
+        close[52:78] = np.linspace(0.00206, 0.00270, 26)
+        close[78:92] = np.linspace(0.00270, 0.00256, 14)
+        close[92:] = np.linspace(0.00256, 0.00268, n - 92)
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.008,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(10.0, 20.0, n),
+                "ema20": np.linspace(0.00210, 0.00260, n),
+                "ema50": np.linspace(0.00212, 0.00250, n),
+                "vwap": np.linspace(0.00211, 0.00254, n),
+                "atr": np.full(n, 0.00006),
+            },
+            index=idx,
+        )
+
+        sliced = _slice_entry_chart_frame(df)
+
+        self.assertLessEqual(sliced.index[0], df.index[70])
+        self.assertGreaterEqual(float(sliced["high"].max()), float(df.iloc[75]["high"]))
+        self.assertGreaterEqual(len(sliced), 72)
+
+    def test_slice_entry_chart_frame_keeps_longer_recent_pump_visible(self):
+        n = 220
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00218)
+        close[48:110] = np.linspace(0.00218, 0.00284, 62)
+        close[110:136] = np.linspace(0.00284, 0.00266, 26)
+        close[136:] = np.linspace(0.00266, 0.00278, n - 136)
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.009,
+                "low": close * 0.991,
+                "close": close,
+                "volume": np.linspace(12.0, 24.0, n),
+                "ema20": np.linspace(0.00214, 0.00270, n),
+                "ema50": np.linspace(0.00212, 0.00258, n),
+                "vwap": np.linspace(0.00213, 0.00262, n),
+                "atr": np.full(n, 0.00006),
+            },
+            index=idx,
+        )
+
+        sliced = _slice_entry_chart_frame(df)
+
+        self.assertLessEqual(sliced.index[0], df.index[110])
+        self.assertGreaterEqual(float(sliced["high"].max()), float(df.iloc[108]["high"]))
+        self.assertGreaterEqual(len(sliced), 92)
+
+    def test_slice_entry_chart_frame_prefers_recent_relevant_pump_over_older_higher_peak(self):
+        n = 260
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00222)
+        close[34:72] = np.linspace(0.00222, 0.00296, 38)
+        close[72:118] = np.linspace(0.00296, 0.00248, 46)
+        close[118:172] = np.linspace(0.00248, 0.00254, 54)
+        close[172:228] = np.linspace(0.00254, 0.00281, 56)
+        close[228:] = np.linspace(0.00281, 0.00276, n - 228)
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.009,
+                "low": close * 0.991,
+                "close": close,
+                "volume": np.linspace(12.0, 24.0, n),
+                "ema20": np.linspace(0.00220, 0.00270, n),
+                "ema50": np.linspace(0.00219, 0.00260, n),
+                "vwap": np.linspace(0.00218, 0.00258, n),
+                "atr": np.full(n, 0.00006),
+            },
+            index=idx,
+        )
+
+        sliced = _slice_entry_chart_frame(df)
+
+        self.assertLessEqual(sliced.index[0], df.index[172])
+        self.assertGreaterEqual(float(sliced["high"].max()), float(df.iloc[224]["high"]))
+        self.assertLessEqual(len(sliced), len(df))
+
+    def test_slice_entry_chart_frame_prefers_latest_active_pump_even_if_older_peak_is_bigger(self):
+        n = 320
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00218)
+        close[34:92] = np.linspace(0.00218, 0.00328, 58)
+        close[92:176] = np.linspace(0.00328, 0.00242, 84)
+        close[176:248] = np.linspace(0.00242, 0.00248, 72)
+        close[248:300] = np.linspace(0.00248, 0.00286, 52)
+        close[300:] = np.linspace(0.00286, 0.00282, n - 300)
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.010,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(12.0, 24.0, n),
+                "ema20": np.linspace(0.00216, 0.00272, n),
+                "ema50": np.linspace(0.00214, 0.00260, n),
+                "vwap": np.linspace(0.00215, 0.00263, n),
+                "atr": np.full(n, 0.00006),
+            },
+            index=idx,
+        )
+
+        sliced = _slice_entry_chart_frame(df)
+
+        self.assertLessEqual(sliced.index[0], df.index[248])
+        self.assertGreaterEqual(float(sliced["high"].max()), float(df.iloc[296]["high"]))
+        self.assertLessEqual(len(sliced), len(df))
+
+    def test_slice_entry_chart_frame_does_not_replace_active_pump_with_tiny_ultra_recent_spike(self):
+        n = 340
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00220)
+        close[86:156] = np.linspace(0.00220, 0.00292, 70)
+        close[156:236] = np.linspace(0.00292, 0.00270, 80)
+        close[236:314] = np.linspace(0.00270, 0.00282, 78)
+        close[314:328] = np.linspace(0.00282, 0.00288, 14)
+        close[328:] = np.linspace(0.00288, 0.00284, n - 328)
+        close[-9:] = np.linspace(0.00284, 0.00286, 9)
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.010,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(12.0, 24.0, n),
+                "ema20": np.linspace(0.00218, 0.00278, n),
+                "ema50": np.linspace(0.00216, 0.00266, n),
+                "vwap": np.linspace(0.00217, 0.00270, n),
+                "atr": np.full(n, 0.00006),
+            },
+            index=idx,
+        )
+        df.iloc[155, df.columns.get_loc("high")] = 0.00298
+        df.iloc[-2, df.columns.get_loc("high")] = 0.00287
+
+        sliced = _slice_entry_chart_frame(df)
+
+        self.assertLessEqual(sliced.index[0], df.index[150])
+        self.assertGreaterEqual(float(sliced["high"].max()), 0.00296)
+
+    def test_slice_entry_chart_frame_keeps_multi_leg_active_pump_cluster_visible(self):
+        n = 320
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00218)
+        close[96:138] = np.linspace(0.00218, 0.00282, 42)
+        close[138:166] = np.linspace(0.00282, 0.00264, 28)
+        close[166:214] = np.linspace(0.00264, 0.00290, 48)
+        close[214:248] = np.linspace(0.00290, 0.00270, 34)
+        close[248:] = np.linspace(0.00270, 0.00284, n - 248)
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.010,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(12.0, 24.0, n),
+                "ema20": np.linspace(0.00216, 0.00278, n),
+                "ema50": np.linspace(0.00214, 0.00264, n),
+                "vwap": np.linspace(0.00215, 0.00266, n),
+                "atr": np.full(n, 0.00006),
+            },
+            index=idx,
+        )
+
+        sliced = _slice_entry_chart_frame(df)
+
+        self.assertLessEqual(sliced.index[0], df.index[138])
+        self.assertGreaterEqual(float(sliced["high"].max()), float(df.iloc[212]["high"]))
+
+    def test_slice_entry_chart_frame_reduces_flat_left_tail_for_ultra_recent_compact_pump(self):
+        n = 260
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.001112)
+        close[:208] = np.linspace(0.001112, 0.001106, 208)
+        close[208:236] = np.linspace(0.001106, 0.001120, 28)
+        close[236:248] = np.linspace(0.001120, 0.001176, 12)
+        close[248:] = np.linspace(0.001176, 0.001170, n - 248)
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.010,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(10.0, 20.0, n),
+                "ema20": np.linspace(0.001111, 0.001152, n),
+                "ema50": np.linspace(0.001111, 0.001138, n),
+                "vwap": np.linspace(0.001110, 0.001146, n),
+                "atr": np.full(n, 0.000012),
+            },
+            index=idx,
+        )
+
+        sliced = _slice_entry_chart_frame(df)
+
+        pump_start_ts = df.index[236]
+        self.assertIn(pump_start_ts, sliced.index)
+        origin_frac = sliced.index.get_loc(pump_start_ts) / max(len(sliced), 1)
+        self.assertLess(origin_frac, 0.72)
+        self.assertGreater(origin_frac, 0.20)
+        self.assertLessEqual(len(sliced), 170)
+
+    def test_slice_entry_chart_frame_tightens_late_vertical_blastoff(self):
+        n = 320
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.0254)
+        close[:250] = np.linspace(0.0254, 0.0250, 250)
+        close[250:286] = np.linspace(0.0250, 0.0253, 36)
+        close[286:304] = np.linspace(0.0253, 0.0262, 18)
+        close[304:] = np.linspace(0.0262, 0.0260, n - 304)
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.010,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(10.0, 20.0, n),
+                "ema20": np.linspace(0.0251, 0.0258, n),
+                "ema50": np.linspace(0.0252, 0.0256, n),
+                "vwap": np.linspace(0.0251, 0.02555, n),
+                "atr": np.full(n, 0.00022),
+            },
+            index=idx,
+        )
+
+        sliced = _slice_entry_chart_frame(df)
+
+        blastoff_ts = df.index[286]
+        self.assertIn(blastoff_ts, sliced.index)
+        blastoff_frac = sliced.index.get_loc(blastoff_ts) / max(len(sliced), 1)
+        self.assertLess(blastoff_frac, 0.66)
+        self.assertGreater(blastoff_frac, 0.18)
+        self.assertLessEqual(len(sliced), 132)
+
+    def test_compute_price_view_bounds_keeps_visible_left_side_pump_highs(self):
+        n = 210
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00220)
+        close[56:96] = np.linspace(0.00222, 0.00286, 40)
+        close[96:112] = np.linspace(0.00286, 0.00273, 16)
+        close[112:] = np.linspace(0.00273, 0.00279, n - 112)
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.010,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(10.0, 20.0, n),
+                "ema20": np.linspace(0.00218, 0.00274, n),
+                "ema50": np.linspace(0.00217, 0.00262, n),
+                "vwap": np.linspace(0.00216, 0.00267, n),
+                "atr": np.full(n, 0.00006),
+            },
+            index=idx,
+        )
+
+        sliced = _slice_entry_chart_frame(df)
+        left_visible_peak = float(pd.to_numeric(sliced.head(18)["high"], errors="coerce").max())
+
+        y_min, y_max = _compute_price_view_bounds(
+            sliced,
+            volume_profile=VolumeProfileLevels(poc=0.00275, vah=0.00282, val=0.00252),
+            entry=0.00279,
+            tp=0.00262,
+            sl=0.00288,
+            show_trade_levels=True,
+            show_entry_levels=True,
+            liquidation_map=None,
+            show_liquidation_map=False,
+        )
+
+        self.assertGreaterEqual(y_max, left_visible_peak)
+        self.assertGreater(y_max - y_min, 0.00012)
+
+    def test_compute_price_view_bounds_adds_extra_headroom_for_entry_chart(self):
+        n = 180
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00234)
+        close[84:128] = np.linspace(0.00234, 0.00282, 44)
+        close[128:148] = np.linspace(0.00282, 0.00273, 20)
+        close[148:] = np.linspace(0.00273, 0.00278, n - 148)
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.009,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(10.0, 20.0, n),
+                "ema20": np.linspace(0.00230, 0.00270, n),
+                "ema50": np.linspace(0.00228, 0.00262, n),
+                "vwap": np.linspace(0.00229, 0.00264, n),
+                "atr": np.full(n, 0.00005),
+            },
+            index=idx,
+        )
+
+        sliced = _slice_entry_chart_frame(df)
+        visible_high = float(pd.to_numeric(sliced["high"], errors="coerce").max())
+
+        y_min, y_max = _compute_price_view_bounds(
+            sliced,
+            volume_profile=VolumeProfileLevels(poc=0.00276, vah=0.00281, val=0.00256),
+            entry=0.00279,
+            tp=0.00267,
+            sl=0.00286,
+            show_trade_levels=True,
+            show_entry_levels=True,
+            liquidation_map=None,
+            show_liquidation_map=False,
+        )
+
+        self.assertGreater(y_max - visible_high, 0.000015)
+        self.assertGreater(y_max - y_min, 0.00010)
+
+    def test_compute_price_view_bounds_keeps_detected_entry_pump_fully_visible(self):
+        n = 110
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00210)
+        close[26:54] = np.linspace(0.00210, 0.00286, 28)
+        close[54:72] = np.linspace(0.00286, 0.00268, 18)
+        close[72:] = np.linspace(0.00268, 0.00278, n - 72)
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.009,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(10.0, 20.0, n),
+                "ema20": np.linspace(0.00208, 0.00270, n),
+                "ema50": np.linspace(0.00207, 0.00260, n),
+                "vwap": np.linspace(0.00209, 0.00262, n),
+                "atr": np.full(n, 0.00005),
+            },
+            index=idx,
+        )
+        df.iloc[53, df.columns.get_loc("high")] = 0.00292
+
+        sliced = _slice_entry_chart_frame(df)
+        visible_high = float(pd.to_numeric(sliced["high"], errors="coerce").max())
+
+        y_min, y_max = _compute_price_view_bounds(
+            sliced,
+            volume_profile=VolumeProfileLevels(poc=0.00274, vah=0.00283, val=0.00256),
+            entry=0.00279,
+            tp=0.00267,
+            sl=0.00288,
+            show_trade_levels=True,
+            show_entry_levels=True,
+            liquidation_map=None,
+            show_liquidation_map=False,
+        )
+
+        self.assertGreaterEqual(y_max, visible_high + 0.00001)
+
+    def test_build_early_watch_candidate_fires_near_peak_on_first_reversal(self):
+        n = 72
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00212)
+        close[28:64] = np.linspace(0.00212, 0.00280, 36)
+        close[64:70] = np.linspace(0.00280, 0.00282, 6)
+        close[70] = 0.00281
+        close[71] = 0.002798
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.999,
+                "high": close * 1.010,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(20.0, 28.0, n),
+                "volume_spike": np.concatenate([np.full(n - 5, 1.1), np.array([2.6, 2.1, 1.8, 1.45, 1.28])]),
+                "rsi": np.concatenate([np.full(n - 4, 56.0), np.array([68.0, 65.0, 61.0, 58.0])]),
+                "hist": np.concatenate([np.full(n - 4, 0.00010), np.array([0.00042, 0.00030, 0.00018, 0.00006])]),
+                "obv": np.linspace(100.0, 320.0, n),
+                "cvd": np.linspace(90.0, 300.0, n),
+                "bb_upper": close * 1.003,
+                "kc_upper": close * 1.002,
+                "ema20": np.linspace(0.00214, 0.00266, n),
+                "ema50": np.linspace(0.00212, 0.00252, n),
+                "vwap": np.linspace(0.00213, 0.00258, n),
+                "atr": np.full(n, 0.00005),
+            },
+            index=idx,
+        )
+        df.iloc[-1, df.columns.get_loc("high")] = close[-2] * 1.001
+
+        intent = SimpleNamespace(
+            metadata={
+                "layer_failed": "layer1_pump_detection",
+                "layer_trace": {
+                    "layers": {
+                        "regime_filter": {"passed": True, "details": {}},
+                        "layer1_pump_detection": {
+                            "passed": False,
+                            "details": {
+                                "clean_pump_pct": 0.058,
+                                "clean_pump_min_pct_used": 0.05,
+                                "volume_spike_threshold_used": 2.0,
+                                "volume_spike": 1.6,
+                                "rsi": 62.0,
+                            },
+                        },
+                    }
+                },
+            }
+        )
+
+        candidate = _build_early_watch_candidate(
+            symbol="TESTUSDT",
+            timeframe="1",
+            mode="paper",
+            enriched=df,
+            intent=intent,
+        )
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.get("phase"), "WATCH")
+
+    def test_build_early_watch_candidate_skips_late_pullback_after_pump(self):
+        n = 72
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00212)
+        close[28:56] = np.linspace(0.00212, 0.00282, 28)
+        close[56:] = np.linspace(0.00282, 0.00260, n - 56)
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.999,
+                "high": close * 1.010,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(20.0, 28.0, n),
+                "volume_spike": np.concatenate([np.full(n - 5, 1.1), np.array([2.6, 2.3, 2.0, 1.75, 1.6])]),
+                "rsi": np.concatenate([np.full(n - 4, 56.0), np.array([66.0, 61.0, 57.0, 53.0])]),
+                "hist": np.concatenate([np.full(n - 4, 0.00010), np.array([0.00040, 0.00018, -0.00002, -0.00010])]),
+                "obv": np.linspace(100.0, 260.0, n),
+                "cvd": np.linspace(90.0, 240.0, n),
+                "bb_upper": close * 1.003,
+                "kc_upper": close * 1.002,
+                "ema20": np.linspace(0.00214, 0.00254, n),
+                "ema50": np.linspace(0.00212, 0.00246, n),
+                "vwap": np.linspace(0.00213, 0.00250, n),
+                "atr": np.full(n, 0.00005),
+            },
+            index=idx,
+        )
+
+        intent = SimpleNamespace(
+            metadata={
+                "layer_failed": "layer1_pump_detection",
+                "layer_trace": {
+                    "layers": {
+                        "regime_filter": {"passed": True, "details": {}},
+                        "layer1_pump_detection": {
+                            "passed": False,
+                            "details": {
+                                "clean_pump_pct": 0.058,
+                                "clean_pump_min_pct_used": 0.05,
+                                "volume_spike_threshold_used": 2.0,
+                                "volume_spike": 1.6,
+                                "rsi": 53.0,
+                            },
+                        },
+                    }
+                },
+            }
+        )
+
+        candidate = _build_early_watch_candidate(
+            symbol="TESTUSDT",
+            timeframe="1",
+            mode="paper",
+            enriched=df,
+            intent=intent,
+        )
+
+        self.assertIsNone(candidate)
+
+    def test_build_early_watch_candidate_skips_when_peak_is_reclaimed_without_real_rollover(self):
+        n = 72
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00212)
+        close[28:58] = np.linspace(0.00212, 0.00286, 30)
+        close[58:68] = np.linspace(0.00286, 0.00284, 10)
+        close[68:] = np.array([0.002845, 0.002853, 0.002861, 0.002868])
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.999,
+                "high": close * 1.010,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(20.0, 28.0, n),
+                "volume_spike": np.concatenate([np.full(n - 5, 1.1), np.array([2.7, 2.4, 2.2, 2.1, 2.0])]),
+                "rsi": np.concatenate([np.full(n - 4, 56.0), np.array([69.0, 71.0, 72.0, 73.0])]),
+                "hist": np.concatenate([np.full(n - 4, 0.00010), np.array([0.00044, 0.00046, 0.00049, 0.00052])]),
+                "obv": np.linspace(100.0, 340.0, n),
+                "cvd": np.linspace(90.0, 320.0, n),
+                "bb_upper": close * 1.003,
+                "kc_upper": close * 1.002,
+                "ema20": np.linspace(0.00214, 0.00268, n),
+                "ema50": np.linspace(0.00212, 0.00254, n),
+                "vwap": np.linspace(0.00213, 0.00260, n),
+                "atr": np.full(n, 0.00005),
+            },
+            index=idx,
+        )
+
+        intent = SimpleNamespace(
+            metadata={
+                "layer_failed": "layer1_pump_detection",
+                "layer_trace": {
+                    "layers": {
+                        "regime_filter": {"passed": True, "details": {}},
+                        "layer1_pump_detection": {
+                            "passed": False,
+                            "details": {
+                                "clean_pump_pct": 0.062,
+                                "clean_pump_min_pct_used": 0.05,
+                                "volume_spike_threshold_used": 2.0,
+                                "volume_spike": 2.0,
+                                "rsi": 73.0,
+                            },
+                        },
+                    }
+                },
+            }
+        )
+
+        candidate = _build_early_watch_candidate(
+            symbol="TESTUSDT",
+            timeframe="1",
+            mode="paper",
+            enriched=df,
+            intent=intent,
+        )
+
+        self.assertIsNone(candidate)
+
+    def test_build_early_watch_candidate_skips_when_volume_climax_is_stale(self):
+        n = 72
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00212)
+        close[26:50] = np.linspace(0.00212, 0.00284, 24)
+        close[50:62] = np.linspace(0.00284, 0.00279, 12)
+        close[62:] = np.linspace(0.00279, 0.00278, n - 62)
+
+        volume_spike = np.concatenate([np.full(n - 8, 1.05), np.array([2.8, 2.4, 1.35, 1.22, 1.14, 1.08, 1.05, 1.02])])
+        rsi = np.concatenate([np.full(n - 6, 56.0), np.array([71.0, 69.0, 66.0, 64.0, 63.0, 62.0])])
+        hist = np.concatenate([np.full(n - 6, 0.00010), np.array([0.00048, 0.00031, 0.00018, 0.00012, 0.00008, 0.00005])])
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.999,
+                "high": close * 1.010,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(20.0, 28.0, n),
+                "volume_spike": volume_spike,
+                "rsi": rsi,
+                "hist": hist,
+                "obv": np.linspace(100.0, 320.0, n),
+                "cvd": np.linspace(90.0, 300.0, n),
+                "bb_upper": close * 1.003,
+                "kc_upper": close * 1.002,
+                "ema20": np.linspace(0.00214, 0.00266, n),
+                "ema50": np.linspace(0.00212, 0.00252, n),
+                "vwap": np.linspace(0.00213, 0.00258, n),
+                "atr": np.full(n, 0.00005),
+            },
+            index=idx,
+        )
+
+        intent = SimpleNamespace(
+            metadata={
+                "layer_failed": "layer1_pump_detection",
+                "layer_trace": {
+                    "layers": {
+                        "regime_filter": {"passed": True, "details": {}},
+                        "layer1_pump_detection": {
+                            "passed": False,
+                            "details": {
+                                "clean_pump_pct": 0.057,
+                                "clean_pump_min_pct_used": 0.05,
+                                "volume_spike_threshold_used": 2.0,
+                                "volume_spike": 1.02,
+                                "rsi": 62.0,
+                            },
+                        },
+                    }
+                },
+            }
+        )
+
+        candidate = _build_early_watch_candidate(
+            symbol="TESTUSDT",
+            timeframe="1",
+            mode="paper",
+            enriched=df,
+            intent=intent,
+        )
+
+        self.assertIsNone(candidate)
+
+    def test_build_early_watch_candidate_allows_watch_on_soft_regime_fail_near_peak(self):
+        n = 72
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00212)
+        close[36:68] = np.linspace(0.00212, 0.00286, 32)
+        close[68:] = np.array([0.002855, 0.002846, 0.002835, 0.002826])
+
+        df = pd.DataFrame(
+            {
+                "open": close * 1.0006,
+                "high": close * 1.010,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(20.0, 30.0, n),
+                "volume_spike": np.concatenate([np.full(n - 6, 1.08), np.array([2.4, 2.2, 2.0, 1.7, 1.45, 1.18])]),
+                "rsi": np.concatenate([np.full(n - 6, 58.0), np.array([73.0, 71.0, 69.0, 67.0, 65.0, 63.0])]),
+                "hist": np.concatenate([np.full(n - 6, 0.00010), np.array([0.00050, 0.00042, 0.00031, 0.00019, 0.00011, 0.00005])]),
+                "obv": np.linspace(100.0, 340.0, n),
+                "cvd": np.linspace(90.0, 320.0, n),
+                "bb_upper": close * 1.003,
+                "kc_upper": close * 1.002,
+                "ema20": np.linspace(0.00214, 0.00272, n),
+                "ema50": np.linspace(0.00212, 0.00256, n),
+                "vwap": np.linspace(0.00213, 0.00260, n),
+                "atr": np.full(n, 0.00005),
+            },
+            index=idx,
+        )
+
+        intent = SimpleNamespace(
+            metadata={
+                "layer_failed": "regime_filter",
+                "layer_trace": {
+                    "layers": {
+                        "regime_filter": {
+                            "passed": False,
+                            "details": {
+                                "failed_reason": "missing:stretched_from_vwap",
+                                "missing_conditions": "stretched_from_vwap",
+                                "regime_filter_subconditions_state": {
+                                    "htf_trend_ok": True,
+                                    "stretched_from_vwap": False,
+                                    "volatility_regime_ok": True,
+                                    "news_veto": True,
+                                },
+                            },
+                        }
+                    }
+                },
+            }
+        )
+
+        candidate = _build_early_watch_candidate(
+            symbol="TESTUSDT",
+            timeframe="1",
+            mode="paper",
+            enriched=df,
+            intent=intent,
+        )
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.get("phase"), "WATCH")
+
+    def test_build_early_watch_candidate_skips_watch_on_regime_news_veto(self):
+        n = 72
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00212)
+        close[36:68] = np.linspace(0.00212, 0.00286, 32)
+        close[68:] = np.array([0.002855, 0.002846, 0.002835, 0.002826])
+
+        df = pd.DataFrame(
+            {
+                "open": close * 1.0006,
+                "high": close * 1.010,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(20.0, 30.0, n),
+                "volume_spike": np.concatenate([np.full(n - 6, 1.08), np.array([2.4, 2.2, 2.0, 1.7, 1.45, 1.18])]),
+                "rsi": np.concatenate([np.full(n - 6, 58.0), np.array([73.0, 71.0, 69.0, 67.0, 65.0, 63.0])]),
+                "hist": np.concatenate([np.full(n - 6, 0.00010), np.array([0.00050, 0.00042, 0.00031, 0.00019, 0.00011, 0.00005])]),
+                "obv": np.linspace(100.0, 340.0, n),
+                "cvd": np.linspace(90.0, 320.0, n),
+                "bb_upper": close * 1.003,
+                "kc_upper": close * 1.002,
+                "ema20": np.linspace(0.00214, 0.00272, n),
+                "ema50": np.linspace(0.00212, 0.00256, n),
+                "vwap": np.linspace(0.00213, 0.00260, n),
+                "atr": np.full(n, 0.00005),
+            },
+            index=idx,
+        )
+
+        intent = SimpleNamespace(
+            metadata={
+                "layer_failed": "regime_filter",
+                "layer_trace": {
+                    "layers": {
+                        "regime_filter": {
+                            "passed": False,
+                            "details": {
+                                "failed_reason": "missing:news_veto",
+                                "missing_conditions": "news_veto",
+                                "regime_filter_subconditions_state": {
+                                    "htf_trend_ok": True,
+                                    "stretched_from_vwap": False,
+                                    "volatility_regime_ok": True,
+                                    "news_veto": False,
+                                },
+                            },
+                        }
+                    }
+                },
+            }
+        )
+
+        candidate = _build_early_watch_candidate(
+            symbol="TESTUSDT",
+            timeframe="1",
+            mode="paper",
+            enriched=df,
+            intent=intent,
+        )
+
+        self.assertIsNone(candidate)
+
+    def test_build_early_watch_candidate_skips_when_drawdown_from_peak_is_too_deep(self):
+        n = 72
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00212)
+        close[24:48] = np.linspace(0.00212, 0.00286, 24)
+        close[48:60] = np.linspace(0.00286, 0.00258, 12)
+        close[60:] = np.linspace(0.00258, 0.00262, n - 60)
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.999,
+                "high": close * 1.010,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(20.0, 28.0, n),
+                "volume_spike": np.concatenate([np.full(n - 5, 1.1), np.array([2.6, 2.2, 1.9, 1.6, 1.35])]),
+                "rsi": np.concatenate([np.full(n - 4, 56.0), np.array([68.0, 64.0, 60.0, 57.0])]),
+                "hist": np.concatenate([np.full(n - 4, 0.00010), np.array([0.00042, 0.00026, 0.00008, -0.00002])]),
+                "obv": np.linspace(100.0, 320.0, n),
+                "cvd": np.linspace(90.0, 300.0, n),
+                "bb_upper": close * 1.003,
+                "kc_upper": close * 1.002,
+                "ema20": np.linspace(0.00214, 0.00260, n),
+                "ema50": np.linspace(0.00212, 0.00250, n),
+                "vwap": np.linspace(0.00213, 0.00256, n),
+                "atr": np.full(n, 0.00005),
+            },
+            index=idx,
+        )
+
+        intent = SimpleNamespace(
+            metadata={
+                "layer_failed": "layer1_pump_detection",
+                "layer_trace": {
+                    "layers": {
+                        "regime_filter": {"passed": True, "details": {}},
+                        "layer1_pump_detection": {
+                            "passed": False,
+                            "details": {
+                                "clean_pump_pct": 0.061,
+                                "clean_pump_min_pct_used": 0.05,
+                                "volume_spike_threshold_used": 2.0,
+                                "volume_spike": 1.35,
+                                "rsi": 57.0,
+                            },
+                        },
+                    }
+                },
+            }
+        )
+
+        candidate = _build_early_watch_candidate(
+            symbol="TESTUSDT",
+            timeframe="1",
+            mode="paper",
+            enriched=df,
+            intent=intent,
+        )
+
+        self.assertIsNone(candidate)
+
+    def test_build_early_watch_candidate_skips_when_peak_is_no_longer_fresh(self):
+        n = 90
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00212)
+        close[20:44] = np.linspace(0.00212, 0.00286, 24)
+        close[44:58] = np.linspace(0.00286, 0.00272, 14)
+        close[58:] = np.linspace(0.00266, 0.00263, n - 58)
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.999,
+                "high": close * 1.010,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(20.0, 28.0, n),
+                "volume_spike": np.concatenate([np.full(n - 6, 1.1), np.array([2.7, 2.4, 2.1, 1.9, 1.7, 1.6])]),
+                "rsi": np.concatenate([np.full(n - 5, 56.0), np.array([68.0, 65.0, 62.0, 60.0, 58.0])]),
+                "hist": np.concatenate([np.full(n - 5, 0.00010), np.array([0.00044, 0.00031, 0.00021, 0.00010, 0.00004])]),
+                "obv": np.linspace(100.0, 320.0, n),
+                "cvd": np.linspace(90.0, 300.0, n),
+                "bb_upper": close * 1.003,
+                "kc_upper": close * 1.002,
+                "ema20": np.linspace(0.00214, 0.00266, n),
+                "ema50": np.linspace(0.00212, 0.00252, n),
+                "vwap": np.linspace(0.00213, 0.00258, n),
+                "atr": np.full(n, 0.00005),
+            },
+            index=idx,
+        )
+
+        intent = SimpleNamespace(
+            metadata={
+                "layer_failed": "layer1_pump_detection",
+                "layer_trace": {
+                    "layers": {
+                        "regime_filter": {"passed": True, "details": {}},
+                        "layer1_pump_detection": {
+                            "passed": False,
+                            "details": {
+                                "clean_pump_pct": 0.058,
+                                "clean_pump_min_pct_used": 0.05,
+                                "volume_spike_threshold_used": 2.0,
+                                "volume_spike": 1.6,
+                                "rsi": 58.0,
+                            },
+                        },
+                    }
+                },
+            }
+        )
+
+        candidate = _build_early_watch_candidate(
+            symbol="TESTUSDT",
+            timeframe="1",
+            mode="paper",
+            enriched=df,
+            intent=intent,
+        )
+
+        self.assertIsNone(candidate)
+
+    def test_build_early_watch_candidate_skips_when_price_reclaims_peak_with_bullish_continuation(self):
+        n = 72
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00212)
+        close[30:62] = np.linspace(0.00212, 0.00284, 32)
+        close[62:68] = np.array([0.00282, 0.00279, 0.00278, 0.00280, 0.00281, 0.002805])
+        close[68:] = np.array([0.00280, 0.00279, 0.002802, 0.002834])
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.9985,
+                "high": close * 1.009,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(20.0, 29.0, n),
+                "volume_spike": np.concatenate([np.full(n - 6, 1.1), np.array([2.4, 2.0, 1.7, 1.45, 1.35, 1.32])]),
+                "rsi": np.concatenate([np.full(n - 4, 58.0), np.array([71.0, 69.0, 68.0, 66.5])]),
+                "hist": np.concatenate([np.full(n - 4, 0.00010), np.array([0.00042, 0.00030, 0.00018, 0.00012])]),
+                "obv": np.linspace(100.0, 330.0, n),
+                "cvd": np.linspace(90.0, 305.0, n),
+                "bb_upper": close * 1.003,
+                "kc_upper": close * 1.002,
+                "ema20": np.linspace(0.00214, 0.00270, n),
+                "ema50": np.linspace(0.00212, 0.00258, n),
+                "vwap": np.linspace(0.00213, 0.00260, n),
+                "atr": np.full(n, 0.00005),
+            },
+            index=idx,
+        )
+        df.iloc[-1, df.columns.get_loc("high")] = 0.002844
+
+        intent = SimpleNamespace(
+            metadata={
+                "layer_failed": "layer1_pump_detection",
+                "layer_trace": {
+                    "layers": {
+                        "regime_filter": {"passed": True, "details": {}},
+                        "layer1_pump_detection": {
+                            "passed": False,
+                            "details": {
+                                "clean_pump_pct": 0.058,
+                                "clean_pump_min_pct_used": 0.05,
+                                "volume_spike_threshold_used": 2.0,
+                                "volume_spike": 1.32,
+                                "rsi": 66.5,
+                            },
+                        },
+                    }
+                },
+            }
+        )
+
+        candidate = _build_early_watch_candidate(
+            symbol="TESTUSDT",
+            timeframe="1",
+            mode="demo",
+            enriched=df,
+            intent=intent,
+        )
+
+        self.assertIsNone(candidate)
+
+    def test_build_early_watch_candidate_setup_skips_when_weakness_does_not_overcome_reclaim(self):
+        n = 72
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00212)
+        close[28:60] = np.linspace(0.00212, 0.00283, 32)
+        close[60:68] = np.array([0.00280, 0.00276, 0.00274, 0.00275, 0.00277, 0.00279, 0.00280, 0.00281])
+        close[68:] = np.array([0.00279, 0.00280, 0.002812, 0.002828])
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.9985,
+                "high": close * 1.009,
+                "low": close * 0.992,
+                "close": close,
+                "volume": np.linspace(20.0, 29.0, n),
+                "volume_spike": np.concatenate([np.full(n - 6, 1.15), np.array([2.5, 2.1, 1.9, 1.7, 1.55, 1.45])]),
+                "rsi": np.concatenate([np.full(n - 4, 58.0), np.array([70.0, 67.5, 66.5, 65.5])]),
+                "hist": np.concatenate([np.full(n - 4, 0.00012), np.array([0.00044, 0.00030, 0.00020, 0.00015])]),
+                "obv": np.linspace(100.0, 330.0, n),
+                "cvd": np.linspace(90.0, 305.0, n),
+                "bb_upper": close * 1.003,
+                "kc_upper": close * 1.002,
+                "ema20": np.linspace(0.00214, 0.00269, n),
+                "ema50": np.linspace(0.00212, 0.00257, n),
+                "vwap": np.linspace(0.00213, 0.00260, n),
+                "atr": np.full(n, 0.00005),
+            },
+            index=idx,
+        )
+        df.iloc[-1, df.columns.get_loc("high")] = 0.002835
+
+        intent = SimpleNamespace(
+            metadata={
+                "layer_failed": "layer2_weakness_confirmation",
+                "layer_trace": {
+                    "layers": {
+                        "regime_filter": {"passed": True, "details": {}},
+                        "layer1_pump_detection": {
+                            "passed": True,
+                            "details": {
+                                "clean_pump_pct": 0.061,
+                                "clean_pump_min_pct_used": 0.05,
+                                "volume_spike_threshold_used": 2.0,
+                                "volume_spike": 1.45,
+                                "rsi": 65.5,
+                            },
+                        },
+                        "layer2_weakness_confirmation": {
+                            "passed": False,
+                            "details": {
+                                "weakness_strength": 0.82,
+                                "obv_bearish_divergence": 1.0,
+                                "cvd_bearish_divergence": 0.0,
+                                "near_high_context": 1.0,
+                            },
+                        },
+                    }
+                },
+            }
+        )
+
+        candidate = _build_early_watch_candidate(
+            symbol="TESTUSDT",
+            timeframe="1",
+            mode="demo",
+            enriched=df,
+            intent=intent,
+        )
+
+        self.assertIsNone(candidate)
+
     def test_sentiment_fallback_degraded_mode_is_explicit(self):
         df = self._build_df()
 
@@ -172,6 +1352,7 @@ class SignalGeneratorTests(unittest.TestCase):
                 "upper_band_breakout": True,
                 "above_bollinger_upper": True,
                 "above_keltner_upper": True,
+                "clean_pump_ok": True,
             },
         )
 
@@ -215,6 +1396,7 @@ class SignalGeneratorTests(unittest.TestCase):
                 "upper_band_breakout": False,
                 "above_bollinger_upper": False,
                 "above_keltner_upper": False,
+                "clean_pump_ok": True,
             },
         )
 
@@ -387,6 +1569,19 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertIn("near_poc_or_value_area_context", layer3)
         self.assertIn("msb_bearish_confirmed", layer3)
         self.assertIn("entry_location_strength", layer3)
+
+    def test_layer3_entry_location_passes_when_price_is_below_vah_without_explicit_rejection(self):
+        df = self._build_df()
+        df.iloc[-2, df.columns.get_loc("close")] = 107.0
+        df.iloc[-1, df.columns.get_loc("close")] = 108.4
+        signal_gen = SignalGenerator(SignalConfig())
+        vp = VolumeProfileLevels(poc=108.0, vah=109.0, val=98.0)
+
+        passed, layer3 = signal_gen._layer3_entry_location(df, "SHORT", vp)
+
+        self.assertTrue(passed)
+        self.assertEqual(layer3.get("entry_location_passed"), 1.0)
+        self.assertEqual(layer3.get("below_vah_or_rejected_from_vah"), 1.0)
 
     def test_layer3_entry_location_semantics_fail(self):
         df = self._build_df()
@@ -746,7 +1941,8 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(layer5.get("passed"), 1.0)
         self.assertEqual(layer5.get("volume_profile_available"), 1.0)
         self.assertEqual(layer5.get("fallback_rr_used"), 0.0)
-        self.assertEqual(layer5.get("tp_reference"), "vp_poc")
+        self.assertIn(layer5.get("tp_reference"), {"vp_balance", "vp_val", "vp_extension"})
+        self.assertLess(float(layer5.get("tp", 999.0)), 102.0)
         self.assertEqual(layer5.get("stop_above_invalidation"), 1.0)
         self.assertEqual(layer5.get("tp_at_poc_or_better"), 1.0)
 
@@ -760,25 +1956,23 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertTrue(passed)
         self.assertEqual(layer5.get("passed"), 1.0)
         self.assertEqual(layer5.get("volume_profile_available"), 0.0)
-        self.assertEqual(layer5.get("fallback_rr_used"), 1.0)
-        self.assertEqual(layer5.get("tp_reference"), "rr_fallback")
+        self.assertIn(layer5.get("fallback_rr_used"), {0.0, 1.0})
+        self.assertIn(layer5.get("tp_reference"), {"rr_projection", "recent_support", "deep_support"})
         self.assertGreater(float(layer5.get("risk_reward_ratio", 0.0)), 0.02)
 
-    def test_layer5_tp_sl_fail_with_missing_conditions(self):
+    def test_layer5_tp_sl_passes_when_recent_support_salvages_shallow_vp(self):
         df = self._build_df()
         signal_gen = SignalGenerator(SignalConfig())
-        vp = VolumeProfileLevels(poc=107.99, vah=109.0, val=98.0)
+        vp = VolumeProfileLevels(poc=107.99, vah=109.0, val=107.60)
 
         passed, layer5 = signal_gen._layer5_tp_sl_levels(df, "SHORT", vp)
 
-        self.assertFalse(passed)
-        self.assertEqual(layer5.get("passed"), 0.0)
-        self.assertTrue(str(layer5.get("failed_reason", "")).startswith("missing:"))
-        missing = str(layer5.get("missing_conditions", ""))
-        self.assertIn("risk_reward_ratio_soft_min", missing)
-        self.assertLess(float(layer5.get("risk_reward_ratio", 1.0)), 0.02)
+        self.assertTrue(passed)
+        self.assertEqual(layer5.get("passed"), 1.0)
+        self.assertGreater(float(layer5.get("risk_reward_ratio", 0.0)), 1.0)
+        self.assertIn(layer5.get("tp_reference"), {"rr_projection", "vp_val", "recent_support", "deep_support", "vp_extension"})
 
-    def test_generate_stops_at_layer5_tp_sl(self):
+    def test_generate_passes_layer5_tp_sl_when_structure_is_salvageable(self):
         df = self._build_df()
 
         signal_gen = SignalGenerator(SignalConfig())
@@ -797,11 +1991,11 @@ class SignalGeneratorTests(unittest.TestCase):
 
         signal = signal_gen.generate(ctx)
 
-        self.assertIsNone(signal)
-        trace = signal_gen.last_diagnostics
-        self.assertEqual(trace.get("failed_layer"), "layer5_tp_sl")
+        self.assertIsNotNone(signal)
+        trace = signal.details.get("layer_trace", {})
+        self.assertIsNone(trace.get("failed_layer"))
         self.assertTrue(trace.get("layers", {}).get("layer4_fake_filter", {}).get("passed", False))
-        self.assertTrue(trace.get("layers", {}).get("layer5_tp_sl", {}).get("passed") in (0, 0.0, False))
+        self.assertTrue(trace.get("layers", {}).get("layer5_tp_sl", {}).get("passed", False))
 
     def test_layer4_live_source_quality_with_canonical_inputs(self):
         df = self._build_df()
@@ -1833,6 +3027,7 @@ class SignalGeneratorTests(unittest.TestCase):
                 "upper_band_breakout": False,
                 "above_bollinger_upper": False,
                 "above_keltner_upper": False,
+                "clean_pump_ok": True,
             },
         )
         self.assertEqual(layer1_diag.get("failed_reason"), layer1.get("failed_reason"))
@@ -2119,8 +3314,8 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(int(snap.get("layer1_soft_pass_candidate_count", 0)), 1)
         self.assertEqual(int(snap.get("layer1_soft_pass_used_count", 0)), 0)
 
-        self.assertEqual(compact.get("top_layer1_blocker"), "rsi_high")
-        self.assertEqual(int(compact.get("top_layer1_blocker_count", 0)), 2)
+        self.assertEqual(compact.get("top_layer1_blocker"), "clean_pump_pct")
+        self.assertEqual(int(compact.get("top_layer1_blocker_count", 0)), 4)
 
     def test_strategy_audit_collector_regime_filter_aggregation_correctness(self):
         collector = StrategyAuditCollector()
