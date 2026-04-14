@@ -7,6 +7,10 @@ from typing import Any
 from urllib.parse import urlencode
 
 import requests
+from trading.exchange.bybit_endpoints import (
+    resolve_private_http_base_url,
+    resolve_public_http_base_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +37,8 @@ class BybitClient:
         self.timeout = timeout
         self.recv_window = str(recv_window)
         self.category = category
-        self.base_url = "https://api-testnet.bybit.com" if sandbox else ("https://api-demo.bybit.com" if demo else "https://api.bybit.com")
-        self.public_base_url = "https://api-testnet.bybit.com" if sandbox else "https://api.bybit.com"
+        self.base_url = resolve_private_http_base_url(testnet=bool(sandbox), demo=bool(demo))
+        self.public_base_url = resolve_public_http_base_url(testnet=bool(sandbox))
         self._private_auth_invalid = False
         self._private_auth_invalid_reason = ""
         self._private_auth_invalid_logged = False
@@ -42,6 +46,7 @@ class BybitClient:
         self._last_time_sync_monotonic = 0.0
 
         self._sess = requests.Session()
+        self._sess.trust_env = False
         self._sess.headers.update(
             {
                 "User-Agent": "koteika-bot/1.0",
@@ -482,6 +487,8 @@ class BybitClient:
         params: dict[str, Any] = {"category": self.category}
         if symbol:
             params["symbol"] = self._normalize_symbol(symbol)
+        elif self.category == "linear":
+            params["settleCoin"] = "USDT"
         payload = self._request("GET", "/v5/order/realtime", params=params, private=True)
         result = payload.get("result", {}) if isinstance(payload, dict) else {}
         items = result.get("list", []) if isinstance(result, dict) else []

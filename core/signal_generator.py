@@ -241,6 +241,26 @@ class SignalGenerator:
         if not news_ok:
             missing.append("news_veto")
         strict_passed = htf_trend_ok and stretched and vol_ok and news_ok
+        sweep_ctx = self._short_sweep_reclaim_context(df)
+        sweep_trigger_ready = bool(
+            (sweep_ctx.get("failed_reclaim") or sweep_ctx.get("retest_failed_breakout"))
+            or (
+                sweep_ctx.get("near_sweep_level")
+                and sweep_ctx.get("rejection_bar")
+                and sweep_ctx.get("post_peak_followthrough")
+            )
+        )
+        sweep_soft_pass_candidate = bool(
+            self.config.regime_soft_pass_enabled
+            and (not strict_passed)
+            and (not degraded)
+            and htf_trend_ok
+            and news_ok
+            and sweep_trigger_ready
+            and (not bool(sweep_ctx.get("acceptance_above_high")))
+            and len(missing) >= 1
+            and all(item in ("stretched_from_vwap", "volatility_regime_ok") for item in missing)
+        )
         soft_pass_candidate = bool(
             (not strict_passed)
             and (not degraded)
@@ -253,8 +273,10 @@ class SignalGenerator:
             self.config.regime_soft_pass_enabled
             and (not strict_passed)
             and (not degraded)
-            and len(missing) == 1
-            and missing[0] in ("stretched_from_vwap", "htf_trend_ok")
+            and (
+                (len(missing) == 1 and missing[0] in ("stretched_from_vwap", "htf_trend_ok"))
+                or sweep_soft_pass_candidate
+            )
         )
         passed = strict_passed or soft_pass_used
         fail_due_to_degraded_only = (not strict_passed) and degraded and not missing
@@ -284,11 +306,20 @@ class SignalGenerator:
             "atr_norm": float(atr_norm),
             "degraded_mode": 1.0 if degraded else 0.0,
             "fail_due_to_degraded_mode_only": 1.0 if fail_due_to_degraded_only else 0.0,
-            "soft_pass_candidate": 1.0 if soft_pass_candidate else 0.0,
+            "soft_pass_candidate": 1.0 if (soft_pass_candidate or sweep_soft_pass_candidate) else 0.0,
             "soft_pass_used": 1.0 if soft_pass_used else 0.0,
-            "soft_pass_reason": missing[0] if soft_pass_used and len(missing) == 1 else "",
+            "soft_pass_reason": (
+                "sweep_volatility_context"
+                if soft_pass_used and sweep_soft_pass_candidate
+                else (missing[0] if soft_pass_used and len(missing) == 1 else "")
+            ),
             "missing_conditions": "" if passed else ",".join(missing),
             "failed_reason": "none" if passed else f"missing:{','.join(missing)}",
+            "failed_reclaim": 1.0 if bool(sweep_ctx.get("failed_reclaim")) else 0.0,
+            "retest_failed_breakout": 1.0 if bool(sweep_ctx.get("retest_failed_breakout")) else 0.0,
+            "rejection_bar": 1.0 if bool(sweep_ctx.get("rejection_bar")) else 0.0,
+            "near_sweep_level": 1.0 if bool(sweep_ctx.get("near_sweep_level")) else 0.0,
+            "acceptance_above_swing_high": 1.0 if bool(sweep_ctx.get("acceptance_above_high")) else 0.0,
             "source_flags": src,
         }
 
@@ -329,6 +360,7 @@ class SignalGenerator:
         clean_lookback = max(lookback, int(self.config.layer1_clean_pump_lookback_bars))
         clean_pump_threshold = max(0.0, float(self.config.layer1_clean_pump_min_pct))
         window = df.tail(lookback)
+        support_window = df.tail(max(lookback, 6))
         clean_window = df.tail(clean_lookback)
         clean_close = pd.to_numeric(clean_window.get("close"), errors="coerce").dropna()
         clean_pump_pct = 0.0
@@ -338,6 +370,14 @@ class SignalGenerator:
             if not pump_track.empty:
                 clean_pump_pct = float(max(0.0, pump_track.max()))
         clean_pump_ok = clean_pump_pct >= clean_pump_threshold
+        near_clean_pump_ok = clean_pump_pct >= max(clean_pump_threshold * 0.84, clean_pump_threshold - 0.010)
+        sweep_ctx = self._short_sweep_reclaim_context(df)
+        failed_reclaim_ctx = bool(sweep_ctx.get("failed_reclaim"))
+        retest_failed_breakout_ctx = bool(sweep_ctx.get("retest_failed_breakout"))
+        acceptance_above_high_ctx = bool(sweep_ctx.get("acceptance_above_high"))
+        rejection_bar_ctx = bool(sweep_ctx.get("rejection_bar"))
+        near_sweep_level_ctx = bool(sweep_ctx.get("near_sweep_level"))
+        post_peak_followthrough_ctx = bool(sweep_ctx.get("post_peak_followthrough"))
 
         def _details_from_row(row: pd.Series, *, pump_bar_offset: int) -> tuple[bool, dict[str, Any]]:
             rsi = self._safe(row.get("rsi"), 50.0)
@@ -358,9 +398,40 @@ class SignalGenerator:
             vol_soft = vol >= volume_spike_soft_threshold
 
             pts = int(rsi_high) + int(vol_high) + int(band_break)
-            passed = clean_pump_ok and band_break and pts >= 2
+            recent_sweep_bar = pump_bar_offset <= 2
+            sweep_trigger_ready = bool(
+                recent_sweep_bar
+                and (not acceptance_above_high_ctx)
+                and (
+                    failed_reclaim_ctx
+                    or retest_failed_breakout_ctx
+                    or (near_sweep_level_ctx and rejection_bar_ctx and post_peak_followthrough_ctx)
+                )
+            )
+            sweep_fast_pass = bool(
+                sweep_trigger_ready
+                and (clean_pump_ok or near_clean_pump_ok)
+                and (rsi_high or rsi_soft or near_upper_band)
+                and (vol_high or vol_soft)
+            )
+            passed = (clean_pump_ok and band_break and pts >= 2) or sweep_fast_pass
             soft_pass_candidate = clean_pump_ok and (not passed) and pts >= 2
             fade_soft_candidate = clean_pump_ok and (not passed) and near_upper_band and rsi_soft and vol_soft
+            near_threshold_soft_candidate = (
+                near_clean_pump_ok
+                and not clean_pump_ok
+                and (not passed)
+                and near_upper_band
+                and rsi_soft
+                and vol_soft
+            )
+            sweep_soft_candidate = bool(
+                sweep_trigger_ready
+                and not sweep_fast_pass
+                and (clean_pump_ok or near_clean_pump_ok)
+                and (rsi_soft or near_upper_band)
+                and vol_soft
+            )
             missing = []
             if not rsi_high:
                 missing.append("rsi_high")
@@ -394,17 +465,32 @@ class SignalGenerator:
                 "above_bollinger_upper": 1.0 if above_bb else 0.0,
                 "above_keltner_upper": 1.0 if above_kc else 0.0,
                 "upper_band_breakout": 1.0 if band_break else 0.0,
+                "near_upper_band": 1.0 if near_upper_band else 0.0,
                 "pump_context_strength": float(pts / 3.0),
                 "clean_pump_pct": float(clean_pump_pct),
                 "clean_pump_min_pct_used": float(clean_pump_threshold),
                 "clean_pump_ok": 1.0 if clean_pump_ok else 0.0,
-                "soft_pass_candidate": 1.0 if soft_pass_candidate else 0.0,
-                "soft_pass_used": 0.0,
+                "near_clean_pump_ok": 1.0 if near_clean_pump_ok else 0.0,
+                "failed_reclaim": 1.0 if failed_reclaim_ctx else 0.0,
+                "retest_failed_breakout": 1.0 if retest_failed_breakout_ctx else 0.0,
+                "rejection_bar": 1.0 if rejection_bar_ctx else 0.0,
+                "near_sweep_level": 1.0 if near_sweep_level_ctx else 0.0,
+                "acceptance_above_swing_high": 1.0 if acceptance_above_high_ctx else 0.0,
+                "soft_pass_candidate": 1.0 if (soft_pass_candidate or sweep_soft_candidate) else 0.0,
+                "soft_pass_used": 1.0 if sweep_fast_pass else 0.0,
                 "soft_pass_reason": "",
                 "_soft_pass_reason_candidate": (
-                    "upper_band_breakout"
-                    if soft_pass_candidate
-                    else ("near_upper_band_context" if fade_soft_candidate else "")
+                    "sweep_reclaim_context"
+                    if sweep_soft_candidate or sweep_fast_pass
+                    else (
+                        "upper_band_breakout"
+                        if soft_pass_candidate
+                        else (
+                            "window_near_threshold_pump_context"
+                            if near_threshold_soft_candidate
+                            else ("near_upper_band_context" if fade_soft_candidate else "")
+                        )
+                    )
                 ),
                 "pump_bar_offset": int(pump_bar_offset),
                 "layer1_subconditions_state": subconditions,
@@ -424,21 +510,132 @@ class SignalGenerator:
             if soft_pass_details is None and str(details.get("_soft_pass_reason_candidate") or ""):
                 soft_pass_details = details
 
-        if self.config.layer1_soft_pass_enabled and clean_pump_ok and window_details:
-            recent_rsi_high = any(bool(float(details.get("rsi_high", 0.0) or 0.0)) for details in window_details)
-            recent_volume_spike = any(bool(float(details.get("volume_spike_high", 0.0) or 0.0)) for details in window_details)
-            recent_upper_band_break = any(bool(float(details.get("upper_band_breakout", 0.0) or 0.0)) for details in window_details)
-            recent_above_bb = any(bool(float(details.get("above_bollinger_upper", 0.0) or 0.0)) for details in window_details)
-            recent_above_kc = any(bool(float(details.get("above_keltner_upper", 0.0) or 0.0)) for details in window_details)
-            if recent_upper_band_break and (recent_rsi_high or recent_volume_spike):
+        if len(support_window) > len(window):
+            support_window_details = list(window_details)
+            for idx in range(len(support_window) - len(window) - 1, -1, -1):
+                pump_bar_offset = len(support_window) - 1 - idx
+                _, details = _details_from_row(support_window.iloc[idx], pump_bar_offset=pump_bar_offset)
+                support_window_details.append(details)
+                if soft_pass_details is None and str(details.get("_soft_pass_reason_candidate") or ""):
+                    soft_pass_details = details
+        else:
+            support_window_details = window_details
+
+        recent_rsi_support = any(
+            float(details.get("rsi", 0.0) or 0.0) >= rsi_soft_threshold for details in support_window_details
+        )
+        recent_volume_support = any(
+            float(details.get("volume_spike", 0.0) or 0.0) >= volume_spike_soft_threshold for details in support_window_details
+        )
+        recent_upper_band_support = any(
+            bool(float(details.get("upper_band_breakout", 0.0) or 0.0))
+            or bool(float(details.get("near_upper_band", 0.0) or 0.0))
+            for details in support_window_details
+        )
+        sweep_expansion_context = bool(
+            recent_upper_band_support
+            and recent_rsi_support
+            and (
+                recent_volume_support
+                or any(
+                    float(details.get("volume_spike", 0.0) or 0.0) >= max(volume_spike_soft_threshold * 0.82, 0.6)
+                    for details in support_window_details
+                )
+            )
+        )
+        sweep_window_pass = bool(
+            not acceptance_above_high_ctx
+            and (clean_pump_ok or (near_clean_pump_ok and sweep_expansion_context))
+            and (
+                failed_reclaim_ctx
+                or retest_failed_breakout_ctx
+                or (near_sweep_level_ctx and rejection_bar_ctx and post_peak_followthrough_ctx)
+            )
+            and recent_rsi_support
+            and recent_upper_band_support
+            and (recent_volume_support or sweep_expansion_context)
+        )
+        if self.config.layer1_soft_pass_enabled and sweep_window_pass:
+            reference_details = next(
+                (
+                    details
+                    for details in support_window_details
+                    if bool(float(details.get("upper_band_breakout", 0.0) or 0.0))
+                    or (
+                        bool(float(details.get("near_upper_band", 0.0) or 0.0))
+                        and float(details.get("volume_spike", 0.0) or 0.0) >= max(volume_spike_soft_threshold * 0.82, 0.6)
+                        and float(details.get("rsi", 0.0) or 0.0) >= rsi_soft_threshold
+                    )
+                ),
+                max(
+                    support_window_details,
+                    key=lambda details: (
+                        float(details.get("pump_context_strength", 0.0) or 0.0),
+                        -int(details.get("pump_bar_offset", 0) or 0),
+                    ),
+                ),
+            )
+            used_details = dict(reference_details)
+            used_details["passed"] = 1.0
+            used_details["failed_reason"] = "none"
+            used_details["missing_conditions"] = ""
+            used_details["soft_pass_candidate"] = 1.0
+            used_details["soft_pass_used"] = 1.0
+            used_details["soft_pass_reason"] = "sweep_reclaim_window_context"
+            used_details["failed_reclaim"] = 1.0 if failed_reclaim_ctx else 0.0
+            used_details["retest_failed_breakout"] = 1.0 if retest_failed_breakout_ctx else 0.0
+            used_details["rejection_bar"] = 1.0 if rejection_bar_ctx else 0.0
+            used_details["near_sweep_level"] = 1.0 if near_sweep_level_ctx else 0.0
+            used_details["acceptance_above_swing_high"] = 1.0 if acceptance_above_high_ctx else 0.0
+            used_details["layer1_subconditions_state"] = {
+                "rsi_high": bool(recent_rsi_support),
+                "volume_spike_high": bool(recent_volume_support),
+                "upper_band_breakout": bool(recent_upper_band_support),
+                "above_bollinger_upper": any(
+                    bool(float(details.get("above_bollinger_upper", 0.0) or 0.0)) for details in support_window_details
+                ),
+                "above_keltner_upper": any(
+                    bool(float(details.get("above_keltner_upper", 0.0) or 0.0)) for details in support_window_details
+                ),
+                "clean_pump_ok": True,
+            }
+            return "SHORT", used_details
+
+        current_soft_reason = str((fallback_details or {}).get("_soft_pass_reason_candidate") or "")
+        if self.config.layer1_soft_pass_enabled and current_soft_reason == "near_upper_band_context":
+            used_details = dict(fallback_details or {})
+            used_details["passed"] = 1.0
+            used_details["failed_reason"] = "none"
+            used_details["missing_conditions"] = ""
+            used_details["soft_pass_candidate"] = 1.0
+            used_details["soft_pass_used"] = 1.0
+            used_details["soft_pass_reason"] = "near_upper_band_context"
+            return "SHORT", used_details
+
+        if self.config.layer1_soft_pass_enabled and (clean_pump_ok or near_clean_pump_ok) and support_window_details:
+            recent_rsi_high = any(bool(float(details.get("rsi_high", 0.0) or 0.0)) for details in support_window_details)
+            recent_volume_spike = any(bool(float(details.get("volume_spike_high", 0.0) or 0.0)) for details in support_window_details)
+            recent_upper_band_break = any(bool(float(details.get("upper_band_breakout", 0.0) or 0.0)) for details in support_window_details)
+            recent_near_upper_band = any(bool(float(details.get("near_upper_band", 0.0) or 0.0)) for details in support_window_details)
+            recent_above_bb = any(bool(float(details.get("above_bollinger_upper", 0.0) or 0.0)) for details in support_window_details)
+            recent_above_kc = any(bool(float(details.get("above_keltner_upper", 0.0) or 0.0)) for details in support_window_details)
+            if (recent_upper_band_break and (recent_rsi_high or recent_volume_spike)) or (
+                near_clean_pump_ok and recent_near_upper_band and recent_rsi_high and recent_volume_spike
+            ):
                 reference_details = next(
                     (
                         details
-                        for details in window_details
+                        for details in support_window_details
                         if bool(float(details.get("upper_band_breakout", 0.0) or 0.0))
+                        or (
+                            near_clean_pump_ok
+                            and bool(float(details.get("near_upper_band", 0.0) or 0.0))
+                            and bool(float(details.get("rsi_high", 0.0) or 0.0))
+                            and bool(float(details.get("volume_spike_high", 0.0) or 0.0))
+                        )
                     ),
                     max(
-                        window_details,
+                        support_window_details,
                         key=lambda details: (
                             float(details.get("pump_context_strength", 0.0) or 0.0),
                             -int(details.get("pump_bar_offset", 0) or 0),
@@ -451,14 +648,22 @@ class SignalGenerator:
                 used_details["missing_conditions"] = ""
                 used_details["soft_pass_candidate"] = 1.0
                 used_details["soft_pass_used"] = 1.0
-                used_details["soft_pass_reason"] = "window_pump_context"
+                used_details["soft_pass_reason"] = (
+                    "window_near_threshold_pump_context"
+                    if near_clean_pump_ok and not clean_pump_ok
+                    else "window_pump_context"
+                )
                 used_details["pump_context_strength"] = float(
-                    (int(recent_rsi_high) + int(recent_volume_spike) + int(recent_upper_band_break)) / 3.0
+                    (
+                        int(recent_rsi_high)
+                        + int(recent_volume_spike)
+                        + int(recent_upper_band_break or recent_near_upper_band)
+                    ) / 3.0
                 )
                 used_details["layer1_subconditions_state"] = {
                     "rsi_high": bool(recent_rsi_high),
                     "volume_spike_high": bool(recent_volume_spike),
-                    "upper_band_breakout": bool(recent_upper_band_break),
+                    "upper_band_breakout": bool(recent_upper_band_break or recent_near_upper_band),
                     "above_bollinger_upper": bool(recent_above_bb),
                     "above_keltner_upper": bool(recent_above_kc),
                 }
@@ -474,6 +679,96 @@ class SignalGenerator:
             return "SHORT", used_details
 
         return None, (fallback_details or _details_from_row(window.iloc[-1], pump_bar_offset=0)[1])
+
+    def _short_sweep_reclaim_context(self, df: pd.DataFrame) -> dict[str, Any]:
+        default = {
+            "swept_high": False,
+            "failed_reclaim": False,
+            "retest_failed_breakout": False,
+            "acceptance_above_high": False,
+            "rejection_bar": False,
+            "lower_close": False,
+            "lower_high": False,
+            "post_peak_followthrough": False,
+            "near_sweep_level": False,
+            "swing_high": 0.0,
+            "sweep_high": 0.0,
+            "sweep_buffer": 0.0,
+            "distance_from_swing_high_pct": 0.0,
+        }
+        if df.empty or len(df) < 4:
+            return default
+
+        recent = df.tail(min(len(df), 14)).copy()
+        if len(recent) < 4:
+            return default
+
+        last = recent.iloc[-1]
+        prev = recent.iloc[-2]
+        prior = recent.iloc[:-1]
+        prior_for_sweep = recent.iloc[:-2] if len(recent) > 4 else recent.iloc[:-1]
+
+        high_series = pd.to_numeric(prior_for_sweep.get("high"), errors="coerce").dropna()
+        if high_series.empty:
+            return default
+        local_prior = recent.tail(min(len(recent), 6)).iloc[:-2]
+        local_high_series = pd.to_numeric(local_prior.get("high"), errors="coerce").dropna()
+        if not local_high_series.empty:
+            swing_high = float(local_high_series.max())
+        else:
+            swing_high = float(high_series.tail(min(len(high_series), 6)).max())
+        last_close = self._safe(last.get("close"), 0.0)
+        prev_close = self._safe(prev.get("close"), last_close)
+        last_high = self._safe(last.get("high"), last_close)
+        prev_high = self._safe(prev.get("high"), prev_close)
+        last_open = self._safe(last.get("open"), last_close)
+        last_low = self._safe(last.get("low"), last_close)
+        atr = max(self._safe(last.get("atr"), last_close * 0.01), last_close * 0.001, 1e-8)
+        tol = max(float(self.config.entry_tolerance_pct), 0.0)
+
+        sweep_buffer = max(atr * 0.25, swing_high * max(tol * 1.5, 0.0012), 1e-8)
+        sweep_high = max(last_high, prev_high)
+        swept_high = bool(sweep_high >= swing_high + sweep_buffer * 0.35)
+        tested_high = bool(sweep_high >= swing_high - sweep_buffer * 0.08)
+        rejection_range = max(last_high - last_low, 1e-8)
+        upper_wick = max(last_high - max(last_open, last_close), 0.0)
+        rejection_bar = bool(upper_wick / rejection_range >= 0.28 and last_close <= last_open)
+        lower_close = bool(last_close < prev_close)
+        lower_high = bool(last_high < prev_high)
+        near_sweep_level = bool(last_close >= swing_high * (1.0 - max(tol * 4.0, 0.006)))
+        failed_reclaim = bool(
+            (swept_high or tested_high)
+            and last_close <= swing_high + sweep_buffer * 0.18
+            and (lower_close or lower_high or rejection_bar)
+        )
+        retest_failed_breakout = bool(
+            prev_high >= swing_high - sweep_buffer * 0.08
+            and prev_close <= swing_high + sweep_buffer * 0.22
+            and last_close <= prev_close * (1.0 + tol * 0.35)
+            and (lower_close or lower_high or rejection_bar)
+        )
+        acceptance_above_high = bool(
+            last_close >= swing_high + sweep_buffer * 0.65
+            and prev_close >= swing_high + sweep_buffer * 0.30
+        )
+        post_peak_followthrough = bool(lower_close or lower_high or rejection_bar or failed_reclaim)
+        distance_from_swing_high_pct = max(0.0, abs(last_close - swing_high) / max(swing_high, 1e-8))
+
+        return {
+            "swept_high": swept_high,
+            "failed_reclaim": failed_reclaim,
+            "retest_failed_breakout": retest_failed_breakout,
+            "acceptance_above_high": acceptance_above_high,
+            "rejection_bar": rejection_bar,
+            "lower_close": lower_close,
+            "lower_high": lower_high,
+            "post_peak_followthrough": post_peak_followthrough,
+            "near_sweep_level": near_sweep_level,
+            "swing_high": float(swing_high),
+            "sweep_high": float(sweep_high),
+            "sweep_buffer": float(sweep_buffer),
+            "distance_from_swing_high_pct": float(distance_from_swing_high_pct),
+        }
 
     def _layer2_weakness_confirmation(self, df: pd.DataFrame, side: str) -> tuple[bool, dict[str, Any]]:
         if side != "SHORT":
@@ -519,21 +814,76 @@ class SignalGenerator:
             }
 
         last = df.iloc[-1]
+        prev = df.iloc[-2]
         ref = df.iloc[-1 - lb]
         close_last = self._safe(last.get("close"), 0.0)
         close_ref = self._safe(ref.get("close"), close_last)
+        recent_high = float(pd.to_numeric(df.tail(lb + 3).get("high"), errors="coerce").max())
         price_up = close_last > close_ref
-        near = close_last >= close_ref * 0.95
+        near = close_last >= max(close_ref, recent_high) * (1.0 - max(float(self.config.entry_tolerance_pct) * 4.0, 0.05))
+        sweep_ctx = self._short_sweep_reclaim_context(df)
         price_ctx = price_up or near
 
         obv_div = self._safe(last.get("obv"), 0.0) < self._safe(ref.get("obv"), 0.0)
         cvd_div = self._safe(last.get("cvd"), 0.0) < self._safe(ref.get("cvd"), 0.0)
-        passed = price_ctx and (obv_div or cvd_div)
-        strength = (int(price_ctx) + int(obv_div) + int(cvd_div)) / 3.0
+        rsi_last = self._safe(last.get("rsi"), 50.0)
+        rsi_prev = self._safe(prev.get("rsi"), rsi_last)
+        hist_last = self._safe(last.get("hist"), 0.0)
+        hist_prev = self._safe(prev.get("hist"), hist_last)
+        rsi_rollover = bool(rsi_last < rsi_prev and rsi_last >= max(self.config.rsi_high * 0.72, 52.0))
+        hist_rollover = bool(hist_last < hist_prev)
+        lower_close = bool(sweep_ctx.get("lower_close"))
+        lower_high = bool(sweep_ctx.get("lower_high"))
+        rejection_bar = bool(sweep_ctx.get("rejection_bar"))
+        failed_reclaim = bool(sweep_ctx.get("failed_reclaim"))
+        retest_failed_breakout = bool(sweep_ctx.get("retest_failed_breakout"))
+        acceptance_above_high = bool(sweep_ctx.get("acceptance_above_high"))
+
+        flow_points = int(obv_div) + int(cvd_div)
+        rollover_points = int(rsi_rollover) + int(hist_rollover) + int(lower_close) + int(lower_high) + int(rejection_bar)
+        rollover_confirm = bool(failed_reclaim or retest_failed_breakout or rollover_points >= 2)
+        flow_confirm = bool(obv_div or cvd_div)
+        prev_close = self._safe(prev.get("close"), close_last)
+        clean_breakout_continuation = bool(
+            price_ctx
+            and not failed_reclaim
+            and not retest_failed_breakout
+            and not rejection_bar
+            and not lower_close
+            and not lower_high
+            and not acceptance_above_high
+            and close_last >= prev_close * (1.0 - max(float(self.config.entry_tolerance_pct) * 0.25, 0.0003))
+            and rsi_last >= rsi_prev
+            and hist_last >= hist_prev
+        )
+        passed = bool(
+            price_ctx
+            and not acceptance_above_high
+            and not clean_breakout_continuation
+            and (
+                failed_reclaim
+                or retest_failed_breakout
+                or (flow_confirm and rollover_points >= 1)
+                or rollover_points >= 3
+                or (flow_confirm and bool(sweep_ctx.get("near_sweep_level")))
+            )
+        )
+        core_strength_points = int(price_ctx) + int(obv_div) + int(cvd_div)
+        confirmation_points = int(rollover_confirm) if core_strength_points > 0 else 0
+        strength = (core_strength_points + confirmation_points) / 4.0
         missing = []
-        if not price_ctx: missing.append("price_up_or_near_high")
-        if not obv_div: missing.append("obv_bearish_divergence")
-        if not cvd_div: missing.append("cvd_bearish_divergence")
+        if not price_ctx:
+            missing.append("price_up_or_near_high")
+        if not obv_div:
+            missing.append("obv_bearish_divergence")
+        if not cvd_div:
+            missing.append("cvd_bearish_divergence")
+        if not rollover_confirm and not flow_confirm:
+            missing.append("weakness_confirmation")
+        if clean_breakout_continuation:
+            missing.append("no_trade_breakout_continuation")
+        if acceptance_above_high:
+            missing.append("acceptance_above_swing_high")
 
         return passed, {
             "passed": 1.0 if passed else 0.0,
@@ -542,8 +892,18 @@ class SignalGenerator:
             "near_high_context": 1.0 if near else 0.0,
             "obv_bearish_divergence": 1.0 if obv_div else 0.0,
             "cvd_bearish_divergence": 1.0 if cvd_div else 0.0,
+            "rsi_rollover": 1.0 if rsi_rollover else 0.0,
+            "hist_rollover": 1.0 if hist_rollover else 0.0,
+            "lower_close_after_peak": 1.0 if lower_close else 0.0,
+            "lower_high_after_peak": 1.0 if lower_high else 0.0,
+            "rejection_bar": 1.0 if rejection_bar else 0.0,
+            "failed_reclaim": 1.0 if failed_reclaim else 0.0,
+            "retest_failed_breakout": 1.0 if retest_failed_breakout else 0.0,
+            "no_trade_breakout_continuation": 1.0 if clean_breakout_continuation else 0.0,
+            "acceptance_above_swing_high": 1.0 if acceptance_above_high else 0.0,
             "close_last_used": float(close_last),
             "close_ref_used": float(close_ref),
+            "recent_high_used": float(recent_high),
             "obv_last_used": float(self._safe(last.get("obv"), 0.0)),
             "obv_ref_used": float(self._safe(ref.get("obv"), 0.0)),
             "cvd_last_used": float(self._safe(last.get("cvd"), 0.0)),
@@ -552,6 +912,17 @@ class SignalGenerator:
             "weakness_strength": float(strength),
             "missing_conditions": ",".join(missing),
             "failed_reason": "none" if passed else f"missing:{','.join(missing)}",
+            "layer2_extended_state": {
+                "rsi_rollover": bool(rsi_rollover),
+                "hist_rollover": bool(hist_rollover),
+                "lower_close_after_peak": bool(lower_close),
+                "lower_high_after_peak": bool(lower_high),
+                "rejection_bar": bool(rejection_bar),
+                "failed_reclaim": bool(failed_reclaim),
+                "retest_failed_breakout": bool(retest_failed_breakout),
+                "acceptance_above_swing_high": bool(acceptance_above_high),
+                "near_sweep_level": bool(sweep_ctx.get("near_sweep_level")),
+            },
             "layer2_subconditions_state": {
                 "price_up_or_near_high": bool(price_ctx),
                 "price_up": bool(price_up),
@@ -610,15 +981,53 @@ class SignalGenerator:
         inside_va = close >= vp.val * (1.0 - tol * 1.5) and close <= vp.vah * (1.0 + tol * 1.1)
         poc_ctx = near_poc or inside_va
         msb_ok, msb = self._layer3_msb_confirmation(df=df, side="SHORT")
+        sweep_ctx = self._short_sweep_reclaim_context(df)
+        failed_reclaim = bool(sweep_ctx.get("failed_reclaim"))
+        retest_failed_breakout = bool(sweep_ctx.get("retest_failed_breakout"))
+        acceptance_above_high = bool(sweep_ctx.get("acceptance_above_high"))
+        rejection_bar = bool(sweep_ctx.get("rejection_bar"))
+        lower_close = bool(sweep_ctx.get("lower_close"))
+        lower_high = bool(sweep_ctx.get("lower_high"))
+        post_peak_followthrough = bool(sweep_ctx.get("post_peak_followthrough"))
 
-        passed = below_or_rej and poc_ctx and bool(msb_ok)
-        strength = (int(below_or_rej) + int(poc_ctx) + int(bool(msb_ok))) / 3.0
+        trigger_ctx = below_or_rej or failed_reclaim or retest_failed_breakout
+        value_ctx = poc_ctx or failed_reclaim or retest_failed_breakout
+        micro_break_confirmed = bool(msb_ok) or lower_close or lower_high or rejection_bar or post_peak_followthrough
+        sweep_entry_ok = bool((failed_reclaim or retest_failed_breakout) and micro_break_confirmed and not acceptance_above_high)
+        value_entry_ok = bool(trigger_ctx and value_ctx and bool(msb_ok) and not acceptance_above_high)
+        passed = sweep_entry_ok or value_entry_ok
+        strength = (
+            int(trigger_ctx or sweep_entry_ok)
+            + int(value_ctx or sweep_entry_ok)
+            + int(bool(msb_ok) or sweep_entry_ok)
+            + int(not acceptance_above_high)
+        ) / 4.0
         missing = []
-        if not below_or_rej: missing.append("below_vah_or_rejected_from_vah")
-        if not poc_ctx: missing.append("near_poc_or_value_area_context")
-        if not bool(msb_ok): missing.append("msb_bearish_confirmed")
+        if not (trigger_ctx or sweep_entry_ok):
+            missing.append("below_vah_or_rejected_from_vah")
+        if not (value_ctx or sweep_entry_ok):
+            missing.append("near_poc_or_value_area_context")
+        if not (bool(msb_ok) or sweep_entry_ok):
+            missing.append("msb_bearish_confirmed")
+        if acceptance_above_high:
+            missing.append("acceptance_above_swing_high")
 
-        d = {"entry_location_passed": 1.0 if passed else 0.0, "failed_reason": "none" if passed else f"missing:{','.join(missing)}", "missing_conditions": ",".join(missing), "entry_location_strength": float(strength), "below_vah_or_rejected_from_vah": 1.0 if below_or_rej else 0.0, "near_poc_or_value_area_context": 1.0 if poc_ctx else 0.0, "msb_bearish_confirmed": 1.0 if bool(msb_ok) else 0.0, "vp_levels_available": 1.0, "below_vah": 1.0 if below_vah else 0.0}
+        d = {
+            "entry_location_passed": 1.0 if passed else 0.0,
+            "failed_reason": "none" if passed else f"missing:{','.join(missing)}",
+            "missing_conditions": ",".join(missing),
+            "entry_location_strength": float(strength),
+            "below_vah_or_rejected_from_vah": 1.0 if below_or_rej else 0.0,
+            "near_poc_or_value_area_context": 1.0 if poc_ctx else 0.0,
+            "failed_reclaim": 1.0 if failed_reclaim else 0.0,
+            "retest_failed_breakout": 1.0 if retest_failed_breakout else 0.0,
+            "sweep_reclaim_entry_ok": 1.0 if sweep_entry_ok else 0.0,
+            "value_area_entry_ok": 1.0 if value_entry_ok else 0.0,
+            "acceptance_above_swing_high": 1.0 if acceptance_above_high else 0.0,
+            "msb_bearish_confirmed": 1.0 if bool(msb_ok) else 0.0,
+            "vp_levels_available": 1.0,
+            "below_vah": 1.0 if below_vah else 0.0,
+        }
         d.update(msb)
         return passed, d
 
@@ -823,6 +1232,10 @@ class SignalGenerator:
             else recent_high_ref
         )
         structural_inv_ref = max(local_recent_high_ref, recent_high_ref, base_inv)
+        sweep_ctx = self._short_sweep_reclaim_context(df)
+        sweep_high = float(sweep_ctx.get("sweep_high") or 0.0)
+        if bool(sweep_ctx.get("swept_high")) and sweep_high > 0:
+            structural_inv_ref = max(structural_inv_ref, sweep_high)
         vp_cap = max(
             structural_inv_ref + atr * 0.72,
             entry + atr * max(atr_sl * 0.74, 0.92),
@@ -832,7 +1245,16 @@ class SignalGenerator:
         else:
             inv_ref = structural_inv_ref
 
-        stop_buffer = max(atr * 0.10, entry * max(tol * 0.34, 0.00045))
+        failed_reclaim = bool(sweep_ctx.get("failed_reclaim"))
+        retest_failed_breakout = bool(sweep_ctx.get("retest_failed_breakout"))
+        stop_buffer = max(
+            atr * (
+                0.32
+                if bool(sweep_ctx.get("swept_high")) or failed_reclaim or retest_failed_breakout
+                else 0.18
+            ),
+            entry * max(tol * 0.40, 0.00055),
+        )
         sl = max(inv_ref + stop_buffer, base_inv)
         provisional_tp = entry - max(atr, entry * 0.0001) * rr
         provisional_tp, sl = self._normalize_levels(entry=entry, tp=provisional_tp, sl=sl, side="SHORT")
@@ -899,11 +1321,72 @@ class SignalGenerator:
             fallback_rr = True
 
         tp, sl = self._normalize_levels(entry=entry, tp=tp, sl=sl, side="SHORT")
+        fair_value = (
+            float((float(vp.vah) + float(vp.val)) / 2.0)
+            if vp is not None and np.isfinite(float(vp.vah)) and np.isfinite(float(vp.val))
+            else 0.0
+        )
+        vwap_target = self._safe(last.get("vwap"), 0.0)
+
+        def _pick_highest_below(candidates: list[tuple[float, str]], ceiling: float) -> tuple[float, str] | None:
+            valid = [(float(value), str(ref)) for value, ref in candidates if np.isfinite(value) and 0 < float(value) < ceiling - max(entry * 0.0001, 1e-8)]
+            return max(valid, key=lambda item: item[0]) if valid else None
+
+        def _pick_lowest_below(candidates: list[tuple[float, str]], ceiling: float) -> tuple[float, str] | None:
+            valid = [(float(value), str(ref)) for value, ref in candidates if np.isfinite(value) and 0 < float(value) < ceiling - max(entry * 0.0001, 1e-8)]
+            return min(valid, key=lambda item: item[0]) if valid else None
+
+        tp1_pick = _pick_highest_below(
+            [
+                (vwap_target, "session_vwap"),
+                (fair_value, "fair_value"),
+                (float(vp.vah), "vp_vah") if vp is not None else (0.0, ""),
+                (entry - risk_distance * 0.85, "rr_tp1"),
+            ],
+            entry,
+        )
+        tp1 = tp1_pick[0] if tp1_pick else 0.0
+        tp1_ref = tp1_pick[1] if tp1_pick else ""
+
+        tp2_pick = _pick_highest_below(
+            [
+                (float(vp.poc), "vp_poc") if vp is not None else (0.0, ""),
+                ((float(vp.vah) + float(vp.val)) / 2.0, "vp_mid") if vp is not None else (0.0, ""),
+                (fair_value, "fair_value"),
+                (recent_support, "recent_support"),
+                (rr_projection, "rr_projection"),
+            ],
+            tp1 if tp1 > 0 else entry,
+        )
+        tp2 = tp2_pick[0] if tp2_pick else 0.0
+        tp2_ref = tp2_pick[1] if tp2_pick else ""
+
+        tp3_pick = _pick_lowest_below(
+            [
+                (float(vp.val), "vp_val") if vp is not None else (0.0, ""),
+                (deep_support, "deep_support"),
+                (entry - risk_distance * max(rr + 0.55, 2.4), "rr_tp3"),
+                (tp, str(tp_ref)),
+            ],
+            tp2 if tp2 > 0 else (tp1 if tp1 > 0 else entry),
+        )
+        tp3 = tp3_pick[0] if tp3_pick else 0.0
+        tp3_ref = tp3_pick[1] if tp3_pick else ""
+
+        final_tp = tp
+        final_tp_ref = str(tp_ref)
+        if tp2 > 0:
+            final_tp = tp2
+            final_tp_ref = str(tp2_ref or tp_ref)
+        elif tp1 > 0:
+            final_tp = tp1
+            final_tp_ref = str(tp1_ref or tp_ref)
+        final_tp, sl = self._normalize_levels(entry=entry, tp=final_tp, sl=sl, side="SHORT")
         stop_pct = (sl - entry) / max(entry, 1e-9)
-        tp_pct = (entry - tp) / max(entry, 1e-9)
+        tp_pct = (entry - final_tp) / max(entry, 1e-9)
         rr_val = (tp_pct / max(stop_pct, 1e-9)) if stop_pct > 0 else 0.0
         stop_ok = sl >= inv_ref and sl > entry
-        tp_ok = tp <= float(vp.poc) * (1.0 + tol) if (tp_ref in {"vp_poc", "vp_balance"} and vp is not None) else tp < entry
+        tp_ok = final_tp <= float(vp.poc) * (1.0 + tol) if (final_tp_ref in {"vp_poc", "vp_balance"} and vp is not None) else final_tp < entry
         rr_ok = rr_val >= rr_floor
         passed = stop_ok and tp_ok and rr_ok
 
@@ -917,10 +1400,39 @@ class SignalGenerator:
             partial_candidates.append(float(vp.poc))
         if np.isfinite(recent_support) and 0 < recent_support < entry:
             partial_candidates.append(float(recent_support))
-        partial_candidates.append(float((entry + tp) / 2.0))
-        partial_candidates.append(float(tp))
+        partial_candidates.extend([float(x) for x in (tp1, tp2, tp3) if x > 0.0])
+        partial_candidates.append(float((entry + final_tp) / 2.0))
+        partial_candidates.append(float(final_tp))
         partial_tps = sorted({round(float(x), 10) for x in partial_candidates if 0 < float(x) < entry}, reverse=True)
-        return passed, {"passed": 1.0 if passed else 0.0, "entry": float(entry), "tp": float(tp), "sl": float(sl), "partial_tps": partial_tps, "stop_above_invalidation": 1.0 if stop_ok else 0.0, "tp_at_poc_or_better": 1.0 if tp_ok else 0.0, "atr_available": 1.0 if atr_available else 0.0, "volume_profile_available": 1.0 if vp is not None else 0.0, "fallback_rr_used": 1.0 if fallback_rr else 0.0, "invalidation_reference": float(inv_ref), "tp_reference": str(tp_ref), "stop_distance_pct": float(stop_pct), "take_profit_distance_pct": float(tp_pct), "risk_reward_ratio": float(rr_val), "missing_conditions": ",".join(missing), "failed_reason": "none" if passed else f"missing:{','.join(missing)}", "tp_sl_strength": float(strength)}
+        details = {
+            "passed": 1.0 if passed else 0.0,
+            "entry": float(entry),
+            "tp": float(final_tp),
+            "sl": float(sl),
+            "tp1": float(tp1) if tp1 > 0 else 0.0,
+            "tp2": float(tp2) if tp2 > 0 else 0.0,
+            "tp3": float(tp3) if tp3 > 0 else 0.0,
+            "tp1_reference": str(tp1_ref),
+            "tp2_reference": str(tp2_ref),
+            "tp3_reference": str(tp3_ref),
+            "partial_tps": partial_tps,
+            "stop_above_invalidation": 1.0 if stop_ok else 0.0,
+            "tp_at_poc_or_better": 1.0 if tp_ok else 0.0,
+            "atr_available": 1.0 if atr_available else 0.0,
+            "volume_profile_available": 1.0 if vp is not None else 0.0,
+            "fallback_rr_used": 1.0 if fallback_rr else 0.0,
+            "invalidation_reference": float(inv_ref),
+            "tp_reference": str(final_tp_ref),
+            "sweep_high_invalidation": 1.0 if bool(sweep_ctx.get("swept_high")) else 0.0,
+            "acceptance_above_high": 1.0 if bool(sweep_ctx.get("acceptance_above_high")) else 0.0,
+            "stop_distance_pct": float(stop_pct),
+            "take_profit_distance_pct": float(tp_pct),
+            "risk_reward_ratio": float(rr_val),
+            "missing_conditions": ",".join(missing),
+            "failed_reason": "none" if passed else f"missing:{','.join(missing)}",
+            "tp_sl_strength": float(strength),
+        }
+        return passed, details
 
     @staticmethod
     def _normalize_levels(entry: float, tp: float, sl: float, side: str) -> tuple[float, float]:

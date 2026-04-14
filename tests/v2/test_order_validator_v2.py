@@ -39,6 +39,19 @@ class OrderValidatorV2Tests(unittest.TestCase):
         with self.assertRaises(OrderValidationError):
             validate_order_intent(intent, rules=self.rules, account=self.account, mark_price=100.0, open_orders=open_orders)
 
+    def test_reject_above_max_qty(self):
+        rules = InstrumentRules(
+            symbol="BTCUSDT",
+            tick_size=0.1,
+            qty_step=0.01,
+            min_qty=0.01,
+            min_notional=5.0,
+            max_qty=0.05,
+        )
+        intent = OrderIntent(symbol="BTCUSDT", side=OrderSide.BUY, qty=0.06)
+        with self.assertRaises(OrderValidationError):
+            validate_order_intent(intent, rules=rules, account=self.account, mark_price=100.0, open_orders=[])
+
 
 if __name__ == "__main__":
     unittest.main()

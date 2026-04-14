@@ -142,47 +142,17 @@ if ($existing.Count -gt 0) {
     Start-Sleep -Seconds 1
 }
 
-Remove-Item Env:PYTHONHOME -ErrorAction SilentlyContinue
-Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
-Remove-Item Env:VIRTUAL_ENV -ErrorAction SilentlyContinue
+$launchTs = Get-Date
+$cmdLine = 'set "PYTHONHOME=" && set "PYTHONPATH=" && set "VIRTUAL_ENV=" && start "" /b "{0}" -u "{1}" --loop --signal-profile {2} 1>>"{3}" 2>>"{4}"' -f $python, $mainPy, $SignalProfile, $stdoutLog, $stderrLog
+& $env:ComSpec /d /c $cmdLine | Out-Null
+Start-Sleep -Seconds 1
 
-function Set-OptionalEnvVar {
-    param(
-        [string]$Name,
-        [string]$Value
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Value)) {
-        Remove-Item ("Env:{0}" -f $Name) -ErrorAction SilentlyContinue
-    } else {
-        Set-Item ("Env:{0}" -f $Name) -Value $Value
-    }
-}
-
-$envSnapshot = @{
-    PYTHONHOME = $env:PYTHONHOME
-    PYTHONPATH = $env:PYTHONPATH
-    VIRTUAL_ENV = $env:VIRTUAL_ENV
-}
-
-try {
-    Set-OptionalEnvVar -Name "PYTHONHOME" -Value $null
-    Set-OptionalEnvVar -Name "PYTHONPATH" -Value $sitePackages
-    Set-OptionalEnvVar -Name "VIRTUAL_ENV" -Value $venvRoot
-
-    $proc = Start-Process `
-        -FilePath $python `
-        -ArgumentList @("-u", $mainPy, "--loop", "--signal-profile", $SignalProfile) `
-        -WorkingDirectory $root `
-        -WindowStyle Hidden `
-        -RedirectStandardOutput $stdoutLog `
-        -RedirectStandardError $stderrLog `
-        -PassThru
-} finally {
-    Set-OptionalEnvVar -Name "PYTHONHOME" -Value $envSnapshot.PYTHONHOME
-    Set-OptionalEnvVar -Name "PYTHONPATH" -Value $envSnapshot.PYTHONPATH
-    Set-OptionalEnvVar -Name "VIRTUAL_ENV" -Value $envSnapshot.VIRTUAL_ENV
-}
+$proc = Get-Process python -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.StartTime -ge $launchTs.AddSeconds(-2) -and ($_.Path -eq $python -or $_.Path -like "*koteika_Ultra*")
+    } |
+    Sort-Object StartTime -Descending |
+    Select-Object -First 1
 
 if (-not $proc) {
     throw "Failed to start bot process."

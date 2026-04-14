@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import importlib
+import json
 import logging
 import os
 import re
@@ -28,6 +29,7 @@ _DISCOVERY_EXCLUDED_SYMBOLS = {
     "ETHBTCUSDT",
     "PUMPBTCUSDT",
 }
+_DISCOVERY_CACHE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "runtime"))
 
 
 class ConfigError(RuntimeError):
@@ -74,30 +76,37 @@ class RuntimeConfig:
 
 
 def _load_dotenv_file(path: str = ".env") -> None:
-    env_path = os.path.abspath(path)
-    if not os.path.exists(env_path):
-        return
-    try:
-        with open(env_path, "r", encoding="utf-8-sig") as handle:
-            for raw_line in handle:
-                line = raw_line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                if line.lower().startswith("export "):
-                    line = line[7:].strip()
-                key, value = line.split("=", 1)
-                key = key.strip()
-                if not key:
-                    continue
-                value = value.strip()
-                if value and value[0] not in ("'", '"') and " #" in value:
-                    value = value.split(" #", 1)[0].strip()
-                parsed = value.strip().strip('"').strip("'")
-                current = os.getenv(key)
-                if current is None or not str(current).strip():
-                    os.environ[key] = parsed
-    except Exception:
-        return
+    candidates = [
+        os.path.abspath(path),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", path)),
+    ]
+    seen: set[str] = set()
+    for env_path in candidates:
+        normalized = os.path.normcase(env_path)
+        if normalized in seen or not os.path.exists(env_path):
+            continue
+        seen.add(normalized)
+        try:
+            with open(env_path, "r", encoding="utf-8-sig") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    if line.lower().startswith("export "):
+                        line = line[7:].strip()
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    if not key:
+                        continue
+                    value = value.strip()
+                    if value and value[0] not in ("'", '"') and " #" in value:
+                        value = value.split(" #", 1)[0].strip()
+                    parsed = value.strip().strip('"').strip("'")
+                    current = os.getenv(key)
+                    if current is None or not str(current).strip():
+                        os.environ[key] = parsed
+        except Exception:
+            continue
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -120,13 +129,56 @@ def _env_first_nonempty(*names: str) -> str:
 
 def _resolve_signal_profile_env() -> str:
     raw = str(os.getenv("BOT_SIGNAL_PROFILE", "both")).strip().lower()
-    return raw if raw in {"both", "main", "early"} else "both"
+    if raw in {"main", "early"}:
+        return raw
+
+    generic_demo = _env_first_nonempty(
+        "BYBIT_DEMO_API_KEY",
+        "BYBIT_DEMO_KEY",
+        "DEMO_BYBIT_API_KEY",
+        "DEMO_API_KEY",
+        "BYBIT_API_KEY",
+        "API_KEY",
+    )
+    if generic_demo:
+        return "both"
+
+    main_demo = _env_first_nonempty(
+        "BYBIT_DEMO_API_KEY_MAIN",
+        "MAIN_BYBIT_DEMO_API_KEY",
+        "BYBIT_API_KEY_MAIN",
+        "API_KEY_MAIN",
+    )
+    if main_demo:
+        return "main"
+
+    early_demo = _env_first_nonempty(
+        "BYBIT_DEMO_API_KEY_EARLY",
+        "EARLY_BYBIT_DEMO_API_KEY",
+        "BYBIT_API_KEY_EARLY",
+        "API_KEY_EARLY",
+    )
+    if early_demo:
+        return "early"
+
+    return "both"
 
 
 def _env_first_nonempty_profiled(profile: str, *names: str) -> str:
     profiled = str(profile or "").strip().lower()
     if profiled not in {"main", "early"}:
-        return _env_first_nonempty(*names)
+        expanded: list[str] = []
+        for name in names:
+            expanded.extend(
+                [
+                    name,
+                    f"{name}_MAIN",
+                    f"MAIN_{name}",
+                    f"{name}_EARLY",
+                    f"EARLY_{name}",
+                ]
+            )
+        return _env_first_nonempty(*expanded)
 
     suffix = profiled.upper()
     expanded: list[str] = []
@@ -144,7 +196,21 @@ def _env_first_nonempty_profiled(profile: str, *names: str) -> str:
 def _env_first_nonempty_profiled_info(profile: str, *names: str) -> tuple[str, bool]:
     profiled = str(profile or "").strip().lower()
     if profiled not in {"main", "early"}:
-        return _env_first_nonempty(*names), False
+        for name in names:
+            for candidate, is_profiled in (
+                (name, False),
+                (f"{name}_MAIN", True),
+                (f"MAIN_{name}", True),
+                (f"{name}_EARLY", True),
+                (f"EARLY_{name}", True),
+            ):
+                raw = os.getenv(candidate)
+                if raw is None:
+                    continue
+                value = str(raw).strip()
+                if value:
+                    return value, is_profiled
+        return "", False
 
     suffix = profiled.upper()
     for name in names:
@@ -255,6 +321,64 @@ def _legacy_env_testnet_default(default: bool = True) -> bool:
     return bool(default)
 
 
+def _discovery_cache_path(*, testnet: bool) -> str:
+    filename = "bybit_symbol_cache_testnet.json" if testnet else "bybit_symbol_cache_mainnet.json"
+    return os.path.join(_DISCOVERY_CACHE_DIR, filename)
+
+
+def _save_discovery_cache(
+    *,
+    testnet: bool,
+    symbols: list[str],
+    min_turnover_usdt: float,
+    max_turnover_usdt: float,
+    perpetual_only: bool,
+    quality_filter: bool,
+) -> None:
+    if not symbols:
+        return
+    try:
+        os.makedirs(_DISCOVERY_CACHE_DIR, exist_ok=True)
+        payload = {
+            "saved_at_ts": time.time(),
+            "testnet": bool(testnet),
+            "min_turnover_usdt": float(min_turnover_usdt),
+            "max_turnover_usdt": float(max_turnover_usdt),
+            "perpetual_only": bool(perpetual_only),
+            "quality_filter": bool(quality_filter),
+            "symbols": list(symbols),
+        }
+        with open(_discovery_cache_path(testnet=testnet), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+    except Exception as exc:
+        logger.debug("symbol discovery cache save skipped: %s", exc)
+
+
+def _load_discovery_cache(*, testnet: bool, limit: int) -> list[str]:
+    try:
+        cache_path = _discovery_cache_path(testnet=testnet)
+        if not os.path.exists(cache_path):
+            return []
+        with open(cache_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict):
+            return []
+        cached_testnet = bool(payload.get("testnet", testnet))
+        if cached_testnet != bool(testnet):
+            return []
+        symbols = payload.get("symbols", [])
+        if not isinstance(symbols, list):
+            return []
+        cleaned = [str(symbol).upper().strip() for symbol in symbols if str(symbol).strip()]
+        cleaned = list(dict.fromkeys(cleaned))
+        if limit > 0:
+            cleaned = cleaned[:limit]
+        return cleaned
+    except Exception as exc:
+        logger.debug("symbol discovery cache load skipped: %s", exc)
+        return []
+
+
 def _discover_linear_usdt_symbols(
     *,
     testnet: bool,
@@ -264,11 +388,12 @@ def _discover_linear_usdt_symbols(
     quality_filter: bool,
     limit: int,
 ) -> list[str]:
+    cache_fallback = _load_discovery_cache(testnet=testnet, limit=limit)
     try:
         from trading.exchange.bybit_client import BybitHttpClient
     except Exception as exc:
         logger.warning("symbol discovery disabled: bybit client unavailable: %s", exc)
-        return ["BTCUSDT"]
+        return cache_fallback or ["BTCUSDT"]
 
     client = BybitHttpClient(
         api_key="",
@@ -346,8 +471,19 @@ def _discover_linear_usdt_symbols(
         if limit > 0:
             symbols = symbols[:limit]
         if symbols:
+            _save_discovery_cache(
+                testnet=testnet,
+                symbols=symbols,
+                min_turnover_usdt=min_turnover_usdt,
+                max_turnover_usdt=max_turnover_usdt,
+                perpetual_only=perpetual_only,
+                quality_filter=quality_filter,
+            )
             return symbols
     except Exception as exc:
+        if cache_fallback:
+            logger.warning("symbol discovery failed, using cached universe (%d symbols): %s", len(cache_fallback), exc)
+            return cache_fallback
         logger.warning("symbol discovery failed, falling back to BTCUSDT: %s", exc)
     finally:
         try:
@@ -355,7 +491,7 @@ def _discover_linear_usdt_symbols(
         except Exception:
             pass
 
-    return ["BTCUSDT"]
+    return cache_fallback or ["BTCUSDT"]
 
 
 def _resolve_symbols(*, testnet: bool) -> list[str]:
@@ -579,7 +715,7 @@ def load_runtime_config() -> RuntimeConfig:
             "RUNTIME_DB_PATH",
         ),
         ws_poll_interval_sec=int(os.getenv("SYNC_POLL_INTERVAL_SEC", "10")),
-        ws_event_staleness_sec=int(os.getenv("SYNC_WS_STALENESS_SEC", "20")),
+        ws_event_staleness_sec=int(os.getenv("SYNC_WS_STALENESS_SEC", "60")),
         stop_attach_grace_sec=int(os.getenv("EXEC_STOP_ATTACH_GRACE_SEC", "8")),
         stale_open_order_sec=int(os.getenv("EXEC_STALE_OPEN_ORDER_SEC", "120")),
         max_exchange_retries=int(os.getenv("EXEC_MAX_EXCHANGE_RETRIES", "2")),
@@ -609,7 +745,7 @@ def validate_runtime_config(cfg: RuntimeConfig):
         if not cfg.adapter.api_key or not cfg.adapter.api_secret:
             if cfg.mode == "demo":
                 raise ConfigError(
-                    "Demo mode requires API keys. Supported env vars: BYBIT_DEMO_API_KEY/BYBIT_DEMO_API_SECRET or generic BYBIT_API_KEY/BYBIT_API_SECRET."
+                    "Demo mode requires API keys. Supported env vars: BYBIT_DEMO_API_KEY/BYBIT_DEMO_API_SECRET, profile-specific BYBIT_DEMO_API_KEY_MAIN/BYBIT_DEMO_API_SECRET_MAIN and BYBIT_DEMO_API_KEY_EARLY/BYBIT_DEMO_API_SECRET_EARLY, or generic BYBIT_API_KEY/BYBIT_API_SECRET."
                 )
             if cfg.mode == "testnet":
                 raise ConfigError(

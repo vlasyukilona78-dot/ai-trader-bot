@@ -1,13 +1,43 @@
 ﻿from __future__ import annotations
 
 import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
-from app.bootstrap import ConfigError, _quality_symbol_allowed, load_runtime_config
+from app.bootstrap import ConfigError, _discover_linear_usdt_symbols, _quality_symbol_allowed, load_runtime_config
 
 
 class BootstrapConfigV2Tests(unittest.TestCase):
+    def test_discovery_uses_cached_universe_when_public_requests_fail(self):
+        class _FailingClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def request_public(self, path, params=None):
+                raise RuntimeError("network_down")
+
+            def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_path = os.path.join(tmp_dir, "symbols.json")
+            with open(cache_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    '{"testnet": false, "symbols": ["AAVEUSDT", "ADAUSDT", "APTUSDT"]}'
+                )
+            with patch("app.bootstrap._discovery_cache_path", return_value=cache_path):
+                with patch("trading.exchange.bybit_client.BybitHttpClient", _FailingClient):
+                    symbols = _discover_linear_usdt_symbols(
+                        testnet=False,
+                        min_turnover_usdt=100000,
+                        max_turnover_usdt=200000000,
+                        perpetual_only=True,
+                        quality_filter=True,
+                        limit=0,
+                    )
+        self.assertEqual(symbols, ["AAVEUSDT", "ADAUSDT", "APTUSDT"])
+
     def test_quality_symbol_filter_rejects_wrappers_and_metals(self):
         self.assertFalse(_quality_symbol_allowed("1000PEPEUSDT"))
         self.assertFalse(_quality_symbol_allowed("SHIB1000USDT"))

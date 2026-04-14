@@ -389,18 +389,19 @@ class ExecutionEngine:
 
         return issues
 
-    def recover_from_restart(self, symbol: str, snapshot: ExchangeSnapshot):
+    def recover_from_restart(self, symbol: str, snapshot: ExchangeSnapshot) -> bool:
         if self.persistence is None:
-            return
+            return False
 
         norm_symbol = self._norm_symbol(symbol)
         entries = self._symbol_inflight_entries(norm_symbol)
         if not entries:
-            return
+            return False
 
         position = self._current_position(snapshot)
         open_orders = [o for o in snapshot.open_orders if self._norm_symbol(o.symbol) == norm_symbol]
         now_ts = time.time()
+        exchange_mutated = False
 
         for entry in entries:
             payload = dict(entry.payload) if isinstance(entry.payload, dict) else {}
@@ -428,6 +429,7 @@ class ExecutionEngine:
                         order_id=order.order_id,
                         order_link_id=order.order_link_id,
                     )
+                    exchange_mutated = exchange_mutated or bool(ok)
                     if not ok:
                         cancel_failures += 1
 
@@ -473,6 +475,7 @@ class ExecutionEngine:
                         order_link_id=order.order_link_id,
                     ):
                         cancelled += 1
+                        exchange_mutated = True
                 payload["remaining_entry_orders_cancelled"] = int(cancelled)
 
             target_state = TradeState.LONG if position.side == PositionSide.LONG else TradeState.SHORT
@@ -495,6 +498,7 @@ class ExecutionEngine:
                     position_idx=position_idx,
                     qty=float(position.qty),
                 )
+                exchange_mutated = exchange_mutated or bool(stop_res.success)
                 if stop_res.success:
                     status = "protected_partial" if is_partial_live else "protected"
                     reason = "restart_stop_attached_partial" if is_partial_live else "restart_stop_attached"
@@ -514,6 +518,7 @@ class ExecutionEngine:
                     close_on_trigger=True,
                 )
             )
+            exchange_mutated = exchange_mutated or bool(close_res.success)
             if close_res.success and close_res.filled_qty >= max(0.0, float(position.qty) * 0.999):
                 self.persistence.update_inflight_status(entry.intent_key, "recovered_close", payload)
                 self.state_machine.transition(norm_symbol, TradeState.FLAT, "restart_recovered_close")
@@ -521,6 +526,8 @@ class ExecutionEngine:
                 payload["grace_deadline_ts"] = now_ts + self.stop_attach_grace_sec
                 self.persistence.update_inflight_status(entry.intent_key, "naked_exposure", payload)
                 self.state_machine.transition(norm_symbol, TradeState.HALTED, "restart_unprotected_exposure")
+
+        return exchange_mutated
 
     def execute(
         self,
@@ -595,6 +602,9 @@ class ExecutionEngine:
                 return ExecutionOutcome(accepted=False, status="REJECTED", reason=f"instrument_metadata:{exc}")
 
             qty = self.adapter.round_qty(risk.quantity, rules.qty_step)
+            if rules.max_qty > 0:
+                max_qty = self.adapter.round_qty(rules.max_qty, rules.qty_step)
+                qty = min(qty, max_qty if max_qty > 0 else rules.max_qty)
             if qty <= 0:
                 return ExecutionOutcome(accepted=False, status="REJECTED", reason="rounded_qty_zero")
 

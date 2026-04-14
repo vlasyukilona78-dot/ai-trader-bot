@@ -428,9 +428,10 @@ class BybitAdapter:
         return out
 
     def get_open_orders_metadata(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        if not symbol:
+            return []
         params: dict[str, Any] = {"category": "linear"}
-        if symbol:
-            params["symbol"] = self.normalize_symbol(symbol)
+        params["symbol"] = self.normalize_symbol(symbol)
         payload = self.client.request_private("GET", "/v5/order/realtime", params=params)
         result = payload.get("result", {}) if isinstance(payload, dict) else {}
         rows = result.get("list", []) if isinstance(result, dict) else []

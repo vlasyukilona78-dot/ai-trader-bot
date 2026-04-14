@@ -23,6 +23,7 @@ class FakeAdapter:
     rules: InstrumentRules = field(default_factory=lambda: InstrumentRules(symbol="BTCUSDT", tick_size=0.1, qty_step=0.001, min_qty=0.001, min_notional=5.0))
     mark_price: float = 100.0
     hedge_mode: bool = False
+    ws_health_meta: dict = field(default_factory=dict)
 
     def __post_init__(self):
         self.positions: list[PositionSnapshot] = []
@@ -55,7 +56,10 @@ class FakeAdapter:
         return float(int(max(qty, 0.0) / qty_step) * qty_step)
 
     def metadata_health(self) -> dict:
-        return {"cached_symbols": 1, "fresh_symbols": 1, "stale_symbols": 0, "ttl_sec": 900}
+        payload = {"cached_symbols": 1, "fresh_symbols": 1, "stale_symbols": 0, "ttl_sec": 900}
+        if self.ws_health_meta:
+            payload["ws"] = dict(self.ws_health_meta)
+        return payload
 
     def get_account(self) -> AccountSnapshot:
         return self.account

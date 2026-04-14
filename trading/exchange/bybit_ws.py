@@ -9,6 +9,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from trading.exchange.bybit_endpoints import resolve_private_ws_url, resolve_public_ws_url
 from trading.exchange.events import ExchangeEventType, NormalizedExchangeEvent
 from trading.exchange.schemas import AccountSnapshot, OpenOrderSnapshot, OrderSide, PositionSide, PositionSnapshot
 
@@ -160,16 +161,10 @@ class BybitWebSocketStream:
         return out
 
     def _public_endpoint(self) -> str:
-        if self.config.testnet:
-            return "wss://stream-testnet.bybit.com/v5/public/linear"
-        return "wss://stream.bybit.com/v5/public/linear"
+        return resolve_public_ws_url(testnet=bool(self.config.testnet))
 
     def _private_endpoint(self) -> str:
-        if self.config.testnet:
-            return "wss://stream-testnet.bybit.com/v5/private"
-        if self.config.demo:
-            return "wss://stream-demo.bybit.com/v5/private"
-        return "wss://stream.bybit.com/v5/private"
+        return resolve_private_ws_url(testnet=bool(self.config.testnet), demo=bool(self.config.demo))
 
     def _auth_payload(self) -> dict:
         expires = int((time.time() + 10) * 1000)
@@ -205,7 +200,14 @@ class BybitWebSocketStream:
         while self._running and not self._stop_evt.is_set():
             try:
                 self._push(ExchangeEventType.RECONNECTING, payload={"channel": channel})
-                with ws_connect(url, open_timeout=8, close_timeout=4, ping_interval=20, ping_timeout=10) as ws:
+                with ws_connect(
+                    url,
+                    open_timeout=8,
+                    close_timeout=4,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    proxy=None,
+                ) as ws:
                     backoff = base_backoff
                     self._push(ExchangeEventType.CONNECTED, payload={"channel": channel})
                     self._push_snapshot_required(f"{channel}_connected")

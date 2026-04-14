@@ -41,6 +41,8 @@ class ExchangeSyncService:
 
         self._ws_connected = False
         self._last_event_ts = 0.0
+        self._ws_channel_connected: dict[str, bool] = {"public": False, "private": False}
+        self._last_event_ts_by_channel: dict[str, float] = {"public": 0.0, "private": 0.0}
         self._account: AccountSnapshot | None = None
         self._positions_by_symbol: dict[str, list[PositionSnapshot]] = {}
         self._orders_by_symbol: dict[str, list[OpenOrderSnapshot]] = {}
@@ -87,9 +89,16 @@ class ExchangeSyncService:
         for event in events:
             self.handle_event(event)
 
+    @staticmethod
+    def _event_channel(event: NormalizedExchangeEvent) -> str:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        raw = str(payload.get("channel") or "").strip().lower()
+        return raw if raw in {"public", "private"} else ""
+
     def pull_adapter_events(self, adapter):
         drain = getattr(adapter, "drain_ws_events", None)
         if not callable(drain):
+            self._ingest_adapter_ws_health(adapter)
             return
         try:
             events = drain() or []
@@ -97,13 +106,62 @@ class ExchangeSyncService:
             events = []
         if events:
             self.process_events(events)
+        self._ingest_adapter_ws_health(adapter)
+
+    def _ingest_adapter_ws_health(self, adapter) -> None:
+        metadata_health = getattr(adapter, "metadata_health", None)
+        if not callable(metadata_health):
+            return
+        try:
+            metadata = metadata_health() or {}
+        except Exception:
+            return
+        if not isinstance(metadata, dict):
+            return
+        ws_meta = metadata.get("ws")
+        if not isinstance(ws_meta, dict):
+            return
+
+        now = time.time()
+        freshness_cap = max(float(self.max_event_staleness_sec) * 1.25, 3.0)
+        saw_fresh_channel = False
+        for channel, field in (("public", "public_last_msg_ts"), ("private", "private_last_msg_ts")):
+            raw_ts = ws_meta.get(field)
+            try:
+                channel_ts = float(raw_ts or 0.0)
+            except (TypeError, ValueError):
+                channel_ts = 0.0
+            if channel_ts <= 0:
+                continue
+            self._last_event_ts = max(self._last_event_ts, channel_ts)
+            self._last_event_ts_by_channel[channel] = max(
+                self._last_event_ts_by_channel.get(channel, 0.0),
+                channel_ts,
+            )
+            if (now - channel_ts) <= freshness_cap:
+                self._ws_channel_connected[channel] = True
+                saw_fresh_channel = True
+        if saw_fresh_channel:
+            self._ws_connected = any(self._ws_channel_connected.values())
 
     def handle_event(self, event: NormalizedExchangeEvent):
         ts = float(event.ts or time.time())
         self._last_event_ts = max(self._last_event_ts, ts)
+        channel = self._event_channel(event)
+        if channel:
+            self._last_event_ts_by_channel[channel] = max(self._last_event_ts_by_channel.get(channel, 0.0), ts)
+            if event.event_type not in (
+                ExchangeEventType.RECONNECTING,
+                ExchangeEventType.DISCONNECTED,
+                ExchangeEventType.ERROR,
+            ):
+                self._ws_channel_connected[channel] = True
+                self._ws_connected = any(self._ws_channel_connected.values())
 
         if event.event_type == ExchangeEventType.CONNECTED:
             self._ws_connected = True
+            if channel:
+                self._ws_channel_connected[channel] = True
             return
 
         if event.event_type in (
@@ -111,7 +169,11 @@ class ExchangeSyncService:
             ExchangeEventType.DISCONNECTED,
             ExchangeEventType.ERROR,
         ):
-            self._ws_connected = False
+            if channel:
+                self._ws_channel_connected[channel] = False
+            else:
+                self._ws_channel_connected = {"public": False, "private": False}
+            self._ws_connected = any(self._ws_channel_connected.values())
             self._require_snapshot(event.symbol)
             return
 
@@ -195,20 +257,35 @@ class ExchangeSyncService:
             return
 
     def _ws_is_fresh(self) -> bool:
-        if not self._ws_connected:
+        public_connected = bool(self._ws_channel_connected.get("public"))
+        public_last_event_ts = float(self._last_event_ts_by_channel.get("public", 0.0))
+        overall_connected = bool(self._ws_connected or any(self._ws_channel_connected.values()))
+        if public_last_event_ts > 0:
+            effective_public_connected = public_connected or public_last_event_ts > 0
+            if not effective_public_connected:
+                return False
+            return (time.time() - public_last_event_ts) <= self.max_event_staleness_sec
+        if not overall_connected:
             return False
         if self._last_event_ts <= 0:
             return False
         return (time.time() - self._last_event_ts) <= self.max_event_staleness_sec
 
     def health(self) -> SyncHealth:
+        public_last_event_ts = float(self._last_event_ts_by_channel.get("public", 0.0))
+        effective_last_event_ts = public_last_event_ts if public_last_event_ts > 0 else float(self._last_event_ts)
+        ws_connected = (
+            bool(self._ws_channel_connected.get("public")) or public_last_event_ts > 0
+            if public_last_event_ts > 0
+            else bool(self._ws_connected or any(self._ws_channel_connected.values()))
+        )
         ws_stale = False
-        if self._last_event_ts > 0:
-            ws_stale = (time.time() - self._last_event_ts) > self.max_event_staleness_sec
+        if effective_last_event_ts > 0:
+            ws_stale = (time.time() - effective_last_event_ts) > self.max_event_staleness_sec
         snapshot_required = self._snapshot_required_global or bool(self._snapshot_required_symbols)
         return SyncHealth(
-            ws_connected=self._ws_connected,
-            ws_last_event_ts=float(self._last_event_ts),
+            ws_connected=ws_connected,
+            ws_last_event_ts=effective_last_event_ts,
             ws_stale=ws_stale,
             fallback_polling=(not self._ws_is_fresh()) or snapshot_required,
             snapshot_required=snapshot_required,
@@ -219,8 +296,30 @@ class ExchangeSyncService:
         if not callable(reconnect):
             return None
 
-        health = self.health()
         now = time.time()
+        metadata_health = getattr(adapter, "metadata_health", None)
+        if callable(metadata_health):
+            try:
+                metadata = metadata_health() or {}
+            except Exception:
+                metadata = {}
+            if isinstance(metadata, dict):
+                ws_meta = metadata.get("ws")
+                if isinstance(ws_meta, dict):
+                    try:
+                        public_last_msg_ts = float(ws_meta.get("public_last_msg_ts") or 0.0)
+                    except (TypeError, ValueError):
+                        public_last_msg_ts = 0.0
+                    if public_last_msg_ts > 0 and (now - public_last_msg_ts) <= self.max_event_staleness_sec:
+                        self._last_event_ts = max(self._last_event_ts, public_last_msg_ts)
+                        self._last_event_ts_by_channel["public"] = max(
+                            self._last_event_ts_by_channel.get("public", 0.0),
+                            public_last_msg_ts,
+                        )
+                        self._ws_channel_connected["public"] = True
+                        self._ws_connected = True
+
+        health = self.health()
         disconnected = (not health.ws_connected) and self._last_event_ts > 0
         if not health.ws_stale and not disconnected:
             return None
@@ -231,6 +330,7 @@ class ExchangeSyncService:
         self._last_forced_reconnect_ts = now
         self._require_snapshot()
         self._ws_connected = False
+        self._ws_channel_connected = {"public": False, "private": False}
         if health.ws_stale:
             return "stale"
         return "disconnected"
@@ -279,3 +379,44 @@ class ExchangeSyncService:
         self._clear_snapshot_requirement(norm_symbol)
 
         return snapshot
+
+    def snapshot_many(self, symbols: list[str]) -> dict[str, ExchangeSnapshot]:
+        norm_symbols = [self._norm_symbol(symbol) for symbol in symbols if symbol]
+        if not norm_symbols:
+            return {}
+
+        if self._ws_is_fresh() and not self._snapshot_required_global:
+            return {symbol: self.snapshot(symbol) for symbol in norm_symbols}
+
+        now = time.time()
+        snapshots = self.reconciler.snapshot_many(norm_symbols)
+        if not snapshots:
+            return {symbol: self.snapshot(symbol) for symbol in norm_symbols}
+
+        sample_snapshot = next(iter(snapshots.values()), None)
+        if sample_snapshot is not None:
+            self._account = sample_snapshot.account
+
+        for norm_symbol, snapshot in snapshots.items():
+            effective_positions, _ = split_effective_positions(
+                list(snapshot.positions),
+                symbol=norm_symbol,
+                size_epsilon=POSITION_SIZE_EPSILON,
+            )
+            healed_snapshot = ExchangeSnapshot(
+                symbol=norm_symbol,
+                account=snapshot.account,
+                positions=effective_positions,
+                open_orders=list(snapshot.open_orders),
+                reconciled_at=snapshot.reconciled_at,
+            )
+            self._positions_by_symbol[norm_symbol] = list(effective_positions)
+            self._orders_by_symbol[norm_symbol] = list(snapshot.open_orders)
+            self._polled_snapshots[norm_symbol] = healed_snapshot
+            self._last_poll_ts[norm_symbol] = now
+            self._clear_snapshot_requirement(norm_symbol)
+
+        if self._snapshot_required_global and not self._snapshot_required_symbols:
+            self._snapshot_required_global = False
+
+        return snapshots

@@ -7,3 +7,9 @@ from trading.signals.strategy_interface import StrategyContext, StrategyInterfac
 class HoldStrategy(StrategyInterface):
     def generate(self, context: StrategyContext) -> StrategyIntent:
         return StrategyIntent(symbol=context.symbol, action=IntentAction.HOLD, reason="default_hold")
+
+    def clone_for_parallel(self) -> "HoldStrategy":
+        return HoldStrategy()
+
+    def record_external_intent(self, intent: StrategyIntent) -> None:
+        return None

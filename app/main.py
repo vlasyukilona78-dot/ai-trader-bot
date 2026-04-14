@@ -1,12 +1,22 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import os
+import runpy
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_RUNTIME_SITE_PACKAGES = PROJECT_ROOT / ".runtime_env" / "Lib" / "site-packages"
+if PROJECT_RUNTIME_SITE_PACKAGES.exists():
+    runtime_site_packages = str(PROJECT_RUNTIME_SITE_PACKAGES)
+    if runtime_site_packages not in sys.path:
+        sys.path.insert(0, runtime_site_packages)
 
 import numpy as np
 import pandas as pd
@@ -17,7 +27,7 @@ from core.market_regime import detect_market_regime
 from core.liquidation_map import build_liquidation_map
 from core.volume_profile import compute_volume_profile
 from trading.alerts.discord import DiscordAlerter
-from trading.alerts.signal_card import (
+from trading.alerts.signal_card_clean import (
     _normalize_human_text,
     build_early_invalidation_text,
     build_early_signal_caption,
@@ -25,18 +35,19 @@ from trading.alerts.signal_card import (
     build_symbol_copy_reply_markup,
 )
 from trading.alerts.telegram import TelegramAlerter
-from trading.execution.engine import ExecutionEngine
+from trading.execution.engine import ExecutionEngine, ExecutionOutcome
 from trading.exchange.bybit_adapter import BybitAdapter
+from trading.exchange.bybit_endpoints import resolve_public_http_base_url
 from trading.metrics.counters import MetricsCounter
 from trading.metrics.logging import setup_logging
 from trading.risk.engine import RiskEngine
 from trading.signals.base import HoldStrategy
 from trading.signals.layered_strategy import LayeredPumpStrategy
 from trading.signals.runtime_source_adapter import build_runtime_signal_inputs
-from trading.signals.signal_types import IntentAction
+from trading.signals.signal_types import IntentAction, StrategyIntent
 from trading.signals.strategy_interface import StrategyContext
 from trading.state.machine import StateMachine
-from trading.state.models import TradeState
+from trading.state.models import StateRecord, TradeState
 from trading.state.persistence import RuntimeStore
 
 if TYPE_CHECKING:
@@ -47,21 +58,28 @@ if TYPE_CHECKING:
 
 
 def _load_dotenv_file(path: str = ".env") -> None:
-    env_path = Path(path)
-    if not env_path.exists():
-        return
-    try:
-        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            if not key:
-                continue
-            os.environ.setdefault(key, value.strip().strip('"').strip("'"))
-    except Exception:
-        return
+    candidates = [Path(path), Path(__file__).resolve().parents[1] / path]
+    seen: set[Path] = set()
+    for env_path in candidates:
+        try:
+            resolved = env_path.resolve()
+        except Exception:
+            resolved = env_path
+        if resolved in seen or not env_path.exists():
+            continue
+        seen.add(resolved)
+        try:
+            for raw_line in env_path.read_text(encoding="utf-8-sig").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key:
+                    continue
+                os.environ.setdefault(key, value.strip().strip('"').strip("'"))
+        except Exception:
+            continue
 
 
 def _as_float(value, default: float = 0.0) -> float:
@@ -101,6 +119,38 @@ def _latest_peak_age_bars(
 def _phase_rank(phase: str) -> int:
     normalized = str(phase or "").strip().upper()
     return {"WATCH": 1, "SETUP": 2}.get(normalized, 0)
+
+
+def _is_observation_only_profile(signal_profile: str) -> bool:
+    return str(signal_profile or "").strip().lower() == "early"
+
+
+def _observation_state_record(symbol: str) -> StateRecord:
+    clean_symbol = str(symbol or "").replace("/", "").upper().strip()
+    return StateRecord(
+        symbol=clean_symbol,
+        state=TradeState.FLAT,
+        reason="observation_profile",
+        updated_at=time.time(),
+    )
+
+
+def _decision_priority(intent, early_candidate: Mapping[str, object] | None) -> tuple[int, int]:
+    action = getattr(intent, "action", None)
+    if action in (
+        IntentAction.LONG_ENTRY,
+        IntentAction.SHORT_ENTRY,
+        IntentAction.EXIT_LONG,
+        IntentAction.EXIT_SHORT,
+    ):
+        return (0, 0)
+
+    phase = str((early_candidate or {}).get("phase") or "").upper()
+    if phase == "SETUP":
+        return (1, 0)
+    if phase == "WATCH":
+        return (1, 1)
+    return (2, 0)
 
 
 def _early_config_float(name: str, default: float) -> float:
@@ -174,23 +224,42 @@ def _send_photo_alerts(
     for alerter in alerters:
         attempted += 1
         send_photo = getattr(alerter, "send_photo", None)
+        send_text = getattr(alerter, "send", None)
+        delivered = False
         try:
             if callable(send_photo):
-                if send_photo(
+                delivered = bool(send_photo(
                     caption=caption,
                     image_bytes=image_bytes,
                     filename=filename,
                     reply_markup=reply_markup,
-                ):
+                ))
+                if delivered:
                     sent += 1
-            elif alerter.send(caption, reply_markup=reply_markup):
+            elif callable(send_text) and send_text(caption, reply_markup=reply_markup):
                 sent += 1
+                delivered = True
         except TypeError:
             try:
                 if callable(send_photo):
-                    if send_photo(caption=caption, image_bytes=image_bytes, filename=filename):
+                    delivered = bool(send_photo(caption=caption, image_bytes=image_bytes, filename=filename))
+                    if delivered:
                         sent += 1
-                elif alerter.send(caption):
+                elif callable(send_text) and send_text(caption):
+                    sent += 1
+                    delivered = True
+            except Exception:
+                delivered = False
+        except Exception:
+            delivered = False
+        if delivered or not callable(send_text):
+            continue
+        try:
+            if send_text(caption, reply_markup=reply_markup):
+                sent += 1
+        except TypeError:
+            try:
+                if send_text(caption):
                     sent += 1
             except Exception:
                 continue
@@ -235,6 +304,74 @@ def _remember_cached_alert(
     cache[symbol] = {
         "key": key,
         "next_allowed_ts": now_ts + max(60, cooldown_sec),
+    }
+
+
+def _format_signature_price(value: object) -> str:
+    numeric = _as_float(value, 0.0)
+    if numeric <= 0:
+        return "0"
+    if numeric < 0.01:
+        precision = 6
+    elif numeric < 1:
+        precision = 5
+    elif numeric < 100:
+        precision = 4
+    else:
+        precision = 2
+    return f"{numeric:.{precision}f}"
+
+
+def _build_early_candidate_signature(candidate: Mapping[str, object], enriched) -> str:
+    phase = str(candidate.get("phase") or "").strip().upper()
+    last_bar_ts = ""
+    try:
+        if enriched is not None and len(enriched.index) > 0:
+            last_bar = pd.Timestamp(enriched.index[-1])
+            if last_bar.tzinfo is not None:
+                last_bar = last_bar.tz_convert("UTC").tz_localize(None)
+            last_bar_ts = last_bar.isoformat()
+    except Exception:
+        last_bar_ts = ""
+    return "|".join(
+        [
+            phase,
+            _format_signature_price(candidate.get("entry")),
+            _format_signature_price(candidate.get("tp")),
+            _format_signature_price(candidate.get("sl")),
+            last_bar_ts,
+        ]
+    )
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _summarize_startup_state(
+    startup_state: Mapping[str, object],
+    *,
+    sample_size: int = 12,
+) -> dict[str, object]:
+    state_counts: Counter[str] = Counter()
+    issue_samples: list[str] = []
+    total_issues = 0
+    for symbol, raw_state in startup_state.items():
+        state = str(raw_state or "")
+        base_state = state
+        if "|issues=" in state:
+            base_state, issues = state.split("|issues=", 1)
+            total_issues += 1
+            if len(issue_samples) < sample_size:
+                issue_samples.append(f"{symbol}:{issues}")
+        state_counts[base_state or "UNKNOWN"] += 1
+    return {
+        "state_counts": dict(state_counts),
+        "issue_count": total_issues,
+        "issue_samples": issue_samples,
     }
 
 
@@ -313,6 +450,25 @@ def _timeframe_to_minutes(timeframe: str) -> int:
         return 1
 
 
+def _needs_pre_alert_refresh(
+    *,
+    prepared_ts: float,
+    timeframe: str,
+    max_age_sec: int | None = None,
+) -> bool:
+    if prepared_ts <= 0:
+        return True
+    timeframe_minutes = _timeframe_to_minutes(timeframe)
+    if max_age_sec is None:
+        if timeframe_minutes <= 1:
+            max_age_sec = 5
+        elif timeframe_minutes <= 5:
+            max_age_sec = 10
+        else:
+            max_age_sec = min(30, timeframe_minutes * 4)
+    return (time.time() - prepared_ts) >= max(2, int(max_age_sec))
+
+
 def _analysis_worker_count(candidate_count: int) -> int:
     configured = _as_int(os.getenv("CONCURRENT_TASKS", "8"), 8)
     return max(1, min(max(1, configured), max(1, candidate_count)))
@@ -337,6 +493,7 @@ def _prepare_symbol_analysis(
     pipeline: "FeaturePipeline",
     timeframe: str,
     candles_limit: int,
+    overlay_live_price: bool = False,
 ) -> dict[str, object]:
     result: dict[str, object] = {
         "symbol": symbol,
@@ -344,7 +501,12 @@ def _prepare_symbol_analysis(
         "rec_state": rec_state,
     }
     try:
-        frame = feed.fetch_frame(symbol=symbol, timeframe=timeframe, candles=candles_limit)
+        frame = feed.fetch_frame(
+            symbol=symbol,
+            timeframe=timeframe,
+            candles=candles_limit,
+            overlay_live_price=overlay_live_price,
+        )
         if frame.ohlcv.empty:
             result["status"] = "empty_ohlcv"
             return result
@@ -368,6 +530,7 @@ def _prepare_symbol_analysis(
         result.update(
             {
                 "status": "ok",
+                "prepared_at": time.time(),
                 "frame": frame,
                 "runtime_inputs": runtime_inputs,
                 "extras": extras,
@@ -382,6 +545,157 @@ def _prepare_symbol_analysis(
         return result
 
 
+def _clone_strategy_for_parallel(strategy):
+    clone = getattr(strategy, "clone_for_parallel", None)
+    if callable(clone):
+        return clone()
+    return None
+
+
+def _record_parallel_strategy_intent(strategy, intent) -> None:
+    recorder = getattr(strategy, "record_external_intent", None)
+    if callable(recorder):
+        try:
+            recorder(intent)
+        except Exception:
+            return
+
+
+def _prepare_symbol_decision(
+    *,
+    symbol: str,
+    snapshot,
+    rec_state,
+    prepared: dict[str, object],
+    timeframe: str,
+    strategy,
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "symbol": symbol,
+        "snapshot": snapshot,
+        "rec_state": rec_state,
+    }
+    try:
+        frame = prepared["frame"]
+        runtime_inputs = prepared["runtime_inputs"]
+        extras = prepared["extras"]
+        features = prepared["features"]
+        mark_price = _as_float(prepared.get("mark_price"), float(features.enriched.iloc[-1]["close"]))
+
+        local_strategy = _clone_strategy_for_parallel(strategy)
+        if local_strategy is None:
+            result["status"] = "error"
+            result["error"] = "strategy_not_parallel_safe"
+            return result
+
+        intent = local_strategy.generate(
+            StrategyContext(
+                symbol=symbol,
+                market_ohlcv=features.enriched,
+                mark_price=mark_price,
+                exchange=snapshot,
+                synced_state=rec_state.state,
+                timeframe=timeframe,
+                synced_state_updated_at=_as_float(getattr(rec_state, "updated_at", 0.0), 0.0),
+                sentiment_index=runtime_inputs.get("sentiment_index"),
+                sentiment_value=runtime_inputs.get("sentiment_value"),
+                sentiment_source=runtime_inputs.get("sentiment_source"),
+                sentiment_degraded=runtime_inputs.get("sentiment_degraded"),
+                funding_rate=runtime_inputs.get("funding_rate"),
+                funding_source=runtime_inputs.get("funding_source"),
+                funding_degraded=runtime_inputs.get("funding_degraded"),
+                long_short_ratio=runtime_inputs.get("long_short_ratio"),
+                long_short_ratio_source=runtime_inputs.get("long_short_ratio_source"),
+                long_short_ratio_degraded=runtime_inputs.get("long_short_ratio_degraded"),
+                open_interest=runtime_inputs.get("open_interest"),
+                open_interest_ratio=runtime_inputs.get("open_interest_ratio"),
+                oi_signal=runtime_inputs.get("oi_signal"),
+                oi_source=runtime_inputs.get("oi_source"),
+                oi_degraded=runtime_inputs.get("oi_degraded"),
+                open_interest_source=runtime_inputs.get("open_interest_source"),
+                news_veto=runtime_inputs.get("news_veto"),
+                news_source=runtime_inputs.get("news_source"),
+                news_degraded=runtime_inputs.get("news_degraded"),
+            )
+        )
+
+        result.update(
+            {
+                "status": "ok",
+                "prepared_at": _as_float(prepared.get("prepared_at"), time.time()),
+                "frame": frame,
+                "runtime_inputs": runtime_inputs,
+                "extras": extras,
+                "features": features,
+                "mark_price": mark_price,
+                "intent": intent,
+            }
+        )
+        return result
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        return result
+
+
+def _should_refresh_live_candidate(intent, early_candidate: Mapping[str, object] | None) -> bool:
+    action = getattr(intent, "action", None)
+    if action in (IntentAction.LONG_ENTRY, IntentAction.SHORT_ENTRY):
+        return True
+    return bool(early_candidate)
+
+
+def _should_block_clean_pump(intent) -> bool:
+    if getattr(intent, "action", None) not in (IntentAction.LONG_ENTRY, IntentAction.SHORT_ENTRY):
+        return False
+    meta = intent.metadata if isinstance(intent.metadata, Mapping) else {}
+    layer1 = _extract_layer_details(meta, "layer1_pump_detection")
+    reported_clean_pump_pct = _as_float(layer1.get("clean_pump_pct"), 0.0)
+    clean_pump_pct = reported_clean_pump_pct
+    clean_pump_min = _as_float(layer1.get("clean_pump_min_pct_used"), 0.0)
+    if clean_pump_min <= 0 or clean_pump_pct <= 0:
+        return False
+    return clean_pump_pct + 1e-8 < clean_pump_min
+
+
+def _refresh_symbol_decision_live(
+    *,
+    symbol: str,
+    sync: "ExchangeSyncService",
+    execution: ExecutionEngine,
+    feed: "MarketDataFeed",
+    pipeline: "FeaturePipeline",
+    timeframe: str,
+    candles_limit: int,
+    strategy,
+) -> dict[str, object] | None:
+    snapshot = sync.snapshot(symbol)
+    rec_state = execution.state_machine.reconcile(symbol, snapshot.positions, snapshot.open_orders)
+    prepared = _prepare_symbol_analysis(
+        symbol=symbol,
+        snapshot=snapshot,
+        rec_state=rec_state,
+        feed=feed,
+        pipeline=pipeline,
+        timeframe=timeframe,
+        candles_limit=candles_limit,
+        overlay_live_price=True,
+    )
+    if str(prepared.get("status") or "") != "ok":
+        return None
+    refreshed = _prepare_symbol_decision(
+        symbol=symbol,
+        snapshot=snapshot,
+        rec_state=rec_state,
+        prepared=prepared,
+        timeframe=timeframe,
+        strategy=strategy,
+    )
+    if str(refreshed.get("status") or "") != "ok":
+        return None
+    return refreshed
+
+
 def _resolve_signal_profile(raw: str | None) -> str:
     profile = str(raw or "both").strip().lower()
     return profile if profile in {"both", "main", "early"} else "both"
@@ -390,7 +704,18 @@ def _resolve_signal_profile(raw: str | None) -> str:
 def _profiled_env_first_nonempty(profile: str, *names: str) -> str:
     normalized = _resolve_signal_profile(profile)
     if normalized not in {"main", "early"}:
+        expanded: list[str] = []
         for name in names:
+            expanded.extend(
+                [
+                    name,
+                    f"{name}_MAIN",
+                    f"MAIN_{name}",
+                    f"{name}_EARLY",
+                    f"EARLY_{name}",
+                ]
+            )
+        for name in expanded:
             value = str(os.getenv(name, "")).strip()
             if value:
                 return value
@@ -456,14 +781,29 @@ def _build_context_chart_caption(symbol: str, *, stage_label: str, timeframe_lab
     return (
         f"<b>{clean_stage_label}</b>\n"
         f"<b>{clean}</b> | <code>{clean}</code>\n"
-        f"Старший ТФ: {timeframe_label}\n"
-        f"HTF уровни + карта ликвидаций"
+        f"\u0421\u0442\u0430\u0440\u0448\u0438\u0439 \u0422\u0424: {timeframe_label}\n"
+        f"HTF \u0443\u0440\u043e\u0432\u043d\u0438 + \u043a\u0430\u0440\u0442\u0430 \u043b\u0438\u043a\u0432\u0438\u0434\u0430\u0446\u0438\u0439"
     )
+
+
+def _build_clean_context_chart_caption(symbol: str, *, stage_label: str, timeframe_label: str) -> str:
+    clean = str(symbol or "").replace("/", "").upper().strip()
+    raw_stage_label = str(stage_label or "").strip()
+    clean_stage_label = _normalize_human_text(raw_stage_label)
+    clean_stage_upper = clean_stage_label.upper()
+    raw_stage_upper = raw_stage_label.upper()
+    if "HTF" in raw_stage_upper:
+        if "\u0420\u0410\u041d\u041d\u0418\u0419" in clean_stage_upper or "EARLY" in clean_stage_upper:
+            clean_stage_label = "\u0420\u0410\u041d\u041d\u0418\u0419 \u0428\u041e\u0420\u0422: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422"
+        elif "\u041b\u041e\u041d\u0413" in clean_stage_upper or "LONG" in clean_stage_upper:
+            clean_stage_label = "\u041b\u041e\u041d\u0413 \u0421\u0418\u0413\u041d\u0410\u041b: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422"
+        elif "\u0428\u041e\u0420\u0422" in clean_stage_upper or "SHORT" in clean_stage_upper:
+            clean_stage_label = "\u0428\u041e\u0420\u0422 \u0421\u0418\u0413\u041d\u0410\u041b: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422"
     return (
         f"<b>{clean_stage_label}</b>\n"
         f"<b>{clean}</b> | <code>{clean}</code>\n"
-        f"Старший ТФ: {timeframe_label}\n"
-        f"HTF уровни + карта ликвидаций"
+        f"\u0421\u0442\u0430\u0440\u0448\u0438\u0439 \u0422\u0424: {timeframe_label}\n"
+        f"HTF \u0443\u0440\u043e\u0432\u043d\u0438 + \u043a\u0430\u0440\u0442\u0430 \u043b\u0438\u043a\u0432\u0438\u0434\u0430\u0446\u0438\u0439"
     )
 
 
@@ -555,15 +895,15 @@ def _build_early_watch_candidate_legacy(*, symbol: str, timeframe: str, mode: st
         layer2_score = _as_float(layer2.get("weakness_strength"), 0.0)
         layer2_triggers: list[str] = []
         if bool(_as_float(layer2.get("near_high_context"), 0.0)):
-            layer2_triggers.append("цена ещё у локального хая")
+            layer2_triggers.append("С†РµРЅР° РµС‰С‘ Сѓ Р»РѕРєР°Р»СЊРЅРѕРіРѕ С…Р°СЏ")
         if obv_divergence:
-            layer2_triggers.append("OBV уже не подтверждает рост")
+            layer2_triggers.append("OBV СѓР¶Рµ РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚")
         if cvd_divergence:
-            layer2_triggers.append("CVD уже не подтверждает рост")
+            layer2_triggers.append("CVD СѓР¶Рµ РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚")
         if liquidation_map.swept_above:
-            layer2_triggers.append("СЃРЅСЏР»Рё РІРµСЂС…РЅСЋСЋ Р»РёРєРІРёРґРЅРѕСЃС‚СЊ")
+            layer2_triggers.append("\\u0421\\u043d\\u044f\\u043b\\u0438 \\u0432\\u0435\\u0440\\u0445\\u043d\\u044e\\u044e \\u043b\\u0438\\u043a\\u0432\\u0438\\u0434\\u043d\\u043e\\u0441\\u0442\\u044c")
         if liquidation_map.downside_magnet:
-            layer2_triggers.append("РЅРёР¶Рµ РµСЃС‚СЊ Р»РёРєРІРёРґР°С†РёРѕРЅРЅС‹Р№ РјР°РіРЅРёС‚")
+            layer2_triggers.append("\\u043d\\u0438\\u0436\\u0435 \\u0435\\u0441\\u0442\\u044c \\u043b\\u0438\\u043a\\u0432\\u0438\\u0434\\u0430\\u0446\\u0438\\u043e\\u043d\\u043d\\u044b\\u0439 \\u043c\\u0430\\u0433\\u043d\\u0438\\u0442")
         if layer2_score < 0.67 and len(layer2_triggers) < 2:
             return None
         continuation_risk = max(0.0, 2.0 - layer2_score)
@@ -575,14 +915,14 @@ def _build_early_watch_candidate_legacy(*, symbol: str, timeframe: str, mode: st
                 symbol=symbol,
                 timeframe=timeframe,
                 mode=mode,
-                phase_label="РАННИЙ ШОРТ: СЕТАП",
+                phase_label="\\u0420\\u0410\\u041d\\u041d\\u0418\\u0419 \\u0428\\u041e\\u0420\\u0422: \\u0421\\u0415\\u0422\\u0410\\u041f",
                 price=close,
                 trace_meta=meta,
                 watch_score=max(4.5, layer2_score * 6.0),
                 watch_max_score=8.0,
                 continuation_risk=continuation_risk,
                 continuation_max_score=4.0,
-                triggers=layer2_triggers or ["памп уже есть", "слабость рядом", "ждём вход по стратегии"],
+                triggers=layer2_triggers or ["РїР°РјРї СѓР¶Рµ РµСЃС‚СЊ", "СЃР»Р°Р±РѕСЃС‚СЊ СЂСЏРґРѕРј", "Р¶РґС‘Рј РІС…РѕРґ РїРѕ СЃС‚СЂР°С‚РµРіРёРё"],
                 wait_for="подтверждение полноценного входа",
                 enriched=enriched,
             ),
@@ -691,48 +1031,48 @@ def _build_early_watch_candidate_legacy(*, symbol: str, timeframe: str, mode: st
     obv_divergence = obv <= max(recent_obv_ref * 0.998, prev_obv)
     cvd_divergence = cvd <= max(recent_cvd_ref * 0.998, prev_cvd)
     if peak_still_fresh:
-        weighted_triggers.append(("пик пампа совсем свежий", 1.25))
-    if peak_still_fresh:
         weighted_triggers.append(("РїРёРє РїР°РјРїР° СЃРѕРІСЃРµРј СЃРІРµР¶РёР№", 1.25))
+    if peak_still_fresh:
+        weighted_triggers.append(("\\u043f\\u0438\\u043a \\u043f\\u0430\\u043c\\u043f\\u0430 \\u0441\\u043e\\u0432\\u0441\\u0435\\u043c \\u0441\\u0432\\u0435\\u0436\\u0438\\u0439", 1.25))
     if near_peak:
-        weighted_triggers.append(("цена ещё у вершины пампа", 1.15))
+        weighted_triggers.append(("С†РµРЅР° РµС‰С‘ Сѓ РІРµСЂС€РёРЅС‹ РїР°РјРїР°", 1.15))
     if first_reaction:
-        weighted_triggers.append(("пошла первая реакция вниз", 1.20))
+        weighted_triggers.append(("РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·", 1.20))
     if near_peak:
-        weighted_triggers.append(("цена ещё у вершины пампа", 1.15))
+        weighted_triggers.append(("С†РµРЅР° РµС‰С‘ Сѓ РІРµСЂС€РёРЅС‹ РїР°РјРїР°", 1.15))
     if first_reaction:
-        weighted_triggers.append(("пошла первая реакция вниз", 1.20))
+        weighted_triggers.append(("РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·", 1.20))
     if near_peak:
-        weighted_triggers.append(("цена ещё у вершины пампа", 1.15))
+        weighted_triggers.append(("С†РµРЅР° РµС‰С‘ Сѓ РІРµСЂС€РёРЅС‹ РїР°РјРїР°", 1.15))
     if first_reaction:
-        weighted_triggers.append(("пошла первая реакция вниз", 1.20))
+        weighted_triggers.append(("РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·", 1.20))
     if close >= max(bb_upper, kc_upper) * 0.998:
-        weighted_triggers.append(("цена у верхней зоны", 1.0))
+        weighted_triggers.append(("С†РµРЅР° Сѓ РІРµСЂС…РЅРµР№ Р·РѕРЅС‹", 1.0))
     if close >= signal_peak_reference * 0.995:
-        weighted_triggers.append(("цена у локального хая", 1.0))
+        weighted_triggers.append(("С†РµРЅР° Сѓ Р»РѕРєР°Р»СЊРЅРѕРіРѕ С…Р°СЏ", 1.0))
     if rsi >= 55.0:
-        weighted_triggers.append(("RSI выше нейтрали", 0.5))
+        weighted_triggers.append(("RSI РІС‹С€Рµ РЅРµР№С‚СЂР°Р»Рё", 0.5))
     if rsi < prev_rsi and rsi >= 52.0:
-        weighted_triggers.append(("RSI разворачивается вниз", 1.25))
+        weighted_triggers.append(("RSI СЂР°Р·РІРѕСЂР°С‡РёРІР°РµС‚СЃСЏ РІРЅРёР·", 1.25))
     if volume_spike >= volume_gate:
-        weighted_triggers.append(("объём ещё повышен", 0.5))
+        weighted_triggers.append(("РѕР±СЉС‘Рј РµС‰С‘ РїРѕРІС‹С€РµРЅ", 0.5))
     if recent_volume_spike > 0 and volume_spike < recent_volume_spike:
-        weighted_triggers.append(("объём затухает", 1.25))
+        weighted_triggers.append(("РѕР±СЉС‘Рј Р·Р°С‚СѓС…Р°РµС‚", 1.25))
     if upper_wick / candle_range >= 0.35:
-        weighted_triggers.append(("есть верхняя тень", 1.0))
+        weighted_triggers.append(("РµСЃС‚СЊ РІРµСЂС…РЅСЏСЏ С‚РµРЅСЊ", 1.0))
     if hist < prev_hist:
-        weighted_triggers.append(("MACD ослабевает", 1.25))
+        weighted_triggers.append(("MACD РѕСЃР»Р°Р±РµРІР°РµС‚", 1.25))
     if close <= recent_close_high * 0.9995:
-        weighted_triggers.append(("цена перестала ускоряться", 0.75))
+        weighted_triggers.append(("С†РµРЅР° РїРµСЂРµСЃС‚Р°Р»Р° СѓСЃРєРѕСЂСЏС‚СЊСЃСЏ", 0.75))
     if obv <= max(recent_obv_ref * 0.998, prev_obv):
-        weighted_triggers.append(("OBV не подтверждает рост", 1.25))
+        weighted_triggers.append(("OBV РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚", 1.25))
     if cvd <= max(recent_cvd_ref * 0.998, prev_cvd):
-        weighted_triggers.append(("CVD не подтверждает рост", 1.25))
+        weighted_triggers.append(("CVD РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚", 1.25))
 
     if liquidation_map.swept_above:
-        weighted_triggers.append(("СЃРЅСЏР»Рё РІРµСЂС…РЅСЋСЋ Р»РёРєРІРёРґРЅРѕСЃС‚СЊ", 1.35))
+        weighted_triggers.append(("\\u0421\\u043d\\u044f\\u043b\\u0438 \\u0432\\u0435\\u0440\\u0445\\u043d\\u044e\\u044e \\u043b\\u0438\\u043a\\u0432\\u0438\\u0434\\u043d\\u043e\\u0441\\u0442\\u044c", 1.35))
     if liquidation_map.downside_magnet:
-        weighted_triggers.append(("РЅРёР¶Рµ РµСЃС‚СЊ Р»РёРєРІРёРґР°С†РёРѕРЅРЅС‹Р№ РјР°РіРЅРёС‚", 1.15))
+        weighted_triggers.append(("\\u043d\\u0438\\u0436\\u0435 \\u0435\\u0441\\u0442\\u044c \\u043b\\u0438\\u043a\\u0432\\u0438\\u0434\\u0430\\u0446\\u0438\\u043e\\u043d\\u043d\\u044b\\u0439 \\u043c\\u0430\\u0433\\u043d\\u0438\\u0442", 1.15))
 
     obv_divergence = obv <= max(recent_obv_ref * 0.998, prev_obv)
     cvd_divergence = cvd <= max(recent_cvd_ref * 0.998, prev_cvd)
@@ -745,14 +1085,14 @@ def _build_early_watch_candidate_legacy(*, symbol: str, timeframe: str, mode: st
         score += float(weight)
 
     weakness_markers = {
-        "RSI разворачивается вниз",
-        "объём затухает",
-        "MACD ослабевает",
-        "OBV не подтверждает рост",
-        "CVD не подтверждает рост",
-        "цена перестала ускоряться",
-        "СЃРЅСЏР»Рё РІРµСЂС…РЅСЋСЋ Р»РёРєРІРёРґРЅРѕСЃС‚СЊ",
-        "РЅРёР¶Рµ РµСЃС‚СЊ Р»РёРєРІРёРґР°С†РёРѕРЅРЅС‹Р№ РјР°РіРЅРёС‚",
+        "RSI СЂР°Р·РІРѕСЂР°С‡РёРІР°РµС‚СЃСЏ РІРЅРёР·",
+        "РѕР±СЉС‘Рј Р·Р°С‚СѓС…Р°РµС‚",
+        "MACD РѕСЃР»Р°Р±РµРІР°РµС‚",
+        "OBV РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚",
+        "CVD РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚",
+        "С†РµРЅР° РїРµСЂРµСЃС‚Р°Р»Р° СѓСЃРєРѕСЂСЏС‚СЊСЃСЏ",
+        "\\u0421\\u043d\\u044f\\u043b\\u0438 \\u0432\\u0435\\u0440\\u0445\\u043d\\u044e\\u044e \\u043b\\u0438\\u043a\\u0432\\u0438\\u0434\\u043d\\u043e\\u0441\\u0442\\u044c",
+        "\\u043d\\u0438\\u0436\\u0435 \\u0435\\u0441\\u0442\\u044c \\u043b\\u0438\\u043a\\u0432\\u0438\\u0434\\u0430\\u0446\\u0438\\u043e\\u043d\\u043d\\u044b\\u0439 \\u043c\\u0430\\u0433\\u043d\\u0438\\u0442",
     }
     if score < 4.5 or len(unique_triggers) < 4:
         return None
@@ -765,7 +1105,7 @@ def _build_early_watch_candidate_legacy(*, symbol: str, timeframe: str, mode: st
             symbol=symbol,
             timeframe=timeframe,
             mode=mode,
-            phase_label="РАННИЙ ШОРТ: НАБЛЮДЕНИЕ",
+            phase_label="\\u0420\\u0410\\u041d\\u041d\\u0418\\u0419 \\u0428\\u041e\\u0420\\u0422: \\u041d\\u0410\\u0411\\u041b\\u042e\\u0414\\u0415\\u041d\\u0418\\u0415",
             price=close,
             trace_meta=meta,
             watch_score=score,
@@ -793,8 +1133,17 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
     regime_entry = layers.get("regime_filter", {})
     layer1_entry = layers.get("layer1_pump_detection", {})
     regime = _extract_layer_details(meta, "regime_filter")
+    layer1 = _extract_layer_details(meta, "layer1_pump_detection")
+    layer2 = _extract_layer_details(meta, "layer2_weakness_confirmation")
+    layer3 = _extract_layer_details(meta, "layer3_entry_location")
     regime_passed = bool(regime_entry.get("passed")) if isinstance(regime_entry, Mapping) else False
     layer1_passed = bool(layer1_entry.get("passed")) if isinstance(layer1_entry, Mapping) else False
+    layer2_failed_reclaim = bool(_as_float(layer2.get("failed_reclaim"), 0.0))
+    layer2_retest_failed_breakout = bool(_as_float(layer2.get("retest_failed_breakout"), 0.0))
+    layer2_acceptance_above_high = bool(_as_float(layer2.get("acceptance_above_swing_high"), 0.0))
+    layer3_failed_reclaim = bool(_as_float(layer3.get("failed_reclaim"), 0.0))
+    layer3_retest_failed_breakout = bool(_as_float(layer3.get("retest_failed_breakout"), 0.0))
+    layer3_acceptance_above_high = bool(_as_float(layer3.get("acceptance_above_swing_high"), 0.0))
     regime_failed_reason = str(regime.get("failed_reason") or "")
     regime_missing_conditions = str(regime.get("missing_conditions") or "")
     soft_regime_fail = (
@@ -804,9 +1153,6 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         and "news_veto" not in regime_missing_conditions
     )
 
-    layer1 = _extract_layer_details(meta, "layer1_pump_detection")
-    layer2 = _extract_layer_details(meta, "layer2_weakness_confirmation")
-    layer3 = _extract_layer_details(meta, "layer3_entry_location")
     liquidation_map = build_liquidation_map(enriched)
     row = enriched.iloc[-1]
     prev = enriched.iloc[-2] if len(enriched) > 1 else row
@@ -814,26 +1160,35 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
     close = _as_float(row.get("close"), 0.0)
     atr = max(_as_float(row.get("atr"), close * 0.01), close * 0.001, 1e-8)
     ema20_last = _as_float(row.get("ema20"), close)
+    local_vah = _as_float(row.get("vah"), 0.0)
     local_poc = _as_float(row.get("poc"), 0.0)
     local_val = _as_float(row.get("val"), 0.0)
 
     confirmed_pump_min = max(_as_float(layer1.get("clean_pump_min_pct_used"), 0.05), 0.0)
     early_pump_min = max(
-        0.0,
-        _early_config_float("EARLY_WATCH_CLEAN_PUMP_MIN_PCT", max(0.0295, confirmed_pump_min - 0.0140)),
+        confirmed_pump_min,
+        _early_config_float("EARLY_WATCH_CLEAN_PUMP_MIN_PCT", max(0.0195, confirmed_pump_min - 0.0220)),
     )
-    clean_pump_pct = _as_float(layer1.get("clean_pump_pct"), 0.0)
+    early_structural_pump_min = max(
+        early_pump_min,
+        _early_config_float(
+            "EARLY_WATCH_STRUCTURAL_PUMP_MIN_PCT",
+            max(early_pump_min, min(confirmed_pump_min, early_pump_min + 0.0085)),
+        ),
+    )
+    reported_clean_pump_pct = _as_float(layer1.get("clean_pump_pct"), 0.0)
+    clean_pump_pct = reported_clean_pump_pct
     confirmed_volume_gate = max(
         _as_float(layer1.get("volume_spike_threshold_used"), _as_float(os.getenv("VOLUME_THRESHOLD"), 2.0)),
         2.0,
     )
     early_volume_gate = max(
-        0.06,
-        _early_config_float("EARLY_WATCH_VOLUME_SPIKE_MIN", max(0.06, confirmed_volume_gate * 0.06)),
+        0.22,
+        _early_config_float("EARLY_WATCH_VOLUME_SPIKE_MIN", max(0.22, confirmed_volume_gate * 0.16)),
     )
-    early_rsi_min = _early_config_float("EARLY_WATCH_RSI_MIN", 45.5)
-    early_watch_score_min = _early_config_float("EARLY_WATCH_SCORE_MIN", 1.85)
-    early_quality_min = _early_config_float("EARLY_WATCH_QUALITY_MIN", 2.2)
+    early_rsi_min = _early_config_float("EARLY_WATCH_RSI_MIN", 42.0)
+    early_watch_score_min = _early_config_float("EARLY_WATCH_SCORE_MIN", 1.55)
+    early_quality_min = _early_config_float("EARLY_WATCH_QUALITY_MIN", 1.95)
 
     high = _as_float(row.get("high"), close)
     low = _as_float(row.get("low"), close)
@@ -945,6 +1300,14 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         clean_pump_pct,
         max(0.0, (signal_peak_reference - active_pump_low) / max(active_pump_low, 1e-8)),
     )
+    reported_pump_below_min = (
+        reported_clean_pump_pct > 0.0
+        and reported_clean_pump_pct + 1e-8 < early_pump_min
+    )
+    marginal_watch_pump = clean_pump_pct < max(
+        early_structural_pump_min + 0.0075,
+        early_structural_pump_min * 1.16,
+    )
     pump_amplitude = max(signal_peak_reference - active_pump_low, atr)
     pump_drawdown_ratio = max(0.0, (signal_peak_reference - close) / max(pump_amplitude, 1e-8))
     pump_range_position = min(1.0, max(0.0, (close - active_pump_low) / max(pump_amplitude, 1e-8)))
@@ -954,13 +1317,13 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
     minimum_reversal_pullback = max(0.0009, min(0.0032, early_reversal_pullback * 0.55))
     early_watch_max_drawdown_ratio = _early_config_float("EARLY_WATCH_MAX_PUMP_DRAWDOWN_RATIO", 0.078)
     early_setup_max_drawdown_ratio = _early_config_float("EARLY_SETUP_MAX_PUMP_DRAWDOWN_RATIO", 0.112)
-    early_watch_min_peak_position = _early_config_float("EARLY_WATCH_MIN_PUMP_RANGE_POSITION", 0.70)
-    early_setup_min_peak_position = _early_config_float("EARLY_SETUP_MIN_PUMP_RANGE_POSITION", 0.66)
-    early_watch_peak_age_cap = max(2, _as_int(os.getenv("EARLY_WATCH_MAX_PEAK_AGE_BARS"), 3 if close >= 0.02 else 4))
+    early_watch_min_peak_position = _early_config_float("EARLY_WATCH_MIN_PUMP_RANGE_POSITION", 0.64)
+    early_setup_min_peak_position = _early_config_float("EARLY_SETUP_MIN_PUMP_RANGE_POSITION", 0.60)
+    early_watch_peak_age_cap = max(2, _as_int(os.getenv("EARLY_WATCH_MAX_PEAK_AGE_BARS"), 4 if close >= 0.02 else 5))
     early_setup_peak_age_cap = max(2, _as_int(os.getenv("EARLY_SETUP_MAX_PEAK_AGE_BARS"), early_watch_peak_age_cap + 1))
     volume_climax_recent = recent_volume_spike >= early_volume_gate and volume_peak_age <= (4 if close >= 0.02 else 5)
     volume_fade_confirmed = recent_volume_spike > 0 and volume_peak_age <= 5 and volume_spike <= recent_volume_spike * 0.88
-    current_volume_supportive = volume_spike >= max(0.58, early_volume_gate * 0.42)
+    current_volume_supportive = volume_spike >= max(0.46, early_volume_gate * 0.38)
     peak_still_fresh = peak_age_bars <= 1
     peak_recent_enough = peak_age_bars <= 2
     near_peak_limit = peak_pullback_limit * (
@@ -1161,17 +1524,49 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
             and high <= signal_peak_reference * 0.9994
         )
     )
+    structural_reversal_ready = bool(
+        peak_followthrough_confirmed
+        or micro_reversal_near_peak
+        or layer2_failed_reclaim
+        or layer2_retest_failed_breakout
+        or layer3_failed_reclaim
+        or layer3_retest_failed_breakout
+        or liquidation_map.swept_above
+    )
+    structure_trigger_confirmed = bool(
+        layer2_failed_reclaim
+        or layer2_retest_failed_breakout
+        or layer3_failed_reclaim
+        or layer3_retest_failed_breakout
+        or liquidation_map.swept_above
+    )
+    weak_watch_structure = not (
+        structure_trigger_confirmed
+        or liquidation_map.swept_above
+        or peak_followthrough_confirmed
+    )
+    acceptance_above_high = bool(layer2_acceptance_above_high or layer3_acceptance_above_high)
     stop_ref = max(
         signal_peak_reference,
         _as_float(layer1.get("bollinger_upper_metric_used"), 0.0),
         _as_float(layer1.get("keltner_upper_metric_used"), 0.0),
         close + atr * 0.82,
     )
-    synthetic_sl = stop_ref + max(atr * 0.14, close * 0.00075)
-    stop_distance = max(synthetic_sl - close, atr * 0.72, close * 0.00095)
+    structural_stop_context = structural_reversal_ready or first_reaction or liquidation_map.swept_above
+    synthetic_sl = stop_ref + max(
+        atr * (0.26 if structural_stop_context else 0.18),
+        close * (0.00110 if close < 0.02 else 0.00085),
+    )
+    stop_distance = max(
+        synthetic_sl - close,
+        atr * (0.88 if structural_stop_context else 0.76),
+        close * (0.00125 if close < 0.02 else 0.00100),
+    )
     synthetic_rr = 2.35 if failed_layer == "layer1_pump_detection" else 2.65
     if peak_recent_enough and near_peak and first_reaction:
         synthetic_rr += 0.20
+    if structural_reversal_ready:
+        synthetic_rr += 0.18
     synthetic_tp = close - stop_distance * synthetic_rr
     structural_tp_candidates = [
         value
@@ -1185,6 +1580,257 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
     if not peak_recent_enough and pullback_from_peak_pct >= max(early_reversal_pullback * 0.80, 0.0028):
         return None
     if peak_age_bars > max(early_setup_peak_age_cap + 1, 5):
+        return None
+
+    atr_pct = atr / max(close, 1e-8)
+    vah_reject_tolerance = max(
+        atr_pct * 1.15,
+        0.0048 if close < 0.02 else 0.0030,
+    )
+    peak_zone_tolerance = max(
+        vah_reject_tolerance * 1.10,
+        0.0056 if close < 0.02 else 0.0036,
+    )
+    value_room_floor = max(
+        atr_pct * 0.72,
+        0.0048 if close < 0.02 else 0.0028,
+    )
+    near_vah_resistance = bool(
+        local_vah > 0
+        and abs(close - local_vah) / max(close, 1e-8) <= vah_reject_tolerance
+    )
+    near_peak_resistance = bool(
+        signal_peak_reference > 0
+        and (signal_peak_reference - close) / max(signal_peak_reference, 1e-8) <= peak_zone_tolerance
+    )
+    value_room_to_poc = bool(
+        local_poc > 0
+        and (close - local_poc) / max(close, 1e-8) >= value_room_floor * 0.78
+    )
+    value_room_to_val = bool(
+        local_val > 0
+        and (close - local_val) / max(close, 1e-8) >= value_room_floor
+    )
+    value_room_to_support = bool(
+        local_support > 0
+        and (close - local_support) / max(close, 1e-8) >= value_room_floor * 1.05
+    )
+    downside_target_ready = bool(
+        liquidation_map.downside_magnet
+        or value_room_to_poc
+        or value_room_to_val
+        or value_room_to_support
+    )
+    upper_rejection_zone_ready = bool(
+        near_vah_resistance
+        or liquidation_map.swept_above
+        or (
+            (layer2_failed_reclaim or layer3_failed_reclaim or layer2_retest_failed_breakout or layer3_retest_failed_breakout)
+            and near_peak_resistance
+        )
+        or (near_peak_resistance and terminal_rejection_bar)
+    )
+    open_upside_liq_magnet = bool(
+        liquidation_map.nearest_above_distance_pct is not None
+        and liquidation_map.nearest_above_distance_pct <= max(
+            atr_pct * 1.65,
+            0.0060 if close < 0.02 else 0.0040,
+        )
+        and not liquidation_map.swept_above
+    )
+    resistance_confluence_score = 0.0
+    if near_vah_resistance:
+        resistance_confluence_score += 1.00
+    if near_peak_resistance:
+        resistance_confluence_score += 0.75
+    if liquidation_map.swept_above:
+        resistance_confluence_score += 1.15
+    if layer2_failed_reclaim or layer3_failed_reclaim:
+        resistance_confluence_score += 1.05
+    if layer2_retest_failed_breakout or layer3_retest_failed_breakout:
+        resistance_confluence_score += 0.90
+    if terminal_rejection_bar:
+        resistance_confluence_score += 0.35
+    downside_confluence_score = 0.0
+    if liquidation_map.downside_magnet:
+        downside_confluence_score += 1.15
+    if value_room_to_poc:
+        downside_confluence_score += 0.70
+    if value_room_to_val:
+        downside_confluence_score += 0.85
+    if value_room_to_support:
+        downside_confluence_score += 0.55
+    recent_upper_liq_reaction = any(
+        band.side == "above"
+        and band.closed_index is not None
+        and band.closed_index >= max(len(enriched) - 8, 0)
+        and (
+            abs(band.level - signal_peak_reference) / max(signal_peak_reference, 1e-8) <= peak_zone_tolerance * 1.35
+            or abs(band.level - close) / max(close, 1e-8) <= peak_zone_tolerance * 1.10
+        )
+        for band in liquidation_map.bands
+    )
+    lower_liq_target_ready = any(
+        band.side == "below"
+        and band.closed_index is None
+        and band.weight >= 1.05
+        and 0.003 <= (close - band.level) / max(close, 1e-8) <= max(value_room_floor * 3.20, 0.035)
+        for band in liquidation_map.bands
+    )
+    if recent_upper_liq_reaction:
+        resistance_confluence_score += 0.90
+    if lower_liq_target_ready:
+        downside_confluence_score += 0.80
+    anchor_touch_tolerance = max(
+        peak_zone_tolerance * 0.92,
+        atr_pct * 1.05,
+        0.0048 if close < 0.02 else 0.0031,
+    )
+    recent_upper_anchor_levels = [
+        level
+        for level in (local_vah, signal_peak_reference)
+        if level > 0
+    ]
+    recent_upper_anchor_levels.extend(
+        band.level
+        for band in liquidation_map.bands
+        if band.side == "above"
+        and (
+            band.closed_index is None
+            or band.closed_index >= max(len(enriched) - 8, 0)
+        )
+    )
+    recent_high_samples = recent_high_tail.tail(3).to_numpy(dtype=float) if len(recent_high_tail) else np.array([], dtype=float)
+    recent_upper_anchor_touch = bool(
+        recent_upper_anchor_levels
+        and recent_high_samples.size
+        and any(
+            abs(high_px - anchor_level) / max(anchor_level, 1e-8) <= anchor_touch_tolerance
+            for high_px in recent_high_samples
+            for anchor_level in recent_upper_anchor_levels
+        )
+    )
+    anchor_reject_score = 0.0
+    if terminal_rejection_bar:
+        anchor_reject_score += 1.05
+    if peak_followthrough_confirmed:
+        anchor_reject_score += 1.00
+    if structure_trigger_confirmed:
+        anchor_reject_score += 1.05
+    if recent_upper_liq_reaction:
+        anchor_reject_score += 0.95
+    if liquidation_map.swept_above:
+        anchor_reject_score += 0.90
+    if near_vah_resistance:
+        anchor_reject_score += 0.50
+    if first_reaction and (rsi < prev_rsi or hist < prev_hist or volume_fade_confirmed):
+        anchor_reject_score += 0.45
+    anchor_reject_floor = (
+        1.10
+        if recent_upper_liq_reaction or liquidation_map.swept_above
+        else 1.35
+        if near_vah_resistance and downside_confluence_score >= 0.85 and first_reaction
+        else 1.55
+    )
+    recent_upper_anchor_reject = bool(
+        recent_upper_anchor_touch
+        and anchor_reject_score >= anchor_reject_floor
+    )
+    if recent_upper_anchor_touch:
+        resistance_confluence_score += 0.55
+    if recent_upper_anchor_reject:
+        resistance_confluence_score += 0.35
+    strong_rejection_cluster = resistance_confluence_score >= 2.00
+    hard_upper_anchor_context = bool(
+        near_vah_resistance
+        or recent_upper_liq_reaction
+        or liquidation_map.swept_above
+        or layer2_failed_reclaim
+        or layer3_failed_reclaim
+        or layer2_retest_failed_breakout
+        or layer3_retest_failed_breakout
+    )
+    watch_downside_target_ready = bool(
+        downside_target_ready
+        or lower_liq_target_ready
+        or (
+            near_peak_resistance
+            and first_reaction
+            and resistance_confluence_score >= 1.80
+            and pullback_from_peak_pct <= max(early_reversal_pullback * 1.08, 0.0048)
+            and (value_room_to_poc or value_room_to_val or value_room_to_support or liquidation_map.downside_magnet)
+        )
+        or (
+            strong_rejection_cluster
+            and (
+                liquidation_map.swept_above
+                or near_vah_resistance
+                or (near_peak_resistance and terminal_rejection_bar)
+            )
+            and (value_room_to_poc or value_room_to_val or value_room_to_support or liquidation_map.downside_magnet)
+        )
+    )
+    if not upper_rejection_zone_ready:
+        return None
+    if not recent_upper_anchor_touch and not liquidation_map.swept_above and not recent_upper_liq_reaction:
+        return None
+    if (
+        not recent_upper_anchor_reject
+        and not micro_reversal_near_peak
+        and not peak_turn_confirmed
+        and not structure_trigger_confirmed
+        and not soft_regime_fail
+    ):
+        return None
+    if (
+        not hard_upper_anchor_context
+        and not soft_regime_fail
+        and not (
+            peak_followthrough_confirmed
+            and terminal_rejection_bar
+            and micro_reversal_near_peak
+            and downside_confluence_score >= 1.10
+            and resistance_confluence_score >= 2.25
+        )
+    ):
+        return None
+    if not watch_downside_target_ready:
+        return None
+    if (
+        open_upside_liq_magnet
+        and not (
+            liquidation_map.swept_above
+            or layer2_failed_reclaim
+            or layer3_failed_reclaim
+            or layer2_retest_failed_breakout
+            or layer3_retest_failed_breakout
+            or peak_followthrough_confirmed
+            or resistance_confluence_score >= 2.35
+        )
+    ):
+        return None
+    upper_zone_distance_candidates = []
+    if local_vah > 0:
+        upper_zone_distance_candidates.append(abs(close - local_vah) / max(close, 1e-8))
+    if signal_peak_reference > 0:
+        upper_zone_distance_candidates.append(abs(signal_peak_reference - close) / max(close, 1e-8))
+    for band in liquidation_map.bands:
+        if band.side != "above":
+            continue
+        if band.closed_index is None and band.level > close:
+            upper_zone_distance_candidates.append(abs(band.level - close) / max(close, 1e-8))
+        elif band.closed_index is not None and band.closed_index >= max(len(enriched) - 8, 0):
+            upper_zone_distance_candidates.append(abs(band.level - close) / max(close, 1e-8))
+    entry_zone_distance_pct = min(upper_zone_distance_candidates) if upper_zone_distance_candidates else 1.0
+    max_watch_entry_zone_distance = max(
+        atr_pct * 1.30,
+        0.0068 if close < 0.02 else 0.0044,
+    )
+    if entry_zone_distance_pct > max_watch_entry_zone_distance and not liquidation_map.swept_above:
+        return None
+    if resistance_confluence_score < 1.55 and not liquidation_map.swept_above and not soft_regime_fail:
+        return None
+    if downside_confluence_score < 0.55 and not liquidation_map.downside_magnet and not soft_regime_fail:
         return None
 
     if soft_regime_fail:
@@ -1247,6 +1893,10 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
             regime_continuation_risk = max(0.0, regime_continuation_risk - 0.55)
         if micro_reversal_near_peak:
             regime_continuation_risk = max(0.0, regime_continuation_risk - 0.35)
+        if strong_rejection_cluster:
+            regime_continuation_risk = max(0.0, regime_continuation_risk - 0.18)
+        if downside_confluence_score >= 1.00:
+            regime_continuation_risk = max(0.0, regime_continuation_risk - 0.10)
 
         regime_quality_score = min(
             10.0,
@@ -1260,35 +1910,56 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
                 + (0.35 if first_reaction else 0.0),
             ),
         )
+        if strong_rejection_cluster:
+            regime_quality_score += min(0.45, resistance_confluence_score * 0.14)
+        if downside_confluence_score > 0.0:
+            regime_quality_score += min(0.25, downside_confluence_score * 0.08)
+        regime_quality_score = min(10.0, regime_quality_score)
+
+        regime_hard_reversal = (
+            micro_reversal_near_peak
+            or liquidation_map.swept_above
+            or peak_followthrough_confirmed
+            or (
+                first_reaction
+                and terminal_rejection_bar
+                and (
+                    rsi < prev_rsi
+                    or hist < prev_hist
+                    or volume_fade_confirmed
+                )
+            )
+        )
 
         if (
-            clean_pump_pct >= early_pump_min * 0.88
+            clean_pump_pct >= early_pump_min
             and peak_recent_enough
             and (near_peak or pump_range_position >= early_watch_min_peak_position * 0.91)
-            and regime_failure_score >= 0.58
-            and regime_watch_score >= max(1.25, early_watch_score_min - 0.45)
-            and regime_quality_score >= max(1.9, early_quality_min - 0.15)
-            and regime_continuation_risk < 3.70
+            and regime_hard_reversal
+            and regime_failure_score >= 1.15
+            and regime_watch_score >= max(2.05, early_watch_score_min + 0.15)
+            and regime_quality_score >= max(3.60, early_quality_min + 0.85)
+            and regime_continuation_risk < 2.85
             and not hard_reclaim_continuation
             and not live_peak_extension
             and not reacceleration_after_pullback
         ):
             regime_triggers = [
-                "памп уже есть",
-                "цена ещё у вершины пампа",
+                "РїР°РјРї СѓР¶Рµ РµСЃС‚СЊ",
+                "С†РµРЅР° РµС‰С‘ Сѓ РІРµСЂС€РёРЅС‹ РїР°РјРїР°",
             ]
             if first_reaction:
-                regime_triggers.append("пошла первая реакция вниз")
+                regime_triggers.append("РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·")
             if peak_followthrough_confirmed:
-                regime_triggers.append("после пика появился lower-high / lower-close")
+                regime_triggers.append("РїРѕСЃР»Рµ РїРёРєР° РїРѕСЏРІРёР»СЃСЏ lower-high / lower-close")
             if hist < prev_hist:
-                regime_triggers.append("MACD ослабевает")
+                regime_triggers.append("MACD РѕСЃР»Р°Р±РµРІР°РµС‚")
             if rsi < prev_rsi:
-                regime_triggers.append("RSI разворачивается вниз")
+                regime_triggers.append("RSI СЂР°Р·РІРѕСЂР°С‡РёРІР°РµС‚СЃСЏ РІРЅРёР·")
             if liquidation_map.downside_magnet:
-                regime_triggers.append("ниже есть ликвидационный магнит")
+                regime_triggers.append("РЅРёР¶Рµ РµСЃС‚СЊ Р»РёРєРІРёРґР°С†РёРѕРЅРЅС‹Р№ РјР°РіРЅРёС‚")
             if liquidation_map.swept_above:
-                regime_triggers.append("верхнюю ликвидность уже сняли")
+                regime_triggers.append("РІРµСЂС…РЅСЋСЋ Р»РёРєРІРёРґРЅРѕСЃС‚СЊ СѓР¶Рµ СЃРЅСЏР»Рё")
 
             return {
                 "phase": "WATCH",
@@ -1296,7 +1967,7 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
                     symbol=symbol,
                     timeframe=timeframe,
                     mode=mode,
-                    phase_label="РАННИЙ ШОРТ: НАБЛЮДЕНИЕ",
+                    phase_label="\\u0420\\u0410\\u041d\\u041d\\u0418\\u0419 \\u0428\\u041e\\u0420\\u0422: \\u041d\\u0410\\u0411\\u041b\\u042e\\u0414\\u0415\\u041d\\u0418\\u0415",
                     price=close,
                     trace_meta=meta,
                     watch_score=regime_watch_score,
@@ -1333,24 +2004,28 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
             moderate_continuation_risk += 1.0
         if liquidation_map.upside_risk > 0:
             moderate_continuation_risk += min(1.0, liquidation_map.upside_risk * 0.28)
+        if strong_rejection_cluster:
+            moderate_continuation_risk = max(0.0, moderate_continuation_risk - 0.18)
+        if downside_confluence_score >= 1.00:
+            moderate_continuation_risk = max(0.0, moderate_continuation_risk - 0.10)
 
         moderate_triggers: list[str] = []
         if peak_still_fresh:
-            moderate_triggers.append("пик пампа совсем свежий")
+            moderate_triggers.append("РїРёРє РїР°РјРїР° СЃРѕРІСЃРµРј СЃРІРµР¶РёР№")
         if near_peak:
-            moderate_triggers.append("цена ещё у вершины пампа")
+            moderate_triggers.append("С†РµРЅР° РµС‰С‘ Сѓ РІРµСЂС€РёРЅС‹ РїР°РјРїР°")
         if first_reaction:
-            moderate_triggers.append("пошла первая реакция вниз")
+            moderate_triggers.append("РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·")
         if micro_reversal_near_peak:
-            moderate_triggers.append("локальный пик уже начал разворачиваться")
+            moderate_triggers.append("Р»РѕРєР°Р»СЊРЅС‹Р№ РїРёРє СѓР¶Рµ РЅР°С‡Р°Р» СЂР°Р·РІРѕСЂР°С‡РёРІР°С‚СЊСЃСЏ")
         if obv_divergence:
-            moderate_triggers.append("OBV уже не подтверждает рост")
+            moderate_triggers.append("OBV СѓР¶Рµ РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚")
         if cvd_divergence:
-            moderate_triggers.append("CVD уже не подтверждает рост")
+            moderate_triggers.append("CVD СѓР¶Рµ РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚")
         if liquidation_map.swept_above:
-            moderate_triggers.append("верхнюю ликвидность уже сняли")
+            moderate_triggers.append("РІРµСЂС…РЅСЋСЋ Р»РёРєРІРёРґРЅРѕСЃС‚СЊ СѓР¶Рµ СЃРЅСЏР»Рё")
         if liquidation_map.downside_magnet:
-            moderate_triggers.append("ниже есть ликвидационный магнит")
+            moderate_triggers.append("РЅРёР¶Рµ РµСЃС‚СЊ Р»РёРєРІРёРґР°С†РёРѕРЅРЅС‹Р№ РјР°РіРЅРёС‚")
 
         moderate_watch_score = 0.0
         if near_peak:
@@ -1384,6 +2059,11 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
                 + (0.45 if micro_reversal_near_peak else 0.0),
             ),
         )
+        if strong_rejection_cluster:
+            moderate_quality_score += min(0.45, resistance_confluence_score * 0.14)
+        if downside_confluence_score > 0.0:
+            moderate_quality_score += min(0.25, downside_confluence_score * 0.08)
+        moderate_quality_score = min(10.0, moderate_quality_score)
         moderate_failure_score = 0.0
         if first_reaction:
             moderate_failure_score += 0.85
@@ -1403,52 +2083,67 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
             moderate_failure_score += 0.45
         if liquidation_map.swept_above:
             moderate_failure_score += 0.75
-        moderate_reversal_ready = (
+        moderate_trigger_ready = bool(
+            first_reaction
+            or micro_reversal_near_peak
+            or liquidation_map.swept_above
+        )
+        moderate_hard_reversal = (
             micro_reversal_near_peak
             or liquidation_map.swept_above
+            or (first_reaction and peak_followthrough_confirmed)
+            or (first_reaction and real_rollover)
+        )
+        moderate_hard_weakness_count = 0
+        if micro_reversal_near_peak:
+            moderate_hard_weakness_count += 1
+        if peak_followthrough_confirmed:
+            moderate_hard_weakness_count += 1
+        if real_rollover:
+            moderate_hard_weakness_count += 1
+        if liquidation_map.swept_above:
+            moderate_hard_weakness_count += 1
+        if obv_divergence:
+            moderate_hard_weakness_count += 1
+        if cvd_divergence:
+            moderate_hard_weakness_count += 1
+        if volume_fade_confirmed:
+            moderate_hard_weakness_count += 1
+        if rsi < prev_rsi and hist < prev_hist:
+            moderate_hard_weakness_count += 1
+
+        moderate_reversal_ready = (
+            moderate_hard_reversal
             or (
                 first_reaction
                 and terminal_rejection_bar
                 and (
-                    peak_followthrough_confirmed
-                    or
-                    rsi < prev_rsi
-                    or hist < prev_hist
-                    or volume_fade_confirmed
-                    or obv_divergence
+                    obv_divergence
                     or cvd_divergence
-                )
-            )
-            or (
-                near_high_context
-                and peak_recent_enough
-                and near_peak
-                and first_reaction
-                and not live_peak_extension
-                and not reacceleration_after_pullback
-                and (
-                    upper_wick / candle_range >= 0.20
-                    or rsi < prev_rsi
-                    or hist < prev_hist
+                    or volume_fade_confirmed
+                    or (rsi < prev_rsi and hist < prev_hist)
                 )
             )
         )
 
         if (
             clean_pump_pct >= early_pump_min
-            and layer2_score >= 0.28
+            and layer2_score >= 0.42
             and peak_recent_enough
             and (near_peak or near_high_context)
+            and moderate_trigger_ready
             and moderate_reversal_ready
+            and moderate_hard_weakness_count >= (1 if liquidation_map.swept_above else 2)
+            and not acceptance_above_high
             and not reclaimed_peak
             and not peak_reclaim_without_reject
             and not hard_reclaim_continuation
             and not live_peak_extension
             and not reacceleration_after_pullback
-            and moderate_continuation_risk < 3.15
-            and moderate_failure_score >= (0.95 if liquidation_map.swept_above else 1.15)
-            and moderate_watch_score >= max(1.95, early_watch_score_min - 0.55)
-            and moderate_quality_score >= max(2.8, early_quality_min - 0.65)
+            and moderate_continuation_risk < 2.65
+            and moderate_failure_score >= (1.25 if liquidation_map.swept_above else 1.55)
+            and moderate_watch_score >= max(2.35, early_watch_score_min + 0.40)
+            and moderate_quality_score >= max(4.10, early_quality_min + 1.65)
         ):
             return {
                 "phase": "WATCH",
@@ -1456,7 +2151,7 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
                     symbol=symbol,
                     timeframe=timeframe,
                     mode=mode,
-                    phase_label="РАННИЙ ШОРТ: НАБЛЮДЕНИЕ",
+                    phase_label="\\u0420\\u0410\\u041d\\u041d\\u0418\\u0419 \\u0428\\u041e\\u0420\\u0422: \\u041d\\u0410\\u0411\\u041b\\u042e\\u0414\\u0415\\u041d\\u0418\\u0415",
                     price=close,
                     trace_meta=meta,
                     watch_score=moderate_watch_score,
@@ -1466,7 +2161,7 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
                     quality_grade=_early_quality_grade(moderate_quality_score),
                     continuation_risk=moderate_continuation_risk,
                     continuation_max_score=4.0,
-                    triggers=moderate_triggers or ["памп уже есть", "появилась первая слабость", "ждём подтверждение"],
+                    triggers=moderate_triggers or ["РїР°РјРї СѓР¶Рµ РµСЃС‚СЊ", "РїРѕСЏРІРёР»Р°СЃСЊ РїРµСЂРІР°СЏ СЃР»Р°Р±РѕСЃС‚СЊ", "Р¶РґС‘Рј РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ"],
                     wait_for="подтверждение слабости и точки входа",
                     enriched=enriched,
                 ),
@@ -1475,23 +2170,26 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
                 "sl": synthetic_sl,
             }
 
+        if not moderate_reversal_ready or moderate_hard_weakness_count < (1 if liquidation_map.swept_above else 2):
+            return None
+
         triggers: list[str] = []
         if peak_still_fresh:
-            triggers.append("пик пампа совсем свежий")
+            triggers.append("РїРёРє РїР°РјРїР° СЃРѕРІСЃРµРј СЃРІРµР¶РёР№")
         if near_peak:
-            triggers.append("цена ещё у вершины пампа")
+            triggers.append("С†РµРЅР° РµС‰С‘ Сѓ РІРµСЂС€РёРЅС‹ РїР°РјРїР°")
         if first_reaction:
-            triggers.append("пошла первая реакция вниз")
+            triggers.append("РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·")
         if bool(_as_float(layer2.get("near_high_context"), 0.0)):
-            triggers.append("цена всё ещё у локального хая")
+            triggers.append("С†РµРЅР° РІСЃС‘ РµС‰С‘ Сѓ Р»РѕРєР°Р»СЊРЅРѕРіРѕ С…Р°СЏ")
         if bool(_as_float(layer2.get("obv_bearish_divergence"), 0.0)):
-            triggers.append("OBV уже не подтверждает рост")
+            triggers.append("OBV СѓР¶Рµ РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚")
         if bool(_as_float(layer2.get("cvd_bearish_divergence"), 0.0)):
-            triggers.append("CVD уже не подтверждает рост")
+            triggers.append("CVD СѓР¶Рµ РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚")
         if liquidation_map.swept_above:
-            triggers.append("верхнюю ликвидность уже сняли")
+            triggers.append("РІРµСЂС…РЅСЋСЋ Р»РёРєРІРёРґРЅРѕСЃС‚СЊ СѓР¶Рµ СЃРЅСЏР»Рё")
         if liquidation_map.downside_magnet:
-            triggers.append("ниже есть ликвидационный магнит")
+            triggers.append("РЅРёР¶Рµ РµСЃС‚СЊ Р»РёРєРІРёРґР°С†РёРѕРЅРЅС‹Р№ РјР°РіРЅРёС‚")
         hard_weakness_count = 0
         if micro_reversal_near_peak:
             hard_weakness_count += 1
@@ -1571,6 +2269,20 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
             or (layer2_score < 0.78 and hard_weakness_count < 2)
         ):
             return None
+        if peak_age_bars > (2 if liquidation_map.swept_above else 2):
+            return None
+        if not structure_trigger_confirmed:
+            return None
+        if hard_weakness_count < (2 if liquidation_map.swept_above else 3):
+            return None
+        if (
+            not volume_fade_confirmed
+            and not obv_divergence
+            and not cvd_divergence
+            and not liquidation_map.swept_above
+            and not (rsi < prev_rsi and hist < prev_hist)
+        ):
+            return None
 
         continuation_risk = max(0.0, 1.9 - layer2_score)
         continuation_risk += continuation_structure_score
@@ -1594,6 +2306,10 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
             continuation_risk = max(0.0, continuation_risk - 0.55)
         if hard_weakness_count >= 3:
             continuation_risk = max(0.0, continuation_risk - 0.25)
+        if strong_rejection_cluster:
+            continuation_risk = max(0.0, continuation_risk - 0.18)
+        if downside_confluence_score >= 1.00:
+            continuation_risk = max(0.0, continuation_risk - 0.10)
         if continuation_risk >= (2.20 if hard_weakness_count >= 3 else 1.95):
             return None
         quality_score = min(
@@ -1612,7 +2328,12 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
                 + (0.4 if liquidation_map.downside_magnet else 0.0),
             ),
         )
-        if clean_pump_pct < confirmed_pump_min:
+        if strong_rejection_cluster:
+            quality_score += min(0.50, resistance_confluence_score * 0.16)
+        if downside_confluence_score > 0.0:
+            quality_score += min(0.25, downside_confluence_score * 0.08)
+        quality_score = min(10.0, quality_score)
+        if clean_pump_pct < early_structural_pump_min:
             quality_score -= 0.45
         if volume_spike < max(0.85, confirmed_volume_gate * 0.62):
             quality_score -= 0.55
@@ -1635,15 +2356,17 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
             setup_failure_score += 0.60
         if liquidation_map.swept_above:
             setup_failure_score += 0.75
-        if clean_pump_pct < confirmed_pump_min:
+        if clean_pump_pct < early_structural_pump_min:
             quality_score = min(quality_score, 7.1)
         if not volume_climax_recent:
             quality_score = min(quality_score, 7.0)
         if hard_weakness_count < 3:
             quality_score = min(quality_score, 6.9)
-        if setup_failure_score < (2.15 if liquidation_map.swept_above else 2.45):
+        if setup_failure_score < (2.35 if liquidation_map.swept_above else 2.80):
             return None
-        if quality_score < max(5.8, early_quality_min + 0.7):
+        if quality_score < max(6.35, early_quality_min + 1.15):
+            return None
+        if not downside_target_ready:
             return None
 
         return {
@@ -1652,7 +2375,7 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
                 symbol=symbol,
                 timeframe=timeframe,
                 mode=mode,
-                phase_label="РАННИЙ ШОРТ: СЕТАП",
+                phase_label="\\u0420\\u0410\\u041d\\u041d\\u0418\\u0419 \\u0428\\u041e\\u0420\\u0422: \\u0421\\u0415\\u0422\\u0410\\u041f",
                 price=close,
                 trace_meta=meta,
                 watch_score=max(4.5, layer2_score * 6.0),
@@ -1662,7 +2385,7 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
                 quality_grade=_early_quality_grade(quality_score),
                 continuation_risk=continuation_risk,
                 continuation_max_score=4.0,
-                triggers=triggers or ["памп уже есть", "слабость рядом", "ждём вход по стратегии"],
+                triggers=triggers or ["РїР°РјРї СѓР¶Рµ РµСЃС‚СЊ", "СЃР»Р°Р±РѕСЃС‚СЊ СЂСЏРґРѕРј", "Р¶РґС‘Рј РІС…РѕРґ РїРѕ СЃС‚СЂР°С‚РµРіРёРё"],
                 wait_for="подтверждение полноценного входа",
                 enriched=enriched,
             ),
@@ -1676,19 +2399,19 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         location_reason = str(layer3.get("failed_reason") or "")
         setup_triggers: list[str] = []
         if peak_recent_enough:
-            setup_triggers.append("пик пампа ещё свежий")
+            setup_triggers.append("РїРёРє РїР°РјРїР° РµС‰С‘ СЃРІРµР¶РёР№")
         if near_peak:
-            setup_triggers.append("цена всё ещё рядом с вершиной")
+            setup_triggers.append("С†РµРЅР° РІСЃС‘ РµС‰С‘ СЂСЏРґРѕРј СЃ РІРµСЂС€РёРЅРѕР№")
         if first_reaction:
-            setup_triggers.append("после пика пошла первая реакция вниз")
+            setup_triggers.append("РїРѕСЃР»Рµ РїРёРєР° РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·")
         if peak_followthrough_confirmed:
-            setup_triggers.append("появился lower-high / lower-close после пика")
+            setup_triggers.append("РїРѕСЏРІРёР»СЃСЏ lower-high / lower-close РїРѕСЃР»Рµ РїРёРєР°")
         if liquidation_map.swept_above:
-            setup_triggers.append("верхнюю ликвидность уже сняли")
+            setup_triggers.append("РІРµСЂС…РЅСЋСЋ Р»РёРєРІРёРґРЅРѕСЃС‚СЊ СѓР¶Рµ СЃРЅСЏР»Рё")
         if liquidation_map.downside_magnet:
-            setup_triggers.append("ниже есть ликвидационный магнит")
+            setup_triggers.append("РЅРёР¶Рµ РµСЃС‚СЊ Р»РёРєРІРёРґР°С†РёРѕРЅРЅС‹Р№ РјР°РіРЅРёС‚")
         if location_reason:
-            setup_triggers.append("сетка почти готова, ждём лучшую точку входа")
+            setup_triggers.append("СЃРµС‚РєР° РїРѕС‡С‚Рё РіРѕС‚РѕРІР°, Р¶РґС‘Рј Р»СѓС‡С€СѓСЋ С‚РѕС‡РєСѓ РІС…РѕРґР°")
 
         setup_failure_score = 0.0
         if first_reaction:
@@ -1717,6 +2440,10 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
             setup_continuation_risk += min(1.0, liquidation_map.upside_risk * 0.30)
         if peak_followthrough_confirmed:
             setup_continuation_risk = max(0.0, setup_continuation_risk - 0.55)
+        if strong_rejection_cluster:
+            setup_continuation_risk = max(0.0, setup_continuation_risk - 0.18)
+        if downside_confluence_score >= 1.00:
+            setup_continuation_risk = max(0.0, setup_continuation_risk - 0.10)
 
         setup_quality_score = min(
             10.0,
@@ -1731,26 +2458,51 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
                 + (0.55 if liquidation_map.swept_above else 0.0),
             ),
         )
+        if strong_rejection_cluster:
+            setup_quality_score += min(0.50, resistance_confluence_score * 0.16)
+        if downside_confluence_score > 0.0:
+            setup_quality_score += min(0.25, downside_confluence_score * 0.08)
+        setup_quality_score = min(10.0, setup_quality_score)
+
+        setup_structural_score = (
+            float(layer2_failed_reclaim or layer3_failed_reclaim)
+            + float(layer2_retest_failed_breakout or layer3_retest_failed_breakout)
+            + float(peak_followthrough_confirmed)
+            + float(liquidation_map.swept_above)
+            + float(real_rollover)
+        )
 
         if (
             clean_pump_pct >= early_pump_min
             and peak_recent_enough
             and near_peak
-            and setup_failure_score >= (1.70 if liquidation_map.swept_above else 2.05)
-            and (first_reaction or peak_followthrough_confirmed or liquidation_map.swept_above)
+            and peak_age_bars <= 2
+            and setup_failure_score >= (1.95 if liquidation_map.swept_above else 2.35)
+            and (first_reaction or micro_reversal_near_peak or liquidation_map.swept_above)
+            and (peak_followthrough_confirmed or real_rollover or liquidation_map.swept_above)
+            and structural_reversal_ready
+            and structure_trigger_confirmed
+            and not acceptance_above_high
             and not hard_reclaim_continuation
             and not live_peak_extension
             and not reacceleration_after_pullback
-            and setup_continuation_risk < 3.05
-            and setup_quality_score >= max(4.9, early_quality_min + 0.15)
+            and setup_continuation_risk < 2.55
+            and setup_structural_score >= (2.35 if liquidation_map.swept_above else 2.75)
+            and setup_quality_score >= max(5.9, early_quality_min + 0.65)
         ):
+            if not (layer2_failed_reclaim or layer3_failed_reclaim or liquidation_map.swept_above):
+                setup_quality_score = min(setup_quality_score, 7.3)
+            if not peak_followthrough_confirmed:
+                setup_quality_score = min(setup_quality_score, 6.9)
+            if not downside_target_ready:
+                return None
             return {
                 "phase": "SETUP",
                 "caption": build_early_signal_caption(
                     symbol=symbol,
                     timeframe=timeframe,
                     mode=mode,
-                    phase_label="РАННИЙ ШОРТ: СЕТАП",
+                    phase_label="\\u0420\\u0410\\u041d\\u041d\\u0418\\u0419 \\u0428\\u041e\\u0420\\u0422: \\u0421\\u0415\\u0422\\u0410\\u041f",
                     price=close,
                     trace_meta=meta,
                     watch_score=max(4.8, layer2_score * 6.2),
@@ -1790,19 +2542,27 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         not volume_climax_recent
         and not volume_fade_confirmed
         and not liquidation_map.swept_above
-        and not (clean_pump_pct >= confirmed_pump_min and peak_recent_enough and near_peak)
+        and not (clean_pump_pct >= early_structural_pump_min and peak_recent_enough and near_peak)
     ):
         return None
     if volume_spike < minimum_live_volume and not liquidation_map.swept_above:
         return None
     if max(rsi, prev_rsi) < early_rsi_min:
         return None
+    prefire_structural_slowdown = (
+        terminal_rejection_bar
+        or micro_reversal_near_peak
+        or volume_fade_confirmed
+        or liquidation_map.swept_above
+        or (first_reaction and (close < prev_close or hist < prev_hist or rsi < prev_rsi))
+    )
     strong_peak_prefire = (
         peak_still_fresh
         and near_peak
-        and clean_pump_pct >= confirmed_pump_min
+        and clean_pump_pct >= early_structural_pump_min
         and rsi >= max(early_rsi_min, 56.0)
         and pump_range_position >= max(early_watch_min_peak_position, 0.72)
+        and prefire_structural_slowdown
         and not reclaimed_peak
         and not bullish_continuation_bar
         and not hard_reclaim_continuation
@@ -1825,25 +2585,25 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
     prefire_triggers: list[tuple[str, float]] = []
     if strong_peak_prefire:
         if peak_recent_enough:
-            prefire_triggers.append(("пик пампа совсем свежий", 1.25))
+            prefire_triggers.append(("РїРёРє РїР°РјРїР° СЃРѕРІСЃРµРј СЃРІРµР¶РёР№", 1.25))
         if near_peak:
-            prefire_triggers.append(("цена еще у вершины пампа", 1.10))
+            prefire_triggers.append(("С†РµРЅР° РµС‰Рµ Сѓ РІРµСЂС€РёРЅС‹ РїР°РјРїР°", 1.10))
         if clean_pump_pct >= early_pump_min:
-            prefire_triggers.append(("чистый памп уже выше раннего минимума", 0.80))
+            prefire_triggers.append(("С‡РёСЃС‚С‹Р№ РїР°РјРї СѓР¶Рµ РІС‹С€Рµ СЂР°РЅРЅРµРіРѕ РјРёРЅРёРјСѓРјР°", 0.80))
         if first_reaction:
-            prefire_triggers.append(("пошла первая реакция вниз", 1.25))
+            prefire_triggers.append(("РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·", 1.25))
         if micro_reversal_near_peak:
-            prefire_triggers.append(("у вершины появилась микрореакция вниз", 1.15))
+            prefire_triggers.append(("Сѓ РІРµСЂС€РёРЅС‹ РїРѕСЏРІРёР»Р°СЃСЊ РјРёРєСЂРѕСЂРµР°РєС†РёСЏ РІРЅРёР·", 1.15))
         if upper_wick / candle_range >= 0.18:
-            prefire_triggers.append(("есть верхняя тень", 0.95))
+            prefire_triggers.append(("РµСЃС‚СЊ РІРµСЂС…РЅСЏСЏ С‚РµРЅСЊ", 0.95))
         if hist < prev_hist:
-            prefire_triggers.append(("MACD ослабевает", 1.10))
+            prefire_triggers.append(("MACD РѕСЃР»Р°Р±РµРІР°РµС‚", 1.10))
         if recent_volume_spike > 0 and volume_spike < recent_volume_spike:
-            prefire_triggers.append(("объем затухает", 1.10))
+            prefire_triggers.append(("РѕР±СЉРµРј Р·Р°С‚СѓС…Р°РµС‚", 1.10))
         if liquidation_map.swept_above:
-            prefire_triggers.append(("верхнюю ликвидность уже сняли", 1.20))
+            prefire_triggers.append(("РІРµСЂС…РЅСЋСЋ Р»РёРєРІРёРґРЅРѕСЃС‚СЊ СѓР¶Рµ СЃРЅСЏР»Рё", 1.20))
         if liquidation_map.downside_magnet:
-            prefire_triggers.append(("ниже есть ликвидационный магнит", 1.00))
+            prefire_triggers.append(("РЅРёР¶Рµ РµСЃС‚СЊ Р»РёРєРІРёРґР°С†РёРѕРЅРЅС‹Р№ РјР°РіРЅРёС‚", 1.00))
 
         prefire_unique_triggers: list[str] = []
         prefire_watch_score = 0.0
@@ -1852,6 +2612,16 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
                 continue
             prefire_unique_triggers.append(label)
             prefire_watch_score += float(weight)
+        generic_prefire_penalty = 0.0
+        if peak_recent_enough:
+            generic_prefire_penalty += 0.70
+        if near_peak:
+            generic_prefire_penalty += 0.65
+        if clean_pump_pct >= early_pump_min:
+            generic_prefire_penalty += 0.45
+        if liquidation_map.downside_magnet:
+            generic_prefire_penalty += 0.35
+        prefire_watch_score = max(0.0, prefire_watch_score - generic_prefire_penalty)
 
         prefire_reclaim_without_rollover = (
             (close >= recent_close_high * 0.9995 or close >= recent_high * 0.9975)
@@ -1884,6 +2654,10 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
             prefire_continuation_risk = max(0.0, prefire_continuation_risk - 0.65)
         if micro_reversal_near_peak:
             prefire_continuation_risk = max(0.0, prefire_continuation_risk - 0.50)
+        if strong_rejection_cluster:
+            prefire_continuation_risk = max(0.0, prefire_continuation_risk - 0.20)
+        if downside_confluence_score >= 1.00:
+            prefire_continuation_risk = max(0.0, prefire_continuation_risk - 0.10)
 
         prefire_failure_score = 0.0
         if first_reaction:
@@ -1915,18 +2689,44 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
                 + (0.60 if near_peak else 0.0)
                 + (0.75 if first_reaction else 0.0)
                 + (0.55 if micro_reversal_near_peak else 0.0)
-                + (0.45 if clean_pump_pct >= confirmed_pump_min else 0.0),
+                + (0.45 if clean_pump_pct >= early_structural_pump_min else 0.0),
             ),
+        )
+        if strong_rejection_cluster:
+            prefire_quality_score += min(0.45, resistance_confluence_score * 0.14)
+        if downside_confluence_score > 0.0:
+            prefire_quality_score += min(0.20, downside_confluence_score * 0.07)
+        prefire_quality_score = min(10.0, prefire_quality_score)
+        if not (peak_followthrough_confirmed or liquidation_map.swept_above or real_rollover):
+            prefire_quality_score = min(prefire_quality_score, 7.0)
+        if not terminal_rejection_bar and not volume_fade_confirmed:
+            prefire_quality_score = min(prefire_quality_score, 6.6)
+
+        prefire_hard_reversal = (
+            micro_reversal_near_peak
+            or liquidation_map.swept_above
+            or peak_followthrough_confirmed
+            or real_rollover
+            or (
+                first_reaction
+                and terminal_rejection_bar
+                and (
+                    hist < prev_hist
+                    or rsi < prev_rsi
+                    or volume_fade_confirmed
+                )
+            )
         )
 
         if (
             prefire_slowdown
+            and prefire_hard_reversal
             and not prefire_reclaim_without_rollover
-            and prefire_failure_score >= (1.15 if liquidation_map.swept_above else 1.45)
-            and prefire_watch_score >= max(2.0, early_watch_score_min - 0.25)
-            and len(prefire_unique_triggers) >= 3
-            and prefire_continuation_risk < 3.05
-            and prefire_quality_score >= max(2.8, early_quality_min - 0.10)
+            and prefire_failure_score >= (1.35 if liquidation_map.swept_above else 1.55)
+            and prefire_watch_score >= max(2.30, early_watch_score_min + 0.40)
+            and len(prefire_unique_triggers) >= 4
+            and prefire_continuation_risk < 2.05
+            and prefire_quality_score >= max(4.25, early_quality_min + 1.55)
         ):
             return {
                 "phase": "WATCH",
@@ -1934,7 +2734,7 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
                     symbol=symbol,
                     timeframe=timeframe,
                     mode=mode,
-                    phase_label="РАННИЙ ШОРТ: НАБЛЮДЕНИЕ",
+                    phase_label="\\u0420\\u0410\\u041d\\u041d\\u0418\\u0419 \\u0428\\u041e\\u0420\\u0422: \\u041d\\u0410\\u0411\\u041b\\u042e\\u0414\\u0415\\u041d\\u0418\\u0415",
                     price=close,
                     trace_meta=meta,
                     watch_score=prefire_watch_score,
@@ -2025,7 +2825,7 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         not current_volume_supportive
         and not (volume_fade_confirmed and (real_rollover or peak_followthrough_confirmed))
         and not liquidation_map.swept_above
-        and not (clean_pump_pct >= confirmed_pump_min and near_peak and first_reaction)
+        and not (clean_pump_pct >= early_structural_pump_min and near_peak and first_reaction)
         and not strong_peak_prefire
     ):
         return None
@@ -2061,6 +2861,8 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         continuation_risk += 0.75
     if liquidation_map.upside_risk > 0:
         continuation_risk += min(1.75, liquidation_map.upside_risk * 0.55)
+    if open_upside_liq_magnet:
+        continuation_risk += 0.75
     if (
         liquidation_map.nearest_above_distance_pct is not None
         and liquidation_map.nearest_above_distance_pct < 0.0045
@@ -2078,6 +2880,12 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         continuation_risk += 1.15
     if strong_peak_prefire:
         continuation_risk = max(0.0, continuation_risk - 0.55)
+    if upper_rejection_zone_ready:
+        continuation_risk = max(0.0, continuation_risk - 0.30)
+    if liquidation_map.swept_above:
+        continuation_risk = max(0.0, continuation_risk - 0.30)
+    if downside_target_ready:
+        continuation_risk = max(0.0, continuation_risk - 0.18)
 
     active_failure_score = 0.0
     if first_reaction:
@@ -2113,6 +2921,8 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         return None
     if pullback_from_peak_pct > watch_pullback_cap:
         return None
+    if acceptance_above_high and not liquidation_map.swept_above:
+        return None
     if micro_reversal_near_peak:
         continuation_risk = max(0.0, continuation_risk - 1.15)
     if reclaimed_peak and not liquidation_map.swept_above and not micro_reversal_near_peak:
@@ -2121,14 +2931,14 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         return None
     if live_peak_extension and not strong_peak_prefire:
         return None
-    if continuation_structure_score >= 2.35 and not liquidation_map.swept_above and not micro_reversal_near_peak and not strong_peak_prefire:
+    if continuation_structure_score >= 1.95 and not liquidation_map.swept_above and not micro_reversal_near_peak and not strong_peak_prefire:
         return None
     if (still_accelerating and not micro_reversal_near_peak and not first_reaction and not strong_peak_prefire) or continuation_risk >= (
         4.10 if strong_peak_prefire else 3.45 if micro_reversal_near_peak else 3.10
     ):
         return None
     if active_failure_score < (
-        0.85 if soft_regime_watch else 1.10 if strong_peak_prefire else 1.45 if liquidation_map.swept_above else 1.75
+        1.20 if soft_regime_watch else 1.35 if strong_peak_prefire else 1.65 if liquidation_map.swept_above else 2.00
     ):
         return None
     if not peak_followthrough_confirmed and not liquidation_map.swept_above and not first_reaction and not strong_peak_prefire and not soft_regime_watch:
@@ -2141,12 +2951,14 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         weighted_triggers.append(("пошла первая реакция вниз", 1.20))
     if clean_pump_pct >= early_pump_min:
         weighted_triggers.append(("чистый памп уже выше раннего минимума", 0.75))
-    if clean_pump_pct >= confirmed_pump_min:
+    if clean_pump_pct >= early_structural_pump_min:
         weighted_triggers.append(("чистый памп уже дотянул до confirmed-порога", 1.0))
     if close >= max(bb_upper, kc_upper) * 0.998:
         weighted_triggers.append(("цена у верхней зоны", 1.0))
     if close >= signal_peak_reference * 0.995:
         weighted_triggers.append(("цена у локального хая", 1.0))
+    if near_vah_resistance:
+        weighted_triggers.append(("цена упёрлась в VAH", 1.35))
     if rsi >= early_rsi_min:
         weighted_triggers.append(("RSI уже повышен", 0.5))
     if rsi < prev_rsi and rsi >= early_rsi_min:
@@ -2169,9 +2981,13 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         weighted_triggers.append(("верхнюю ликвидность уже сняли", 1.35))
     if liquidation_map.downside_magnet:
         weighted_triggers.append(("ниже есть ликвидационный магнит", 1.15))
+    if value_room_to_poc:
+        weighted_triggers.append(("ниже есть POC как цель отката", 0.95))
+    if value_room_to_val:
+        weighted_triggers.append(("ниже есть VAL как цель отката", 1.00))
 
     if peak_followthrough_confirmed:
-        weighted_triggers.append(("РїРѕСЃР»Рµ РїРёРєР° СѓР¶Рµ РїРѕСЏРІРёР»СЃСЏ lower-high / lower-close", 1.45))
+        weighted_triggers.append(("после пика уже появился lower-high / lower-close", 1.45))
 
     normalized_weighted_triggers: list[tuple[str, float]] = []
     for label, weight in weighted_triggers:
@@ -2188,6 +3004,22 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
             continue
         unique_triggers.append(label)
         watch_score += float(weight)
+    generic_watch_penalty = 0.0
+    if near_peak:
+        generic_watch_penalty += 0.60
+    if clean_pump_pct >= early_pump_min:
+        generic_watch_penalty += 0.40
+    if clean_pump_pct >= early_structural_pump_min:
+        generic_watch_penalty += 0.45
+    if close >= max(bb_upper, kc_upper) * 0.998:
+        generic_watch_penalty += 0.35
+    if close >= signal_peak_reference * 0.995:
+        generic_watch_penalty += 0.35
+    if rsi >= early_rsi_min:
+        generic_watch_penalty += 0.20
+    if volume_spike >= early_volume_gate:
+        generic_watch_penalty += 0.20
+    watch_score = max(0.0, watch_score - generic_watch_penalty)
 
     active_weakness_score = 0.0
     if terminal_rejection_bar:
@@ -2212,31 +3044,96 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         active_weakness_score += 0.65
     if continuation_after_pause:
         active_weakness_score = max(0.0, active_weakness_score - 1.25)
+    weak_anchor_without_level = bool(
+        recent_upper_anchor_touch
+        and not (
+            near_vah_resistance
+            or recent_upper_liq_reaction
+            or liquidation_map.swept_above
+        )
+    )
+    watch_live_volume_floor = max(
+        0.16 if close < 0.02 else 0.10,
+        early_volume_gate * 0.52,
+    )
+    if near_vah_resistance or recent_upper_liq_reaction or liquidation_map.swept_above:
+        watch_live_volume_floor = min(
+            watch_live_volume_floor,
+            max(
+                0.12 if close < 0.02 else 0.08,
+                early_volume_gate * 0.42,
+            ),
+        )
+    if (
+        volume_spike < watch_live_volume_floor
+        and not (
+            liquidation_map.swept_above
+            or peak_followthrough_confirmed
+            or structure_trigger_confirmed
+            or recent_upper_liq_reaction
+        )
+    ):
+        return None
+    if weak_anchor_without_level:
+        if not (peak_followthrough_confirmed or structure_trigger_confirmed or micro_reversal_near_peak):
+            return None
+        if active_weakness_score < 2.95 and not strong_peak_prefire and not soft_regime_fail:
+            return None
+    weak_rejection_floor = max(
+        minimum_reversal_pullback * 1.12,
+        0.0017 if close < 0.02 else 0.0011,
+    )
+    if weak_watch_structure:
+        if (
+            pullback_from_peak_pct < weak_rejection_floor
+            and not micro_reversal_near_peak
+            and not strong_peak_prefire
+            and not soft_regime_fail
+        ):
+            return None
+        if active_weakness_score < 2.40 and not strong_peak_prefire and not soft_regime_fail:
+            return None
+        if (
+            continuation_structure_score > 1.35
+            and not micro_reversal_near_peak
+            and not strong_peak_prefire
+            and not soft_regime_fail
+        ):
+            return None
+        if (
+            not volume_climax_recent
+            and recent_volume_spike < max(0.22, early_volume_gate * 2.10)
+            and not liquidation_map.swept_above
+            and not soft_regime_fail
+        ):
+            return None
+    if weak_watch_structure and (reported_pump_below_min or marginal_watch_pump):
+        if not (
+            recent_upper_liq_reaction
+            or micro_reversal_near_peak
+            or strong_peak_prefire
+            or soft_regime_fail
+        ):
+            return None
+        if downside_confluence_score < 1.05 and not liquidation_map.downside_magnet:
+            return None
+        if active_weakness_score < 2.65:
+            return None
 
     weakness_markers = {
-        "RSI разворачивается вниз",
-        "объём затухает",
-        "MACD ослабевает",
-        "OBV не подтверждает рост",
-        "CVD не подтверждает рост",
-        "цена перестала ускоряться",
-        "верхнюю ликвидность уже сняли",
-        "ниже есть ликвидационный магнит",
+        "\u0052\u0053\u0049 \u0440\u0430\u0437\u0432\u043e\u0440\u0430\u0447\u0438\u0432\u0430\u0435\u0442\u0441\u044f \u0432\u043d\u0438\u0437",
+        "\u043e\u0431\u044a\u0451\u043c \u0437\u0430\u0442\u0443\u0445\u0430\u0435\u0442",
+        "\u004d\u0041\u0043\u0044 \u043e\u0441\u043b\u0430\u0431\u0435\u0432\u0430\u0435\u0442",
+        "\u004f\u0042\u0056 \u043d\u0435 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0430\u0435\u0442 \u0440\u043e\u0441\u0442",
+        "\u0043\u0056\u0044 \u043d\u0435 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0430\u0435\u0442 \u0440\u043e\u0441\u0442",
+        "\u0446\u0435\u043d\u0430 \u043f\u0435\u0440\u0435\u0441\u0442\u0430\u043b\u0430 \u0443\u0441\u043a\u043e\u0440\u044f\u0442\u044c\u0441\u044f",
+        "\u0432\u0435\u0440\u0445\u043d\u044e\u044e \u043b\u0438\u043a\u0432\u0438\u0434\u043d\u043e\u0441\u0442\u044c \u0443\u0436\u0435 \u0441\u043d\u044f\u043b\u0438",
+        "\u043d\u0438\u0436\u0435 \u0435\u0441\u0442\u044c \u043b\u0438\u043a\u0432\u0438\u0434\u0430\u0446\u0438\u043e\u043d\u043d\u044b\u0439 \u043c\u0430\u0433\u043d\u0438\u0442",
+        "\u043f\u043e\u0441\u043b\u0435 \u043f\u0438\u043a\u0430 \u0443\u0436\u0435 \u043f\u043e\u044f\u0432\u0438\u043b\u0441\u044f \u006c\u006f\u0077\u0065\u0072\u002d\u0068\u0069\u0067\u0068 \u002f \u006c\u006f\u0077\u0065\u0072\u002d\u0063\u006c\u006f\u0073\u0065",
+        "\u043f\u043e\u0448\u043b\u0430 \u043f\u0435\u0440\u0432\u0430\u044f \u0440\u0435\u0430\u043a\u0446\u0438\u044f \u0432\u043d\u0438\u0437",
     }
-    weakness_markers.add("пошла первая реакция вниз")
-    weakness_markers = {
-        "RSI разворачивается вниз",
-        "объём затухает",
-        "MACD ослабевает",
-        "OBV не подтверждает рост",
-        "CVD не подтверждает рост",
-        "цена перестала ускоряться",
-        "верхнюю ликвидность уже сняли",
-        "ниже есть ликвидационный магнит",
-        "после пика уже появился lower-high / lower-close",
-        "пошла первая реакция вниз",
-    }
-    weakness_count = sum(1 for trigger in unique_triggers if trigger in weakness_markers)
+    normalized_triggers = {_normalize_human_text(trigger) for trigger in unique_triggers}
+    weakness_count = sum(1 for trigger in normalized_triggers if trigger in weakness_markers)
     peak_rollover_fast_track = (
         peak_recent_enough
         and near_peak
@@ -2258,15 +3155,38 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
     if strong_peak_prefire:
         effective_watch_score_min = min(effective_watch_score_min, early_watch_score_min - 0.35)
         effective_quality_min = min(effective_quality_min, early_quality_min - 0.20)
-    required_triggers = 2 if peak_rollover_fast_track or strong_peak_prefire or (near_peak and (micro_reversal_near_peak or first_reaction)) else 3 if near_peak else 4
+    required_triggers = (
+        3
+        if peak_rollover_fast_track
+        or strong_peak_prefire
+        or (near_peak and (micro_reversal_near_peak or first_reaction))
+        else 3
+        if near_peak
+        else 4
+    )
     if soft_regime_watch:
-        required_triggers = max(2, required_triggers - 1)
+        required_triggers = max(3, required_triggers - 1)
     if watch_score < effective_watch_score_min or len(unique_triggers) < required_triggers:
         return None
-    if weakness_count < 1 and not liquidation_map.swept_above and not micro_reversal_near_peak and not strong_peak_prefire:
+    if weakness_count < 2 and not liquidation_map.swept_above and not micro_reversal_near_peak and not strong_peak_prefire:
         return None
-    active_weakness_min = 0.35 if soft_regime_watch else 0.45 if strong_peak_prefire else 1.05 if peak_rollover_fast_track else 1.20 if near_peak else 1.85
+    active_weakness_min = 0.75 if soft_regime_watch else 1.10 if strong_peak_prefire else 1.55 if peak_rollover_fast_track else 1.65 if near_peak else 2.10
     if active_weakness_score < active_weakness_min and not liquidation_map.swept_above:
+        return None
+    if (
+        not structural_reversal_ready
+        and not liquidation_map.swept_above
+        and not peak_followthrough_confirmed
+        and not (
+            first_reaction
+            and terminal_rejection_bar
+            and (
+                rsi < prev_rsi
+                or hist < prev_hist
+                or volume_fade_confirmed
+            )
+        )
+    ):
         return None
     if (
         not real_rollover
@@ -2281,7 +3201,7 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
                 or rsi < prev_rsi
                 or hist < prev_hist
                 or upper_wick / candle_range >= 0.16
-                or clean_pump_pct >= confirmed_pump_min * 1.05
+                or clean_pump_pct >= early_structural_pump_min * 1.05
             )
         )
     ):
@@ -2302,26 +3222,44 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
             + (0.55 if near_peak else 0.0)
             + (0.65 if first_reaction else 0.0)
             + (0.55 if micro_reversal_near_peak else 0.0)
-            + (0.75 if clean_pump_pct >= confirmed_pump_min else 0.0)
+            + (0.75 if clean_pump_pct >= early_structural_pump_min else 0.0)
             + (0.40 if volume_spike >= confirmed_volume_gate else 0.0),
         ),
     )
-    if clean_pump_pct < confirmed_pump_min:
+    if clean_pump_pct < early_structural_pump_min:
         quality_score -= 0.55
     if volume_spike < max(0.95, confirmed_volume_gate * 0.72):
         quality_score -= 0.65
     if weakness_count < 3:
         quality_score -= 0.55
-    if clean_pump_pct < confirmed_pump_min:
+    if clean_pump_pct < early_structural_pump_min:
         quality_score = min(quality_score, 7.8)
     if not volume_climax_recent:
         quality_score = min(quality_score, 7.5)
     if weakness_count < 3:
         quality_score = min(quality_score, 7.5)
+    if not (layer2_failed_reclaim or layer3_failed_reclaim or liquidation_map.swept_above or peak_followthrough_confirmed):
+        quality_score = min(quality_score, 7.0)
     if peak_rollover_fast_track:
         quality_score = max(quality_score, early_quality_min + 0.15)
     if active_weakness_score < 2.4:
         quality_score = min(quality_score, 6.9)
+    if not structural_reversal_ready:
+        quality_score = min(quality_score, 6.8 if strong_peak_prefire else 6.4)
+    if not (layer2_failed_reclaim or layer3_failed_reclaim or liquidation_map.swept_above) and active_weakness_score < 2.8:
+        quality_score = min(quality_score, 6.6)
+    if weak_anchor_without_level and not (peak_followthrough_confirmed or liquidation_map.swept_above):
+        quality_score = min(quality_score, 7.15)
+    if (
+        phase == "WATCH"
+        and not (
+            recent_upper_liq_reaction
+            or liquidation_map.swept_above
+            or near_vah_resistance
+            or peak_followthrough_confirmed
+        )
+    ):
+        quality_score = min(quality_score, 7.25)
     if quality_score < effective_quality_min:
         return None
 
@@ -2331,7 +3269,7 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
             symbol=symbol,
             timeframe=timeframe,
             mode=mode,
-            phase_label="РАННИЙ ШОРТ: НАБЛЮДЕНИЕ",
+            phase_label="\\u0420\\u0410\\u041d\\u041d\\u0418\\u0419 \\u0428\\u041e\\u0420\\u0422: \\u041d\\u0410\\u0411\\u041b\\u042e\\u0414\\u0415\\u041d\\u0418\\u0415",
             price=close,
             trace_meta=meta,
             watch_score=watch_score,
@@ -2349,6 +3287,479 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         "tp": synthetic_tp,
         "sl": synthetic_sl,
     }
+
+
+def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, enriched, intent) -> dict[str, object] | None:
+    if getattr(intent, "action", None) != IntentAction.SHORT_ENTRY:
+        return None
+
+    meta = intent.metadata if isinstance(intent.metadata, Mapping) else {}
+    trace = meta.get("layer_trace", {}) if isinstance(meta, Mapping) else {}
+    layers = trace.get("layers", {}) if isinstance(trace, Mapping) else {}
+    if not isinstance(layers, Mapping):
+        return None
+
+    layer1 = _extract_layer_details(meta, "layer1_pump_detection")
+    layer2 = _extract_layer_details(meta, "layer2_weakness_confirmation")
+    layer3 = _extract_layer_details(meta, "layer3_entry_location")
+    if enriched is None or getattr(enriched, "empty", True):
+        return None
+
+    row = enriched.iloc[-1]
+    prev = enriched.iloc[-2] if len(enriched) > 1 else row
+    close = _as_float(row.get("close"), 0.0)
+    if close <= 0.0:
+        return None
+
+    liquidation_map = build_liquidation_map(enriched)
+    atr = max(_as_float(row.get("atr"), close * 0.01), close * 0.001, 1e-8)
+    local_vah = _as_float(row.get("vah"), 0.0)
+    local_poc = _as_float(row.get("poc"), 0.0)
+    local_val = _as_float(row.get("val"), 0.0)
+    recent_high_series = enriched.tail(min(len(enriched), 28 if close >= 0.02 else 36))["high"] if "high" in enriched.columns else pd.Series([close])
+    recent_low_series = enriched.tail(min(len(enriched), 28 if close >= 0.02 else 36))["low"] if "low" in enriched.columns else pd.Series([close])
+    recent_high = _as_float(pd.to_numeric(recent_high_series, errors="coerce").max(), close)
+    recent_low = _as_float(pd.to_numeric(recent_low_series, errors="coerce").min(), close)
+    if recent_high <= 0.0 or recent_low <= 0.0 or recent_high <= recent_low:
+        return None
+
+    pump_min = max(_as_float(layer1.get("clean_pump_min_pct_used"), 0.05), 0.0)
+    derived_pump_pct = max(0.0, (recent_high - recent_low) / max(recent_low, 1e-8))
+    clean_pump_pct = max(_as_float(layer1.get("clean_pump_pct"), 0.0), derived_pump_pct)
+    volume_spike = max(_as_float(layer1.get("volume_spike"), 0.0), _as_float(row.get("volume_spike"), 0.0))
+    recent_volume_spike_series = enriched.tail(8)["volume_spike"] if "volume_spike" in enriched.columns else pd.Series([volume_spike])
+    recent_volume_spike = _as_float(pd.to_numeric(recent_volume_spike_series, errors="coerce").max(), volume_spike)
+    rsi = max(_as_float(layer1.get("rsi"), 0.0), _as_float(row.get("rsi"), 50.0))
+    prev_rsi = _as_float(prev.get("rsi"), rsi)
+    hist = _as_float(row.get("hist"), 0.0)
+    prev_hist = _as_float(prev.get("hist"), hist)
+    prev_close = _as_float(prev.get("close"), close)
+
+    failed_reclaim = bool(_as_float(layer2.get("failed_reclaim"), 0.0) or _as_float(layer3.get("failed_reclaim"), 0.0))
+    retest_failed_breakout = bool(
+        _as_float(layer2.get("retest_failed_breakout"), 0.0)
+        or _as_float(layer3.get("retest_failed_breakout"), 0.0)
+    )
+    acceptance_above_high = bool(
+        _as_float(layer2.get("acceptance_above_swing_high"), 0.0)
+        or _as_float(layer3.get("acceptance_above_swing_high"), 0.0)
+    )
+    if acceptance_above_high:
+        return None
+
+    weakness_strength = max(_as_float(layer2.get("weakness_strength"), 0.0), 0.0)
+    distance_from_high_pct = max(0.0, (recent_high - close) / max(recent_high, 1e-8))
+    range_position = min(1.0, max(0.0, (close - recent_low) / max(recent_high - recent_low, 1e-8)))
+    first_reaction = close < prev_close or hist < prev_hist or rsi < prev_rsi
+    momentum_rollover = hist < prev_hist or rsi < prev_rsi
+    volume_fade = recent_volume_spike > 0.0 and volume_spike <= recent_volume_spike * 0.92
+
+    if clean_pump_pct < max(pump_min, 0.04):
+        return None
+    if distance_from_high_pct > (0.0175 if close < 0.02 else 0.0125):
+        return None
+    if distance_from_high_pct < (0.0014 if close < 0.02 else 0.0010) and not (failed_reclaim or retest_failed_breakout or volume_fade):
+        return None
+    if range_position < 0.62:
+        return None
+    if rsi < 56.5:
+        return None
+    if max(volume_spike, recent_volume_spike) < (0.12 if close < 0.02 else 0.095):
+        return None
+    has_structural_failure = failed_reclaim or retest_failed_breakout
+    atr_pct = atr / max(close, 1e-8)
+    vah_reject_tolerance = max(
+        atr_pct * 1.15,
+        0.0048 if close < 0.02 else 0.0030,
+    )
+    peak_zone_tolerance = max(
+        vah_reject_tolerance * 1.18,
+        0.0062 if close < 0.02 else 0.0039,
+    )
+    value_room_floor = max(
+        atr_pct * 0.72,
+        0.0048 if close < 0.02 else 0.0028,
+    )
+    near_vah_resistance = bool(
+        local_vah > 0
+        and abs(close - local_vah) / max(close, 1e-8) <= vah_reject_tolerance
+    )
+    near_peak_resistance = bool(
+        distance_from_high_pct <= max(vah_reject_tolerance * 1.20, 0.0058 if close < 0.02 else 0.0038)
+    )
+    value_room_to_poc = bool(
+        local_poc > 0
+        and (close - local_poc) / max(close, 1e-8) >= value_room_floor * 0.78
+    )
+    value_room_to_val = bool(
+        local_val > 0
+        and (close - local_val) / max(close, 1e-8) >= value_room_floor
+    )
+    value_room_to_recent_low = bool(
+        recent_low > 0
+        and (close - recent_low) / max(close, 1e-8) >= value_room_floor * 1.05
+    )
+    recent_upper_liq_reaction = any(
+        band.side == "above"
+        and band.closed_index is not None
+        and band.closed_index >= max(len(enriched) - 8, 0)
+        and (
+            abs(band.level - recent_high) / max(recent_high, 1e-8) <= peak_zone_tolerance * 1.35
+            or abs(band.level - close) / max(close, 1e-8) <= peak_zone_tolerance * 1.05
+        )
+        for band in liquidation_map.bands
+    )
+    lower_liq_target_ready = any(
+        band.side == "below"
+        and band.closed_index is None
+        and band.weight >= 1.05
+        and 0.003 <= (close - band.level) / max(close, 1e-8) <= max(value_room_floor * 3.20, 0.035)
+        for band in liquidation_map.bands
+    )
+    resistance_confluence_score = 0.0
+    if near_vah_resistance:
+        resistance_confluence_score += 1.00
+    if near_peak_resistance:
+        resistance_confluence_score += 0.95
+    if recent_upper_liq_reaction:
+        resistance_confluence_score += 0.90
+    if liquidation_map.swept_above:
+        resistance_confluence_score += 1.15
+    if has_structural_failure:
+        resistance_confluence_score += 1.05
+    downside_confluence_score = 0.0
+    if liquidation_map.downside_magnet:
+        downside_confluence_score += 1.15
+    if lower_liq_target_ready:
+        downside_confluence_score += 0.80
+    if value_room_to_poc:
+        downside_confluence_score += 0.75
+    if value_room_to_val:
+        downside_confluence_score += 0.85
+    if value_room_to_recent_low:
+        downside_confluence_score += 0.55
+    recent_high_tail = (
+        pd.to_numeric(enriched.tail(4)["high"], errors="coerce").dropna()
+        if "high" in enriched.columns
+        else pd.Series([recent_high])
+    )
+    anchor_touch_tolerance = max(
+        peak_zone_tolerance * 0.90,
+        atr_pct * 1.00,
+        0.0046 if close < 0.02 else 0.0030,
+    )
+    recent_upper_anchor_levels = [
+        level
+        for level in (local_vah, recent_high)
+        if level > 0
+    ]
+    recent_upper_anchor_levels.extend(
+        band.level
+        for band in liquidation_map.bands
+        if band.side == "above"
+        and (
+            band.closed_index is None
+            or band.closed_index >= max(len(enriched) - 8, 0)
+        )
+    )
+    recent_high_samples = recent_high_tail.tail(3).to_numpy(dtype=float) if len(recent_high_tail) else np.array([], dtype=float)
+    recent_upper_anchor_touch = bool(
+        recent_upper_anchor_levels
+        and recent_high_samples.size
+        and any(
+            abs(high_px - anchor_level) / max(anchor_level, 1e-8) <= anchor_touch_tolerance
+            for high_px in recent_high_samples
+            for anchor_level in recent_upper_anchor_levels
+        )
+    )
+    anchor_reject_score = 0.0
+    if first_reaction:
+        anchor_reject_score += 0.55
+    if momentum_rollover:
+        anchor_reject_score += 0.45
+    if volume_fade:
+        anchor_reject_score += 0.45
+    if has_structural_failure:
+        anchor_reject_score += 1.05
+    if recent_upper_liq_reaction:
+        anchor_reject_score += 0.95
+    if liquidation_map.swept_above:
+        anchor_reject_score += 0.95
+    if near_vah_resistance:
+        anchor_reject_score += 0.55
+    anchor_reject_floor = (
+        1.10
+        if recent_upper_liq_reaction or liquidation_map.swept_above
+        else 1.45
+        if near_vah_resistance and downside_confluence_score >= 1.10 and first_reaction and volume_fade
+        else 1.85
+    )
+    recent_upper_anchor_reject = bool(
+        recent_upper_anchor_touch
+        and anchor_reject_score >= anchor_reject_floor
+    )
+    hard_upper_anchor_context = bool(
+        near_vah_resistance
+        or recent_upper_liq_reaction
+        or liquidation_map.swept_above
+    )
+    weak_watch_structure = not (
+        has_structural_failure
+        or near_vah_resistance
+        or recent_upper_liq_reaction
+        or liquidation_map.swept_above
+    )
+    if recent_upper_anchor_touch:
+        resistance_confluence_score += 0.55
+    if recent_upper_anchor_reject:
+        resistance_confluence_score += 0.40
+    downside_target_ready = bool(
+        liquidation_map.downside_magnet
+        or lower_liq_target_ready
+        or value_room_to_poc
+        or value_room_to_val
+        or value_room_to_recent_low
+    )
+    upper_rejection_zone_ready = bool(
+        near_vah_resistance
+        or recent_upper_liq_reaction
+        or liquidation_map.swept_above
+        or has_structural_failure
+        or near_peak_resistance
+    )
+    open_upside_liq_magnet = bool(
+        liquidation_map.nearest_above_distance_pct is not None
+        and liquidation_map.nearest_above_distance_pct <= max(
+            atr_pct * 1.65,
+            0.0060 if close < 0.02 else 0.0040,
+        )
+        and not liquidation_map.swept_above
+    )
+    if not upper_rejection_zone_ready:
+        return None
+    if not downside_target_ready:
+        return None
+    if not recent_upper_anchor_touch and not liquidation_map.swept_above and not recent_upper_liq_reaction:
+        return None
+    if not recent_upper_anchor_reject and not (has_structural_failure and first_reaction):
+        return None
+    if open_upside_liq_magnet and not has_structural_failure:
+        return None
+    upper_zone_distance_candidates = []
+    if local_vah > 0:
+        upper_zone_distance_candidates.append(abs(close - local_vah) / max(close, 1e-8))
+    if recent_high > 0:
+        upper_zone_distance_candidates.append(abs(recent_high - close) / max(close, 1e-8))
+    for band in liquidation_map.bands:
+        if band.side != "above":
+            continue
+        if band.closed_index is None and band.level > close:
+            upper_zone_distance_candidates.append(abs(band.level - close) / max(close, 1e-8))
+        elif band.closed_index is not None and band.closed_index >= max(len(enriched) - 8, 0):
+            upper_zone_distance_candidates.append(abs(band.level - close) / max(close, 1e-8))
+    entry_zone_distance_pct = min(upper_zone_distance_candidates) if upper_zone_distance_candidates else 1.0
+    max_setup_entry_zone_distance = max(
+        atr_pct * 1.15,
+        0.0054 if close < 0.02 else 0.0035,
+    )
+    if entry_zone_distance_pct > max_setup_entry_zone_distance and not liquidation_map.swept_above:
+        return None
+    if resistance_confluence_score < (2.15 if has_structural_failure else 2.45):
+        return None
+    if downside_confluence_score < 1.10:
+        return None
+    if weakness_strength < 0.54 and not (has_structural_failure and first_reaction):
+        return None
+    if not first_reaction:
+        return None
+    if not (momentum_rollover or volume_fade or has_structural_failure):
+        return None
+    if not has_structural_failure and weakness_strength < 0.60 and not volume_fade:
+        return None
+    if not has_structural_failure and not (momentum_rollover and volume_fade):
+        return None
+
+    triggers: list[str] = []
+    if close >= recent_high * 0.992:
+        triggers.append("цена всё ещё у локального хая")
+    if first_reaction:
+        triggers.append("пошла первая реакция вниз")
+    if hist < prev_hist:
+        triggers.append("MACD ослабевает")
+    if rsi < prev_rsi:
+        triggers.append("RSI разворачивается вниз")
+    if volume_fade:
+        triggers.append("объём затухает")
+    if failed_reclaim:
+        triggers.append("ретестом не вернули уровень")
+    if retest_failed_breakout:
+        triggers.append("сломанный пробой не удержали")
+    if weakness_strength >= 0.62:
+        triggers.append("слабость уже подтверждается структурно")
+    if near_vah_resistance:
+        triggers.append("цена у VAH")
+    if liquidation_map.swept_above:
+        triggers.append("верхнюю ликвидность уже сняли")
+    if liquidation_map.downside_magnet:
+        triggers.append("ниже есть ликвидационный магнит")
+    if value_room_to_poc:
+        triggers.append("ниже есть POC как цель отката")
+    if value_room_to_val:
+        triggers.append("ниже есть VAL как цель отката")
+
+    unique_triggers: list[str] = []
+    for trigger in triggers:
+        if trigger not in unique_triggers:
+            unique_triggers.append(trigger)
+
+    continuation_risk = 3.15
+    continuation_risk -= min(1.20, weakness_strength * 1.35)
+    if first_reaction:
+        continuation_risk -= 0.40
+    if volume_fade:
+        continuation_risk -= 0.25
+    if failed_reclaim:
+        continuation_risk -= 0.35
+    if retest_failed_breakout:
+        continuation_risk -= 0.30
+    if upper_rejection_zone_ready:
+        continuation_risk -= 0.20
+    if liquidation_map.swept_above:
+        continuation_risk -= 0.22
+    if downside_target_ready:
+        continuation_risk -= 0.15
+    if open_upside_liq_magnet:
+        continuation_risk += 0.60
+    continuation_risk = max(0.8, min(4.0, continuation_risk))
+
+    watch_score = 4.8 + min(2.0, weakness_strength * 2.1)
+    if first_reaction:
+        watch_score += 0.70
+    if failed_reclaim:
+        watch_score += 0.60
+    if retest_failed_breakout:
+        watch_score += 0.55
+    if volume_fade:
+        watch_score += 0.35
+    watch_score = min(8.0, max(0.0, watch_score))
+
+    quality_score = 6.0 + min(2.2, weakness_strength * 2.0)
+    if first_reaction:
+        quality_score += 0.50
+    if failed_reclaim:
+        quality_score += 0.55
+    if retest_failed_breakout:
+        quality_score += 0.45
+    if near_vah_resistance:
+        quality_score += 0.35
+    if liquidation_map.swept_above:
+        quality_score += 0.45
+    if downside_target_ready:
+        quality_score += 0.20
+    if resistance_confluence_score > 0.0:
+        quality_score += min(0.55, resistance_confluence_score * 0.16)
+    if downside_confluence_score > 0.0:
+        quality_score += min(0.35, downside_confluence_score * 0.10)
+    quality_score -= continuation_risk * 0.28
+    if entry_zone_distance_pct > max_setup_entry_zone_distance * 0.78:
+        quality_score -= 0.30
+    quality_score = min(10.0, max(0.0, quality_score))
+
+    phase = "SETUP" if has_structural_failure else "WATCH"
+    watch_live_volume_floor = 0.16 if close < 0.02 else 0.10
+    if hard_upper_anchor_context:
+        watch_live_volume_floor = min(
+            watch_live_volume_floor,
+            0.12 if close < 0.02 else 0.08,
+        )
+    required_trigger_count = 4
+    if len(unique_triggers) < required_trigger_count:
+        return None
+    if phase == "WATCH" and not has_structural_failure and not hard_upper_anchor_context:
+        return None
+    if (
+        phase == "WATCH"
+        and volume_spike < watch_live_volume_floor
+        and not (
+            has_structural_failure
+            or recent_upper_liq_reaction
+            or liquidation_map.swept_above
+        )
+    ):
+        return None
+    if phase == "SETUP" and continuation_risk > 2.45:
+        return None
+    if phase == "WATCH" and continuation_risk > 2.95:
+        return None
+    if phase == "WATCH" and weak_watch_structure and continuation_risk > 2.65:
+        return None
+    if phase == "SETUP" and quality_score < 7.05:
+        return None
+    if phase == "WATCH" and quality_score < 6.85:
+        return None
+    if phase == "WATCH" and weak_watch_structure and quality_score < 7.15:
+        return None
+    if phase == "WATCH" and not has_structural_failure:
+        quality_score = min(quality_score, 8.35)
+    if phase == "WATCH" and not (recent_upper_liq_reaction or liquidation_map.swept_above):
+        quality_score = min(quality_score, 7.85)
+    wait_for = (
+        "подтверждение полноценного входа"
+        if phase == "SETUP"
+        else "подтверждение слабости и входа"
+    )
+    phase_label = "\\u0420\\u0410\\u041d\\u041d\\u0418\\u0419 \\u0428\\u041e\\u0420\\u0422: \\u0421\\u0415\\u0422\\u0410\\u041f" if phase == "SETUP" else "\\u0420\\u0410\\u041d\\u041d\\u0418\\u0419 \\u0428\\u041e\\u0420\\u0422: \\u041d\\u0410\\u0411\\u041b\\u042e\\u0414\\u0415\\u041d\\u0418\\u0415"
+
+    tp = _as_float(getattr(intent, "take_profit", None), close - atr * 1.55)
+    sl = _as_float(getattr(intent, "stop_loss", None), close + atr * 1.05)
+    if tp <= 0.0:
+        tp = close - atr * 1.55
+    if sl <= close:
+        sl = close + atr * 1.05
+
+    return {
+        "phase": phase,
+        "caption": build_early_signal_caption(
+            symbol=symbol,
+            timeframe=timeframe,
+            mode=mode,
+            phase_label=phase_label,
+            price=close,
+            trace_meta=meta,
+            watch_score=watch_score,
+            watch_max_score=8.0,
+            quality_score=quality_score,
+            quality_max_score=10.0,
+            quality_grade=_early_quality_grade(quality_score),
+            continuation_risk=continuation_risk,
+            continuation_max_score=4.0,
+            triggers=unique_triggers,
+            wait_for=wait_for,
+            enriched=enriched,
+        ),
+        "entry": close,
+        "tp": tp,
+        "sl": sl,
+    }
+
+
+def _build_early_signal_candidate(*, symbol: str, timeframe: str, mode: str, enriched, intent) -> dict[str, object] | None:
+    candidate = _build_approved_early_candidate(
+        symbol=symbol,
+        timeframe=timeframe,
+        mode=mode,
+        enriched=enriched,
+        intent=intent,
+    )
+    if candidate is not None:
+        return candidate
+    return _build_early_watch_candidate(
+        symbol=symbol,
+        timeframe=timeframe,
+        mode=mode,
+        enriched=enriched,
+        intent=intent,
+    )
 
 
 def _strategy_audit_log_payload(strategy) -> dict[str, object]:
@@ -2705,9 +4116,13 @@ def _startup_reconcile(
     sync: ExchangeSyncService,
     state_machine: StateMachine,
     execution: ExecutionEngine,
+    signal_profile: str = "main",
 ):
     summary: dict[str, str] = {}
     for symbol in symbols:
+        if _is_observation_only_profile(signal_profile):
+            summary[symbol] = TradeState.FLAT.value
+            continue
         snapshot = sync.snapshot(symbol)
         rec_state = state_machine.reconcile(symbol, snapshot.positions, snapshot.open_orders)
         execution.recover_from_restart(symbol, snapshot)
@@ -2741,6 +4156,7 @@ def run_cycle(
     alerters,
     state_alert_cache: dict[str, object],
     intervention_alert_cache: dict[str, object],
+    decision_log_cache: dict[str, object],
     early_signal_state: dict[str, dict[str, object]],
     early_signal_stats: dict[str, int],
     mode: str,
@@ -2752,6 +4168,8 @@ def run_cycle(
 ):
     sync.pull_adapter_events(adapter)
     ws_recovery_reason = sync.maybe_recover_ws(adapter)
+    log_hold_decisions = _env_flag("LOG_HOLD_DECISIONS", False)
+    log_dataset_appends = _env_flag("LOG_ONLINE_DATASET_APPENDS", False)
     if ws_recovery_reason:
         logger.warning(
             "ws_reconnect_triggered reason=%s",
@@ -2759,7 +4177,19 @@ def run_cycle(
             extra={"event": "ws_reconnect_triggered"},
         )
     prepared_contexts: dict[str, dict[str, object]] = {}
+    decision_contexts: dict[str, dict[str, object]] = {}
+    prepared_decisions: dict[str, dict[str, object]] = {}
     analysis_workers = _analysis_worker_count(len(symbols))
+    observation_only_profile = _is_observation_only_profile(signal_profile)
+    intervention_alert_cooldown_sec = max(
+        300,
+        _as_int(os.getenv("INTERVENTION_ALERT_COOLDOWN_SEC", "10800"), 10800),
+    )
+    state_blocked_alert_cooldown_sec = max(
+        300,
+        _as_int(os.getenv("STATE_BLOCKED_ALERT_COOLDOWN_SEC", "10800"), 10800),
+    )
+    bulk_snapshots: dict[str, object] = {}
 
     if symbols:
         if analysis_workers > 1 and len(symbols) > 1:
@@ -2801,27 +4231,31 @@ def run_cycle(
                     candles_limit=candles_limit,
                 )
 
+    try:
+        bulk_snapshots = sync.snapshot_many(symbols)
+    except Exception as exc:
+        logger.warning("bulk_snapshot_unavailable err=%s", exc, extra={"event": "bulk_snapshot_unavailable"})
+        bulk_snapshots = {}
+
     for symbol in symbols:
         try:
-            snapshot = sync.snapshot(symbol)
-            rec_state = execution.state_machine.reconcile(symbol, snapshot.positions, snapshot.open_orders)
-            execution.recover_from_restart(symbol, snapshot)
+            snapshot = bulk_snapshots.get(symbol) or sync.snapshot(symbol)
+            if observation_only_profile:
+                rec_state = _observation_state_record(symbol)
+                cycle_ts = time.time()
+                intervention = []
+            else:
+                rec_state = execution.state_machine.reconcile(symbol, snapshot.positions, snapshot.open_orders)
+                recovery_touched_exchange = execution.recover_from_restart(symbol, snapshot)
 
-            # Recovery is allowed to mutate exchange state, so refresh before new decision.
-            snapshot = sync.reconciler.snapshot(symbol)
-            rec_state = execution.state_machine.reconcile(symbol, snapshot.positions, snapshot.open_orders)
+                if recovery_touched_exchange:
+                    snapshot = sync.reconciler.snapshot(symbol)
+                    rec_state = execution.state_machine.reconcile(symbol, snapshot.positions, snapshot.open_orders)
+                else:
+                    rec_state = execution.state_machine.get(symbol)
 
-            cycle_ts = time.time()
-            intervention_alert_cooldown_sec = max(
-                300,
-                _as_int(os.getenv("INTERVENTION_ALERT_COOLDOWN_SEC", "10800"), 10800),
-            )
-            state_blocked_alert_cooldown_sec = max(
-                300,
-                _as_int(os.getenv("STATE_BLOCKED_ALERT_COOLDOWN_SEC", "10800"), 10800),
-            )
-
-            intervention = execution.detect_external_intervention(symbol, snapshot)
+                cycle_ts = time.time()
+                intervention = execution.detect_external_intervention(symbol, snapshot)
             if intervention:
                 counters.inc("interventions")
                 issues = ",".join(intervention)
@@ -2843,7 +4277,7 @@ def run_cycle(
                 ):
                     _send_alerts(
                         alerters,
-                        f"[КРИТИЧНО] intervention symbol={symbol} issues={issues} state={current_state_value}",
+                        f"[\\u041a\\u0420\\u0418\\u0422\\u0418\\u0427\\u041d\\u041e] intervention symbol={symbol} issues={issues} state={current_state_value}",
                     )
                     _remember_cached_alert(
                         intervention_alert_cache,
@@ -2855,7 +4289,7 @@ def run_cycle(
             else:
                 intervention_alert_cache.pop(symbol, None)
 
-            current_state = execution.state_machine.get(symbol).state
+            current_state = rec_state.state if observation_only_profile else execution.state_machine.get(symbol).state
             if current_state in (TradeState.HALTED, TradeState.RECOVERING, TradeState.ERROR):
                 counters.inc("state_blocked")
                 state_key = current_state.value
@@ -2876,7 +4310,7 @@ def run_cycle(
                     )
                     _send_alerts(
                         alerters,
-                        f"[КРИТИЧНО] state_blocked symbol={symbol} state={state_key} reason={reason}",
+                        f"[\\u041a\\u0420\\u0418\\u0422\\u0418\\u0427\\u041d\\u041e] state_blocked symbol={symbol} state={state_key} reason={reason}",
                     )
                     _remember_cached_alert(
                         state_alert_cache,
@@ -2888,7 +4322,8 @@ def run_cycle(
                 continue
 
             state_alert_cache.pop(symbol, None)
-            rec_state = execution.state_machine.get(symbol)
+            if not observation_only_profile:
+                rec_state = execution.state_machine.get(symbol)
 
             prepared = prepared_contexts.get(symbol)
             if not prepared:
@@ -2918,51 +4353,169 @@ def run_cycle(
             if early_signal_learner is not None:
                 early_row = early_signal_learner.resolve_with_frame(symbol=symbol, enriched=features.enriched)
                 if early_row is not None:
-                    logger.info(
-                        "online_early_dataset_appended symbol=%s phase=%s target_win=%s future_return=%s target_horizon=%s",
-                        symbol,
-                        early_row.get("signal_phase"),
-                        early_row.get("target_win"),
-                        early_row.get("future_return"),
-                        early_row.get("target_horizon"),
-                        extra={"event": "online_early_dataset_appended"},
-                    )
+                    if log_dataset_appends:
+                        logger.info(
+                            "online_early_dataset_appended symbol=%s phase=%s target_win=%s future_return=%s target_horizon=%s",
+                            symbol,
+                            early_row.get("signal_phase"),
+                            early_row.get("target_win"),
+                            early_row.get("future_return"),
+                            early_row.get("target_horizon"),
+                            extra={"event": "online_early_dataset_appended"},
+                        )
                     if early_online_retrainer is not None and early_online_retrainer.maybe_retrain():
                         logger.info(
                             "online_early_retrain_completed dataset=%s",
                             early_online_retrainer.config.dataset_path,
-                            extra={"event": "online_early_retrain_completed"},
-                        )
+                        extra={"event": "online_early_retrain_completed"},
+                    )
 
-            mark_price = _as_float(prepared.get("mark_price"), float(features.enriched.iloc[-1]["close"]))
-            intent = strategy.generate(
-                StrategyContext(
+            decision_contexts[symbol] = {
+                "symbol": symbol,
+                "snapshot": snapshot,
+                "rec_state": rec_state,
+                "prepared": prepared,
+                "frame": frame,
+                "runtime_inputs": runtime_inputs,
+                "extras": extras,
+                "features": features,
+            }
+        except Exception as exc:
+            counters.inc("cycle_errors")
+            logger.exception("cycle_error symbol=%s err=%s", symbol, exc, extra={"event": "cycle_error"})
+
+    precomputed_early_candidates: dict[str, dict[str, object] | None] = {}
+
+    if decision_contexts:
+        if analysis_workers > 1 and len(decision_contexts) > 1:
+            with ThreadPoolExecutor(max_workers=analysis_workers) as executor:
+                futures = [
+                    (
+                        symbol,
+                        executor.submit(
+                            _prepare_symbol_decision,
+                            symbol=symbol,
+                            snapshot=context["snapshot"],
+                            rec_state=context["rec_state"],
+                            prepared=context["prepared"],
+                            timeframe=timeframe,
+                            strategy=strategy,
+                        ),
+                    )
+                    for symbol, context in decision_contexts.items()
+                ]
+                for symbol, future in futures:
+                    try:
+                        prepared_decisions[symbol] = future.result()
+                    except Exception as exc:
+                        prepared_decisions[symbol] = {
+                            "symbol": symbol,
+                            "status": "error",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+        else:
+            for symbol, context in decision_contexts.items():
+                prepared_decisions[symbol] = _prepare_symbol_decision(
                     symbol=symbol,
-                    market_ohlcv=features.enriched,
-                    mark_price=mark_price,
-                    exchange=snapshot,
-                    synced_state=rec_state.state,
-                    sentiment_index=runtime_inputs.get("sentiment_index"),
-                    sentiment_value=runtime_inputs.get("sentiment_value"),
-                    sentiment_source=runtime_inputs.get("sentiment_source"),
-                    sentiment_degraded=runtime_inputs.get("sentiment_degraded"),
-                    funding_rate=runtime_inputs.get("funding_rate"),
-                    funding_source=runtime_inputs.get("funding_source"),
-                    funding_degraded=runtime_inputs.get("funding_degraded"),
-                    long_short_ratio=runtime_inputs.get("long_short_ratio"),
-                    long_short_ratio_source=runtime_inputs.get("long_short_ratio_source"),
-                    long_short_ratio_degraded=runtime_inputs.get("long_short_ratio_degraded"),
-                    open_interest=runtime_inputs.get("open_interest"),
-                    open_interest_ratio=runtime_inputs.get("open_interest_ratio"),
-                    oi_signal=runtime_inputs.get("oi_signal"),
-                    oi_source=runtime_inputs.get("oi_source"),
-                    oi_degraded=runtime_inputs.get("oi_degraded"),
-                    open_interest_source=runtime_inputs.get("open_interest_source"),
-                    news_veto=runtime_inputs.get("news_veto"),
-                    news_source=runtime_inputs.get("news_source"),
-                    news_degraded=runtime_inputs.get("news_degraded"),
+                    snapshot=context["snapshot"],
+                    rec_state=context["rec_state"],
+                    prepared=context["prepared"],
+                    timeframe=timeframe,
+                    strategy=strategy,
                 )
-            )
+
+    if signal_profile != "main":
+        for symbol, decision_prepared in prepared_decisions.items():
+            if str(decision_prepared.get("status") or "") != "ok":
+                continue
+            try:
+                precomputed_early_candidates[symbol] = _build_early_signal_candidate(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    mode=mode,
+                    enriched=decision_prepared["features"].enriched,
+                    intent=decision_prepared["intent"],
+                )
+            except Exception:
+                precomputed_early_candidates[symbol] = None
+
+    processing_symbols = sorted(
+        symbols,
+        key=lambda current_symbol: (
+            _decision_priority(
+                (prepared_decisions.get(current_symbol) or {}).get("intent"),
+                precomputed_early_candidates.get(current_symbol),
+            ),
+            current_symbol,
+        ),
+    )
+
+    for symbol in processing_symbols:
+        try:
+            decision_prepared = prepared_decisions.get(symbol)
+            if not decision_prepared:
+                continue
+
+            prepared_status = str(decision_prepared.get("status") or "")
+            if prepared_status != "ok":
+                counters.inc("cycle_errors")
+                logger.error(
+                    "cycle_error symbol=%s err=%s",
+                    symbol,
+                    decision_prepared.get("error") or "decision_unavailable",
+                    extra={"event": "cycle_error"},
+                )
+                continue
+
+            snapshot = decision_prepared["snapshot"]
+            rec_state = decision_prepared["rec_state"]
+            frame = decision_prepared["frame"]
+            runtime_inputs = decision_prepared["runtime_inputs"]
+            extras = decision_prepared["extras"]
+            features = decision_prepared["features"]
+            mark_price = _as_float(decision_prepared.get("mark_price"), float(features.enriched.iloc[-1]["close"]))
+            decision_prepared_ts = _as_float(decision_prepared.get("prepared_at"), 0.0)
+            intent = decision_prepared["intent"]
+            early_candidate = None
+            if signal_profile != "main":
+                early_candidate = precomputed_early_candidates.get(symbol)
+
+            if _should_refresh_live_candidate(intent, early_candidate):
+                refreshed_decision = _refresh_symbol_decision_live(
+                    symbol=symbol,
+                    sync=sync,
+                    execution=execution,
+                    feed=feed,
+                    pipeline=pipeline,
+                    timeframe=timeframe,
+                    candles_limit=candles_limit,
+                    strategy=strategy,
+                )
+                if refreshed_decision is not None:
+                    snapshot = refreshed_decision["snapshot"]
+                    rec_state = refreshed_decision["rec_state"]
+                    frame = refreshed_decision["frame"]
+                    runtime_inputs = refreshed_decision["runtime_inputs"]
+                    extras = refreshed_decision["extras"]
+                    features = refreshed_decision["features"]
+                    mark_price = _as_float(
+                        refreshed_decision.get("mark_price"),
+                        float(features.enriched.iloc[-1]["close"]),
+                    )
+                    decision_prepared_ts = _as_float(refreshed_decision.get("prepared_at"), time.time())
+                    intent = refreshed_decision["intent"]
+                    if signal_profile != "main":
+                        try:
+                            early_candidate = _build_early_signal_candidate(
+                                symbol=symbol,
+                                timeframe=timeframe,
+                                mode=mode,
+                                enriched=features.enriched,
+                                intent=intent,
+                            )
+                        except Exception:
+                            early_candidate = None
+            _record_parallel_strategy_intent(strategy, intent)
 
             try:
                 rules = adapter.get_instrument_rules(symbol)
@@ -2973,15 +4526,33 @@ def run_cycle(
                 )
                 continue
 
+            if (
+                os.getenv("ENFORCE_CLEAN_PUMP_MIN", "1").strip().lower() not in {"0", "false", "off"}
+                and _should_block_clean_pump(intent)
+            ):
+                intent = StrategyIntent(
+                    symbol=symbol,
+                    action=IntentAction.HOLD,
+                    reason="clean_pump_below_min",
+                    metadata=intent.metadata if isinstance(intent.metadata, dict) else {},
+                )
+
             decision = risk.evaluate(
                 intent=intent,
                 account=snapshot.account,
-                existing_positions=snapshot.positions,
+                existing_positions=[] if observation_only_profile else snapshot.positions,
                 mark_price=mark_price,
                 rules=rules,
             )
 
-            outcome = execution.execute(intent=intent, risk=decision, snapshot=snapshot, mark_price=mark_price)
+            if signal_profile == "early" and intent.action != IntentAction.HOLD:
+                outcome = ExecutionOutcome(
+                    accepted=False,
+                    status="IGNORED",
+                    reason="early_profile_monitor_only",
+                )
+            else:
+                outcome = execution.execute(intent=intent, risk=decision, snapshot=snapshot, mark_price=mark_price)
 
             if (
                 trade_learner is not None
@@ -3016,14 +4587,15 @@ def run_cycle(
                     qty=float(outcome.filled_qty),
                 )
                 if dataset_row is not None:
-                    logger.info(
-                        "online_dataset_appended symbol=%s target_win=%s future_return=%s target_horizon=%s",
-                        symbol,
-                        dataset_row.get("target_win"),
-                        dataset_row.get("future_return"),
-                        dataset_row.get("target_horizon"),
-                        extra={"event": "online_dataset_appended"},
-                    )
+                    if log_dataset_appends:
+                        logger.info(
+                            "online_dataset_appended symbol=%s target_win=%s future_return=%s target_horizon=%s",
+                            symbol,
+                            dataset_row.get("target_win"),
+                            dataset_row.get("future_return"),
+                            dataset_row.get("target_horizon"),
+                            extra={"event": "online_dataset_appended"},
+                        )
                     if online_retrainer is not None and online_retrainer.maybe_retrain():
                         logger.info(
                             "online_retrain_completed dataset=%s",
@@ -3066,49 +4638,316 @@ def run_cycle(
             if isinstance(regime_diag, dict):
                 regime_news_quality = regime_diag.get("source_flags", {}).get("news_quality") or "n/a"
 
-            logger.info(
-                "symbol=%s state=%s intent=%s risk=%s exec=%s reason=%s layer_failed=%s sentiment_mode=%s sentiment_quality=%s regime_news_quality=%s sentiment_degraded=%s",
-                symbol,
-                rec_state.state.value,
-                intent.action.value,
-                decision.reason,
-                outcome.status,
-                outcome.reason,
-                layer_failed,
-                sentiment_mode,
-                sentiment_quality,
-                regime_news_quality,
-                sentiment_degraded,
-                extra={"event": "decision"},
-            )
+            log_decision = True
+            if intent.action == IntentAction.HOLD and str(outcome.status).upper() == "IGNORED":
+                if not log_hold_decisions:
+                    log_decision = False
+                else:
+                    decision_cooldown_sec = max(
+                        60,
+                        _as_int(os.getenv("DECISION_LOG_COOLDOWN_SEC", "1200"), 1200),
+                    )
+                    decision_key = "|".join(
+                        [
+                            str(intent.action.value),
+                            str(decision.reason),
+                            str(outcome.reason),
+                            str(layer_failed),
+                            str(regime_news_quality),
+                        ]
+                    )
+                    now_ts = time.time()
+                    log_decision = _should_emit_cached_alert(
+                        decision_log_cache,
+                        symbol=symbol,
+                        key=decision_key,
+                        now_ts=now_ts,
+                        cooldown_sec=decision_cooldown_sec,
+                    )
+                    if log_decision:
+                        _remember_cached_alert(
+                            decision_log_cache,
+                            symbol=symbol,
+                            key=decision_key,
+                            now_ts=now_ts,
+                            cooldown_sec=decision_cooldown_sec,
+                        )
 
-            early_candidate = None
-            if signal_profile != "main":
-                early_candidate = _build_early_watch_candidate(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    mode=mode,
-                    enriched=features.enriched,
-                    intent=intent,
+            if log_decision:
+                logger.info(
+                    "symbol=%s state=%s intent=%s risk=%s exec=%s reason=%s layer_failed=%s sentiment_mode=%s sentiment_quality=%s regime_news_quality=%s sentiment_degraded=%s",
+                    symbol,
+                    rec_state.state.value,
+                    intent.action.value,
+                    decision.reason,
+                    outcome.status,
+                    outcome.reason,
+                    layer_failed,
+                    sentiment_mode,
+                    sentiment_quality,
+                    regime_news_quality,
+                    sentiment_degraded,
+                    extra={"event": "decision"},
                 )
+
             early_state = early_signal_state.get(symbol, {})
             active_phase = str(early_state.get("active_phase") or "")
             last_emitted_phase = str(early_state.get("last_emitted_phase") or "")
             cooldown_until_ts = _as_float(early_state.get("cooldown_until_ts"), 0.0)
+            last_emitted_ts = _as_float(early_state.get("last_emitted_ts"), 0.0)
+            inactive_cycles = _as_int(early_state.get("inactive_cycles"), 0)
             early_cooldown_sec = max(60, _as_int(os.getenv("EARLY_SIGNAL_COOLDOWN_SEC", "1800"), 1800))
+            signature_cooldown_until_ts = _as_float(early_state.get("signature_cooldown_until_ts"), 0.0)
+            last_signature = str(early_state.get("last_signature") or "")
+            early_signature_cooldown_sec = max(
+                early_cooldown_sec,
+                _as_int(os.getenv("EARLY_SIGNAL_SIGNATURE_COOLDOWN_SEC", "2700"), 2700),
+            )
             cycle_ts = time.time()
+            emitted_early_phase = ""
 
             if intent.action in (IntentAction.LONG_ENTRY, IntentAction.SHORT_ENTRY):
-                if active_phase:
+                phase = str(early_candidate.get("phase") or "") if isinstance(early_candidate, Mapping) else ""
+                if phase:
+                    in_cooldown = cycle_ts < cooldown_until_ts and phase == last_emitted_phase
+                    phase_upgraded = _phase_rank(phase) > _phase_rank(active_phase)
+                    if in_cooldown and not phase_upgraded:
+                        early_signal_stats["suppressed_by_cooldown"] = int(
+                            early_signal_stats.get("suppressed_by_cooldown", 0)
+                        ) + 1
+                    elif phase != active_phase:
+                        refreshed_decision = _refresh_symbol_decision_live(
+                            symbol=symbol,
+                            sync=sync,
+                            execution=execution,
+                            feed=feed,
+                            pipeline=pipeline,
+                            timeframe=timeframe,
+                            candles_limit=candles_limit,
+                            strategy=strategy,
+                        )
+                        if refreshed_decision is not None:
+                            snapshot = refreshed_decision["snapshot"]
+                            rec_state = refreshed_decision["rec_state"]
+                            frame = refreshed_decision["frame"]
+                            runtime_inputs = refreshed_decision["runtime_inputs"]
+                            extras = refreshed_decision["extras"]
+                            features = refreshed_decision["features"]
+                            mark_price = _as_float(
+                                refreshed_decision.get("mark_price"),
+                                float(features.enriched.iloc[-1]["close"]),
+                            )
+                            decision_prepared_ts = _as_float(refreshed_decision.get("prepared_at"), time.time())
+                            intent = refreshed_decision["intent"]
+                            try:
+                                early_candidate = _build_early_signal_candidate(
+                                    symbol=symbol,
+                                    timeframe=timeframe,
+                                    mode=mode,
+                                    enriched=features.enriched,
+                                    intent=intent,
+                                )
+                            except Exception:
+                                early_candidate = None
+                        if isinstance(early_candidate, Mapping) and str(early_candidate.get("phase") or "") == phase:
+                            if _needs_pre_alert_refresh(
+                                prepared_ts=decision_prepared_ts,
+                                timeframe=timeframe,
+                            ):
+                                refreshed_decision = _refresh_symbol_decision_live(
+                                    symbol=symbol,
+                                    sync=sync,
+                                    execution=execution,
+                                    feed=feed,
+                                    pipeline=pipeline,
+                                    timeframe=timeframe,
+                                    candles_limit=candles_limit,
+                                    strategy=strategy,
+                                )
+                                if refreshed_decision is not None:
+                                    snapshot = refreshed_decision["snapshot"]
+                                    rec_state = refreshed_decision["rec_state"]
+                                    frame = refreshed_decision["frame"]
+                                    runtime_inputs = refreshed_decision["runtime_inputs"]
+                                    extras = refreshed_decision["extras"]
+                                    features = refreshed_decision["features"]
+                                    mark_price = _as_float(
+                                        refreshed_decision.get("mark_price"),
+                                        float(features.enriched.iloc[-1]["close"]),
+                                    )
+                                    decision_prepared_ts = _as_float(
+                                        refreshed_decision.get("prepared_at"), time.time()
+                                    )
+                                    intent = refreshed_decision["intent"]
+                                    try:
+                                        early_candidate = _build_early_signal_candidate(
+                                            symbol=symbol,
+                                            timeframe=timeframe,
+                                            mode=mode,
+                                            enriched=features.enriched,
+                                            intent=intent,
+                                        )
+                                    except Exception:
+                                        early_candidate = None
+                            if not isinstance(early_candidate, Mapping) or str(early_candidate.get("phase") or "") != phase:
+                                continue
+                            early_signature = _build_early_candidate_signature(early_candidate, features.enriched)
+                            if (
+                                early_signature
+                                and early_signature == last_signature
+                                and cycle_ts < signature_cooldown_until_ts
+                            ):
+                                early_signal_stats["suppressed_by_cooldown"] = int(
+                                    early_signal_stats.get("suppressed_by_cooldown", 0)
+                                ) + 1
+                                continue
+                            reply_markup = build_symbol_copy_reply_markup(symbol)
+                            chart_bytes = _build_alert_chart(
+                                symbol=symbol,
+                                timeframe=timeframe,
+                                enriched=features.enriched,
+                                side="SHORT",
+                                entry=_as_float(early_candidate.get("entry"), mark_price),
+                                tp=_as_float(early_candidate.get("tp"), mark_price * 0.99),
+                                sl=_as_float(early_candidate.get("sl"), mark_price * 1.01),
+                                show_trade_levels=True,
+                                show_liquidation_map=False,
+                                timeframe_label=_format_chart_timeframe_label(timeframe),
+                            )
+                            attempted = 0
+                            sent = 0
+                            if chart_bytes:
+                                a1, s1 = _send_photo_alerts(
+                                    alerters,
+                                    str(early_candidate.get("caption") or ""),
+                                    chart_bytes,
+                                    filename=f"{symbol.lower()}_early_1m.png",
+                                    reply_markup=reply_markup,
+                                )
+                                attempted += a1
+                                sent += s1
+                            else:
+                                a1, s1 = _send_alerts(
+                                    alerters,
+                                    str(early_candidate.get("caption") or ""),
+                                    reply_markup=reply_markup,
+                                )
+                                attempted += a1
+                                sent += s1
+
+                            context_chart_bytes = _build_higher_timeframe_chart(
+                                symbol=symbol,
+                                side="SHORT",
+                                entry=_as_float(early_candidate.get("entry"), mark_price),
+                                tp=_as_float(early_candidate.get("tp"), mark_price * 0.99),
+                                sl=_as_float(early_candidate.get("sl"), mark_price * 1.01),
+                                feed=feed,
+                                pipeline=pipeline,
+                                runtime_extras=extras,
+                            )
+                            if context_chart_bytes:
+                                a2, s2 = _send_photo_alerts(
+                                    alerters,
+                                    _build_clean_context_chart_caption(
+                                        symbol,
+                                        stage_label="\u0420\u0410\u041d\u041d\u0418\u0419 \u0428\u041e\u0420\u0422: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422",
+                                        timeframe_label=_format_chart_timeframe_label(
+                                            os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "240")
+                                        ),
+                                    ),
+                                    context_chart_bytes,
+                                    filename=f"{symbol.lower()}_early_4h.png",
+                                    reply_markup=reply_markup,
+                                )
+                                attempted += a2
+                                sent += s2
+                            _log_alert_delivery(
+                                logger,
+                                event="early_signal_alert_delivery",
+                                attempted=attempted,
+                                sent=sent,
+                                skip_reason="no_alerters_configured" if attempted == 0 else "",
+                            )
+                            early_signal_stats["watch_sent" if phase == "WATCH" else "setup_sent"] = int(
+                                early_signal_stats.get("watch_sent" if phase == "WATCH" else "setup_sent", 0)
+                            ) + 1
+                            if phase == "SETUP" and active_phase == "WATCH":
+                                early_signal_stats["watch_to_setup_promoted"] = int(
+                                    early_signal_stats.get("watch_to_setup_promoted", 0)
+                                ) + 1
+                            if early_signal_learner is not None:
+                                signal_price = _as_float(early_candidate.get("entry"), mark_price)
+                                tp_price = _as_float(early_candidate.get("tp"), signal_price * 0.99)
+                                sl_price = _as_float(early_candidate.get("sl"), signal_price * 1.01)
+                                downside_target = max((signal_price - tp_price) / max(signal_price, 1e-8), 0.0)
+                                upside_risk = max((sl_price - signal_price) / max(signal_price, 1e-8), 0.0)
+                                early_signal_learner.record_signal(
+                                    symbol=symbol,
+                                    phase=phase,
+                                    market_regime=detect_market_regime(features.enriched).value,
+                                    signal_price=signal_price,
+                                    signal_ts=cycle_ts,
+                                    signal_bar_ts=features.enriched.index[-1],
+                                    features=dict(features.row.values),
+                                    horizon_bars=42 if phase == "WATCH" else 30,
+                                    success_move_pct=min(max(downside_target * 0.55, 0.004), 0.03),
+                                    failure_move_pct=min(max(upside_risk * 0.60, 0.0035), 0.025),
+                                )
+                            early_signal_state[symbol] = {
+                                "active_phase": phase,
+                                "last_emitted_phase": phase,
+                                "cooldown_until_ts": cycle_ts + early_cooldown_sec,
+                                "last_emitted_ts": cycle_ts,
+                                "inactive_cycles": 0,
+                                "last_signature": early_signature,
+                                "signature_cooldown_until_ts": cycle_ts + early_signature_cooldown_sec,
+                            }
+                            emitted_early_phase = phase
+
+            if intent.action in (IntentAction.LONG_ENTRY, IntentAction.SHORT_ENTRY):
+                if active_phase or emitted_early_phase:
                     early_signal_stats["entry_confirmed"] = int(early_signal_stats.get("entry_confirmed", 0)) + 1
-                early_signal_state.pop(symbol, None)
+                early_signal_state[symbol] = {
+                    "active_phase": "",
+                    "last_emitted_phase": emitted_early_phase or last_emitted_phase or active_phase,
+                    "cooldown_until_ts": max(cooldown_until_ts, cycle_ts + early_cooldown_sec),
+                    "last_emitted_ts": cycle_ts,
+                    "inactive_cycles": 0,
+                    "last_signature": last_signature,
+                    "signature_cooldown_until_ts": max(
+                        signature_cooldown_until_ts,
+                        cycle_ts + early_signature_cooldown_sec,
+                    ),
+                }
             elif early_candidate is None:
                 if active_phase:
+                    invalidation_grace_sec = _as_int(
+                        os.getenv("EARLY_INVALIDATION_GRACE_SEC", "180"),
+                        180,
+                    )
+                    invalidation_miss_limit = _as_int(
+                        os.getenv("EARLY_INVALIDATION_MISS_LIMIT", "3"),
+                        3,
+                    )
+                    inactive_cycles += 1
+                    early_signal_state[symbol] = {
+                        "active_phase": active_phase,
+                        "last_emitted_phase": last_emitted_phase,
+                        "cooldown_until_ts": cooldown_until_ts,
+                        "last_emitted_ts": last_emitted_ts,
+                        "inactive_cycles": inactive_cycles,
+                        "last_signature": last_signature,
+                        "signature_cooldown_until_ts": signature_cooldown_until_ts,
+                    }
+                    if cycle_ts - last_emitted_ts < invalidation_grace_sec:
+                        continue
+                    if inactive_cycles < invalidation_miss_limit:
+                        continue
                     invalidation_text = build_early_invalidation_text(
                         symbol=symbol,
                         timeframe=timeframe,
                         mode=mode,
-                        reason="сценарий сломан или подтверждение не пришло",
+                        reason="\u0441\u0446\u0435\u043d\u0430\u0440\u0438\u0439 \u0441\u043b\u043e\u043c\u0430\u043d \u0438\u043b\u0438 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u0435 \u043d\u0435 \u043f\u0440\u0438\u0448\u043b\u043e",
                     )
                     attempted, sent = _send_alerts(
                         alerters,
@@ -3127,6 +4966,13 @@ def run_cycle(
                         "active_phase": "",
                         "last_emitted_phase": last_emitted_phase or active_phase,
                         "cooldown_until_ts": cycle_ts + early_cooldown_sec,
+                        "last_emitted_ts": cycle_ts,
+                        "inactive_cycles": 0,
+                        "last_signature": last_signature,
+                        "signature_cooldown_until_ts": max(
+                            signature_cooldown_until_ts,
+                            cycle_ts + early_signature_cooldown_sec,
+                        ),
                     }
             else:
                 phase = str(early_candidate.get("phase") or "")
@@ -3138,6 +4984,53 @@ def run_cycle(
                             early_signal_stats.get("suppressed_by_cooldown", 0)
                         ) + 1
                     elif phase != active_phase:
+                        refreshed_decision = _refresh_symbol_decision_live(
+                            symbol=symbol,
+                            sync=sync,
+                            execution=execution,
+                            feed=feed,
+                            pipeline=pipeline,
+                            timeframe=timeframe,
+                            candles_limit=candles_limit,
+                            strategy=strategy,
+                        )
+                        if refreshed_decision is not None:
+                            snapshot = refreshed_decision["snapshot"]
+                            rec_state = refreshed_decision["rec_state"]
+                            frame = refreshed_decision["frame"]
+                            runtime_inputs = refreshed_decision["runtime_inputs"]
+                            extras = refreshed_decision["extras"]
+                            features = refreshed_decision["features"]
+                            mark_price = _as_float(
+                                refreshed_decision.get("mark_price"),
+                                float(features.enriched.iloc[-1]["close"]),
+                            )
+                            decision_prepared_ts = _as_float(refreshed_decision.get("prepared_at"), time.time())
+                            intent = refreshed_decision["intent"]
+                            try:
+                                early_candidate = _build_early_signal_candidate(
+                                    symbol=symbol,
+                                    timeframe=timeframe,
+                                    mode=mode,
+                                    enriched=features.enriched,
+                                    intent=intent,
+                                )
+                            except Exception:
+                                early_candidate = None
+                        if not isinstance(early_candidate, Mapping):
+                            continue
+                        if str(early_candidate.get("phase") or "") != phase:
+                            continue
+                        early_signature = _build_early_candidate_signature(early_candidate, features.enriched)
+                        if (
+                            early_signature
+                            and early_signature == last_signature
+                            and cycle_ts < signature_cooldown_until_ts
+                        ):
+                            early_signal_stats["suppressed_by_cooldown"] = int(
+                                early_signal_stats.get("suppressed_by_cooldown", 0)
+                            ) + 1
+                            continue
                         reply_markup = build_symbol_copy_reply_markup(symbol)
                         chart_bytes = _build_alert_chart(
                             symbol=symbol,
@@ -3185,9 +5078,9 @@ def run_cycle(
                         if context_chart_bytes:
                             a2, s2 = _send_photo_alerts(
                                 alerters,
-                                _build_context_chart_caption(
+                                _build_clean_context_chart_caption(
                                     symbol,
-                                    stage_label="РАННИЙ ШОРТ: HTF КОНТЕКСТ",
+                                    stage_label="\u0420\u0410\u041d\u041d\u0418\u0419 \u0428\u041e\u0420\u0422: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422",
                                     timeframe_label=_format_chart_timeframe_label(
                                         os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "240")
                                     ),
@@ -3234,10 +5127,46 @@ def run_cycle(
                             "active_phase": phase,
                             "last_emitted_phase": phase,
                             "cooldown_until_ts": cycle_ts + early_cooldown_sec,
+                            "last_emitted_ts": cycle_ts,
+                            "inactive_cycles": 0,
+                            "last_signature": early_signature,
+                            "signature_cooldown_until_ts": cycle_ts + early_signature_cooldown_sec,
                         }
 
             if intent.action in (IntentAction.LONG_ENTRY, IntentAction.SHORT_ENTRY) and outcome.accepted:
-                action_label = "ШОРТ СИГНАЛ" if intent.action == IntentAction.SHORT_ENTRY else "ЛОНГ СИГНАЛ"
+                refreshed_decision = _refresh_symbol_decision_live(
+                    symbol=symbol,
+                    sync=sync,
+                    execution=execution,
+                    feed=feed,
+                    pipeline=pipeline,
+                    timeframe=timeframe,
+                    candles_limit=candles_limit,
+                    strategy=strategy,
+                )
+                if refreshed_decision is not None:
+                    snapshot = refreshed_decision["snapshot"]
+                    rec_state = refreshed_decision["rec_state"]
+                    frame = refreshed_decision["frame"]
+                    runtime_inputs = refreshed_decision["runtime_inputs"]
+                    extras = refreshed_decision["extras"]
+                    features = refreshed_decision["features"]
+                    mark_price = _as_float(
+                        refreshed_decision.get("mark_price"),
+                        float(features.enriched.iloc[-1]["close"]),
+                    )
+                    decision_prepared_ts = _as_float(refreshed_decision.get("prepared_at"), time.time())
+                    intent = refreshed_decision["intent"]
+                    decision = risk.evaluate(
+                        intent=intent,
+                        account=snapshot.account,
+                        existing_positions=snapshot.positions,
+                        mark_price=mark_price,
+                        rules=rules,
+                    )
+                    if intent.action not in (IntentAction.LONG_ENTRY, IntentAction.SHORT_ENTRY) or not decision.approved:
+                        continue
+                action_label = ("\u0428\u041e\u0420\u0422 \u0421\u0418\u0413\u041d\u0410\u041b" if intent.action == IntentAction.SHORT_ENTRY else "\u041b\u041e\u041d\u0413 \u0421\u0418\u0413\u041d\u0410\u041b")
                 caption = build_signal_caption(
                     symbol=symbol,
                     timeframe=timeframe,
@@ -3293,12 +5222,12 @@ def run_cycle(
                 if context_chart_bytes:
                     a2, s2 = _send_photo_alerts(
                         alerters,
-                        _build_context_chart_caption(
+                        _build_clean_context_chart_caption(
                             symbol,
                             stage_label=(
-                                "ШОРТ СИГНАЛ: HTF КОНТЕКСТ"
+                                "\u0428\u041e\u0420\u0422 \u0421\u0418\u0413\u041d\u0410\u041b: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422"
                                 if intent.action == IntentAction.SHORT_ENTRY
-                                else "ЛОНГ СИГНАЛ: HTF КОНТЕКСТ"
+                                else "\u041b\u041e\u041d\u0413 \u0421\u0418\u0413\u041d\u0410\u041b: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422"
                             ),
                             timeframe_label=_format_chart_timeframe_label(
                                 os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "240")
@@ -3335,7 +5264,10 @@ def main() -> int:
     args = parse_args()
     logger = setup_logging("INFO")
     _load_dotenv_file()
-    signal_profile = _resolve_signal_profile(args.signal_profile or os.getenv("BOT_SIGNAL_PROFILE"))
+    requested_signal_profile = args.signal_profile or os.getenv("BOT_SIGNAL_PROFILE")
+    if not requested_signal_profile and str(os.getenv("BOT_RUNTIME_MODE", "")).strip().lower() == "demo":
+        requested_signal_profile = "main"
+    signal_profile = _resolve_signal_profile(requested_signal_profile)
     os.environ["BOT_SIGNAL_PROFILE"] = signal_profile
 
     try:
@@ -3360,7 +5292,7 @@ def main() -> int:
     adapter = BybitAdapter(cfg.adapter)
     adapter.set_ws_symbols(cfg.symbols)
 
-    feed = MarketDataFeed(base_url="https://api.bybit.com")
+    feed = MarketDataFeed(base_url=resolve_public_http_base_url(testnet=bool(cfg.adapter.testnet)))
     reconciler = ExchangeReconciler(adapter)
     sync = ExchangeSyncService(
         reconciler,
@@ -3434,11 +5366,13 @@ def main() -> int:
         sync=sync,
         state_machine=state_machine,
         execution=execution,
+        signal_profile=signal_profile,
     )
+    startup_state_summary = _summarize_startup_state(startup_state)
     maintenance = runtime_store.maintenance()
     inflight = runtime_store.load_open_inflight_intents()
     logger.info(
-        "startup_safety mode=%s testnet=%s demo=%s dry_run=%s symbols=%d db=%s inflight=%d states=%s maintenance=%s live_cap=%s",
+        "startup_safety mode=%s testnet=%s demo=%s dry_run=%s symbols=%d db=%s inflight=%d state_counts=%s issue_count=%d issue_samples=%s maintenance=%s live_cap=%s",
         cfg.mode,
         cfg.adapter.testnet,
         cfg.adapter.demo,
@@ -3446,7 +5380,9 @@ def main() -> int:
         len(cfg.symbols),
         cfg.runtime_db_path,
         len(inflight),
-        startup_state,
+        startup_state_summary.get("state_counts", {}),
+        startup_state_summary.get("issue_count", 0),
+        startup_state_summary.get("issue_samples", []),
         maintenance,
         cfg.live_startup_max_notional_usdt,
         extra={"event": "startup_safety"},
@@ -3508,12 +5444,12 @@ def main() -> int:
         )
 
     startup_text = (
-        f"<b>СТАРТ БОТА</b>\n"
-        f"Режим: {cfg.mode}\n"
-        f"Demo: {'да' if cfg.adapter.demo else 'нет'}\n"
-        f"Testnet: {'да' if cfg.adapter.testnet else 'нет'}\n"
-        f"Dry run: {'да' if cfg.adapter.dry_run else 'нет'}\n"
-        f"Символов: {len(cfg.symbols)}"
+        f"<b>\u0421\u0422\u0410\u0420\u0422 \u0411\u041e\u0422\u0410</b>\n"
+        f"\u0420\u0435\u0436\u0438\u043c: {cfg.mode}\n"
+        f"Demo: {'\u0434\u0430' if cfg.adapter.demo else '\u043d\u0435\u0442'}\n"
+        f"Testnet: {'\u0434\u0430' if cfg.adapter.testnet else '\u043d\u0435\u0442'}\n"
+        f"Dry run: {'\u0434\u0430' if cfg.adapter.dry_run else '\u043d\u0435\u0442'}\n"
+        f"\u0421\u0438\u043c\u0432\u043e\u043b\u043e\u0432: {len(cfg.symbols)}"
     )
     startup_text = "\n".join(_normalize_human_text(line) for line in startup_text.splitlines())
     attempted, sent = _send_alerts(alerters, startup_text)
@@ -3526,8 +5462,12 @@ def main() -> int:
     )
 
     last_maintenance_ts = time.time()
+    last_health_log_ts = 0.0
+    health_log_interval_sec = max(60, _as_int(os.getenv("BOT_HEALTH_LOG_INTERVAL_SEC", "180"), 180))
+    verbose_health_logging = _env_flag("BOT_HEALTH_LOG_VERBOSE", False)
     state_alert_cache: dict[str, str] = {}
     intervention_alert_cache: dict[str, str] = {}
+    decision_log_cache: dict[str, str] = {}
     early_signal_state: dict[str, dict[str, object]] = {}
     early_signal_stats: dict[str, int] = {
         "watch_sent": 0,
@@ -3555,6 +5495,7 @@ def main() -> int:
                 alerters=alerters,
                 state_alert_cache=state_alert_cache,
                 intervention_alert_cache=intervention_alert_cache,
+                decision_log_cache=decision_log_cache,
                 early_signal_state=early_signal_state,
                 early_signal_stats=early_signal_stats,
                 mode=cfg.mode,
@@ -3572,30 +5513,50 @@ def main() -> int:
 
             health = sync.health()
             strategy_audit_payload = _strategy_audit_log_payload(strategy)
-            logger.info(
-                "metrics=%s risk=%s sync=%s metadata=%s early_signal_stats=%s strategy_audit_compact=%s strategy_audit_regime_filter=%s strategy_audit_regime_diagnostics=%s strategy_audit_layer1=%s strategy_audit_layer1_diagnostics=%s strategy_audit_layer2=%s strategy_audit_layer2_diagnostics=%s strategy_audit_layer4=%s strategy_audit_source_quality=%s strategy_audit=%s",
-                counters.snapshot(),
-                risk.health_snapshot(),
-                {
-                    "ws_connected": health.ws_connected,
-                    "ws_stale": health.ws_stale,
-                    "fallback_polling": health.fallback_polling,
-                    "snapshot_required": health.snapshot_required,
-                },
-                adapter.metadata_health(),
-                dict(early_signal_stats),
-                strategy_audit_payload.get("strategy_audit_compact", {}),
-                strategy_audit_payload.get("strategy_audit_regime_filter", {}),
-                strategy_audit_payload.get("strategy_audit_regime_diagnostics", {}),
-                strategy_audit_payload.get("strategy_audit_layer1", {}),
-                strategy_audit_payload.get("strategy_audit_layer1_diagnostics", {}),
-                strategy_audit_payload.get("strategy_audit_layer2", {}),
-                strategy_audit_payload.get("strategy_audit_layer2_diagnostics", {}),
-                strategy_audit_payload.get("strategy_audit_layer4", {}),
-                strategy_audit_payload.get("strategy_audit_source_quality", {}),
-                strategy_audit_payload.get("strategy_audit", {}),
-                extra={"event": "health"},
-            )
+            now_ts = time.time()
+            if now_ts - last_health_log_ts >= health_log_interval_sec:
+                if verbose_health_logging:
+                    logger.info(
+                        "metrics=%s risk=%s sync=%s metadata=%s early_signal_stats=%s strategy_audit_compact=%s strategy_audit_regime_filter=%s strategy_audit_regime_diagnostics=%s strategy_audit_layer1=%s strategy_audit_layer1_diagnostics=%s strategy_audit_layer2=%s strategy_audit_layer2_diagnostics=%s strategy_audit_layer4=%s strategy_audit_source_quality=%s strategy_audit=%s",
+                        counters.snapshot(),
+                        risk.health_snapshot(),
+                        {
+                            "ws_connected": health.ws_connected,
+                            "ws_stale": health.ws_stale,
+                            "fallback_polling": health.fallback_polling,
+                            "snapshot_required": health.snapshot_required,
+                        },
+                        adapter.metadata_health(),
+                        dict(early_signal_stats),
+                        strategy_audit_payload.get("strategy_audit_compact", {}),
+                        strategy_audit_payload.get("strategy_audit_regime_filter", {}),
+                        strategy_audit_payload.get("strategy_audit_regime_diagnostics", {}),
+                        strategy_audit_payload.get("strategy_audit_layer1", {}),
+                        strategy_audit_payload.get("strategy_audit_layer1_diagnostics", {}),
+                        strategy_audit_payload.get("strategy_audit_layer2", {}),
+                        strategy_audit_payload.get("strategy_audit_layer2_diagnostics", {}),
+                        strategy_audit_payload.get("strategy_audit_layer4", {}),
+                        strategy_audit_payload.get("strategy_audit_source_quality", {}),
+                        strategy_audit_payload.get("strategy_audit", {}),
+                        extra={"event": "health"},
+                    )
+                else:
+                    logger.info(
+                        "metrics=%s risk=%s sync=%s metadata=%s early_signal_stats=%s strategy_audit_compact=%s",
+                        counters.snapshot(),
+                        risk.health_snapshot(),
+                        {
+                            "ws_connected": health.ws_connected,
+                            "ws_stale": health.ws_stale,
+                            "fallback_polling": health.fallback_polling,
+                            "snapshot_required": health.snapshot_required,
+                        },
+                        adapter.metadata_health(),
+                        dict(early_signal_stats),
+                        strategy_audit_payload.get("strategy_audit_compact", {}),
+                        extra={"event": "health"},
+                    )
+                last_health_log_ts = now_ts
 
             if not args.loop:
                 break
@@ -3609,5 +5570,14 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    explicit_profile = str(os.getenv("BOT_SIGNAL_PROFILE", "")).strip().lower()
+    if len(sys.argv) == 1 and explicit_profile not in {"main", "early"}:
+        project_root = Path(__file__).resolve().parents[1]
+        root_entry = project_root / "main.py"
+        sys.path.insert(0, str(project_root))
+        runpy.run_path(str(root_entry), run_name="__main__")
+        raise SystemExit(0)
     raise SystemExit(main())
+
+
 

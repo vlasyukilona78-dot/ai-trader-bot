@@ -35,6 +35,8 @@ def validate_order_intent(
 
     if intent.qty < rules.min_qty:
         raise OrderValidationError("below_min_qty")
+    if rules.max_qty > 0 and intent.qty > rules.max_qty:
+        raise OrderValidationError("above_max_qty")
 
     notional = intent.qty * mark_price
     if notional < rules.min_notional:

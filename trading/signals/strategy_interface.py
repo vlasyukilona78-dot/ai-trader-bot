@@ -17,6 +17,8 @@ class StrategyContext:
     mark_price: float
     exchange: ExchangeSnapshot
     synced_state: TradeState
+    timeframe: str | None = None
+    synced_state_updated_at: float | None = None
     sentiment_index: float | None = None
     sentiment_value: float | None = None
     sentiment_source: str | None = None

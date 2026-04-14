@@ -33,3 +33,27 @@ class ExchangeReconciler:
         positions = self.adapter.get_positions(symbol=symbol)
         orders = self.adapter.get_open_orders(symbol=symbol)
         return ExchangeSnapshot(symbol=symbol, account=account, positions=positions, open_orders=orders)
+
+    def snapshot_many(self, symbols: list[str]) -> dict[str, ExchangeSnapshot]:
+        account = self.adapter.get_account()
+        positions = self.adapter.get_positions(symbol=None)
+        orders = self.adapter.get_open_orders(symbol=None)
+
+        positions_by_symbol: dict[str, list[PositionSnapshot]] = {}
+        for position in positions:
+            positions_by_symbol.setdefault(str(position.symbol).upper().strip(), []).append(position)
+
+        orders_by_symbol: dict[str, list[OpenOrderSnapshot]] = {}
+        for order in orders:
+            orders_by_symbol.setdefault(str(order.symbol).upper().strip(), []).append(order)
+
+        snapshots: dict[str, ExchangeSnapshot] = {}
+        for symbol in symbols:
+            norm = str(symbol).replace("/", "").upper().strip()
+            snapshots[norm] = ExchangeSnapshot(
+                symbol=norm,
+                account=account,
+                positions=list(positions_by_symbol.get(norm, [])),
+                open_orders=list(orders_by_symbol.get(norm, [])),
+            )
+        return snapshots

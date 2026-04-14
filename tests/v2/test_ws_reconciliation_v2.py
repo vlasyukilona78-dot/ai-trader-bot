@@ -33,6 +33,19 @@ class WebsocketReconciliationV2Tests(unittest.TestCase):
         health = self.sync.health()
         self.assertTrue(health.fallback_polling)
 
+    def test_adapter_ws_metadata_marks_public_channel_fresh(self):
+        now = time.time()
+        self.adapter.ws_health_meta = {
+            "running": True,
+            "public_last_msg_ts": now,
+            "private_last_msg_ts": now - 30,
+        }
+        self.sync.pull_adapter_events(self.adapter)
+        health = self.sync.health()
+        self.assertTrue(health.ws_connected)
+        self.assertFalse(health.ws_stale)
+        self.assertFalse(health.fallback_polling)
+
     def test_ws_snapshot_and_stale_order_cleanup(self):
         self.sync.handle_event(NormalizedExchangeEvent(event_type=ExchangeEventType.CONNECTED, ts=time.time()))
         self.sync.handle_event(
@@ -297,6 +310,22 @@ class WebsocketReconciliationV2Tests(unittest.TestCase):
 
         self.assertEqual(reason, "stale")
         self.assertEqual(calls, ["reconnect"])
+
+    def test_public_market_event_marks_public_ws_connected_and_fresh(self):
+        self.sync.handle_event(
+            NormalizedExchangeEvent(
+                event_type=ExchangeEventType.MARKET,
+                symbol="BTCUSDT",
+                payload={"channel": "public", "mark_price": 101.0},
+                ts=time.time(),
+            )
+        )
+
+        health = self.sync.health()
+
+        self.assertTrue(health.ws_connected)
+        self.assertFalse(health.ws_stale)
+        self.assertFalse(health.fallback_polling)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import os
+from datetime import datetime, timezone
 
 import matplotlib
 
@@ -11,6 +13,10 @@ from matplotlib.patches import Rectangle
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 import numpy as np
 import pandas as pd
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
 from core.liquidation_map import LiquidationMap, build_liquidation_map
 from core.volume_profile import VolumeProfileLevels
@@ -299,6 +305,19 @@ def _draw_last_price_marker(ax, x_values, price: float, *, color: str = "#83d6ff
         bbox={"facecolor": "#1b5d82", "edgecolor": "none", "alpha": 0.92, "pad": 1.0},
         zorder=8,
     )
+
+
+def _resolve_chart_timezone():
+    configured = str(os.getenv("BOT_CHART_TIMEZONE", "")).strip()
+    if configured and ZoneInfo is not None:
+        try:
+            return ZoneInfo(configured)
+        except Exception:
+            pass
+    try:
+        return datetime.now().astimezone().tzinfo or timezone.utc
+    except Exception:
+        return timezone.utc
 
 
 def _clip_isolated_recent_wicks(
@@ -1519,25 +1538,26 @@ def _configure_time_axis(ax, *, timeframe_label: str, frame: pd.DataFrame):
 
     span_minutes = max((frame.index[-1] - frame.index[0]).total_seconds() / 60.0, 1.0)
     tf = str(timeframe_label or "").lower()
+    tz = _resolve_chart_timezone()
 
     if "h" in tf:
         if span_minutes <= 24 * 60 * 3:
-            locator = mdates.DayLocator(interval=1)
+            locator = mdates.DayLocator(interval=1, tz=tz)
         elif span_minutes <= 24 * 60 * 8:
-            locator = mdates.DayLocator(interval=2)
+            locator = mdates.DayLocator(interval=2, tz=tz)
         else:
-            locator = mdates.DayLocator(interval=3)
-        formatter = mdates.DateFormatter("%m-%d")
+            locator = mdates.DayLocator(interval=3, tz=tz)
+        formatter = mdates.DateFormatter("%m-%d", tz=tz)
     else:
         if span_minutes <= 105:
-            locator = mdates.MinuteLocator(interval=15)
+            locator = mdates.MinuteLocator(interval=15, tz=tz)
         elif span_minutes <= 240:
-            locator = mdates.MinuteLocator(interval=30)
+            locator = mdates.MinuteLocator(interval=30, tz=tz)
         elif span_minutes <= 540:
-            locator = mdates.HourLocator(interval=1)
+            locator = mdates.HourLocator(interval=1, tz=tz)
         else:
-            locator = mdates.HourLocator(interval=2)
-        formatter = mdates.DateFormatter("%H:%M")
+            locator = mdates.HourLocator(interval=2, tz=tz)
+        formatter = mdates.DateFormatter("%H:%M", tz=tz)
 
     ax.xaxis.set_major_locator(locator)
     ax.xaxis.set_major_formatter(formatter)
@@ -1929,6 +1949,21 @@ def build_signal_chart(
         if not show_liquidation_map
         else "Контекст: HTF уровни и карта ликвидаций"
     )
+    subtitle = (
+        "Входной график: локальные уровни и TP/SL"
+        if not show_liquidation_map
+        else "Контекст: HTF уровни и карта ликвидаций"
+    )
+    subtitle = (
+        "Входной график: локальные уровни и TP/SL"
+        if not show_liquidation_map
+        else "Контекст: HTF уровни и карта ликвидаций"
+    )
+    subtitle = (
+        "Входной график: локальные уровни и TP/SL"
+        if not show_liquidation_map
+        else "Контекст: HTF уровни и карта ликвидаций"
+    )
     ax_price.text(
         0.015,
         1.012,
@@ -1960,7 +1995,7 @@ def build_signal_chart(
     fig.subplots_adjust(left=0.036, right=0.970, top=0.954, bottom=0.080, hspace=0.050)
 
     buffer = io.BytesIO()
-    fig.savefig(buffer, format="png", dpi=205, facecolor=fig.get_facecolor(), bbox_inches="tight", pad_inches=0.10)
+    fig.savefig(buffer, format="png", dpi=(176 if show_liquidation_map else 182), facecolor=fig.get_facecolor(), bbox_inches="tight", pad_inches=0.10)
     plt.close(fig)
     buffer.seek(0)
     return buffer.read()

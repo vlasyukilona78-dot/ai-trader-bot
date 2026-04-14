@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 import requests
+from trading.exchange.bybit_endpoints import resolve_public_http_base_url
 
 
 @dataclass
@@ -26,16 +27,17 @@ class MarketDataClient:
 
     def __init__(
         self,
-        base_url: str = "https://api.bybit.com",
+        base_url: str | None = None,
         sentiment_url: str = "https://api.alternative.me/fng/",
         timeout: int = 12,
         max_retries: int = 3,
     ):
-        self.base_url = base_url.rstrip("/")
+        self.base_url = (base_url or resolve_public_http_base_url(testnet=False)).rstrip("/")
         self.sentiment_url = sentiment_url
         self.timeout = timeout
         self.max_retries = max_retries
         self._session = requests.Session()
+        self._session.trust_env = False
         self._session.headers.update({"User-Agent": "crypto-ai-bot/2.0", "Accept": "application/json"})
         self._symbol_categories: dict[str, str] = {}
 

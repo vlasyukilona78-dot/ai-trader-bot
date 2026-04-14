@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import os
+import time
+from collections.abc import Mapping
+from dataclasses import replace
 
 from core.market_regime import detect_market_regime
 from core.signal_generator import SignalConfig, SignalContext, SignalGenerator
 from core.volume_profile import compute_volume_profile
+from trading.exchange.schemas import PositionSide
+from trading.portfolio.positions import first_effective_position_for_symbol
 from trading.signals.signal_types import IntentAction, StrategyIntent
 from trading.signals.strategy_audit import StrategyAuditCollector
 from trading.signals.strategy_interface import StrategyContext, StrategyInterface
@@ -23,16 +28,16 @@ class LayeredPumpStrategy(StrategyInterface):
             regime_soft_pass_enabled=True,
             layer1_pump_lookback_bars=12,
             layer1_clean_pump_lookback_bars=48,
-            layer1_clean_pump_min_pct=0.0435,
-            early_watch_clean_pump_min_pct=0.0295,
+            layer1_clean_pump_min_pct=0.0400,
+            early_watch_clean_pump_min_pct=0.0280,
             early_watch_volume_spike_min=max(0.06, env_volume_threshold * 0.06),
             early_watch_rsi_min=45.5,
             early_watch_quality_min=2.20,
             layer1_soft_pass_enabled=True,
-            rsi_high=63.5,
-            volume_spike_threshold=max(1.45, env_volume_threshold * 0.75),
-            layer1_rsi_soft=48.5,
-            layer1_volume_spike_soft=max(0.85, env_volume_threshold * 0.45),
+            rsi_high=62.0,
+            volume_spike_threshold=max(1.35, env_volume_threshold * 0.70),
+            layer1_rsi_soft=47.5,
+            layer1_volume_spike_soft=max(0.75, env_volume_threshold * 0.40),
             layer1_upper_band_proximity_pct=0.0018,
             weakness_lookback=3,
             entry_tolerance_pct=0.0085,
@@ -77,6 +82,13 @@ class LayeredPumpStrategy(StrategyInterface):
             if value is not None:
                 return value
         return None
+
+    @staticmethod
+    def _safe_float(value, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
 
     @staticmethod
     def _regime_condition_state(value: object) -> bool | None:
@@ -407,6 +419,144 @@ class LayeredPumpStrategy(StrategyInterface):
     def reset_audit(self) -> None:
         self._audit.reset()
 
+    def clone_for_parallel(self) -> "LayeredPumpStrategy":
+        return LayeredPumpStrategy(config=replace(self._generator.config))
+
+    def record_external_intent(self, intent: StrategyIntent) -> None:
+        metadata = intent.metadata if isinstance(intent.metadata, Mapping) else {}
+        trace = metadata.get("layer_trace", {})
+        if not isinstance(trace, Mapping):
+            trace = {}
+        signal_side: str | None = None
+        if intent.action == IntentAction.SHORT_ENTRY:
+            signal_side = "SHORT"
+        elif intent.action == IntentAction.LONG_ENTRY:
+            signal_side = "LONG"
+        self._audit.record(trace, signal_side=signal_side)
+
+    def _managed_short_exit_intent(
+        self,
+        *,
+        context: StrategyContext,
+        enriched,
+        volume_profile,
+        trace_meta: dict,
+    ) -> StrategyIntent | None:
+        if context.synced_state != TradeState.SHORT:
+            return None
+
+        position = first_effective_position_for_symbol(context.exchange.positions, context.symbol)
+        if position is None or position.side != PositionSide.SHORT:
+            return None
+        if enriched is None or getattr(enriched, "empty", True) or len(enriched) < 3:
+            return None
+
+        last = enriched.iloc[-1]
+        prev = enriched.iloc[-2]
+        close = self._safe_float(last.get("close"), context.mark_price)
+        prev_close = self._safe_float(prev.get("close"), close)
+        entry_price = self._safe_float(getattr(position, "entry_price", 0.0), 0.0)
+        if close <= 0.0 or entry_price <= 0.0:
+            return None
+
+        atr = max(self._safe_float(last.get("atr"), close * 0.01), close * 0.001, 1e-8)
+        ema20 = self._safe_float(last.get("ema20"), close)
+        vwap = self._safe_float(last.get("vwap"), close)
+        rsi = self._safe_float(last.get("rsi"), 50.0)
+        prev_rsi = self._safe_float(prev.get("rsi"), rsi)
+        hist = self._safe_float(last.get("hist"), 0.0)
+        prev_hist = self._safe_float(prev.get("hist"), hist)
+        atr_pct = atr / max(close, 1e-9)
+
+        recent_support = 0.0
+        if "low" in enriched.columns:
+            try:
+                recent_support = self._safe_float(enriched.tail(min(len(enriched), 24))["low"].min(), 0.0)
+            except Exception:
+                recent_support = 0.0
+
+        current_stop = self._safe_float(getattr(position, "stop_loss", None), entry_price + atr)
+        risk_distance = max(current_stop - entry_price, atr * 0.85, entry_price * 0.0012)
+        reward_distance = max(entry_price - close, 0.0)
+        reward_r = reward_distance / max(risk_distance, 1e-9)
+
+        holding_minutes = 0.0
+        if context.synced_state_updated_at:
+            holding_minutes = max(0.0, (time.time() - float(context.synced_state_updated_at)) / 60.0)
+
+        vp_poc = self._safe_float(getattr(volume_profile, "poc", 0.0), 0.0) if volume_profile is not None else 0.0
+        vp_val = self._safe_float(getattr(volume_profile, "val", 0.0), 0.0) if volume_profile is not None else 0.0
+        near_poc = bool(vp_poc > 0.0 and close <= vp_poc * (1.0 + max(atr_pct * 0.85, 0.0032)))
+        near_val = bool(vp_val > 0.0 and close <= vp_val * (1.0 + max(atr_pct * 1.05, 0.0048)))
+        near_recent_support = bool(
+            recent_support > 0.0 and close <= recent_support * (1.0 + max(atr_pct * 0.95, 0.0042))
+        )
+        target_zone_touched = bool(near_poc or near_val or near_recent_support)
+
+        close_above_ema20 = close > ema20 * (1.0 + max(atr_pct * 0.12, 0.0008))
+        close_above_vwap = close > vwap * (1.0 + max(atr_pct * 0.12, 0.0008))
+        bounce_strength = 0
+        bounce_strength += int(close > prev_close)
+        bounce_strength += int(rsi >= prev_rsi + 0.8)
+        bounce_strength += int(hist > prev_hist)
+        bounce_strength += int(close_above_ema20)
+        bounce_strength += int(close_above_vwap)
+
+        bullish_reclaim = close_above_ema20 and close_above_vwap and bounce_strength >= 3
+        stagnation_exit = holding_minutes >= 12.0 and reward_r < 0.18 and bounce_strength >= 3 and close_above_ema20
+        target_bounce_exit = target_zone_touched and reward_r >= 0.40 and bullish_reclaim
+        profit_protect_exit = reward_r >= 0.70 and bullish_reclaim
+        hard_reclaim_exit = reward_r >= 0.25 and close >= entry_price and close_above_ema20 and close_above_vwap and bounce_strength >= 4
+
+        exit_type = ""
+        reason = ""
+        if hard_reclaim_exit:
+            exit_type = "reclaim_invalidation"
+            reason = "managed_exit_reclaim_invalidation"
+        elif target_bounce_exit:
+            exit_type = "target_zone_bounce"
+            reason = "managed_exit_target_zone_bounce"
+        elif profit_protect_exit:
+            exit_type = "profit_reclaim"
+            reason = "managed_exit_profit_reclaim"
+        elif stagnation_exit:
+            exit_type = "stagnation"
+            reason = "managed_exit_stagnation"
+
+        if not reason:
+            return None
+
+        exit_confidence = min(
+            0.96,
+            0.52
+            + min(0.18, reward_r * 0.12)
+            + (0.08 if target_zone_touched else 0.0)
+            + (0.06 if bullish_reclaim else 0.0),
+        )
+        exit_meta = {
+            **(trace_meta if isinstance(trace_meta, dict) else {}),
+            "managed_exit": True,
+            "exit_type": exit_type,
+            "managed_exit_reason": reason,
+            "managed_exit_details": {
+                "reward_r": float(reward_r),
+                "holding_minutes": float(holding_minutes),
+                "target_zone_touched": 1.0 if target_zone_touched else 0.0,
+                "near_poc": 1.0 if near_poc else 0.0,
+                "near_val": 1.0 if near_val else 0.0,
+                "near_recent_support": 1.0 if near_recent_support else 0.0,
+                "bullish_reclaim": 1.0 if bullish_reclaim else 0.0,
+                "bounce_strength": float(bounce_strength),
+            },
+        }
+        return StrategyIntent(
+            symbol=context.symbol,
+            action=IntentAction.EXIT_SHORT,
+            reason=reason,
+            confidence=float(exit_confidence),
+            metadata=exit_meta,
+        )
+
     def generate(self, context: StrategyContext) -> StrategyIntent:
         df = context.market_ohlcv
         if df.empty or len(df) < 80:
@@ -463,8 +613,16 @@ class LayeredPumpStrategy(StrategyInterface):
         trace_meta = self._trace_meta()
         trace = trace_meta.get("layer_trace", {}) if isinstance(trace_meta, dict) else {}
         self._audit.record(trace, signal_side=getattr(signal, "side", None))
+        managed_short_exit = self._managed_short_exit_intent(
+            context=context,
+            enriched=enriched,
+            volume_profile=vp,
+            trace_meta=trace_meta if isinstance(trace_meta, dict) else {},
+        )
 
         if signal is None:
+            if managed_short_exit is not None:
+                return managed_short_exit
             failed_layer = trace_meta.get("layer_failed") or "unknown"
             return StrategyIntent(
                 symbol=context.symbol,
@@ -491,6 +649,9 @@ class LayeredPumpStrategy(StrategyInterface):
                 metadata={"legacy_signal_id": signal.signal_id, **trace_meta},
             )
 
+        if managed_short_exit is not None:
+            return managed_short_exit
+
         if context.synced_state != TradeState.FLAT:
             return StrategyIntent(
                 symbol=context.symbol,
@@ -498,6 +659,16 @@ class LayeredPumpStrategy(StrategyInterface):
                 reason="state_not_flat",
                 metadata=trace_meta,
             )
+
+        entry_meta = {"legacy_signal_id": signal.signal_id, **trace_meta}
+        if signal.partial_tps:
+            entry_meta["partial_tps"] = [float(x) for x in signal.partial_tps]
+        signal_details = signal.details if isinstance(signal.details, Mapping) else {}
+        layer5_details = signal_details.get("layer5", {}) if isinstance(signal_details, Mapping) else {}
+        if isinstance(layer5_details, Mapping):
+            for key in ("tp1", "tp2", "tp3", "tp1_reference", "tp2_reference", "tp3_reference", "tp_reference"):
+                if key in layer5_details:
+                    entry_meta[key] = layer5_details.get(key)
 
         if signal.side == "LONG":
             return StrategyIntent(
@@ -507,7 +678,7 @@ class LayeredPumpStrategy(StrategyInterface):
                 stop_loss=float(signal.sl),
                 take_profit=float(signal.tp),
                 confidence=float(signal.confidence),
-                metadata={"legacy_signal_id": signal.signal_id, **trace_meta},
+                metadata=entry_meta,
             )
 
         return StrategyIntent(
@@ -517,6 +688,6 @@ class LayeredPumpStrategy(StrategyInterface):
             stop_loss=float(signal.sl),
             take_profit=float(signal.tp),
             confidence=float(signal.confidence),
-            metadata={"legacy_signal_id": signal.signal_id, **trace_meta},
+            metadata=entry_meta,
         )
 
