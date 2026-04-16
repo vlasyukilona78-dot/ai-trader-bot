@@ -98,6 +98,17 @@ class ExecutionEngine:
     def _clear_external_recovery(self, symbol: str):
         self._external_recovery_until.pop(self._norm_symbol(symbol), None)
 
+    @staticmethod
+    def _safe_max_qty(rules) -> float:
+        max_qty = float(getattr(rules, "max_qty", 0.0) or 0.0)
+        if max_qty <= 0:
+            return 0.0
+        qty_step = max(float(getattr(rules, "qty_step", 0.0) or 0.0), 0.0)
+        step_buffer = qty_step if qty_step > 0 else 0.0
+        pct_buffer = max_qty * 0.002
+        candidate = max_qty - max(step_buffer, pct_buffer)
+        return candidate if candidate > 0 else max_qty
+
     def _can_auto_remediate_external(self) -> bool:
         config = getattr(self.adapter, "config", None)
         if config is None:
@@ -369,6 +380,27 @@ class ExecutionEngine:
             inflight=inflight,
         )
 
+        position_issue_names = {
+            "external_position_without_intent",
+            "unprotected_position_without_intent",
+            "state_exchange_side_mismatch",
+        }
+        if position is not None and any(issue in position_issue_names for issue in issues):
+            live_position = self._fetch_live_position(norm_symbol)
+            if live_position is None:
+                issues = [issue for issue in issues if issue not in position_issue_names]
+                position = None
+            else:
+                position = live_position
+                issues = self._collect_external_intervention_issues(
+                    symbol=norm_symbol,
+                    snapshot=snapshot,
+                    rec=rec,
+                    position=position,
+                    open_orders=open_orders,
+                    inflight=inflight,
+                )
+
         if self._attempt_auto_remediate_external(
             symbol=norm_symbol,
             rec=rec,
@@ -603,7 +635,7 @@ class ExecutionEngine:
 
             qty = self.adapter.round_qty(risk.quantity, rules.qty_step)
             if rules.max_qty > 0:
-                max_qty = self.adapter.round_qty(rules.max_qty, rules.qty_step)
+                max_qty = self.adapter.round_qty(self._safe_max_qty(rules), rules.qty_step)
                 qty = min(qty, max_qty if max_qty > 0 else rules.max_qty)
             if qty <= 0:
                 return ExecutionOutcome(accepted=False, status="REJECTED", reason="rounded_qty_zero")

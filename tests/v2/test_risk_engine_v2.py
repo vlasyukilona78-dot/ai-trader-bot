@@ -57,6 +57,67 @@ class RiskEngineV2Tests(unittest.TestCase):
         self.assertFalse(decision.approved)
         self.assertEqual(decision.reason, "liquidation_too_close")
 
+    def test_caps_quantity_with_small_safety_margin_below_exchange_max_qty(self):
+        rules = InstrumentRules(
+            symbol="BTCUSDT",
+            tick_size=0.1,
+            qty_step=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            max_qty=1000.0,
+        )
+        limits = RiskLimits(
+            max_risk_per_trade_pct=0.5,
+            max_daily_loss_pct=0.05,
+            max_leverage=50.0,
+            max_concurrent_positions=2,
+            max_symbol_exposure_pct=1.0,
+            max_total_notional_pct=1.0,
+            min_liquidation_buffer_pct=0.0,
+            require_stop_loss=True,
+            pyramiding_enabled=False,
+        )
+        engine = RiskEngine(limits)
+        intent = StrategyIntent(symbol="BTCUSDT", action=IntentAction.LONG_ENTRY, reason="t", stop_loss=99.99)
+        decision = engine.evaluate(intent=intent, account=self.account, existing_positions=[], mark_price=100.0, rules=rules)
+        self.assertTrue(decision.approved)
+        self.assertLess(decision.quantity, 1000.0)
+        self.assertEqual(decision.quantity, 998.0)
+
+    def test_execution_cost_buffer_reduces_position_size(self):
+        intent = StrategyIntent(symbol="BTCUSDT", action=IntentAction.LONG_ENTRY, reason="t", stop_loss=99.0)
+        baseline = self.engine.evaluate(
+            intent=intent,
+            account=self.account,
+            existing_positions=[],
+            mark_price=100.0,
+            rules=self.rules,
+        )
+        widened_limits = RiskLimits(
+            max_risk_per_trade_pct=0.01,
+            max_daily_loss_pct=0.05,
+            max_leverage=2.0,
+            max_concurrent_positions=2,
+            max_symbol_exposure_pct=0.4,
+            max_total_notional_pct=0.8,
+            min_liquidation_buffer_pct=0.01,
+            execution_cost_buffer_bps=50.0,
+            require_stop_loss=True,
+            pyramiding_enabled=False,
+        )
+        widened_engine = RiskEngine(widened_limits)
+        widened = widened_engine.evaluate(
+            intent=intent,
+            account=self.account,
+            existing_positions=[],
+            mark_price=100.0,
+            rules=self.rules,
+        )
+
+        self.assertTrue(baseline.approved)
+        self.assertTrue(widened.approved)
+        self.assertLess(widened.quantity, baseline.quantity)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
+
 from trading.exchange.schemas import AccountSnapshot, InstrumentRules, OpenOrderSnapshot, OrderIntent
 
 
@@ -7,11 +9,23 @@ class OrderValidationError(ValueError):
     pass
 
 
+def _to_decimal(value: float) -> Decimal:
+    return Decimal(str(value))
+
+
 def _is_step_aligned(value: float, step: float, tol: float = 1e-9) -> bool:
     if step <= 0:
         return False
-    units = round(value / step)
-    return abs(value - units * step) <= tol * max(1.0, step)
+    try:
+        value_d = _to_decimal(value)
+        step_d = _to_decimal(step)
+        tol_d = _to_decimal(tol) * max(Decimal("1"), step_d)
+    except (InvalidOperation, ValueError):
+        return False
+    if step_d <= 0:
+        return False
+    remainder = value_d % step_d
+    return remainder <= tol_d or (step_d - remainder) <= tol_d
 
 
 def validate_order_intent(

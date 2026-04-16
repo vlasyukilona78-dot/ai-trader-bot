@@ -15,6 +15,7 @@ class RiskLimits:
     cooldown_after_stop_sec: int = 900
     halt_after_consecutive_losses: int = 4
     min_liquidation_buffer_pct: float = 0.01
+    execution_cost_buffer_bps: float = 6.0
     require_stop_loss: bool = True
     pyramiding_enabled: bool = False
 
@@ -31,6 +32,7 @@ def load_risk_limits_from_env() -> RiskLimits:
         cooldown_after_stop_sec=int(os.getenv("RISK_COOLDOWN_AFTER_STOP_SEC", "900")),
         halt_after_consecutive_losses=int(os.getenv("RISK_HALT_AFTER_CONSECUTIVE_LOSSES", "4")),
         min_liquidation_buffer_pct=float(os.getenv("RISK_MIN_LIQ_BUFFER_PCT", "0.01")),
+        execution_cost_buffer_bps=float(os.getenv("RISK_EXECUTION_COST_BUFFER_BPS", "6.0")),
         require_stop_loss=os.getenv("RISK_REQUIRE_STOP_LOSS", "true").lower() in ("1", "true", "yes"),
         pyramiding_enabled=os.getenv("RISK_PYRAMIDING_ENABLED", "false").lower() in ("1", "true", "yes"),
     )

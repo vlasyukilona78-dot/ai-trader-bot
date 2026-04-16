@@ -52,6 +52,10 @@ class OrderValidatorV2Tests(unittest.TestCase):
         with self.assertRaises(OrderValidationError):
             validate_order_intent(intent, rules=rules, account=self.account, mark_price=100.0, open_orders=[])
 
+    def test_accept_decimal_safe_qty_step_alignment(self):
+        intent = OrderIntent(symbol="BTCUSDT", side=OrderSide.BUY, qty=0.05)
+        validate_order_intent(intent, rules=self.rules, account=self.account, mark_price=100.0, open_orders=[])
+
 
 if __name__ == "__main__":
     unittest.main()

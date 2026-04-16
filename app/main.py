@@ -307,6 +307,76 @@ def _remember_cached_alert(
     }
 
 
+def _should_emit_symbol_rate_limited_alert(
+    cache: dict[str, object],
+    *,
+    symbol: str,
+    now_ts: float,
+) -> bool:
+    cached = cache.get(symbol)
+    if isinstance(cached, Mapping):
+        next_allowed_ts = _as_float(cached.get("symbol_next_allowed_ts"), 0.0)
+    else:
+        next_allowed_ts = 0.0
+    return now_ts >= next_allowed_ts
+
+
+def _remember_symbol_rate_limited_alert(
+    cache: dict[str, object],
+    *,
+    symbol: str,
+    now_ts: float,
+    cooldown_sec: int,
+) -> None:
+    cached = cache.get(symbol)
+    payload = dict(cached) if isinstance(cached, Mapping) else {}
+    payload["symbol_next_allowed_ts"] = now_ts + max(60, cooldown_sec)
+    cache[symbol] = payload
+
+
+def _format_alert_price_bucket(value: float) -> str:
+    price = _as_float(value, 0.0)
+    if price <= 0:
+        return "0"
+    if price < 0.01:
+        return f"{price:.8f}"
+    if price < 1.0:
+        return f"{price:.6f}"
+    return f"{price:.4f}"
+
+
+def _build_main_signal_signature(
+    *,
+    symbol: str,
+    intent,
+    enriched,
+    mark_price: float,
+) -> str:
+    metadata = intent.metadata if isinstance(getattr(intent, "metadata", None), Mapping) else {}
+    legacy_signal_id = str(metadata.get("legacy_signal_id") or "").strip()
+    if legacy_signal_id:
+        return f"legacy|{legacy_signal_id}"
+
+    bar_ts = ""
+    if enriched is not None and not getattr(enriched, "empty", True):
+        try:
+            bar_ts = str(enriched.index[-1])
+        except Exception:
+            bar_ts = ""
+
+    return "|".join(
+        [
+            str(symbol).replace("/", "").upper(),
+            str(getattr(intent, "action", "") or ""),
+            str(getattr(intent, "reason", "") or ""),
+            bar_ts,
+            _format_alert_price_bucket(mark_price),
+            _format_alert_price_bucket(getattr(intent, "take_profit", None)),
+            _format_alert_price_bucket(getattr(intent, "stop_loss", None)),
+        ]
+    )
+
+
 def _format_signature_price(value: object) -> str:
     numeric = _as_float(value, 0.0)
     if numeric <= 0:
@@ -3085,6 +3155,15 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
     )
     if weak_watch_structure:
         if (
+            not recent_upper_anchor_reject
+            and not strong_upper_reversal_bar
+            and not peak_followthrough_confirmed
+            and not liquidation_map.swept_above
+            and not strong_peak_prefire
+            and not soft_regime_fail
+        ):
+            return None
+        if (
             pullback_from_peak_pct < weak_rejection_floor
             and not micro_reversal_near_peak
             and not strong_peak_prefire
@@ -3104,6 +3183,15 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
             not volume_climax_recent
             and recent_volume_spike < max(0.22, early_volume_gate * 2.10)
             and not liquidation_map.swept_above
+            and not soft_regime_fail
+        ):
+            return None
+        if (
+            volume_spike >= max(0.95, recent_volume_spike * 0.96, early_volume_gate * 3.0)
+            and not volume_fade_confirmed
+            and not peak_followthrough_confirmed
+            and not liquidation_map.swept_above
+            and not strong_peak_prefire
             and not soft_regime_fail
         ):
             return None
@@ -3250,6 +3338,8 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         quality_score = min(quality_score, 6.6)
     if weak_anchor_without_level and not (peak_followthrough_confirmed or liquidation_map.swept_above):
         quality_score = min(quality_score, 7.15)
+    if weak_watch_structure and not (recent_upper_anchor_reject or liquidation_map.swept_above):
+        quality_score = min(quality_score, 6.75 if strong_upper_reversal_bar else 6.45)
     if (
         phase == "WATCH"
         and not (
@@ -3334,6 +3424,11 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
     hist = _as_float(row.get("hist"), 0.0)
     prev_hist = _as_float(prev.get("hist"), hist)
     prev_close = _as_float(prev.get("close"), close)
+    open_px = _as_float(row.get("open"), close)
+    high_px = max(_as_float(row.get("high"), close), close, open_px)
+    low_px = min(_as_float(row.get("low"), close), close, open_px)
+    candle_range = max(high_px - low_px, close * 0.0004, 1e-8)
+    upper_wick = max(high_px - max(open_px, close), 0.0)
 
     failed_reclaim = bool(_as_float(layer2.get("failed_reclaim"), 0.0) or _as_float(layer3.get("failed_reclaim"), 0.0))
     retest_failed_breakout = bool(
@@ -3498,6 +3593,10 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
         recent_upper_anchor_touch
         and anchor_reject_score >= anchor_reject_floor
     )
+    strong_upper_reversal_bar = bool(
+        upper_wick / candle_range >= 0.24
+        and (close < prev_close or close <= open_px)
+    )
     hard_upper_anchor_context = bool(
         near_vah_resistance
         or recent_upper_liq_reaction
@@ -3543,6 +3642,13 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
         return None
     if not recent_upper_anchor_reject and not (has_structural_failure and first_reaction):
         return None
+    if (
+        not has_structural_failure
+        and not liquidation_map.swept_above
+        and not recent_upper_liq_reaction
+        and not strong_upper_reversal_bar
+    ):
+        return None
     if open_upside_liq_magnet and not has_structural_failure:
         return None
     upper_zone_distance_candidates = []
@@ -3577,6 +3683,14 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
     if not has_structural_failure and weakness_strength < 0.60 and not volume_fade:
         return None
     if not has_structural_failure and not (momentum_rollover and volume_fade):
+        return None
+    marginal_pump_without_hard_context = bool(
+        clean_pump_pct < max(pump_min + 0.0045, 0.0475)
+        and not has_structural_failure
+        and not liquidation_map.swept_above
+        and not recent_upper_liq_reaction
+    )
+    if marginal_pump_without_hard_context:
         return None
 
     triggers: list[str] = []
@@ -3666,12 +3780,52 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
     quality_score = min(10.0, max(0.0, quality_score))
 
     phase = "SETUP" if has_structural_failure else "WATCH"
-    watch_live_volume_floor = 0.16 if close < 0.02 else 0.10
+    watch_live_volume_floor = 0.18 if close < 0.02 else 0.12
     if hard_upper_anchor_context:
         watch_live_volume_floor = min(
             watch_live_volume_floor,
             0.12 if close < 0.02 else 0.08,
         )
+    if (
+        phase == "WATCH"
+        and not (recent_upper_liq_reaction or liquidation_map.swept_above)
+        and not (
+            near_vah_resistance
+            and recent_upper_anchor_reject
+            and downside_confluence_score >= 1.35
+            and volume_fade
+            and momentum_rollover
+        )
+    ):
+        return None
+    if (
+        phase == "WATCH"
+        and volume_spike >= (2.40 if close < 0.02 else 1.95)
+        and not has_structural_failure
+        and not liquidation_map.swept_above
+        and not recent_upper_liq_reaction
+    ):
+        return None
+    if (
+        phase == "WATCH"
+        and weak_watch_structure
+        and not (
+            recent_upper_anchor_reject
+            or strong_upper_reversal_bar
+            or peak_followthrough_confirmed
+            or liquidation_map.swept_above
+        )
+    ):
+        return None
+    if (
+        phase == "WATCH"
+        and weak_watch_structure
+        and volume_spike >= max(0.95, recent_volume_spike * 0.97, 0.95 if close < 0.02 else 0.72)
+        and not volume_fade
+        and not peak_followthrough_confirmed
+        and not liquidation_map.swept_above
+    ):
+        return None
     required_trigger_count = 4
     if len(unique_triggers) < required_trigger_count:
         return None
@@ -3693,6 +3847,14 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
         return None
     if phase == "WATCH" and weak_watch_structure and continuation_risk > 2.65:
         return None
+    if (
+        phase == "WATCH"
+        and not has_structural_failure
+        and not liquidation_map.swept_above
+        and not recent_upper_liq_reaction
+        and continuation_risk > 2.35
+    ):
+        return None
     if phase == "SETUP" and quality_score < 7.05:
         return None
     if phase == "WATCH" and quality_score < 6.85:
@@ -3700,9 +3862,13 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
     if phase == "WATCH" and weak_watch_structure and quality_score < 7.15:
         return None
     if phase == "WATCH" and not has_structural_failure:
-        quality_score = min(quality_score, 8.35)
+        quality_score = min(quality_score, 7.45 if strong_upper_reversal_bar else 7.10)
+    if phase == "WATCH" and weak_watch_structure:
+        quality_score = min(quality_score, 6.95 if recent_upper_anchor_reject else 6.55)
     if phase == "WATCH" and not (recent_upper_liq_reaction or liquidation_map.swept_above):
-        quality_score = min(quality_score, 7.85)
+        quality_score = min(quality_score, 7.15 if near_vah_resistance else 6.95)
+    if phase == "WATCH" and volume_spike < (0.20 if close < 0.02 else 0.13):
+        quality_score = min(quality_score, 6.85)
     wait_for = (
         "подтверждение полноценного входа"
         if phase == "SETUP"
@@ -3770,6 +3936,11 @@ def _strategy_audit_log_payload(strategy) -> dict[str, object]:
         "vwap_stretch_threshold_used",
         "atr_norm",
         "volatility_threshold_used",
+        "mtf_trend_5m_used",
+        "mtf_trend_15m_used",
+        "mtf_rsi_5m_used",
+        "mtf_rsi_15m_used",
+        "mtf_hard_filter_enabled",
         "degraded_mode",
         "fail_due_to_degraded_mode_only",
         "soft_pass_candidate",
@@ -3818,6 +3989,11 @@ def _strategy_audit_log_payload(strategy) -> dict[str, object]:
         "vwap_stretch_threshold_used": None,
         "atr_norm": None,
         "volatility_threshold_used": None,
+        "mtf_trend_5m_used": None,
+        "mtf_trend_15m_used": None,
+        "mtf_rsi_5m_used": None,
+        "mtf_rsi_15m_used": None,
+        "mtf_hard_filter_enabled": 0.0,
         "failed_reason": "",
         "missing_conditions": "",
         "degraded_mode": 0.0,
@@ -3913,7 +4089,13 @@ def _strategy_audit_log_payload(strategy) -> dict[str, object]:
         subconditions = source.get("regime_filter_subconditions_state", {})
         out["regime_filter_subconditions_state"] = _normalize_bool_state_map(
             subconditions,
-            ("htf_trend_ok", "stretched_from_vwap", "volatility_regime_ok", "news_veto"),
+            (
+                "htf_trend_ok",
+                "stretched_from_vwap",
+                "volatility_regime_ok",
+                "news_veto",
+                "mtf_short_context_ok",
+            ),
         )
         return out
 
@@ -4157,6 +4339,7 @@ def run_cycle(
     state_alert_cache: dict[str, object],
     intervention_alert_cache: dict[str, object],
     decision_log_cache: dict[str, object],
+    signal_alert_cache: dict[str, object],
     early_signal_state: dict[str, dict[str, object]],
     early_signal_stats: dict[str, int],
     mode: str,
@@ -4188,6 +4371,14 @@ def run_cycle(
     state_blocked_alert_cooldown_sec = max(
         300,
         _as_int(os.getenv("STATE_BLOCKED_ALERT_COOLDOWN_SEC", "10800"), 10800),
+    )
+    signal_alert_cooldown_sec = max(
+        300,
+        _as_int(os.getenv("SIGNAL_ALERT_COOLDOWN_SEC", "5400"), 5400),
+    )
+    signal_symbol_cooldown_sec = max(
+        900,
+        _as_int(os.getenv("SIGNAL_ALERT_SYMBOL_COOLDOWN_SEC", "2700"), 2700),
     )
     bulk_snapshots: dict[str, object] = {}
 
@@ -4261,13 +4452,6 @@ def run_cycle(
                 issues = ",".join(intervention)
                 current_state_value = execution.state_machine.get(symbol).state.value
                 intervention_key = f"{current_state_value}|{issues}"
-                logger.error(
-                    "symbol=%s state=%s intervention=%s",
-                    symbol,
-                    current_state_value,
-                    issues,
-                    extra={"event": "intervention"},
-                )
                 if _should_emit_cached_alert(
                     intervention_alert_cache,
                     symbol=symbol,
@@ -4275,6 +4459,13 @@ def run_cycle(
                     now_ts=cycle_ts,
                     cooldown_sec=intervention_alert_cooldown_sec,
                 ):
+                    logger.error(
+                        "symbol=%s state=%s intervention=%s",
+                        symbol,
+                        current_state_value,
+                        issues,
+                        extra={"event": "intervention"},
+                    )
                     _send_alerts(
                         alerters,
                         f"[\\u041a\\u0420\\u0418\\u0422\\u0418\\u0427\\u041d\\u041e] intervention symbol={symbol} issues={issues} state={current_state_value}",
@@ -5166,6 +5357,27 @@ def run_cycle(
                     )
                     if intent.action not in (IntentAction.LONG_ENTRY, IntentAction.SHORT_ENTRY) or not decision.approved:
                         continue
+                signal_signature = _build_main_signal_signature(
+                    symbol=symbol,
+                    intent=intent,
+                    enriched=features.enriched,
+                    mark_price=mark_price,
+                )
+                signal_now_ts = time.time()
+                if not _should_emit_cached_alert(
+                    signal_alert_cache,
+                    symbol=symbol,
+                    key=signal_signature,
+                    now_ts=signal_now_ts,
+                    cooldown_sec=signal_alert_cooldown_sec,
+                ):
+                    continue
+                if not _should_emit_symbol_rate_limited_alert(
+                    signal_alert_cache,
+                    symbol=symbol,
+                    now_ts=signal_now_ts,
+                ):
+                    continue
                 action_label = ("\u0428\u041e\u0420\u0422 \u0421\u0418\u0413\u041d\u0410\u041b" if intent.action == IntentAction.SHORT_ENTRY else "\u041b\u041e\u041d\u0413 \u0421\u0418\u0413\u041d\u0410\u041b")
                 caption = build_signal_caption(
                     symbol=symbol,
@@ -5245,6 +5457,19 @@ def run_cycle(
                     attempted=attempted,
                     sent=sent,
                     skip_reason="no_alerters_configured" if attempted == 0 else "",
+                )
+                _remember_cached_alert(
+                    signal_alert_cache,
+                    symbol=symbol,
+                    key=signal_signature,
+                    now_ts=signal_now_ts,
+                    cooldown_sec=signal_alert_cooldown_sec,
+                )
+                _remember_symbol_rate_limited_alert(
+                    signal_alert_cache,
+                    symbol=symbol,
+                    now_ts=signal_now_ts,
+                    cooldown_sec=signal_symbol_cooldown_sec,
                 )
 
         except Exception as exc:
@@ -5468,6 +5693,7 @@ def main() -> int:
     state_alert_cache: dict[str, str] = {}
     intervention_alert_cache: dict[str, str] = {}
     decision_log_cache: dict[str, str] = {}
+    signal_alert_cache: dict[str, str] = {}
     early_signal_state: dict[str, dict[str, object]] = {}
     early_signal_stats: dict[str, int] = {
         "watch_sent": 0,
@@ -5496,6 +5722,7 @@ def main() -> int:
                 state_alert_cache=state_alert_cache,
                 intervention_alert_cache=intervention_alert_cache,
                 decision_log_cache=decision_log_cache,
+                signal_alert_cache=signal_alert_cache,
                 early_signal_state=early_signal_state,
                 early_signal_stats=early_signal_stats,
                 mode=cfg.mode,

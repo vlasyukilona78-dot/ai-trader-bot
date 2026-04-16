@@ -49,8 +49,14 @@ class SignalConfig:
     regime_volatility_baseline_lookback: int = 96
     regime_soft_pass_enabled: bool = False
     regime_strong_trend_adx: float = 30.0
+    regime_mtf_hard_filter_enabled: bool = True
+    regime_mtf_trend_15m_max_short: float = 0.0020
+    regime_mtf_trend_5m_max_short: float = 0.0014
+    regime_mtf_rsi_15m_max_short: float = 64.0
+    regime_mtf_rsi_5m_max_short: float = 70.0
     fake_filter_lsr_extreme_soft: float = 1.01
     fake_filter_oi_volume_spike_soft: float = 1.2
+    allow_long_entries: bool = False
 
 
 @dataclass
@@ -90,7 +96,7 @@ class SignalResult:
     tp: float
     partial_tps: list[float] = field(default_factory=list)
     confidence: float = 0.0
-    strategy: str = "layered_pump_panic"
+    strategy: str = "pump_short_profile"
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
     features: dict[str, float] = field(default_factory=dict)
     details: dict[str, Any] = field(default_factory=dict)
@@ -183,11 +189,28 @@ class SignalGenerator:
         htf_trend_threshold = float(self.config.regime_strong_trend_adx)
         htf_uptrend_structure = ema20 >= ema50 and close >= ema20
         htf_strong_uptrend = htf_uptrend_structure and adx >= htf_trend_threshold
+        mtf_hard_enabled = bool(self.config.regime_mtf_hard_filter_enabled)
+        mtf_trend_5m = self._safe(last.get("mtf_trend_5m"), 0.0)
+        mtf_trend_15m = self._safe(last.get("mtf_trend_15m"), 0.0)
+        mtf_rsi_5m = self._safe(last.get("mtf_rsi_5m"), 50.0)
+        mtf_rsi_15m = self._safe(last.get("mtf_rsi_15m"), 50.0)
+        mtf_15m_strong_up = (
+            mtf_trend_15m >= float(self.config.regime_mtf_trend_15m_max_short)
+            and mtf_rsi_15m >= float(self.config.regime_mtf_rsi_15m_max_short)
+        )
+        mtf_5m_continuation_up = (
+            mtf_trend_5m >= float(self.config.regime_mtf_trend_5m_max_short)
+            and mtf_rsi_5m >= float(self.config.regime_mtf_rsi_5m_max_short)
+        )
+        mtf_short_context_ok = not (mtf_hard_enabled and (mtf_15m_strong_up or mtf_5m_continuation_up))
         if regime == MarketRegime.PANIC:
             htf_direction_context = "panic_regime"
             htf_trend_ok = False
         elif htf_strong_uptrend:
             htf_direction_context = "strong_uptrend"
+            htf_trend_ok = False
+        elif not mtf_short_context_ok:
+            htf_direction_context = "mtf_uptrend_block"
             htf_trend_ok = False
         else:
             htf_direction_context = "not_strong_uptrend"
@@ -234,6 +257,8 @@ class SignalGenerator:
         missing: list[str] = []
         if not htf_trend_ok:
             missing.append("htf_trend_ok")
+        if not mtf_short_context_ok:
+            missing.append("mtf_short_context_ok")
         if not stretched:
             missing.append("stretched_from_vwap")
         if not vol_ok:
@@ -255,6 +280,7 @@ class SignalGenerator:
             and (not strict_passed)
             and (not degraded)
             and htf_trend_ok
+            and mtf_short_context_ok
             and news_ok
             and sweep_trigger_ready
             and (not bool(sweep_ctx.get("acceptance_above_high")))
@@ -265,14 +291,15 @@ class SignalGenerator:
             (not strict_passed)
             and (not degraded)
             and (
-                (htf_trend_ok and (int(stretched) + int(vol_ok) + int(news_ok) >= 2))
-                or ((not htf_trend_ok) and stretched and vol_ok and news_ok)
+                (htf_trend_ok and mtf_short_context_ok and (int(stretched) + int(vol_ok) + int(news_ok) >= 2))
+                or ((not htf_trend_ok) and mtf_short_context_ok and stretched and vol_ok and news_ok)
             )
         )
         soft_pass_used = bool(
             self.config.regime_soft_pass_enabled
             and (not strict_passed)
             and (not degraded)
+            and mtf_short_context_ok
             and (
                 (len(missing) == 1 and missing[0] in ("stretched_from_vwap", "htf_trend_ok"))
                 or sweep_soft_pass_candidate
@@ -291,12 +318,18 @@ class SignalGenerator:
         return passed, {
             "passed": 1.0 if passed else 0.0,
             "htf_trend_ok": 1.0 if htf_trend_ok else 0.0,
+            "mtf_short_context_ok": 1.0 if mtf_short_context_ok else 0.0,
             "stretched_from_vwap": 1.0 if stretched else 0.0,
             "volatility_regime_ok": 1.0 if vol_ok else 0.0,
             "news_veto": 1.0 if news_ok else 0.0,
             "htf_trend_metric_used": float(adx),
             "htf_trend_threshold_used": float(htf_trend_threshold),
             "htf_trend_direction_context": str(htf_direction_context),
+            "mtf_trend_5m_used": float(mtf_trend_5m),
+            "mtf_trend_15m_used": float(mtf_trend_15m),
+            "mtf_rsi_5m_used": float(mtf_rsi_5m),
+            "mtf_rsi_15m_used": float(mtf_rsi_15m),
+            "mtf_hard_filter_enabled": 1.0 if mtf_hard_enabled else 0.0,
             "vwap_distance_metric_used": float(vwap_dist),
             "vwap_stretch_threshold_used": float(vwap_stretch_threshold),
             "volatility_threshold_used": float(volatility_threshold),
@@ -972,10 +1005,14 @@ class SignalGenerator:
         prev = df.iloc[-2]
         close = self._safe(last.get("close"))
         prev_close = self._safe(prev.get("close"))
+        prev_high = self._safe(prev.get("high"), prev_close)
         tol = max(0.0, float(self.config.entry_tolerance_pct))
 
-        below_vah = close <= vp.vah * (1.0 + tol)
-        rejected = prev_close >= vp.vah * (1.0 - tol) and close <= vp.vah * (1.0 + tol)
+        below_vah = close <= vp.vah * (1.0 - max(tol * 0.12, 0.00045))
+        rejected = bool(
+            (prev_close >= vp.vah * (1.0 - tol * 0.45) or prev_high >= vp.vah * (1.0 - tol * 0.18))
+            and close <= min(prev_close, vp.vah * (1.0 + tol * 0.35))
+        )
         below_or_rej = below_vah or rejected
         near_poc = abs(close - vp.poc) <= max(vp.poc * max(0.010, tol * 2.0), 1e-8)
         inside_va = close >= vp.val * (1.0 - tol * 1.5) and close <= vp.vah * (1.0 + tol * 1.1)
@@ -989,12 +1026,44 @@ class SignalGenerator:
         lower_close = bool(sweep_ctx.get("lower_close"))
         lower_high = bool(sweep_ctx.get("lower_high"))
         post_peak_followthrough = bool(sweep_ctx.get("post_peak_followthrough"))
+        ema20_last = self._safe(last.get("ema20"), 0.0)
+        ema20_prev = self._safe(prev.get("ema20"), ema20_last)
 
         trigger_ctx = below_or_rej or failed_reclaim or retest_failed_breakout
         value_ctx = poc_ctx or failed_reclaim or retest_failed_breakout
-        micro_break_confirmed = bool(msb_ok) or lower_close or lower_high or rejection_bar or post_peak_followthrough
+        micro_break_confirmed = (
+            lower_close
+            or lower_high
+            or rejection_bar
+            or post_peak_followthrough
+            or bool(msb_ok and (rejected or failed_reclaim or retest_failed_breakout))
+        )
+        fresh_reaction = bool(rejection_bar or lower_close or lower_high or post_peak_followthrough)
+        fresh_reaction_or_reject = bool(
+            fresh_reaction
+            or rejected
+            or failed_reclaim
+            or retest_failed_breakout
+        )
+        continuation_above_fast_value = bool(
+            ema20_last > 0
+            and close >= ema20_last * (1.0 - max(tol * 0.10, 0.00035))
+            and ema20_last >= ema20_prev
+            and close >= prev_close * (1.0 - max(tol * 0.12, 0.00035))
+            and not failed_reclaim
+            and not retest_failed_breakout
+            and not fresh_reaction
+        )
         sweep_entry_ok = bool((failed_reclaim or retest_failed_breakout) and micro_break_confirmed and not acceptance_above_high)
-        value_entry_ok = bool(trigger_ctx and value_ctx and bool(msb_ok) and not acceptance_above_high)
+        value_entry_ok = bool(
+            trigger_ctx
+            and value_ctx
+            and bool(msb_ok)
+            and micro_break_confirmed
+            and fresh_reaction_or_reject
+            and not acceptance_above_high
+            and not continuation_above_fast_value
+        )
         passed = sweep_entry_ok or value_entry_ok
         strength = (
             int(trigger_ctx or sweep_entry_ok)
@@ -1009,8 +1078,12 @@ class SignalGenerator:
             missing.append("near_poc_or_value_area_context")
         if not (bool(msb_ok) or sweep_entry_ok):
             missing.append("msb_bearish_confirmed")
+        if not (fresh_reaction_or_reject or sweep_entry_ok):
+            missing.append("fresh_reaction_from_high")
         if acceptance_above_high:
             missing.append("acceptance_above_swing_high")
+        if continuation_above_fast_value:
+            missing.append("no_trade_continuation_above_fast_value")
 
         d = {
             "entry_location_passed": 1.0 if passed else 0.0,
@@ -1025,6 +1098,8 @@ class SignalGenerator:
             "value_area_entry_ok": 1.0 if value_entry_ok else 0.0,
             "acceptance_above_swing_high": 1.0 if acceptance_above_high else 0.0,
             "msb_bearish_confirmed": 1.0 if bool(msb_ok) else 0.0,
+            "fresh_reaction_from_high": 1.0 if fresh_reaction else 0.0,
+            "continuation_above_fast_value": 1.0 if continuation_above_fast_value else 0.0,
             "vp_levels_available": 1.0,
             "below_vah": 1.0 if below_vah else 0.0,
         }
@@ -1373,14 +1448,41 @@ class SignalGenerator:
         tp3 = tp3_pick[0] if tp3_pick else 0.0
         tp3_ref = tp3_pick[1] if tp3_pick else ""
 
+        tp1_rr = ((entry - tp1) / max(risk_distance, 1e-9)) if tp1 > 0 else 0.0
+        tp2_rr = ((entry - tp2) / max(risk_distance, 1e-9)) if tp2 > 0 else 0.0
+        tp3_rr = ((entry - tp3) / max(risk_distance, 1e-9)) if tp3 > 0 else 0.0
+        base_tp_rr = ((entry - tp) / max(risk_distance, 1e-9)) if tp > 0 else 0.0
+        strong_unwind_context = bool(
+            failed_reclaim
+            or retest_failed_breakout
+            or bool(sweep_ctx.get("swept_high"))
+            or structure_depth_pct >= 0.035
+            or recent_depth_pct >= 0.028
+        )
+
         final_tp = tp
         final_tp_ref = str(tp_ref)
-        if tp2 > 0:
-            final_tp = tp2
-            final_tp_ref = str(tp2_ref or tp_ref)
-        elif tp1 > 0:
-            final_tp = tp1
-            final_tp_ref = str(tp1_ref or tp_ref)
+        if strong_unwind_context:
+            extended_candidates: list[tuple[float, str]] = []
+            if tp3 > 0 and tp3_rr >= max(rr + 0.55, 2.20):
+                extended_candidates.append((tp3, str(tp3_ref or "tp3")))
+            if tp > 0 and base_tp_rr >= max(rr + 0.35, 2.05):
+                extended_candidates.append((tp, str(tp_ref)))
+            if extended_candidates:
+                final_tp, final_tp_ref = min(extended_candidates, key=lambda item: item[0])
+            elif tp2 > 0:
+                final_tp = tp2
+                final_tp_ref = str(tp2_ref or tp_ref)
+            elif tp1 > 0:
+                final_tp = tp1
+                final_tp_ref = str(tp1_ref or tp_ref)
+        else:
+            if tp2 > 0:
+                final_tp = tp2
+                final_tp_ref = str(tp2_ref or tp_ref)
+            elif tp1 > 0:
+                final_tp = tp1
+                final_tp_ref = str(tp1_ref or tp_ref)
         final_tp, sl = self._normalize_levels(entry=entry, tp=final_tp, sl=sl, side="SHORT")
         stop_pct = (sl - entry) / max(entry, 1e-9)
         tp_pct = (entry - final_tp) / max(entry, 1e-9)
@@ -1416,6 +1518,7 @@ class SignalGenerator:
             "tp2_reference": str(tp2_ref),
             "tp3_reference": str(tp3_ref),
             "partial_tps": partial_tps,
+            "tp_selection_mode": "extended" if strong_unwind_context and final_tp_ref in {str(tp3_ref), str(tp_ref)} else "protective",
             "stop_above_invalidation": 1.0 if stop_ok else 0.0,
             "tp_at_poc_or_better": 1.0 if tp_ok else 0.0,
             "atr_available": 1.0 if atr_available else 0.0,

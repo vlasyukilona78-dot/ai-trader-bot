@@ -7,6 +7,7 @@ from dataclasses import replace
 
 from core.market_regime import detect_market_regime
 from core.signal_generator import SignalConfig, SignalContext, SignalGenerator
+from core.feature_engineering import sanitize_feature_frame
 from core.volume_profile import compute_volume_profile
 from trading.exchange.schemas import PositionSide
 from trading.portfolio.positions import first_effective_position_for_symbol
@@ -20,6 +21,7 @@ class LayeredPumpStrategy(StrategyInterface):
     """Adapter around migrated layered strategy that returns intents only."""
 
     def __init__(self, config: SignalConfig | None = None, audit_collector: StrategyAuditCollector | None = None):
+        self._allow_long_entries = str(os.getenv("ENABLE_LONG_SIGNALS", "0")).strip().lower() in {"1", "true", "yes", "on"}
         env_volume_threshold = max(1.0, float(os.getenv("VOLUME_THRESHOLD", "2.0")))
         runtime_config = config or SignalConfig(
             regime_volatility_threshold_override=0.0006,
@@ -44,6 +46,7 @@ class LayeredPumpStrategy(StrategyInterface):
             msb_lookback=14,
             msb_recent_bars=11,
             msb_break_buffer_pct=0.0002,
+            allow_long_entries=self._allow_long_entries,
         )
         self._generator = SignalGenerator(runtime_config)
         self._audit = audit_collector or StrategyAuditCollector()
@@ -152,6 +155,11 @@ class LayeredPumpStrategy(StrategyInterface):
             "htf_trend_metric_used": None,
             "htf_trend_threshold_used": None,
             "htf_trend_direction_context": "",
+            "mtf_trend_5m_used": None,
+            "mtf_trend_15m_used": None,
+            "mtf_rsi_5m_used": None,
+            "mtf_rsi_15m_used": None,
+            "mtf_hard_filter_enabled": 0.0,
             "vwap_distance_metric_used": None,
             "vwap_stretch_threshold_used": None,
             "atr_norm": None,
@@ -169,6 +177,11 @@ class LayeredPumpStrategy(StrategyInterface):
         for key in (
             "htf_trend_metric_used",
             "htf_trend_threshold_used",
+            "mtf_trend_5m_used",
+            "mtf_trend_15m_used",
+            "mtf_rsi_5m_used",
+            "mtf_rsi_15m_used",
+            "mtf_hard_filter_enabled",
             "vwap_distance_metric_used",
             "vwap_stretch_threshold_used",
             "atr_norm",
@@ -199,7 +212,7 @@ class LayeredPumpStrategy(StrategyInterface):
         out["source_flags"] = dict(source_flags) if isinstance(source_flags, dict) else {}
 
         subconditions: dict[str, bool] = {}
-        for key in ("htf_trend_ok", "stretched_from_vwap", "volatility_regime_ok", "news_veto"):
+        for key in ("htf_trend_ok", "mtf_short_context_ok", "stretched_from_vwap", "volatility_regime_ok", "news_veto"):
             state = self._regime_condition_state(regime_details.get(key))
             if state is not None:
                 subconditions[key] = state
@@ -484,6 +497,30 @@ class LayeredPumpStrategy(StrategyInterface):
         if context.synced_state_updated_at:
             holding_minutes = max(0.0, (time.time() - float(context.synced_state_updated_at)) / 60.0)
 
+        timeframe_minutes = 1.0
+        timeframe_text = str(context.timeframe or "1").strip().lower()
+        try:
+            if timeframe_text.endswith("h"):
+                timeframe_minutes = max(1.0, float(timeframe_text[:-1]) * 60.0)
+            elif timeframe_text.endswith("m"):
+                timeframe_minutes = max(1.0, float(timeframe_text[:-1]))
+            else:
+                timeframe_minutes = max(1.0, float(timeframe_text))
+        except (TypeError, ValueError):
+            timeframe_minutes = 1.0
+
+        bars_held = int(max(4.0, min(float(len(enriched)), holding_minutes / max(timeframe_minutes, 1.0) + 2.0)))
+        trade_window = enriched.tail(bars_held)
+        best_close_low = self._safe_float(trade_window["close"].min(), close)
+        if "low" in trade_window.columns:
+            try:
+                best_wick_low = self._safe_float(trade_window["low"].min(), best_close_low)
+            except Exception:
+                best_wick_low = best_close_low
+            best_low = max(best_wick_low, best_close_low - atr * 0.20)
+        else:
+            best_low = best_close_low
+
         vp_poc = self._safe_float(getattr(volume_profile, "poc", 0.0), 0.0) if volume_profile is not None else 0.0
         vp_val = self._safe_float(getattr(volume_profile, "val", 0.0), 0.0) if volume_profile is not None else 0.0
         near_poc = bool(vp_poc > 0.0 and close <= vp_poc * (1.0 + max(atr_pct * 0.85, 0.0032)))
@@ -492,6 +529,10 @@ class LayeredPumpStrategy(StrategyInterface):
             recent_support > 0.0 and close <= recent_support * (1.0 + max(atr_pct * 0.95, 0.0042))
         )
         target_zone_touched = bool(near_poc or near_val or near_recent_support)
+
+        best_reward_distance = max(entry_price - best_low, 0.0)
+        best_reward_r = best_reward_distance / max(risk_distance, 1e-9)
+        reward_retention = reward_r / max(best_reward_r, 1e-9) if best_reward_r > 1e-9 else 1.0
 
         close_above_ema20 = close > ema20 * (1.0 + max(atr_pct * 0.12, 0.0008))
         close_above_vwap = close > vwap * (1.0 + max(atr_pct * 0.12, 0.0008))
@@ -502,11 +543,34 @@ class LayeredPumpStrategy(StrategyInterface):
         bounce_strength += int(close_above_ema20)
         bounce_strength += int(close_above_vwap)
 
+        rsi_turning_up = rsi >= prev_rsi + 0.6
+        hist_turning_up = hist > prev_hist and hist > -0.02
+        rebound_confirmed = bounce_strength >= 2 and (rsi_turning_up or hist_turning_up)
+        reclaiming_entry = close >= entry_price * (1.0 - max(atr_pct * 0.18, 0.0007))
         bullish_reclaim = close_above_ema20 and close_above_vwap and bounce_strength >= 3
-        stagnation_exit = holding_minutes >= 12.0 and reward_r < 0.18 and bounce_strength >= 3 and close_above_ema20
-        target_bounce_exit = target_zone_touched and reward_r >= 0.40 and bullish_reclaim
-        profit_protect_exit = reward_r >= 0.70 and bullish_reclaim
-        hard_reclaim_exit = reward_r >= 0.25 and close >= entry_price and close_above_ema20 and close_above_vwap and bounce_strength >= 4
+        stagnation_exit = holding_minutes >= 14.0 and reward_r < 0.15 and rebound_confirmed and close_above_ema20
+        fast_fail_exit = holding_minutes >= 5.0 and reward_r < 0.10 and close_above_ema20 and close_above_vwap and rebound_confirmed
+        no_progress_exit = (
+            holding_minutes >= 10.0
+            and best_reward_r < 0.18
+            and reward_r < 0.06
+            and reclaiming_entry
+            and bounce_strength >= 2
+            and not close_above_vwap
+        )
+        profit_giveback_exit = (
+            holding_minutes >= 6.0
+            and best_reward_r >= 0.55
+            and reward_r >= 0.12
+            and reward_r <= max(0.12, best_reward_r * 0.42)
+            and reward_retention <= 0.45
+            and rebound_confirmed
+            and (close_above_ema20 or close_above_vwap or reclaiming_entry)
+        )
+        time_decay_exit = holding_minutes >= 18.0 and reward_r < 0.12 and rebound_confirmed and (close_above_ema20 or close_above_vwap)
+        target_bounce_exit = target_zone_touched and reward_r >= 0.32 and (bullish_reclaim or rebound_confirmed)
+        profit_protect_exit = reward_r >= 0.85 and rebound_confirmed and (close_above_ema20 or close_above_vwap)
+        hard_reclaim_exit = reward_r >= 0.15 and reclaiming_entry and close_above_ema20 and close_above_vwap and bounce_strength >= 4
 
         exit_type = ""
         reason = ""
@@ -519,6 +583,18 @@ class LayeredPumpStrategy(StrategyInterface):
         elif profit_protect_exit:
             exit_type = "profit_reclaim"
             reason = "managed_exit_profit_reclaim"
+        elif profit_giveback_exit:
+            exit_type = "profit_giveback"
+            reason = "managed_exit_profit_giveback"
+        elif fast_fail_exit:
+            exit_type = "failed_followthrough"
+            reason = "managed_exit_failed_followthrough"
+        elif no_progress_exit:
+            exit_type = "no_progress_rebound"
+            reason = "managed_exit_no_progress_rebound"
+        elif time_decay_exit:
+            exit_type = "time_decay"
+            reason = "managed_exit_time_decay"
         elif stagnation_exit:
             exit_type = "stagnation"
             reason = "managed_exit_stagnation"
@@ -540,12 +616,20 @@ class LayeredPumpStrategy(StrategyInterface):
             "managed_exit_reason": reason,
             "managed_exit_details": {
                 "reward_r": float(reward_r),
+                "best_reward_r": float(best_reward_r),
+                "reward_retention": float(reward_retention),
                 "holding_minutes": float(holding_minutes),
+                "bars_held": float(bars_held),
+                "timeframe_minutes": float(timeframe_minutes),
                 "target_zone_touched": 1.0 if target_zone_touched else 0.0,
                 "near_poc": 1.0 if near_poc else 0.0,
                 "near_val": 1.0 if near_val else 0.0,
                 "near_recent_support": 1.0 if near_recent_support else 0.0,
                 "bullish_reclaim": 1.0 if bullish_reclaim else 0.0,
+                "rebound_confirmed": 1.0 if rebound_confirmed else 0.0,
+                "rsi_turning_up": 1.0 if rsi_turning_up else 0.0,
+                "hist_turning_up": 1.0 if hist_turning_up else 0.0,
+                "reclaiming_entry": 1.0 if reclaiming_entry else 0.0,
                 "bounce_strength": float(bounce_strength),
             },
         }
@@ -573,6 +657,7 @@ class LayeredPumpStrategy(StrategyInterface):
             from core.indicators import compute_indicators
 
             enriched = compute_indicators(df)
+        enriched = sanitize_feature_frame(enriched)
 
         regime = detect_market_regime(enriched)
         vp = compute_volume_profile(enriched)
@@ -669,6 +754,14 @@ class LayeredPumpStrategy(StrategyInterface):
             for key in ("tp1", "tp2", "tp3", "tp1_reference", "tp2_reference", "tp3_reference", "tp_reference"):
                 if key in layer5_details:
                     entry_meta[key] = layer5_details.get(key)
+
+        if signal.side == "LONG" and not self._allow_long_entries:
+            return StrategyIntent(
+                symbol=context.symbol,
+                action=IntentAction.HOLD,
+                reason="long_disabled_for_short_on_pump",
+                metadata=trace_meta,
+            )
 
         if signal.side == "LONG":
             return StrategyIntent(

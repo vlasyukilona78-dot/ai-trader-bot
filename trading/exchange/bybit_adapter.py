@@ -66,6 +66,10 @@ class BybitAdapterConfig:
     ws_private_enabled: bool = True
     ws_stale_after_sec: int = 25
     ws_reconnect_delay_sec: float = 1.0
+    ws_open_timeout_sec: float = 12.0
+    ws_close_timeout_sec: float = 6.0
+    ws_ping_interval_sec: float = 30.0
+    ws_ping_timeout_sec: float = 20.0
     ws_symbols: list[str] = field(default_factory=list)
 
 
@@ -109,6 +113,10 @@ class BybitAdapter:
             private_stream_enabled=bool(self.config.ws_private_enabled and not self.config.dry_run),
             reconnect_delay_sec=float(self.config.ws_reconnect_delay_sec),
             stale_after_sec=max(5, int(self.config.ws_stale_after_sec)),
+            open_timeout_sec=float(self.config.ws_open_timeout_sec),
+            close_timeout_sec=float(self.config.ws_close_timeout_sec),
+            ping_interval_sec=float(self.config.ws_ping_interval_sec),
+            ping_timeout_sec=float(self.config.ws_ping_timeout_sec),
         )
         self._ws_stream = BybitWebSocketStream(ws_cfg)
         self._ws_stream.start()
@@ -165,9 +173,10 @@ class BybitAdapter:
         qty_step = cls._safe_float(lot.get("qtyStep"), 0.0)
         min_qty = cls._safe_float(lot.get("minOrderQty"), 0.0)
         min_notional = cls._safe_float(lot.get("minNotionalValue"), 0.0)
-        max_qty = cls._safe_float(lot.get("maxOrderQty"), 0.0)
-        if max_qty <= 0:
-            max_qty = cls._safe_float(lot.get("maxMktOrderQty"), 0.0)
+        max_order_qty = cls._safe_float(lot.get("maxOrderQty"), 0.0)
+        max_market_qty = cls._safe_float(lot.get("maxMktOrderQty"), 0.0)
+        positive_caps = [value for value in (max_order_qty, max_market_qty) if value > 0]
+        max_qty = min(positive_caps) if positive_caps else 0.0
 
         return InstrumentRules(
             symbol=symbol,

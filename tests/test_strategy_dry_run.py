@@ -13,8 +13,9 @@ try:
     from trading.alerts.signal_card import build_early_signal_caption
     from trading.alerts.signal_card_clean import build_early_signal_caption as build_early_signal_caption_clean
 
+    from core.feature_engineering import sanitize_feature_frame
     from core.market_regime import MarketRegime
-    from core.signal_generator import SignalConfig, SignalContext, SignalGenerator
+    from core.signal_generator import SignalConfig, SignalContext, SignalGenerator, SignalResult
     from core.volume_profile import VolumeProfileLevels
     from trading.exchange.schemas import AccountSnapshot, PositionSide, PositionSnapshot
     from trading.market_data.feed import MarketDataFeed
@@ -108,6 +109,37 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertTrue(trace.get("layers", {}).get("layer3_entry_location", {}).get("passed", False))
         self.assertTrue(trace.get("layers", {}).get("layer4_fake_filter", {}).get("passed", False))
         self.assertTrue(trace.get("layers", {}).get("layer5_tp_sl", {}).get("passed", False))
+
+    def test_regime_filter_blocks_strong_mtf_uptrend_for_short(self):
+        df = self._build_df()
+        df["mtf_trend_5m"] = 0.0022
+        df["mtf_trend_15m"] = 0.0031
+        df["mtf_rsi_5m"] = 74.0
+        df["mtf_rsi_15m"] = 69.0
+
+        signal_gen = SignalGenerator(SignalConfig())
+        passed, details = signal_gen._regime_filter(
+            df,
+            MarketRegime.TREND,
+            news_veto=False,
+            news_source="live_news",
+            news_degraded=False,
+        )
+
+        self.assertFalse(passed)
+        self.assertEqual(float(details.get("mtf_short_context_ok", 1.0)), 0.0)
+        self.assertIn("mtf_short_context_ok", str(details.get("missing_conditions") or ""))
+
+    def test_sanitize_feature_frame_clamps_invalid_indicator_values(self):
+        df = self._build_df()
+        df["volume_spike"] = np.inf
+        df["rsi"] = np.nan
+        df["hist"] = np.nan
+        out = sanitize_feature_frame(df)
+
+        self.assertTrue(np.isfinite(float(out["volume_spike"].iloc[-1])))
+        self.assertTrue(np.isfinite(float(out["rsi"].iloc[-1])))
+        self.assertTrue(np.isfinite(float(out["hist"].iloc[-1])))
 
     def test_format_chart_timeframe_label_formats_hours_cleanly(self):
         self.assertEqual(_format_chart_timeframe_label("1"), "1m")
@@ -2435,6 +2467,40 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertTrue(trace.get("layers", {}).get("layer4_fake_filter", {}).get("passed", False))
         self.assertTrue(trace.get("layers", {}).get("layer5_tp_sl", {}).get("passed", False))
 
+    def test_layered_strategy_blocks_long_entries_when_short_profile_is_active(self):
+        df = self._build_df()
+        strategy = LayeredPumpStrategy(SignalConfig())
+        strategy._generator = SimpleNamespace(  # type: ignore[assignment]
+            generate=lambda _ctx: SignalResult(
+                signal_id="sig-long",
+                symbol="BTC/USDT",
+                side="LONG",
+                entry=100.0,
+                sl=99.0,
+                tp=103.0,
+            ),
+            last_diagnostics={},
+        )
+        exchange = ExchangeSnapshot(
+            symbol="BTC/USDT",
+            account=AccountSnapshot(equity_usdt=1000.0, available_balance_usdt=1000.0),
+            positions=[],
+            open_orders=[],
+        )
+
+        intent = strategy.generate(
+            StrategyContext(
+                symbol="BTC/USDT",
+                market_ohlcv=df,
+                mark_price=float(df.iloc[-1]["close"]),
+                exchange=exchange,
+                synced_state=TradeState.FLAT,
+            )
+        )
+
+        self.assertEqual(intent.action, IntentAction.HOLD)
+        self.assertEqual(intent.reason, "long_disabled_for_short_on_pump")
+
     def test_layer4_live_source_quality_with_canonical_inputs(self):
         df = self._build_df()
         signal_gen = SignalGenerator(SignalConfig())
@@ -2610,6 +2676,206 @@ class SignalGeneratorTests(unittest.TestCase):
 
         self.assertEqual(intent.action, IntentAction.EXIT_SHORT)
         self.assertIn(intent.metadata.get("exit_type"), {"target_zone_bounce", "profit_reclaim"})
+
+    def test_layered_strategy_managed_exit_short_on_failed_followthrough(self):
+        n = 120
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.linspace(112.0, 111.0, n)
+        close[-6:] = [111.15, 111.28, 111.44, 111.63, 111.84, 112.05]
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.006,
+                "low": close * 0.994,
+                "close": close,
+                "volume": np.linspace(8.0, 13.0, n),
+            },
+            index=idx,
+        )
+        df["rsi"] = np.linspace(44.0, 59.0, n)
+        df["volume_spike"] = 1.18
+        df["bb_upper"] = close * 1.018
+        df["bb_lower"] = close * 0.982
+        df["kc_upper"] = close * 1.015
+        df["kc_lower"] = close * 0.985
+        df["obv"] = np.linspace(1100.0, 970.0, n)
+        df["cvd"] = np.linspace(1060.0, 940.0, n)
+        df["vwap"] = np.linspace(111.7, 111.35, n)
+        df["atr"] = 0.62
+        df["ema20"] = np.linspace(111.8, 111.4, n)
+        df["ema50"] = np.linspace(112.2, 111.7, n)
+        df["hist"] = np.linspace(-0.12, 0.04, n)
+        df["poc"] = 110.8
+        df["vah"] = 112.4
+        df["val"] = 110.2
+        df["adx"] = 16.0
+
+        exchange = ExchangeSnapshot(
+            symbol="BTC/USDT",
+            account=AccountSnapshot(equity_usdt=1000.0, available_balance_usdt=1000.0),
+            positions=[
+                PositionSnapshot(
+                    symbol="BTC/USDT",
+                    side=PositionSide.SHORT,
+                    qty=1.0,
+                    entry_price=112.0,
+                    liq_price=120.0,
+                    leverage=3.0,
+                    position_idx=2,
+                    stop_loss=114.0,
+                )
+            ],
+            open_orders=[],
+        )
+
+        strategy = LayeredPumpStrategy(SignalConfig())
+        intent = strategy.generate(
+            StrategyContext(
+                symbol="BTC/USDT",
+                market_ohlcv=df,
+                mark_price=float(df.iloc[-1]["close"]),
+                exchange=exchange,
+                synced_state=TradeState.SHORT,
+                synced_state_updated_at=float(idx[-12].timestamp()),
+            )
+        )
+
+        self.assertEqual(intent.action, IntentAction.EXIT_SHORT)
+        self.assertEqual(intent.metadata.get("exit_type"), "failed_followthrough")
+
+    def test_layered_strategy_managed_exit_short_on_profit_giveback(self):
+        n = 120
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.linspace(112.0, 110.4, n)
+        close[-12:] = [110.7, 110.5, 110.3, 110.15, 110.05, 110.22, 110.48, 110.74, 111.02, 111.28, 111.46, 111.62]
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.006,
+                "low": close * 0.994,
+                "close": close,
+                "volume": np.linspace(8.0, 13.0, n),
+            },
+            index=idx,
+        )
+        df["rsi"] = np.linspace(41.0, 58.0, n)
+        df.loc[df.index[-6]:, "rsi"] = [47.0, 49.0, 51.0, 53.0, 55.0, 57.0]
+        df["volume_spike"] = 1.14
+        df["bb_upper"] = close * 1.018
+        df["bb_lower"] = close * 0.982
+        df["kc_upper"] = close * 1.015
+        df["kc_lower"] = close * 0.985
+        df["obv"] = np.linspace(1180.0, 910.0, n)
+        df["cvd"] = np.linspace(1140.0, 900.0, n)
+        df["vwap"] = np.linspace(111.9, 111.15, n)
+        df["atr"] = 0.64
+        df["ema20"] = np.linspace(111.8, 111.05, n)
+        df["ema50"] = np.linspace(112.1, 111.4, n)
+        df["hist"] = np.linspace(-0.22, 0.06, n)
+        df["poc"] = 109.9
+        df["vah"] = 112.4
+        df["val"] = 109.2
+        df["adx"] = 16.0
+
+        exchange = ExchangeSnapshot(
+            symbol="BTC/USDT",
+            account=AccountSnapshot(equity_usdt=1000.0, available_balance_usdt=1000.0),
+            positions=[
+                PositionSnapshot(
+                    symbol="BTC/USDT",
+                    side=PositionSide.SHORT,
+                    qty=1.0,
+                    entry_price=112.0,
+                    liq_price=120.0,
+                    leverage=3.0,
+                    position_idx=2,
+                    stop_loss=114.0,
+                )
+            ],
+            open_orders=[],
+        )
+
+        strategy = LayeredPumpStrategy(SignalConfig())
+        intent = strategy.generate(
+            StrategyContext(
+                symbol="BTC/USDT",
+                market_ohlcv=df,
+                mark_price=float(df.iloc[-1]["close"]),
+                exchange=exchange,
+                synced_state=TradeState.SHORT,
+                synced_state_updated_at=float(idx[-16].timestamp()),
+            )
+        )
+
+        self.assertEqual(intent.action, IntentAction.EXIT_SHORT)
+        self.assertEqual(intent.metadata.get("exit_type"), "profit_giveback")
+
+    def test_layered_strategy_managed_exit_short_on_no_progress_rebound(self):
+        n = 120
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.linspace(112.0, 111.84, n)
+        close[-10:] = [111.88, 111.85, 111.82, 111.79, 111.81, 111.86, 111.92, 111.97, 112.00, 112.03]
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.005,
+                "low": close * 0.995,
+                "close": close,
+                "volume": np.linspace(8.0, 12.0, n),
+            },
+            index=idx,
+        )
+        df["rsi"] = np.linspace(45.0, 55.0, n)
+        df.loc[df.index[-6]:, "rsi"] = [49.0, 50.0, 50.5, 51.2, 52.0, 53.0]
+        df["volume_spike"] = 1.08
+        df["bb_upper"] = close * 1.014
+        df["bb_lower"] = close * 0.986
+        df["kc_upper"] = close * 1.012
+        df["kc_lower"] = close * 0.988
+        df["obv"] = np.linspace(1090.0, 1020.0, n)
+        df["cvd"] = np.linspace(1050.0, 990.0, n)
+        df["vwap"] = np.linspace(112.25, 112.08, n)
+        df["atr"] = 0.52
+        df["ema20"] = np.linspace(112.22, 112.00, n)
+        df["ema50"] = np.linspace(112.35, 112.12, n)
+        df["hist"] = np.linspace(-0.08, 0.02, n)
+        df["poc"] = 111.10
+        df["vah"] = 112.55
+        df["val"] = 110.75
+        df["adx"] = 14.0
+
+        exchange = ExchangeSnapshot(
+            symbol="BTC/USDT",
+            account=AccountSnapshot(equity_usdt=1000.0, available_balance_usdt=1000.0),
+            positions=[
+                PositionSnapshot(
+                    symbol="BTC/USDT",
+                    side=PositionSide.SHORT,
+                    qty=1.0,
+                    entry_price=112.0,
+                    liq_price=120.0,
+                    leverage=3.0,
+                    position_idx=2,
+                    stop_loss=114.0,
+                )
+            ],
+            open_orders=[],
+        )
+
+        strategy = LayeredPumpStrategy(SignalConfig())
+        intent = strategy.generate(
+            StrategyContext(
+                symbol="BTC/USDT",
+                market_ohlcv=df,
+                mark_price=float(df.iloc[-1]["close"]),
+                exchange=exchange,
+                synced_state=TradeState.SHORT,
+                synced_state_updated_at=float(idx[-18].timestamp()),
+            )
+        )
+
+        self.assertEqual(intent.action, IntentAction.EXIT_SHORT)
+        self.assertEqual(intent.metadata.get("exit_type"), "no_progress_rebound")
 
     def test_signal_generator_prefers_structural_tp2_as_protective_take_profit(self):
         df = self._build_df()
@@ -3480,6 +3746,7 @@ class SignalGeneratorTests(unittest.TestCase):
             regime_filter.get("regime_filter_subconditions_state", {}),
             {
                 "htf_trend_ok": True,
+                "mtf_short_context_ok": True,
                 "stretched_from_vwap": False,
                 "volatility_regime_ok": False,
                 "news_veto": True,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
 import types
 import unittest
@@ -127,6 +128,40 @@ class BybitPostSigningV2Tests(unittest.TestCase):
             self.assertEqual(captured.get("payload"), sent_body)
             self.assertIn('"orderType":"Market"', sent_body)
             self.assertIn('"symbol":"BTCUSDT"', sent_body)
+        finally:
+            client.close()
+
+    def test_trading_stop_uses_explicit_trigger_types_and_partial_mode(self):
+        client = self._make_client()
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "BYBIT_SL_TRIGGER_BY": "LastPrice",
+                    "BYBIT_TP_TRIGGER_BY": "IndexPrice",
+                    "BYBIT_TPSL_MODE": "Partial",
+                },
+                clear=False,
+            ):
+                _ = client.set_trading_stop(
+                    symbol="BTCUSDT",
+                    stop_loss=95.0,
+                    take_profit=90.0,
+                    position_idx=2,
+                    qty=0.5,
+                )
+
+            kwargs = client._sess.request.call_args.kwargs
+            sent_body = kwargs.get("data")
+            self.assertIsInstance(sent_body, str)
+            payload = json.loads(sent_body)
+            self.assertEqual(payload.get("symbol"), "BTCUSDT")
+            self.assertEqual(payload.get("tpslMode"), "Partial")
+            self.assertEqual(payload.get("slTriggerBy"), "LastPrice")
+            self.assertEqual(payload.get("tpTriggerBy"), "IndexPrice")
+            self.assertEqual(payload.get("slSize"), "0.5")
+            self.assertEqual(payload.get("tpSize"), "0.5")
+            self.assertEqual(payload.get("positionIdx"), 2)
         finally:
             client.close()
 

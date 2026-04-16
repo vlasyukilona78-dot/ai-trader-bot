@@ -180,6 +180,22 @@ class ExecutionEngineV2Tests(unittest.TestCase):
         self.assertTrue(out.accepted)
         self.assertGreaterEqual(len(self.adapter.placed_orders), 2)
 
+    def test_entry_caps_qty_with_exchange_safety_margin_before_validation(self):
+        self.adapter.instrument_rules["BTCUSDT"].max_qty = 1000.0
+        self.adapter.instrument_rules["BTCUSDT"].qty_step = 1.0
+        self.sm.transition("BTCUSDT", TradeState.FLAT, "init")
+        intent = StrategyIntent(symbol="BTCUSDT", action=IntentAction.LONG_ENTRY, reason="x", stop_loss=99.0, take_profit=102.0)
+
+        out = self.exec.execute(
+            intent=intent,
+            risk=RiskDecision(approved=True, reason="ok", quantity=1000.0),
+            snapshot=self._snapshot("BTCUSDT"),
+            mark_price=100.0,
+        )
+
+        self.assertTrue(out.accepted)
+        self.assertAlmostEqual(float(self.adapter.placed_orders[-1].qty), 998.0)
+
     def test_manual_external_position_detection(self):
         self.adapter.positions = [
             PositionSnapshot(

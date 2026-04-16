@@ -121,7 +121,42 @@ def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     return out
 
 
-def _compute_mtf_features(df: pd.DataFrame) -> dict[str, float]:
+def sanitize_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    out = out.replace([np.inf, -np.inf], np.nan)
+
+    core_price_cols = [col for col in ("open", "high", "low", "close", "volume") if col in out.columns]
+    for col in core_price_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    if core_price_cols:
+        out = out.dropna(subset=[col for col in ("open", "high", "low", "close") if col in out.columns])
+    if "volume" in out.columns:
+        out["volume"] = out["volume"].fillna(0.0).clip(lower=0.0)
+
+    numeric_cols = list(out.select_dtypes(include=[np.number]).columns)
+    for col in numeric_cols:
+        series = pd.to_numeric(out[col], errors="coerce")
+        if col == "rsi":
+            out[col] = series.clip(lower=0.0, upper=100.0).fillna(50.0)
+        elif col == "volume_spike":
+            out[col] = series.clip(lower=0.0, upper=30.0).fillna(1.0)
+        elif col in {"atr", "atr_norm"}:
+            out[col] = series.clip(lower=0.0).fillna(0.0)
+        elif col in {"vwap_dist", "close_ret_5", "close_ret_20", "mtf_trend_5m", "mtf_trend_15m"}:
+            out[col] = series.clip(lower=-1.0, upper=1.0).fillna(0.0)
+        elif col in {"hist", "obv", "cvd"}:
+            out[col] = series.ffill().bfill().fillna(0.0)
+        else:
+            out[col] = series.ffill().bfill()
+
+    return out
+
+
+def compute_mtf_feature_snapshot(df: pd.DataFrame) -> dict[str, float]:
     values = {
         "mtf_rsi_5m": 50.0,
         "mtf_rsi_15m": 50.0,
@@ -202,7 +237,7 @@ def build_feature_row(
         "close_ret_20": ret_20,
     }
 
-    values.update(_compute_mtf_features(df))
+    values.update(compute_mtf_feature_snapshot(df))
 
     for key in list(values.keys()):
         if not np.isfinite(values[key]):

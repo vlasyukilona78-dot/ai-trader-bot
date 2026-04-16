@@ -499,7 +499,7 @@ def _resolve_symbols(*, testnet: bool) -> list[str]:
     if str(raw or "").strip().upper() == "ALL_BYBIT_LINEAR_USDT":
         return _discover_linear_usdt_symbols(
             testnet=testnet,
-            min_turnover_usdt=float(os.getenv("BOT_SYMBOL_24H_TURNOVER_MIN_USDT", "100000")),
+            min_turnover_usdt=float(os.getenv("BOT_SYMBOL_24H_TURNOVER_MIN_USDT", "200000")),
             max_turnover_usdt=float(os.getenv("BOT_SYMBOL_24H_TURNOVER_MAX_USDT", "200000000")),
             perpetual_only=_env_bool("BOT_SYMBOL_DISCOVERY_PERPETUAL_ONLY", True),
             quality_filter=_env_bool("BOT_SYMBOL_DISCOVERY_QUALITY_FILTER", True),
@@ -696,6 +696,10 @@ def load_runtime_config() -> RuntimeConfig:
         ws_private_enabled=_env_bool("WS_PRIVATE_ENABLED", True),
         ws_stale_after_sec=int(os.getenv("WS_STALE_AFTER_SEC", "25")),
         ws_reconnect_delay_sec=float(os.getenv("WS_RECONNECT_DELAY_SEC", "1.0")),
+        ws_open_timeout_sec=float(os.getenv("WS_OPEN_TIMEOUT_SEC", "12.0")),
+        ws_close_timeout_sec=float(os.getenv("WS_CLOSE_TIMEOUT_SEC", "6.0")),
+        ws_ping_interval_sec=float(os.getenv("WS_PING_INTERVAL_SEC", "30.0")),
+        ws_ping_timeout_sec=float(os.getenv("WS_PING_TIMEOUT_SEC", "20.0")),
         ws_symbols=symbols,
     )
 

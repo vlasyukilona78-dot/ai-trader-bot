@@ -1,9 +1,9 @@
 {
   "version": "default",
-  "created_at": "2026-04-14T00:04:35.219008+00:00",
+  "created_at": "2026-04-15T04:48:27.069494+00:00",
   "model_type": "xgboost",
   "dataset_path": "data\\processed\\online_training_dataset_early.csv",
-  "rows": 515,
+  "rows": 610,
   "feature_names": [
     "rsi",
     "ema20",

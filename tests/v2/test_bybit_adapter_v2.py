@@ -30,6 +30,27 @@ class BybitAdapterV2Tests(unittest.TestCase):
         self.assertAlmostEqual(rules.min_qty, 0.1)
         self.assertAlmostEqual(rules.tick_size, 0.1)
 
+    def test_extract_instrument_rules_prefers_stricter_market_qty_cap(self):
+        payload = {
+            "result": {
+                "list": [
+                    {
+                        "lotSizeFilter": {
+                            "qtyStep": "1",
+                            "minOrderQty": "1",
+                            "minNotionalValue": "5",
+                            "maxOrderQty": "1000000",
+                            "maxMktOrderQty": "250000",
+                        },
+                        "priceFilter": {"tickSize": "0.0001"},
+                    }
+                ]
+            }
+        }
+        rules = BybitAdapter._extract_instrument_rules("ENJUSDT", payload)
+        self.assertEqual(rules.symbol, "ENJUSDT")
+        self.assertAlmostEqual(rules.max_qty, 250000.0)
+
     def test_round_qty(self):
         self.assertEqual(BybitAdapter.round_qty(1.239, 0.01), 1.23)
         self.assertEqual(BybitAdapter.round_qty(0.009, 0.01), 0.0)

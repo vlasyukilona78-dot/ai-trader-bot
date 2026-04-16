@@ -12,7 +12,7 @@ except Exception:
     HAS_NUMPY_PANDAS = False
 
 if HAS_NUMPY_PANDAS:
-    from core.feature_engineering import REQUIRED_MODEL_FEATURES
+    from core.feature_engineering import REQUIRED_MODEL_FEATURES, sanitize_feature_frame
     from trading.features.pipeline import FeaturePipeline
     from trading.features.validators import FeatureValidationError, assert_no_future_rows
 else:
@@ -47,6 +47,20 @@ class FeaturePipelineV2Tests(unittest.TestCase):
         self.assertTrue(set(REQUIRED_MODEL_FEATURES).issubset(set(bundle.row.values.keys())))
         for name in REQUIRED_MODEL_FEATURES:
             self.assertTrue(np.isfinite(float(bundle.row.values[name])))
+
+    def test_sanitize_feature_frame_repairs_inf_and_duplicate_rows(self):
+        df = self._build_df(n=16)
+        broken = pd.concat([df.iloc[:8], df.iloc[7:]], axis=0)
+        broken["rsi"] = np.nan
+        broken["volume_spike"] = np.inf
+        broken["hist"] = np.nan
+        out = sanitize_feature_frame(broken)
+
+        self.assertTrue(out.index.is_monotonic_increasing)
+        self.assertEqual(len(out.index.unique()), len(out))
+        self.assertTrue(np.isfinite(float(out["volume_spike"].iloc[-1])))
+        self.assertTrue(np.isfinite(float(out["rsi"].iloc[-1])))
+        self.assertTrue(np.isfinite(float(out["hist"].iloc[-1])))
 
 
 if __name__ == "__main__":

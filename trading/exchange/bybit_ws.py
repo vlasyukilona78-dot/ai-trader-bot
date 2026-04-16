@@ -32,6 +32,10 @@ class BybitWebSocketConfig:
     reconnect_delay_sec: float = 1.0
     max_queue_size: int = 2000
     stale_after_sec: int = 25
+    open_timeout_sec: float = 12.0
+    close_timeout_sec: float = 6.0
+    ping_interval_sec: float = 30.0
+    ping_timeout_sec: float = 20.0
 
 
 class BybitWebSocketStream:
@@ -202,10 +206,10 @@ class BybitWebSocketStream:
                 self._push(ExchangeEventType.RECONNECTING, payload={"channel": channel})
                 with ws_connect(
                     url,
-                    open_timeout=8,
-                    close_timeout=4,
-                    ping_interval=20,
-                    ping_timeout=10,
+                    open_timeout=max(2.0, float(self.config.open_timeout_sec)),
+                    close_timeout=max(1.0, float(self.config.close_timeout_sec)),
+                    ping_interval=max(5.0, float(self.config.ping_interval_sec)),
+                    ping_timeout=max(3.0, float(self.config.ping_timeout_sec)),
                     proxy=None,
                 ) as ws:
                     backoff = base_backoff

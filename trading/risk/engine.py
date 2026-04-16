@@ -113,6 +113,17 @@ class RiskEngine:
             self.state.consecutive_losses = 0
         self._persist_state()
 
+    @staticmethod
+    def _safe_max_qty(rules: InstrumentRules) -> float:
+        max_qty = float(rules.max_qty or 0.0)
+        if max_qty <= 0:
+            return 0.0
+        qty_step = max(float(rules.qty_step or 0.0), 0.0)
+        step_buffer = qty_step if qty_step > 0 else 0.0
+        pct_buffer = max_qty * 0.002
+        candidate = max_qty - max(step_buffer, pct_buffer)
+        return candidate if candidate > 0 else max_qty
+
     def _global_guards(self, account: AccountSnapshot) -> tuple[bool, str]:
         self._roll_session_if_needed()
         now_ts = self._now_ts()
@@ -187,11 +198,19 @@ class RiskEngine:
             return RiskDecision(approved=False, reason="max_symbol_exposure")
 
         stop_loss = float(intent.stop_loss or 0.0)
+        execution_cost_pct = max(float(getattr(self.limits, "execution_cost_buffer_bps", 0.0) or 0.0), 0.0) / 10000.0
+        effective_stop_loss = stop_loss
+        if execution_cost_pct > 0.0:
+            execution_cost_distance = mark_price * execution_cost_pct
+            if intent.action == IntentAction.LONG_ENTRY:
+                effective_stop_loss = max(stop_loss - execution_cost_distance, 1e-9)
+            else:
+                effective_stop_loss = stop_loss + execution_cost_distance
         raw_qty = position_size_for_stop(
             equity_usdt=equity,
             risk_pct=self.limits.max_risk_per_trade_pct,
             entry_price=mark_price,
-            stop_loss=stop_loss,
+            stop_loss=effective_stop_loss,
         )
         if raw_qty <= 0:
             return RiskDecision(approved=False, reason="non_positive_size")
@@ -221,7 +240,7 @@ class RiskEngine:
         qty_cap_by_notional = max_notional_allowed / mark_price
         qty = min(raw_qty, qty_cap_by_notional)
         if rules.max_qty > 0:
-            qty = min(qty, rules.max_qty)
+            qty = min(qty, self._safe_max_qty(rules))
         qty = int(qty / rules.qty_step) * rules.qty_step if rules.qty_step > 0 else qty
         if qty < rules.min_qty:
             return RiskDecision(approved=False, reason="below_min_qty_after_limits")

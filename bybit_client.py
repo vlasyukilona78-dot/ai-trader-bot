@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import time
 from typing import Any
 from urllib.parse import urlencode
@@ -537,10 +538,22 @@ class BybitClient:
             return {"retCode": 0, "retMsg": "dry_run_simulation", "result": {"symbol": self._normalize_symbol(symbol)}}
 
         normalized_symbol = self._normalize_symbol(symbol)
+        trigger_by_allowed = {"LastPrice", "MarkPrice", "IndexPrice"}
+        sl_trigger_by = str(os.getenv("BYBIT_SL_TRIGGER_BY", "MarkPrice") or "MarkPrice").strip()
+        tp_trigger_by = str(os.getenv("BYBIT_TP_TRIGGER_BY", "MarkPrice") or "MarkPrice").strip()
+        if sl_trigger_by not in trigger_by_allowed:
+            sl_trigger_by = "MarkPrice"
+        if tp_trigger_by not in trigger_by_allowed:
+            tp_trigger_by = "MarkPrice"
+        explicit_tpsl_mode = str(os.getenv("BYBIT_TPSL_MODE", "") or "").strip().title()
+        if explicit_tpsl_mode not in {"", "Full", "Partial"}:
+            explicit_tpsl_mode = ""
+
         body: dict[str, Any] = {
             "category": self.category,
             "symbol": normalized_symbol,
             "stopLoss": str(stop_loss),
+            "slTriggerBy": sl_trigger_by,
         }
 
         if qty is not None and qty > 0:
@@ -549,10 +562,18 @@ class BybitClient:
             if take_profit is not None:
                 body["takeProfit"] = str(take_profit)
                 body["tpSize"] = str(qty)
+                body["tpTriggerBy"] = tp_trigger_by
         else:
             body["tpslMode"] = "Full"
             if take_profit is not None:
                 body["takeProfit"] = str(take_profit)
+                body["tpTriggerBy"] = tp_trigger_by
+
+        if explicit_tpsl_mode:
+            body["tpslMode"] = explicit_tpsl_mode
+            if explicit_tpsl_mode == "Full":
+                body.pop("slSize", None)
+                body.pop("tpSize", None)
 
         if position_idx is not None:
             body["positionIdx"] = int(position_idx)
