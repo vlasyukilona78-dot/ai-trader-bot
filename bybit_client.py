@@ -579,6 +579,33 @@ class BybitClient:
             body["positionIdx"] = int(position_idx)
         return self._request("POST", "/v5/position/trading-stop", private=True, json_body=body)
 
+    def set_position_leverage(
+        self,
+        symbol: str,
+        *,
+        buy_leverage: float,
+        sell_leverage: float | None = None,
+    ) -> dict[str, Any]:
+        normalized_symbol = self._normalize_symbol(symbol)
+        sell_leverage_value = float(sell_leverage if sell_leverage is not None else buy_leverage)
+        body = {
+            "category": self.category,
+            "symbol": normalized_symbol,
+            "buyLeverage": str(buy_leverage),
+            "sellLeverage": str(sell_leverage_value),
+        }
+        if self.dry_run:
+            return {
+                "retCode": 0,
+                "retMsg": "dry_run_simulation",
+                "result": {
+                    "symbol": normalized_symbol,
+                    "buyLeverage": body["buyLeverage"],
+                    "sellLeverage": body["sellLeverage"],
+                },
+            }
+        return self._request("POST", "/v5/position/set-leverage", private=True, json_body=body)
+
     def cancel_order(
         self,
         *,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 from trading.exchange.events import NormalizedExchangeEvent
 from trading.exchange.schemas import (
@@ -31,12 +32,26 @@ class FakeAdapter:
         self.placed_orders: list[OrderIntent] = []
         self.stop_calls: list[dict] = []
         self.canceled_orders: list[dict] = []
+        self.instrument_rules: dict[str, InstrumentRules] = {
+            self.normalize_symbol(self.rules.symbol): InstrumentRules(
+                symbol=self.normalize_symbol(self.rules.symbol),
+                tick_size=self.rules.tick_size,
+                qty_step=self.rules.qty_step,
+                min_qty=self.rules.min_qty,
+                min_notional=self.rules.min_notional,
+                max_qty=self.rules.max_qty,
+            )
+        }
+        self.config = SimpleNamespace(demo=False, testnet=True, dry_run=True, target_entry_leverage=3.0)
         self.fail_next_order: bool = False
         self.fail_next_stop: bool = False
         self.fail_order_times: int = 0
+        self.fail_order_results: list[OrderResult] = []
         self.fail_stop_times: int = 0
         self.partial_fill_qty: float | None = None
         self.partial_fill_leaves_open: bool = False
+        self.force_refresh_calls: list[str] = []
+        self.ensure_leverage_calls: list[dict] = []
         self.ws_events: list[NormalizedExchangeEvent] = []
 
     @staticmethod
@@ -79,14 +94,33 @@ class FakeAdapter:
     def get_mark_price(self, symbol: str) -> float:
         return float(self.mark_price)
 
-    def get_instrument_rules(self, symbol: str) -> InstrumentRules:
+    def get_instrument_rules(self, symbol: str, *, force_refresh: bool = False) -> InstrumentRules:
+        norm = self.normalize_symbol(symbol)
+        if force_refresh:
+            self.force_refresh_calls.append(norm)
+        rules = self.instrument_rules.get(norm)
+        if rules is None:
+            rules = InstrumentRules(
+                symbol=norm,
+                tick_size=self.rules.tick_size,
+                qty_step=self.rules.qty_step,
+                min_qty=self.rules.min_qty,
+                min_notional=self.rules.min_notional,
+                max_qty=self.rules.max_qty,
+            )
+            self.instrument_rules[norm] = rules
         return InstrumentRules(
-            symbol=self.normalize_symbol(symbol),
-            tick_size=self.rules.tick_size,
-            qty_step=self.rules.qty_step,
-            min_qty=self.rules.min_qty,
-            min_notional=self.rules.min_notional,
+            symbol=norm,
+            tick_size=rules.tick_size,
+            qty_step=rules.qty_step,
+            min_qty=rules.min_qty,
+            min_notional=rules.min_notional,
+            max_qty=rules.max_qty,
         )
+
+    def ensure_position_leverage(self, symbol: str, leverage: float) -> bool:
+        self.ensure_leverage_calls.append({"symbol": self.normalize_symbol(symbol), "leverage": float(leverage)})
+        return True
 
     def drain_ws_events(self) -> list[NormalizedExchangeEvent]:
         out = list(self.ws_events)
@@ -95,6 +129,8 @@ class FakeAdapter:
 
     def place_market_order(self, intent: OrderIntent) -> OrderResult:
         self.placed_orders.append(intent)
+        if self.fail_order_results:
+            return self.fail_order_results.pop(0)
         if self.fail_order_times > 0:
             self.fail_order_times -= 1
             return OrderResult(

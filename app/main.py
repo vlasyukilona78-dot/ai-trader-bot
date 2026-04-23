@@ -728,6 +728,151 @@ def _should_block_clean_pump(intent) -> bool:
     return clean_pump_pct + 1e-8 < clean_pump_min
 
 
+def _current_recent_peak_price(enriched: pd.DataFrame, *, fallback_price: float) -> float:
+    if enriched is None or getattr(enriched, "empty", True):
+        return max(fallback_price, 0.0)
+    try:
+        highs = pd.to_numeric(enriched.tail(28)["high"], errors="coerce").dropna()
+    except Exception:
+        highs = pd.Series(dtype=float)
+    recent_high = _as_float(highs.max() if not highs.empty else fallback_price, fallback_price)
+    return max(recent_high, fallback_price, 0.0)
+
+
+def _should_block_recent_main_short_reentry(
+    cache: Mapping[str, object] | None,
+    *,
+    symbol: str,
+    now_ts: float,
+    entry_price: float,
+    recent_peak_price: float,
+    atr: float,
+    cooldown_sec: int,
+) -> bool:
+    if cooldown_sec <= 0:
+        return False
+    cached = cache.get(symbol) if isinstance(cache, Mapping) else None
+    if not isinstance(cached, Mapping):
+        return False
+
+    last_entry_ts = _as_float(cached.get("main_short_entry_ts"), 0.0)
+    last_entry_price = _as_float(cached.get("main_short_entry_price"), 0.0)
+    last_peak_price = _as_float(cached.get("main_short_peak_price"), 0.0)
+    last_atr = _as_float(cached.get("main_short_atr"), 0.0)
+    if last_entry_ts <= 0 or now_ts >= last_entry_ts + max(300, cooldown_sec):
+        return False
+    if last_entry_price <= 0 or last_peak_price <= 0:
+        return False
+
+    atr_ref = max(atr, last_atr, last_entry_price * 0.0022, 1e-8)
+    same_entry_zone_abs = max(atr_ref * 0.95, last_entry_price * (0.0068 if last_entry_price < 1.0 else 0.0042))
+    meaningful_new_peak_abs = max(atr_ref * 1.45, last_peak_price * (0.0105 if last_peak_price < 1.0 else 0.0068))
+
+    entry_still_same_zone = abs(entry_price - last_entry_price) <= same_entry_zone_abs
+    no_meaningful_new_peak = recent_peak_price <= last_peak_price + meaningful_new_peak_abs
+    return bool(entry_still_same_zone and no_meaningful_new_peak)
+
+
+def _remember_recent_main_short_reentry(
+    cache: dict[str, object],
+    *,
+    symbol: str,
+    now_ts: float,
+    entry_price: float,
+    recent_peak_price: float,
+    atr: float,
+) -> None:
+    cached = cache.get(symbol)
+    payload = dict(cached) if isinstance(cached, Mapping) else {}
+    payload.update(
+        {
+            "main_short_entry_ts": now_ts,
+            "main_short_entry_price": entry_price,
+            "main_short_peak_price": recent_peak_price,
+            "main_short_atr": atr,
+        }
+    )
+    cache[symbol] = payload
+
+
+def _should_block_live_main_short_continuation(intent, enriched: pd.DataFrame | None) -> bool:
+    if getattr(intent, "action", None) != IntentAction.SHORT_ENTRY:
+        return False
+    if enriched is None or getattr(enriched, "empty", True) or len(enriched) < 4:
+        return False
+
+    meta = intent.metadata if isinstance(getattr(intent, "metadata", None), Mapping) else {}
+    layer2 = _extract_layer_details(meta, "layer2_weakness_confirmation")
+    layer3 = _extract_layer_details(meta, "layer3_entry_location")
+    failed_reclaim = bool(
+        _as_float(layer2.get("failed_reclaim"), 0.0) or _as_float(layer3.get("failed_reclaim"), 0.0)
+    )
+    retest_failed_breakout = bool(
+        _as_float(layer2.get("retest_failed_breakout"), 0.0)
+        or _as_float(layer3.get("retest_failed_breakout"), 0.0)
+    )
+    acceptance_above_high = bool(
+        _as_float(layer2.get("acceptance_above_swing_high"), 0.0)
+        or _as_float(layer3.get("acceptance_above_swing_high"), 0.0)
+    )
+    if failed_reclaim or retest_failed_breakout or acceptance_above_high:
+        return False
+
+    row = enriched.iloc[-1]
+    prev = enriched.iloc[-2]
+    close = _as_float(row.get("close"), 0.0)
+    prev_close = _as_float(prev.get("close"), close)
+    if close <= 0:
+        return False
+    high = _as_float(row.get("high"), close)
+    low = _as_float(row.get("low"), close)
+    open_px = _as_float(row.get("open"), close)
+    candle_range = max(high - low, 1e-8)
+    close_position_in_candle = max(0.0, min(1.0, (close - low) / candle_range))
+    recent_peak = _current_recent_peak_price(enriched, fallback_price=high)
+    recent_close_tail = pd.to_numeric(enriched.tail(4)["close"], errors="coerce").dropna()
+    up_closes_last3 = 0
+    if len(recent_close_tail) >= 2:
+        recent_close_values = recent_close_tail.to_numpy(dtype=float)
+        up_closes_last3 = int(
+            sum(curr > prev_close_value for prev_close_value, curr in zip(recent_close_values[:-1], recent_close_values[1:]))
+        )
+
+    rsi = _as_float(row.get("rsi"), 50.0)
+    prev_rsi = _as_float(prev.get("rsi"), rsi)
+    hist = _as_float(row.get("hist"), 0.0)
+    prev_hist = _as_float(prev.get("hist"), hist)
+    volume_spike = _as_float(row.get("volume_spike"), 0.0)
+    prev_volume_spike = _as_float(prev.get("volume_spike"), volume_spike)
+    ema20 = _as_float(row.get("ema20"), close)
+    ema20_prev = _as_float(prev.get("ema20"), ema20)
+    vah = _as_float(row.get("vah"), 0.0)
+    atr = max(_as_float(row.get("atr"), close * 0.01), close * 0.0015, 1e-8)
+    atr_pct = atr / max(close, 1e-8)
+    near_peak = close >= recent_peak * (0.994 if close < 0.05 else 0.996)
+    near_vah = vah > 0 and abs(close - vah) / max(close, 1e-8) <= max(atr_pct * 0.40, 0.0022)
+    strong_upper_reversal_bar = bool(
+        (high - max(open_px, close)) / candle_range >= 0.24
+        and (close <= open_px or close < prev_close)
+    )
+    momentum_rollover = bool(rsi < prev_rsi or hist < prev_hist)
+    volume_fade = bool(
+        volume_spike <= max(prev_volume_spike * 0.93, prev_volume_spike - 0.18)
+        or volume_spike <= max(0.95, prev_volume_spike * 0.86)
+    )
+    live_continuation = bool(
+        up_closes_last3 >= 2
+        and close >= prev_close * (1.0 - max(atr_pct * 0.18, 0.0004))
+        and close_position_in_candle >= 0.56
+        and volume_spike >= max(0.95, prev_volume_spike * 0.88, 0.85 if close < 1.0 else 0.65)
+        and ema20 >= ema20_prev
+        and not volume_fade
+        and not momentum_rollover
+        and not strong_upper_reversal_bar
+    )
+    return bool(live_continuation and (near_peak or near_vah))
+
+
 def _refresh_symbol_decision_live(
     *,
     symbol: str,
@@ -1279,6 +1424,8 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         volume_peak_age = max(len(volume_spike_values) - 1 - int(np.nanargmax(volume_spike_values)), 0)
     hist = _as_float(row.get("hist"), 0.0)
     prev_hist = _as_float(prev.get("hist"), hist)
+    mtf_trend_5m = _as_float(row.get("mtf_trend_5m"), 0.0)
+    mtf_rsi_5m = _as_float(row.get("mtf_rsi_5m"), 50.0)
     recent_peak_window = min(len(enriched), 32 if close < 0.02 else 26)
     pump_context_window = min(len(enriched), 56 if close < 0.02 else 42)
     recent_high_series = enriched.tail(recent_peak_window)["high"] if "high" in enriched.columns else pd.Series([high])
@@ -1549,6 +1696,16 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         and rsi >= prev_rsi * 0.998
         and not liquidation_map.swept_above
     )
+    mtf_continuation_drive = bool(
+        mtf_trend_5m >= _early_config_float("EARLY_WATCH_MTF_TREND_RISK_MIN", 0.0060)
+        and mtf_rsi_5m >= _early_config_float("EARLY_WATCH_MTF_RSI_RISK_MIN", 75.0)
+        and close >= prev_close * (1.0 - (0.0012 if close < 0.02 else 0.0008))
+        and close_position_in_candle >= 0.54
+        and not real_rollover
+        and not peak_turn_confirmed
+        and not micro_reversal_near_peak
+        and not liquidation_map.swept_above
+    )
     continuation_structure_score = 0.0
     if fresh_breakout_bar:
         continuation_structure_score += 1.45
@@ -1564,6 +1721,8 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         continuation_structure_score += 0.45
     if close >= ema20_last * (1.0015 if close < 0.02 else 1.0010) and ema20_slope > 0:
         continuation_structure_score += 0.35
+    if mtf_continuation_drive:
+        continuation_structure_score += 0.70
     lower_close_followthrough = (
         close < prev_close
         and prev_close <= prev2_close * 1.0006
@@ -1840,6 +1999,32 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
             and (value_room_to_poc or value_room_to_val or value_room_to_support or liquidation_map.downside_magnet)
         )
     )
+    fresh_live_continuation_without_reject = bool(
+        (
+            live_peak_extension
+            or trend_follow_through
+            or reacceleration_after_pullback
+            or mtf_continuation_drive
+            or continuation_structure_score >= 2.25
+            or (
+                near_peak
+                and close >= prev_close
+                and close_position_in_candle >= 0.68
+                and upper_wick / candle_range <= 0.20
+                and volume_spike >= max(recent_volume_spike * 0.94, early_volume_gate * 0.80, 0.75)
+            )
+        )
+        and not (
+            liquidation_map.swept_above
+            or recent_upper_liq_reaction
+            or structure_trigger_confirmed
+            or peak_followthrough_confirmed
+            or micro_reversal_near_peak
+            or real_rollover
+        )
+    )
+    if fresh_live_continuation_without_reject:
+        return None
     if not upper_rejection_zone_ready:
         return None
     if not recent_upper_anchor_touch and not liquidation_map.swept_above and not recent_upper_liq_reaction:
@@ -3423,12 +3608,27 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
     prev_rsi = _as_float(prev.get("rsi"), rsi)
     hist = _as_float(row.get("hist"), 0.0)
     prev_hist = _as_float(prev.get("hist"), hist)
+    mtf_trend_5m = _as_float(row.get("mtf_trend_5m"), 0.0)
+    mtf_rsi_5m = _as_float(row.get("mtf_rsi_5m"), 50.0)
     prev_close = _as_float(prev.get("close"), close)
     open_px = _as_float(row.get("open"), close)
     high_px = max(_as_float(row.get("high"), close), close, open_px)
     low_px = min(_as_float(row.get("low"), close), close, open_px)
     candle_range = max(high_px - low_px, close * 0.0004, 1e-8)
     upper_wick = max(high_px - max(open_px, close), 0.0)
+    close_position_in_candle = max(0.0, min(1.0, (close - low_px) / candle_range))
+    recent_close_tail = (
+        pd.to_numeric(enriched.tail(4)["close"], errors="coerce").dropna()
+        if "close" in enriched.columns
+        else pd.Series([close])
+    )
+    recent_close_high = _as_float(recent_close_tail.max() if not recent_close_tail.empty else close, close)
+    up_closes_last3 = 0
+    if len(recent_close_tail) >= 2:
+        recent_close_values = recent_close_tail.to_numpy(dtype=float)
+        up_closes_last3 = int(
+            sum(curr > prev_close_value for prev_close_value, curr in zip(recent_close_values[:-1], recent_close_values[1:]))
+        )
 
     failed_reclaim = bool(_as_float(layer2.get("failed_reclaim"), 0.0) or _as_float(layer3.get("failed_reclaim"), 0.0))
     retest_failed_breakout = bool(
@@ -3640,13 +3840,44 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
         return None
     if not recent_upper_anchor_touch and not liquidation_map.swept_above and not recent_upper_liq_reaction:
         return None
-    if not recent_upper_anchor_reject and not (has_structural_failure and first_reaction):
+    live_pump_weakening = bool(
+        first_reaction
+        and recent_upper_anchor_touch
+        and momentum_rollover
+        and (
+            volume_fade
+            or weakness_strength >= 0.66
+            or strong_upper_reversal_bar
+        )
+        and (
+            near_vah_resistance
+            or recent_upper_liq_reaction
+            or liquidation_map.swept_above
+            or liquidation_map.downside_magnet
+            or value_room_to_poc
+            or value_room_to_val
+        )
+    )
+    high_mtf_continuation_watch = bool(
+        mtf_trend_5m >= _early_config_float("EARLY_APPROVED_MTF_TREND_RISK_MIN", 0.0060)
+        and mtf_rsi_5m >= _early_config_float("EARLY_APPROVED_MTF_RSI_RISK_MIN", 75.0)
+        and close >= prev_close * (1.0 - (0.0012 if close < 0.02 else 0.0008))
+        and close_position_in_candle >= 0.52
+        and not has_structural_failure
+        and not liquidation_map.swept_above
+        and not recent_upper_liq_reaction
+        and not volume_fade
+    )
+    if high_mtf_continuation_watch and not live_pump_weakening:
+        return None
+    if not recent_upper_anchor_reject and not (has_structural_failure and first_reaction) and not live_pump_weakening:
         return None
     if (
         not has_structural_failure
         and not liquidation_map.swept_above
         and not recent_upper_liq_reaction
         and not strong_upper_reversal_bar
+        and not live_pump_weakening
     ):
         return None
     if open_upside_liq_magnet and not has_structural_failure:
@@ -3670,19 +3901,23 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
     )
     if entry_zone_distance_pct > max_setup_entry_zone_distance and not liquidation_map.swept_above:
         return None
-    if resistance_confluence_score < (2.15 if has_structural_failure else 2.45):
+    min_resistance_confluence = 2.15 if has_structural_failure else (2.18 if live_pump_weakening else 2.45)
+    if resistance_confluence_score < min_resistance_confluence:
         return None
     if downside_confluence_score < 1.10:
         return None
-    if weakness_strength < 0.54 and not (has_structural_failure and first_reaction):
+    if weakness_strength < (0.50 if live_pump_weakening else 0.54) and not (has_structural_failure and first_reaction):
         return None
     if not first_reaction:
         return None
     if not (momentum_rollover or volume_fade or has_structural_failure):
         return None
-    if not has_structural_failure and weakness_strength < 0.60 and not volume_fade:
+    if not has_structural_failure and weakness_strength < (0.56 if live_pump_weakening else 0.60) and not volume_fade:
         return None
-    if not has_structural_failure and not (momentum_rollover and volume_fade):
+    if not has_structural_failure and not (
+        (momentum_rollover and volume_fade)
+        or live_pump_weakening
+    ):
         return None
     marginal_pump_without_hard_context = bool(
         clean_pump_pct < max(pump_min + 0.0045, 0.0475)
@@ -3786,6 +4021,18 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
             watch_live_volume_floor,
             0.12 if close < 0.02 else 0.08,
         )
+    live_continuation_watch = bool(
+        phase == "WATCH"
+        and up_closes_last3 >= 2
+        and close >= recent_close_high * 0.9975
+        and close_position_in_candle >= 0.56
+        and volume_spike >= max(0.95, recent_volume_spike * 0.86, 0.90 if close < 1.0 else 0.70)
+        and not volume_fade
+        and not strong_upper_reversal_bar
+        and not has_structural_failure
+        and not liquidation_map.swept_above
+        and not recent_upper_liq_reaction
+    )
     if (
         phase == "WATCH"
         and not (recent_upper_liq_reaction or liquidation_map.swept_above)
@@ -3826,7 +4073,23 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
         and not liquidation_map.swept_above
     ):
         return None
-    required_trigger_count = 4
+    if live_continuation_watch and not live_pump_weakening:
+        return None
+    fresh_live_extension_watch = bool(
+        phase == "WATCH"
+        and near_peak_resistance
+        and close >= prev_close
+        and close_position_in_candle >= 0.68
+        and upper_wick / candle_range <= 0.20
+        and volume_spike >= max(recent_volume_spike * 0.94, 0.75 if close < 1.0 else 0.58)
+        and not live_pump_weakening
+        and not has_structural_failure
+        and not liquidation_map.swept_above
+        and not recent_upper_liq_reaction
+    )
+    if fresh_live_extension_watch:
+        return None
+    required_trigger_count = 3 if phase == "WATCH" and live_pump_weakening else 4
     if len(unique_triggers) < required_trigger_count:
         return None
     if phase == "WATCH" and not has_structural_failure and not hard_upper_anchor_context:
@@ -3843,9 +4106,11 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
         return None
     if phase == "SETUP" and continuation_risk > 2.45:
         return None
-    if phase == "WATCH" and continuation_risk > 2.95:
+    if phase == "WATCH" and continuation_risk > (3.18 if live_pump_weakening else 3.02):
         return None
     if phase == "WATCH" and weak_watch_structure and continuation_risk > 2.65:
+        return None
+    if phase == "WATCH" and live_continuation_watch and continuation_risk > 2.05:
         return None
     if (
         phase == "WATCH"
@@ -3857,12 +4122,15 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
         return None
     if phase == "SETUP" and quality_score < 7.05:
         return None
-    if phase == "WATCH" and quality_score < 6.85:
+    if phase == "WATCH" and quality_score < (6.40 if live_pump_weakening else 6.70):
         return None
-    if phase == "WATCH" and weak_watch_structure and quality_score < 7.15:
+    if phase == "WATCH" and weak_watch_structure and quality_score < (6.90 if live_pump_weakening else 7.15):
         return None
     if phase == "WATCH" and not has_structural_failure:
-        quality_score = min(quality_score, 7.45 if strong_upper_reversal_bar else 7.10)
+        quality_score = min(
+            quality_score,
+            7.60 if live_pump_weakening else (7.45 if strong_upper_reversal_bar else 7.10),
+        )
     if phase == "WATCH" and weak_watch_structure:
         quality_score = min(quality_score, 6.95 if recent_upper_anchor_reject else 6.55)
     if phase == "WATCH" and not (recent_upper_liq_reaction or liquidation_map.swept_above):
@@ -4299,13 +4567,54 @@ def _startup_reconcile(
     state_machine: StateMachine,
     execution: ExecutionEngine,
     signal_profile: str = "main",
+    logger=None,
 ):
-    summary: dict[str, str] = {}
-    for symbol in symbols:
-        if _is_observation_only_profile(signal_profile):
-            summary[symbol] = TradeState.FLAT.value
+    normalized_symbols = [str(symbol).replace("/", "").upper().strip() for symbol in symbols if symbol]
+    summary: dict[str, str] = {symbol: TradeState.FLAT.value for symbol in normalized_symbols}
+    if _is_observation_only_profile(signal_profile):
+        return summary
+
+    active_symbols: set[str] = set()
+    persisted_records = getattr(state_machine, "_records", {})
+    if isinstance(persisted_records, Mapping):
+        for symbol, rec in persisted_records.items():
+            state_value = getattr(rec, "state", TradeState.FLAT)
+            if state_value != TradeState.FLAT:
+                active_symbols.add(str(symbol).replace("/", "").upper().strip())
+
+    if execution.persistence is not None:
+        try:
+            inflight_rows = execution.persistence.load_open_inflight_intents()
+        except Exception:
+            inflight_rows = []
+        for row in inflight_rows:
+            active_symbols.add(str(getattr(row, "symbol", "")).replace("/", "").upper().strip())
+
+    bulk_snapshots = sync.snapshot_many(normalized_symbols)
+    for symbol, snapshot in bulk_snapshots.items():
+        if list(snapshot.positions) or list(snapshot.open_orders):
+            active_symbols.add(str(symbol).replace("/", "").upper().strip())
+
+    if logger is not None:
+        try:
+            logger.info(
+                "startup_reconcile_scope total=%d active_candidates=%d exchange_active=%d",
+                len(normalized_symbols),
+                len(active_symbols),
+                sum(
+                    1
+                    for snapshot in bulk_snapshots.values()
+                    if list(snapshot.positions) or list(snapshot.open_orders)
+                ),
+                extra={"event": "startup_reconcile_scope"},
+            )
+        except Exception:
+            pass
+
+    for symbol in normalized_symbols:
+        if symbol not in active_symbols:
             continue
-        snapshot = sync.snapshot(symbol)
+        snapshot = bulk_snapshots.get(symbol) or sync.snapshot(symbol)
         rec_state = state_machine.reconcile(symbol, snapshot.positions, snapshot.open_orders)
         execution.recover_from_restart(symbol, snapshot)
 
@@ -4379,6 +4688,10 @@ def run_cycle(
     signal_symbol_cooldown_sec = max(
         900,
         _as_int(os.getenv("SIGNAL_ALERT_SYMBOL_COOLDOWN_SEC", "2700"), 2700),
+    )
+    main_reentry_cooldown_sec = max(
+        300,
+        _as_int(os.getenv("MAIN_SIGNAL_REENTRY_COOLDOWN_SEC", "1800"), 1800),
     )
     bulk_snapshots: dict[str, object] = {}
 
@@ -4727,6 +5040,35 @@ def run_cycle(
                     reason="clean_pump_below_min",
                     metadata=intent.metadata if isinstance(intent.metadata, dict) else {},
                 )
+            elif signal_profile == "main" and _should_block_live_main_short_continuation(intent, features.enriched):
+                intent = StrategyIntent(
+                    symbol=symbol,
+                    action=IntentAction.HOLD,
+                    reason="main_short_live_continuation",
+                    metadata=intent.metadata if isinstance(intent.metadata, dict) else {},
+                )
+            elif signal_profile == "main" and getattr(intent, "action", None) == IntentAction.SHORT_ENTRY:
+                recent_peak_price = _current_recent_peak_price(features.enriched, fallback_price=mark_price)
+                current_atr = max(
+                    _as_float(features.enriched.iloc[-1].get("atr"), mark_price * 0.01),
+                    mark_price * 0.0015,
+                    1e-8,
+                )
+                if _should_block_recent_main_short_reentry(
+                    signal_alert_cache,
+                    symbol=symbol,
+                    now_ts=time.time(),
+                    entry_price=mark_price,
+                    recent_peak_price=recent_peak_price,
+                    atr=current_atr,
+                    cooldown_sec=main_reentry_cooldown_sec,
+                ):
+                    intent = StrategyIntent(
+                        symbol=symbol,
+                        action=IntentAction.HOLD,
+                        reason="main_short_same_pump_reentry_blocked",
+                        metadata=intent.metadata if isinstance(intent.metadata, dict) else {},
+                    )
 
             decision = risk.evaluate(
                 intent=intent,
@@ -4744,6 +5086,27 @@ def run_cycle(
                 )
             else:
                 outcome = execution.execute(intent=intent, risk=decision, snapshot=snapshot, mark_price=mark_price)
+
+            if (
+                signal_profile == "main"
+                and getattr(intent, "action", None) == IntentAction.SHORT_ENTRY
+                and outcome.accepted
+                and outcome.filled_qty > 0
+            ):
+                recent_peak_price = _current_recent_peak_price(features.enriched, fallback_price=mark_price)
+                current_atr = max(
+                    _as_float(features.enriched.iloc[-1].get("atr"), mark_price * 0.01),
+                    mark_price * 0.0015,
+                    1e-8,
+                )
+                _remember_recent_main_short_reentry(
+                    signal_alert_cache,
+                    symbol=symbol,
+                    now_ts=time.time(),
+                    entry_price=float(outcome.avg_price if outcome.avg_price > 0 else mark_price),
+                    recent_peak_price=recent_peak_price,
+                    atr=current_atr,
+                )
 
             if (
                 trade_learner is not None
@@ -5592,6 +5955,7 @@ def main() -> int:
         state_machine=state_machine,
         execution=execution,
         signal_profile=signal_profile,
+        logger=logger,
     )
     startup_state_summary = _summarize_startup_state(startup_state)
     maintenance = runtime_store.maintenance()

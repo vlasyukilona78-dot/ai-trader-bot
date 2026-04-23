@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -18,6 +19,8 @@ from trading.state.persistence import RuntimeStore
 
 if TYPE_CHECKING:
     from trading.exchange.bybit_adapter import BybitAdapter
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class ExecutionOutcome:
@@ -245,8 +248,134 @@ class ExecutionEngine:
         msg = str(result.error or raw.get("retMsg") or "").lower()
         return ret_code in (10006, 10016, 30084) or "rate" in msg or "timeout" in msg
 
+    @staticmethod
+    def _is_leverage_limit_error(result: OrderResult) -> bool:
+        raw = result.raw if isinstance(result.raw, dict) else {}
+        ret_code = int(raw.get("retCode", 0) or 0)
+        msg = str(result.error or raw.get("retMsg") or "").lower()
+        return ret_code == 110090 or ("adjust your leverage" in msg and "position limit" in msg)
+
+    @staticmethod
+    def _is_qty_invalid_error(result: OrderResult) -> bool:
+        raw = result.raw if isinstance(result.raw, dict) else {}
+        ret_code = int(raw.get("retCode", 0) or 0)
+        msg = str(result.error or raw.get("retMsg") or "").lower()
+        return ret_code == 10001 and "qty invalid" in msg
+
+    @staticmethod
+    def _is_zero_position_error(result: OrderResult) -> bool:
+        raw = result.raw if isinstance(result.raw, dict) else {}
+        ret_code = int(raw.get("retCode", 0) or 0)
+        msg = str(result.error or raw.get("retMsg") or "").lower()
+        return ret_code == 110017 or "current position is zero" in msg
+
+    def _retry_validation_after_account_refresh(
+        self,
+        *,
+        order_intent: OrderIntent,
+        rules,
+        account,
+        mark_price: float,
+        open_orders: list[OpenOrderSnapshot],
+        last_error: OrderValidationError,
+    ) -> tuple[bool, Any, str]:
+        if str(last_error) != "insufficient_available_balance":
+            return False, account, str(last_error)
+        try:
+            refreshed_account = self.adapter.get_account()
+        except Exception as exc:
+            logger.warning("account_refresh_after_validation_failed symbol=%s error=%s", order_intent.symbol, exc)
+            return False, account, str(last_error)
+        try:
+            validate_order_intent(
+                order_intent,
+                rules=rules,
+                account=refreshed_account,
+                mark_price=mark_price,
+                open_orders=open_orders,
+            )
+        except OrderValidationError as exc:
+            return False, refreshed_account, str(exc)
+        logger.info(
+            "account_refresh_after_validation_ok symbol=%s old_available=%.6f new_available=%.6f",
+            order_intent.symbol,
+            float(getattr(account, "available_balance_usdt", 0.0) or 0.0),
+            float(getattr(refreshed_account, "available_balance_usdt", 0.0) or 0.0),
+        )
+        return True, refreshed_account, ""
+
+    def _retry_after_leverage_alignment(self, order_intent: OrderIntent, last: OrderResult) -> OrderResult:
+        if not self._is_leverage_limit_error(last):
+            return last
+        target = float(getattr(getattr(self.adapter, "config", None), "target_entry_leverage", 0.0) or 0.0)
+        if target <= 0:
+            return last
+        align_fn = getattr(self.adapter, "ensure_position_leverage", None)
+        if not callable(align_fn):
+            return last
+        if not bool(align_fn(order_intent.symbol, target)):
+            return last
+        logger.info("retrying order after leverage alignment symbol=%s leverage=%s", order_intent.symbol, target)
+        return self.adapter.place_market_order(order_intent)
+
+    def _retry_after_qty_refresh(
+        self,
+        *,
+        order_intent: OrderIntent,
+        last: OrderResult,
+        account,
+        mark_price: float,
+        open_orders: list[OpenOrderSnapshot],
+    ) -> tuple[OrderIntent, OrderResult]:
+        if not self._is_qty_invalid_error(last):
+            return order_intent, last
+        try:
+            fresh_rules = self.adapter.get_instrument_rules(order_intent.symbol, force_refresh=True)
+        except Exception:
+            return order_intent, last
+
+        adjusted_qty = self.adapter.round_qty(float(order_intent.qty), float(fresh_rules.qty_step))
+        if fresh_rules.max_qty > 0:
+            max_qty = self.adapter.round_qty(self._safe_max_qty(fresh_rules), fresh_rules.qty_step)
+            adjusted_qty = min(adjusted_qty, max_qty if max_qty > 0 else fresh_rules.max_qty)
+        if adjusted_qty <= 0:
+            return order_intent, last
+
+        retried_intent = order_intent
+        if abs(float(adjusted_qty) - float(order_intent.qty)) > 1e-12:
+            retried_intent = OrderIntent(
+                symbol=order_intent.symbol,
+                side=order_intent.side,
+                qty=float(adjusted_qty),
+                reduce_only=order_intent.reduce_only,
+                position_idx=order_intent.position_idx,
+                client_order_id=order_intent.client_order_id,
+                close_on_trigger=order_intent.close_on_trigger,
+            )
+        try:
+            validate_order_intent(
+                retried_intent,
+                rules=fresh_rules,
+                account=account,
+                mark_price=mark_price,
+                open_orders=open_orders,
+            )
+        except OrderValidationError:
+            return order_intent, last
+
+        logger.info(
+            "retrying order after qty refresh symbol=%s old_qty=%s new_qty=%s",
+            order_intent.symbol,
+            order_intent.qty,
+            retried_intent.qty,
+        )
+        return retried_intent, self.adapter.place_market_order(retried_intent)
+
     def _place_order_with_retry(self, order_intent: OrderIntent) -> OrderResult:
         last = self.adapter.place_market_order(order_intent)
+        if last.success:
+            return last
+        last = self._retry_after_leverage_alignment(order_intent, last)
         if last.success:
             return last
         attempts = max(1, self.max_exchange_retries)
@@ -665,27 +794,47 @@ class ExecutionEngine:
                 status="pending_submission",
             )
 
+            active_account = snapshot.account
             try:
                 validate_order_intent(
                     order_intent,
                     rules=rules,
-                    account=snapshot.account,
+                    account=active_account,
                     mark_price=mark_price,
                     open_orders=snapshot.open_orders,
                 )
             except OrderValidationError as exc:
-                self._persist_intent_status(
-                    intent_key=intent_key,
-                    symbol=norm_symbol,
-                    action=intent.action,
-                    payload=payload,
-                    status="validation_failed",
+                refreshed_ok, active_account, refreshed_reason = self._retry_validation_after_account_refresh(
+                    order_intent=order_intent,
+                    rules=rules,
+                    account=active_account,
+                    mark_price=mark_price,
+                    open_orders=snapshot.open_orders,
+                    last_error=exc,
                 )
-                return ExecutionOutcome(accepted=False, status="REJECTED", reason=f"order_validation:{exc}")
+                if not refreshed_ok:
+                    self._persist_intent_status(
+                        intent_key=intent_key,
+                        symbol=norm_symbol,
+                        action=intent.action,
+                        payload=payload,
+                        status="validation_failed",
+                    )
+                    return ExecutionOutcome(accepted=False, status="REJECTED", reason=f"order_validation:{refreshed_reason}")
 
             pending_state = TradeState.PENDING_ENTRY_LONG if pos_side == PositionSide.LONG else TradeState.PENDING_ENTRY_SHORT
             self.state_machine.transition(norm_symbol, pending_state, "entry_order_submitted")
             result = self._place_order_with_retry(order_intent)
+            order_intent, result = self._retry_after_qty_refresh(
+                order_intent=order_intent,
+                last=result,
+                account=active_account,
+                mark_price=mark_price,
+                open_orders=snapshot.open_orders,
+            )
+            if not result.success:
+                result = self._retry_after_leverage_alignment(order_intent, result)
+            payload["requested_qty"] = float(order_intent.qty)
             if not result.success:
                 self.state_machine.transition(norm_symbol, TradeState.FLAT, "entry_order_failed")
                 self._persist_intent_status(
@@ -822,6 +971,12 @@ class ExecutionEngine:
                 self.state_machine.transition(norm_symbol, TradeState.FLAT, "exit_without_position")
                 return ExecutionOutcome(accepted=False, status="IGNORED", reason="no_position")
 
+            live_position = self._fetch_live_position(norm_symbol)
+            if live_position is None or float(live_position.qty) <= 0:
+                self.state_machine.transition(norm_symbol, TradeState.FLAT, "exit_without_live_position")
+                return ExecutionOutcome(accepted=False, status="IGNORED", reason="no_live_position")
+            position = live_position
+
             if intent.action == IntentAction.EXIT_LONG and position.side != PositionSide.LONG:
                 return ExecutionOutcome(accepted=False, status="REJECTED", reason="position_side_mismatch")
             if intent.action == IntentAction.EXIT_SHORT and position.side != PositionSide.SHORT:
@@ -857,6 +1012,16 @@ class ExecutionEngine:
                 )
             )
             if not result.success:
+                if self._is_zero_position_error(result):
+                    self.state_machine.transition(norm_symbol, TradeState.FLAT, "exit_zero_position_on_exchange")
+                    self._persist_intent_status(
+                        intent_key=exit_key,
+                        symbol=norm_symbol,
+                        action=intent.action,
+                        payload={**payload, "exchange_error": result.error},
+                        status="exchange_already_flat",
+                    )
+                    return ExecutionOutcome(accepted=False, status="IGNORED", reason="no_live_position", raw=result.raw)
                 fallback_state = TradeState.LONG if position.side == PositionSide.LONG else TradeState.SHORT
                 self.state_machine.transition(norm_symbol, fallback_state, "exit_order_failed")
                 self._persist_intent_status(

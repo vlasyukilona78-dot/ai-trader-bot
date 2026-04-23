@@ -28,7 +28,7 @@ class _FakeSession:
 class TelegramClientV2Tests(unittest.TestCase):
     def test_prefers_proxy_then_direct_when_proxy_configured(self):
         env = {"TELEGRAM_PROXY_URL": "socks5://127.0.0.1:1080"}
-        with patch.dict(os.environ, env, clear=False):
+        with patch.dict(os.environ, env, clear=False), patch.object(TelegramClient, "_proxy_reachable", return_value=True):
             client = TelegramClient(token="t", chat_id="c")
         self.assertEqual([name for name, _ in client._transports], ["proxy", "direct"])
 
@@ -54,6 +54,13 @@ class TelegramClientV2Tests(unittest.TestCase):
             ("direct", _FakeSession(_FakeResponse(200, "ok"))),
         ]
         self.assertTrue(client.send_photo("caption", b"png-bytes"))
+
+    def test_skips_dead_local_proxy_and_uses_direct(self):
+        with patch.dict(os.environ, {"TELEGRAM_PROXY_URL": "http://127.0.0.1:10801"}, clear=False), patch.object(
+            TelegramClient, "_proxy_reachable", return_value=False
+        ):
+            client = TelegramClient(token="t", chat_id="c")
+        self.assertEqual([name for name, _ in client._transports], ["direct"])
 
 
 if __name__ == "__main__":

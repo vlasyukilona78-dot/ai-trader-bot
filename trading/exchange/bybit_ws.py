@@ -31,11 +31,11 @@ class BybitWebSocketConfig:
     private_stream_enabled: bool = False
     reconnect_delay_sec: float = 1.0
     max_queue_size: int = 2000
-    stale_after_sec: int = 25
+    stale_after_sec: int = 45
     open_timeout_sec: float = 12.0
     close_timeout_sec: float = 6.0
-    ping_interval_sec: float = 30.0
-    ping_timeout_sec: float = 20.0
+    ping_interval_sec: float = 60.0
+    ping_timeout_sec: float = 30.0
 
 
 class BybitWebSocketStream:

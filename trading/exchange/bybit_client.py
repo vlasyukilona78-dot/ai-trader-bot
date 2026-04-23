@@ -66,6 +66,9 @@ class BybitHttpClient:
     def set_trading_stop(self, **kwargs):
         return self._client.set_trading_stop(**kwargs)
 
+    def set_position_leverage(self, **kwargs):
+        return self._client.set_position_leverage(**kwargs)
+
     def cancel_order(self, **kwargs):
         return self._client.cancel_order(**kwargs)
 

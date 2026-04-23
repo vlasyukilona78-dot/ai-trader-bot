@@ -9,7 +9,15 @@ try:
     import numpy as np
     import pandas as pd
     from alerts.chart_generator import _compute_price_view_bounds, _slice_entry_chart_frame, build_signal_chart
-    from app.main import _build_approved_early_candidate, _build_early_watch_candidate, _build_higher_timeframe_chart, _format_chart_timeframe_label, _strategy_audit_log_payload
+    from app.main import (
+        _build_approved_early_candidate,
+        _build_early_watch_candidate,
+        _build_higher_timeframe_chart,
+        _current_recent_peak_price,
+        _format_chart_timeframe_label,
+        _should_block_recent_main_short_reentry,
+        _strategy_audit_log_payload,
+    )
     from trading.alerts.signal_card import build_early_signal_caption
     from trading.alerts.signal_card_clean import build_early_signal_caption as build_early_signal_caption_clean
 
@@ -804,6 +812,73 @@ class SignalGeneratorTests(unittest.TestCase):
 
         self.assertIsNotNone(candidate)
         self.assertEqual(candidate.get("phase"), "WATCH")
+
+    def test_build_early_watch_candidate_skips_live_stair_step_continuation_even_near_vah(self):
+        n = 72
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.218)
+        close[26:63] = np.linspace(0.218, 0.2256, 37)
+        close[63:69] = np.linspace(0.2256, 0.2260, 6)
+        close[69:] = np.array([0.22592, 0.22604, 0.22606])
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.9995,
+                "high": close * 1.0048,
+                "low": close * 0.996,
+                "close": close,
+                "volume": np.linspace(24.0, 40.0, n),
+                "volume_spike": np.concatenate([np.full(n - 5, 1.2), np.array([4.2, 5.6, 6.1, 6.4, 6.8])]),
+                "rsi": np.concatenate([np.full(n - 4, 58.0), np.array([61.0, 62.0, 63.0, 63.4])]),
+                "hist": np.concatenate([np.full(n - 4, 0.00022), np.array([0.00034, 0.00039, 0.00042, 0.00044])]),
+                "obv": np.linspace(140.0, 380.0, n),
+                "cvd": np.linspace(120.0, 340.0, n),
+                "bb_upper": close * 1.0028,
+                "kc_upper": close * 1.0021,
+                "ema20": np.linspace(0.2184, 0.2242, n),
+                "ema50": np.linspace(0.2182, 0.2226, n),
+                "vwap": np.linspace(0.2183, 0.2235, n),
+                "atr": np.full(n, 0.0011),
+                "poc": np.full(n, 0.2234),
+                "vah": np.full(n, 0.2262),
+                "val": np.full(n, 0.2214),
+            },
+            index=idx,
+        )
+        df.iloc[-3:, df.columns.get_loc("open")] = [0.22572, 0.22588, 0.22596]
+        df.iloc[-3:, df.columns.get_loc("high")] = [0.22615, 0.22622, 0.22626]
+        df.iloc[-3:, df.columns.get_loc("low")] = [0.22568, 0.22582, 0.22594]
+
+        intent = SimpleNamespace(
+            metadata={
+                "layer_failed": "layer1_pump_detection",
+                "layer_trace": {
+                    "layers": {
+                        "regime_filter": {"passed": True, "details": {}},
+                        "layer1_pump_detection": {
+                            "passed": False,
+                            "details": {
+                                "clean_pump_pct": 0.0456,
+                                "clean_pump_min_pct_used": 0.04,
+                                "volume_spike_threshold_used": 2.0,
+                                "volume_spike": 6.8,
+                                "rsi": 63.4,
+                            },
+                        },
+                    }
+                },
+            }
+        )
+
+        candidate = _build_early_watch_candidate(
+            symbol="STGUSDT",
+            timeframe="1",
+            mode="paper",
+            enriched=df,
+            intent=intent,
+        )
+
+        self.assertIsNone(candidate)
 
     def test_build_early_watch_candidate_skips_when_current_volume_is_too_thin_without_reject_cluster(self):
         n = 72
@@ -2025,6 +2100,127 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(layer3.get("entry_location_passed"), 1.0)
         self.assertEqual(layer3.get("sweep_reclaim_entry_ok"), 1.0)
 
+    def test_layer3_entry_location_blocks_live_breakout_that_has_not_started_fading(self):
+        df = self._build_df()
+        if "hist" not in df.columns:
+            df["hist"] = 0.0
+        if "volume_spike" not in df.columns:
+            df["volume_spike"] = 1.0
+        df.iloc[-3:, df.columns.get_loc("open")] = [108.2, 108.7, 109.1]
+        df.iloc[-3:, df.columns.get_loc("high")] = [109.2, 109.8, 110.3]
+        df.iloc[-3:, df.columns.get_loc("low")] = [108.0, 108.6, 109.0]
+        df.iloc[-3:, df.columns.get_loc("close")] = [108.9, 109.4, 109.7]
+        df.iloc[-3:, df.columns.get_loc("rsi")] = [66.0, 69.0, 72.0]
+        df.iloc[-3:, df.columns.get_loc("hist")] = [0.18, 0.24, 0.30]
+        df.iloc[-3:, df.columns.get_loc("volume_spike")] = [1.05, 1.18, 1.32]
+        signal_gen = SignalGenerator(SignalConfig())
+        vp = VolumeProfileLevels(poc=108.6, vah=109.9, val=98.0)
+
+        passed, layer3 = signal_gen._layer3_entry_location(df, "SHORT", vp)
+
+        self.assertFalse(passed)
+        self.assertEqual(layer3.get("entry_location_passed"), 0.0)
+        missing = str(layer3.get("missing_conditions", ""))
+        self.assertIn("fade_confirmation", missing)
+        self.assertIn("no_trade_continuation_above_fast_value", missing)
+
+    def test_layer3_entry_location_blocks_first_impulse_volume_climax(self):
+        df = self._build_df()
+        if "hist" not in df.columns:
+            df["hist"] = 0.0
+        if "volume_spike" not in df.columns:
+            df["volume_spike"] = 1.0
+        df.iloc[-3:, df.columns.get_loc("open")] = [106.2, 107.1, 108.0]
+        df.iloc[-3:, df.columns.get_loc("high")] = [107.2, 108.2, 112.2]
+        df.iloc[-3:, df.columns.get_loc("low")] = [106.0, 106.9, 107.8]
+        df.iloc[-3:, df.columns.get_loc("close")] = [106.9, 107.6, 112.0]
+        df.iloc[-3:, df.columns.get_loc("rsi")] = [66.0, 72.0, 84.0]
+        df.iloc[-3:, df.columns.get_loc("hist")] = [0.12, 0.18, 0.31]
+        df.iloc[-3:, df.columns.get_loc("volume_spike")] = [0.95, 1.10, 2.60]
+        signal_gen = SignalGenerator(SignalConfig())
+        vp = VolumeProfileLevels(poc=108.0, vah=112.4, val=100.0)
+
+        passed, layer3 = signal_gen._layer3_entry_location(df, "SHORT", vp)
+
+        self.assertFalse(passed)
+        self.assertEqual(layer3.get("entry_location_passed"), 0.0)
+        self.assertEqual(layer3.get("first_impulse_volume_climax"), 1.0)
+        self.assertIn("no_trade_continuation_above_fast_value", str(layer3.get("missing_conditions", "")))
+
+    def test_layer3_entry_location_blocks_stair_step_continuation_near_peak_without_reject(self):
+        df = self._build_df()
+        if "hist" not in df.columns:
+            df["hist"] = 0.0
+        if "volume_spike" not in df.columns:
+            df["volume_spike"] = 1.0
+        df.iloc[-4:, df.columns.get_loc("open")] = [108.8, 109.1, 109.4, 109.6]
+        df.iloc[-4:, df.columns.get_loc("high")] = [109.6, 109.9, 110.2, 110.4]
+        df.iloc[-4:, df.columns.get_loc("low")] = [108.6, 108.9, 109.2, 109.4]
+        df.iloc[-4:, df.columns.get_loc("close")] = [109.2, 109.55, 109.82, 110.0]
+        df.iloc[-4:, df.columns.get_loc("rsi")] = [66.0, 68.5, 70.2, 71.0]
+        df.iloc[-4:, df.columns.get_loc("hist")] = [0.12, 0.15, 0.17, 0.18]
+        df.iloc[-4:, df.columns.get_loc("volume_spike")] = [1.02, 1.08, 1.14, 1.18]
+        signal_gen = SignalGenerator(SignalConfig())
+        vp = VolumeProfileLevels(poc=108.7, vah=110.1, val=98.0)
+
+        passed, layer3 = signal_gen._layer3_entry_location(df, "SHORT", vp)
+
+        self.assertFalse(passed)
+        self.assertEqual(layer3.get("entry_location_passed"), 0.0)
+        self.assertIn("no_trade_continuation_above_fast_value", str(layer3.get("missing_conditions", "")))
+
+    def test_layer3_entry_location_blocks_high_mtf_continuation_without_rollover(self):
+        df = self._build_df()
+        if "hist" not in df.columns:
+            df["hist"] = 0.0
+        if "volume_spike" not in df.columns:
+            df["volume_spike"] = 1.0
+        df["mtf_trend_5m"] = 0.0
+        df["mtf_rsi_5m"] = 50.0
+        df.iloc[-3:, df.columns.get_loc("open")] = [107.7, 108.0, 108.15]
+        df.iloc[-3:, df.columns.get_loc("high")] = [108.3, 108.5, 108.75]
+        df.iloc[-3:, df.columns.get_loc("low")] = [107.6, 107.9, 108.05]
+        df.iloc[-3:, df.columns.get_loc("close")] = [108.05, 108.28, 108.55]
+        df.iloc[-3:, df.columns.get_loc("rsi")] = [72.0, 76.0, 80.0]
+        df.iloc[-3:, df.columns.get_loc("hist")] = [0.14, 0.18, 0.23]
+        df.iloc[-3:, df.columns.get_loc("volume_spike")] = [0.92, 1.02, 1.08]
+        df.iloc[-1, df.columns.get_loc("mtf_trend_5m")] = 0.009
+        df.iloc[-1, df.columns.get_loc("mtf_rsi_5m")] = 80.0
+        signal_gen = SignalGenerator(SignalConfig())
+        vp = VolumeProfileLevels(poc=108.2, vah=109.0, val=100.0)
+
+        passed, layer3 = signal_gen._layer3_entry_location(df, "SHORT", vp)
+
+        self.assertFalse(passed)
+        self.assertEqual(layer3.get("entry_location_passed"), 0.0)
+        self.assertEqual(layer3.get("high_mtf_continuation"), 1.0)
+        self.assertIn("no_trade_high_mtf_continuation", str(layer3.get("missing_conditions", "")))
+
+    def test_layer3_entry_location_blocks_late_bounce_far_from_upper_anchor(self):
+        df = self._build_df()
+        if "hist" not in df.columns:
+            df["hist"] = 0.0
+        if "volume_spike" not in df.columns:
+            df["volume_spike"] = 1.0
+        df.iloc[-8, df.columns.get_loc("high")] = 112.8
+        df.iloc[-8, df.columns.get_loc("close")] = 112.0
+        df.iloc[-4:, df.columns.get_loc("open")] = [106.8, 107.1, 107.4, 107.65]
+        df.iloc[-4:, df.columns.get_loc("high")] = [107.4, 107.8, 108.0, 108.25]
+        df.iloc[-4:, df.columns.get_loc("low")] = [106.6, 107.0, 107.2, 107.45]
+        df.iloc[-4:, df.columns.get_loc("close")] = [107.1, 107.45, 107.75, 108.05]
+        df.iloc[-4:, df.columns.get_loc("rsi")] = [48.0, 52.0, 56.0, 59.0]
+        df.iloc[-4:, df.columns.get_loc("hist")] = [-0.08, -0.05, -0.02, 0.02]
+        df.iloc[-4:, df.columns.get_loc("volume_spike")] = [0.55, 0.62, 0.70, 0.78]
+        signal_gen = SignalGenerator(SignalConfig())
+        vp = VolumeProfileLevels(poc=107.2, vah=107.9, val=100.0)
+
+        passed, layer3 = signal_gen._layer3_entry_location(df, "SHORT", vp)
+
+        self.assertFalse(passed)
+        self.assertEqual(layer3.get("entry_location_passed"), 0.0)
+        self.assertEqual(layer3.get("late_bounce_without_upper_anchor"), 1.0)
+        self.assertIn("no_trade_late_bounce_without_upper_anchor", str(layer3.get("missing_conditions", "")))
+
     def test_live_price_overlay_updates_current_bucket_close_without_dropping_history(self):
         now_bucket = pd.Timestamp.utcnow().floor("1min")
         if now_bucket.tzinfo is None:
@@ -2047,6 +2243,30 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertAlmostEqual(float(updated.iloc[-1]["close"]), 104.25, places=8)
         self.assertAlmostEqual(float(updated.iloc[-1]["high"]), 104.25, places=8)
         self.assertAlmostEqual(float(updated.iloc[-1]["low"]), 101.0, places=8)
+
+    def test_recent_main_short_reentry_guard_blocks_same_pump_reopen_without_new_peak(self):
+        df = self._build_df()
+        recent_peak = _current_recent_peak_price(df, fallback_price=float(df.iloc[-1]["close"]))
+        now_ts = 1_800_000_000.0
+
+        blocked = _should_block_recent_main_short_reentry(
+            {
+                "BTCUSDT": {
+                    "main_short_entry_ts": now_ts - 180,
+                    "main_short_entry_price": 108.4,
+                    "main_short_peak_price": recent_peak,
+                    "main_short_atr": 1.8,
+                }
+            },
+            symbol="BTCUSDT",
+            now_ts=now_ts,
+            entry_price=108.55,
+            recent_peak_price=recent_peak + 0.2,
+            atr=1.8,
+            cooldown_sec=900,
+        )
+
+        self.assertTrue(blocked)
 
     def test_layer2_blocks_clean_breakout_continuation_without_rejection(self):
         df = self._build_df()
@@ -2399,6 +2619,129 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertTrue(trace.get("layers", {}).get("layer2_weakness_confirmation", {}).get("passed", False))
         self.assertTrue(trace.get("layers", {}).get("layer3_entry_location", {}).get("passed", False))
         self.assertTrue(trace.get("layers", {}).get("layer4_fake_filter", {}).get("passed") in (0, 0.0, False))
+
+    def test_generate_stops_at_degraded_guard_when_structure_is_weak(self):
+        df = self._build_df()
+        signal_gen = SignalGenerator(SignalConfig())
+        signal_gen._regime_filter = lambda df, regime, **kwargs: (True, {})
+        signal_gen._layer1_pump_detection = lambda df: ("SHORT", {"volume_spike": 2.3})
+        signal_gen._layer2_weakness_confirmation = lambda df, side: (
+            True,
+            {
+                "weakness_strength": 0.78,
+                "failed_reclaim": 0.0,
+                "retest_failed_breakout": 0.0,
+                "rejection_bar": 0.0,
+                "lower_close_after_peak": 0.0,
+                "lower_high_after_peak": 0.0,
+            },
+        )
+        signal_gen._layer3_entry_location = lambda df, side, vp: (
+            True,
+            {
+                "entry_location_strength": 0.80,
+                "sweep_reclaim_entry_ok": 0.0,
+                "value_area_entry_ok": 1.0,
+                "fresh_reaction_from_high": 1.0,
+                "below_vah_or_rejected_from_vah": 1.0,
+                "failed_reclaim": 0.0,
+                "retest_failed_breakout": 0.0,
+            },
+        )
+        signal_gen._layer4_fake_filter = lambda **kwargs: (
+            True,
+            {
+                "degraded_mode": 1.0,
+                "sentiment": 50.0,
+                "crowd_extreme": 0.0,
+            },
+        )
+        signal_gen._layer5_tp_sl_levels = lambda df, side, vp: (
+            True,
+            {"entry": 105.0, "tp": 101.0, "sl": 108.0, "partial_tps": []},
+        )
+
+        ctx = SignalContext(
+            symbol="BTC/USDT",
+            df=df,
+            volume_profile=VolumeProfileLevels(poc=102.0, vah=109.0, val=98.0),
+            regime=MarketRegime.PUMP,
+            sentiment_index=None,
+            sentiment_source="unavailable",
+            funding_rate=None,
+            long_short_ratio=None,
+            open_interest=None,
+            open_interest_source="unavailable",
+        )
+
+        signal = signal_gen.generate(ctx)
+
+        self.assertIsNone(signal)
+        trace = signal_gen.last_diagnostics
+        self.assertEqual(trace.get("failed_layer"), "layer4_degraded_guard")
+        self.assertTrue(trace.get("layers", {}).get("layer4_fake_filter", {}).get("passed", False))
+        self.assertTrue(trace.get("layers", {}).get("layer4_degraded_guard", {}).get("passed") in (0, 0.0, False))
+
+    def test_generate_allows_degraded_entry_only_with_hard_structure_and_caps_confidence(self):
+        df = self._build_df()
+        signal_gen = SignalGenerator(SignalConfig())
+        signal_gen._regime_filter = lambda df, regime, **kwargs: (True, {})
+        signal_gen._layer1_pump_detection = lambda df: ("SHORT", {"volume_spike": 3.8})
+        signal_gen._layer2_weakness_confirmation = lambda df, side: (
+            True,
+            {
+                "weakness_strength": 0.91,
+                "failed_reclaim": 1.0,
+                "retest_failed_breakout": 0.0,
+                "rejection_bar": 1.0,
+                "lower_close_after_peak": 1.0,
+                "lower_high_after_peak": 1.0,
+            },
+        )
+        signal_gen._layer3_entry_location = lambda df, side, vp: (
+            True,
+            {
+                "entry_location_strength": 0.92,
+                "sweep_reclaim_entry_ok": 1.0,
+                "value_area_entry_ok": 1.0,
+                "fresh_reaction_from_high": 1.0,
+                "below_vah_or_rejected_from_vah": 1.0,
+                "failed_reclaim": 1.0,
+                "retest_failed_breakout": 0.0,
+            },
+        )
+        signal_gen._layer4_fake_filter = lambda **kwargs: (
+            True,
+            {
+                "degraded_mode": 1.0,
+                "sentiment": 88.0,
+                "crowd_extreme": 1.0,
+            },
+        )
+        signal_gen._layer5_tp_sl_levels = lambda df, side, vp: (
+            True,
+            {"entry": 105.0, "tp": 101.0, "sl": 108.0, "partial_tps": []},
+        )
+
+        ctx = SignalContext(
+            symbol="BTC/USDT",
+            df=df,
+            volume_profile=VolumeProfileLevels(poc=102.0, vah=109.0, val=98.0),
+            regime=MarketRegime.PUMP,
+            sentiment_index=None,
+            sentiment_source="unavailable",
+            funding_rate=None,
+            long_short_ratio=None,
+            open_interest=None,
+            open_interest_source="unavailable",
+        )
+
+        signal = signal_gen.generate(ctx)
+
+        self.assertIsNotNone(signal)
+        self.assertLessEqual(signal.confidence, signal_gen.config.degraded_signal_confidence_cap)
+        trace = signal_gen.last_diagnostics
+        self.assertTrue(trace.get("layers", {}).get("layer4_degraded_guard", {}).get("passed", False))
 
     def test_layer5_tp_sl_pass_with_vp_target(self):
         df = self._build_df()

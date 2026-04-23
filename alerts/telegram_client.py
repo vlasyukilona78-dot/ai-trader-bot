@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
+from urllib.parse import urlparse
 
 import requests
 
@@ -15,7 +17,16 @@ class TelegramClient:
         self.token = token or ""
         self.chat_id = chat_id or ""
         self.timeout = timeout
-        self._transports = self._build_transports()
+        self._configured_proxy_url = self._resolve_proxy_url()
+        self._transports = self._build_transports(self._configured_proxy_url)
+        self._transport_names = [name for name, _ in self._transports]
+        self._has_proxy_transport = "proxy" in self._transport_names
+        logger.info(
+            "telegram transports configured transports=%s proxy_configured=%s proxy_active=%s",
+            ",".join(self._transport_names) or "none",
+            bool(self._configured_proxy_url),
+            self._has_proxy_transport,
+        )
 
     @staticmethod
     def _create_session(proxy_url: str = "") -> requests.Session:
@@ -25,12 +36,14 @@ class TelegramClient:
             session.proxies.update({"http": proxy_url, "https": proxy_url})
         return session
 
-    def _build_transports(self) -> list[tuple[str, requests.Session]]:
-        proxy_url = self._resolve_proxy_url()
+    def _build_transports(self, proxy_url: str = "") -> list[tuple[str, requests.Session]]:
         transports: list[tuple[str, requests.Session]] = []
         if proxy_url:
-            transports.append(("proxy", self._create_session(proxy_url)))
-            if self._env_truthy("TELEGRAM_DIRECT_FALLBACK", False):
+            if self._proxy_reachable(proxy_url):
+                transports.append(("proxy", self._create_session(proxy_url)))
+            else:
+                logger.warning("telegram proxy is not reachable at startup: %s", proxy_url)
+            if self._env_truthy("TELEGRAM_DIRECT_FALLBACK", True) or not transports:
                 transports.append(("direct", self._create_session()))
             return transports
         transports.append(("direct", self._create_session()))
@@ -61,6 +74,24 @@ class TelegramClient:
             if value:
                 return value
         return ""
+
+    @staticmethod
+    def _proxy_reachable(proxy_url: str) -> bool:
+        try:
+            parsed = urlparse(proxy_url)
+            host = str(parsed.hostname or "").strip()
+            port = int(parsed.port or 0)
+        except Exception:
+            return True
+        if not host or port <= 0:
+            return True
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            return True
+        try:
+            with socket.create_connection((host, port), timeout=0.35):
+                return True
+        except OSError:
+            return False
 
     @property
     def enabled(self) -> bool:
@@ -115,7 +146,7 @@ class TelegramClient:
         delivered, transport = self._post_with_failover(
             url,
             data=payload,
-            timeout=(3, max(6, int(self.timeout))) if self._resolve_proxy_url() else (4, max(6, int(self.timeout))),
+            timeout=(3, max(6, int(self.timeout))) if self._has_proxy_transport else (4, max(6, int(self.timeout))),
             attempts_per_transport=1,
         )
         if delivered:
@@ -141,7 +172,7 @@ class TelegramClient:
             url,
             data=data,
             files=files,
-            timeout=(3, max(int(self.timeout), 18)) if self._resolve_proxy_url() else (5, max(int(self.timeout), 25)),
+            timeout=(3, max(int(self.timeout), 18)) if self._has_proxy_transport else (5, max(int(self.timeout), 25)),
             attempts_per_transport=1,
         )
         if delivered:
@@ -171,7 +202,7 @@ class TelegramClient:
             url,
             data=data,
             files=files,
-            timeout=(3, max(int(self.timeout), 15)) if self._resolve_proxy_url() else (6, max(int(self.timeout), 25)),
+            timeout=(3, max(int(self.timeout), 15)) if self._has_proxy_transport else (6, max(int(self.timeout), 25)),
             attempts_per_transport=1,
         )
         if delivered:

@@ -54,6 +54,7 @@ class BybitAdapterV2Tests(unittest.TestCase):
     def test_round_qty(self):
         self.assertEqual(BybitAdapter.round_qty(1.239, 0.01), 1.23)
         self.assertEqual(BybitAdapter.round_qty(0.009, 0.01), 0.0)
+        self.assertEqual(BybitAdapter.round_qty(0.30000000000000004, 0.1), 0.3)
 
     def test_order_side_parsing_accepts_long_short_aliases(self):
         self.assertEqual(BybitAdapter._parse_order_side("LONG").value, "BUY")
@@ -131,6 +132,18 @@ class BybitAdapterV2Tests(unittest.TestCase):
         self.assertGreater(snapshot.equity_usdt, 0.0)
         self.assertGreater(snapshot.available_balance_usdt, 0.0)
         self.assertTrue(adapter._demo_auto_fund_attempted)
+
+    def test_ensure_position_leverage_records_success(self):
+        class FakeClient:
+            def set_position_leverage(self, **kwargs):
+                return {"retCode": 0, "retMsg": "OK", "result": kwargs}
+
+        adapter = object.__new__(BybitAdapter)
+        adapter.client = FakeClient()
+        adapter._applied_leverage_cache = {}
+        ok = BybitAdapter.ensure_position_leverage(adapter, "BTCUSDT", 3.0)
+        self.assertTrue(ok)
+        self.assertEqual(adapter._applied_leverage_cache["BTCUSDT"], 3.0)
 
 
 if __name__ == "__main__":

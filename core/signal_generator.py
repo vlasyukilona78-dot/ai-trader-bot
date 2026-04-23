@@ -56,6 +56,10 @@ class SignalConfig:
     regime_mtf_rsi_5m_max_short: float = 70.0
     fake_filter_lsr_extreme_soft: float = 1.01
     fake_filter_oi_volume_spike_soft: float = 1.2
+    degraded_mode_requires_strong_structure: bool = True
+    degraded_mode_min_layer2_strength: float = 0.74
+    degraded_mode_min_layer3_strength: float = 0.74
+    degraded_signal_confidence_cap: float = 0.70
     allow_long_entries: bool = False
 
 
@@ -1026,8 +1030,70 @@ class SignalGenerator:
         lower_close = bool(sweep_ctx.get("lower_close"))
         lower_high = bool(sweep_ctx.get("lower_high"))
         post_peak_followthrough = bool(sweep_ctx.get("post_peak_followthrough"))
+        rsi_last = self._safe(last.get("rsi"), 50.0)
+        rsi_prev = self._safe(prev.get("rsi"), rsi_last)
+        hist_last = self._safe(last.get("hist"), 0.0)
+        hist_prev = self._safe(prev.get("hist"), hist_last)
+        volume_spike_last = self._safe(last.get("volume_spike"), 0.0)
+        volume_spike_prev = self._safe(prev.get("volume_spike"), volume_spike_last)
+        rsi_rollover = bool(rsi_last < rsi_prev)
+        hist_rollover = bool(hist_last < hist_prev)
+        volume_fade = bool(
+            volume_spike_last <= max(volume_spike_prev * 0.96, volume_spike_prev - 0.12)
+            or volume_spike_last <= max(0.95, volume_spike_prev * 0.88)
+        )
         ema20_last = self._safe(last.get("ema20"), 0.0)
         ema20_prev = self._safe(prev.get("ema20"), ema20_last)
+        recent_close_tail = pd.to_numeric(df.tail(4)["close"], errors="coerce").dropna()
+        up_closes_last3 = 0
+        if len(recent_close_tail) >= 2:
+            recent_close_values = recent_close_tail.to_numpy(dtype=float)
+            up_closes_last3 = int(
+                sum(curr > prev_close_value for prev_close_value, curr in zip(recent_close_values[:-1], recent_close_values[1:]))
+            )
+        last_high = self._safe(last.get("high"), close)
+        last_low = self._safe(last.get("low"), close)
+        candle_range = max(last_high - last_low, 1e-8)
+        close_position_in_candle = max(0.0, min(1.0, (close - last_low) / candle_range))
+        open_px = self._safe(last.get("open"), close)
+        body_pct = (close - open_px) / max(close, 1e-8)
+        upper_wick_ratio = max(last_high - max(open_px, close), 0.0) / candle_range
+        atr = max(self._safe(last.get("atr"), close * 0.01), close * 0.001, 1e-8)
+        atr_pct = atr / max(close, 1e-8)
+        recent_high_series = pd.to_numeric(
+            df.tail(min(len(df), 24)).get("high"),
+            errors="coerce",
+        ).dropna()
+        recent_high_24 = float(recent_high_series.max()) if not recent_high_series.empty else last_high
+        distance_from_recent_high_pct = max(0.0, (recent_high_24 - close) / max(recent_high_24, 1e-8))
+        mtf_trend_5m = self._safe(last.get("mtf_trend_5m"), 0.0)
+        mtf_rsi_5m = self._safe(last.get("mtf_rsi_5m"), 50.0)
+        bb_upper = self._safe(last.get("bb_upper"), 0.0)
+        kc_upper = self._safe(last.get("kc_upper"), 0.0)
+        upper_band_ref = max(bb_upper, kc_upper, 0.0)
+        above_fast_upper_band = bool(upper_band_ref > 0 and close >= upper_band_ref * (1.0 - max(tol * 0.18, 0.00045)))
+        green_extension_bar = bool(close >= max(open_px, prev_close) and close_position_in_candle >= 0.66)
+        first_impulse_volume_climax = bool(
+            close >= prev_close
+            and volume_spike_last >= max(2.25, volume_spike_prev * 1.18)
+            and close_position_in_candle >= 0.40
+            and not failed_reclaim
+            and not retest_failed_breakout
+            and not lower_close
+            and not lower_high
+            and not volume_fade
+        )
+        live_breakout_extension = bool(
+            green_extension_bar
+            and (above_fast_upper_band or rsi_last >= 78.0)
+            and upper_wick_ratio <= 0.24
+            and (volume_spike_last >= 0.75 or rsi_last >= 84.0 or above_fast_upper_band)
+            and not failed_reclaim
+            and not retest_failed_breakout
+            and not rejection_bar
+            and not lower_close
+            and not lower_high
+        )
 
         trigger_ctx = below_or_rej or failed_reclaim or retest_failed_breakout
         value_ctx = poc_ctx or failed_reclaim or retest_failed_breakout
@@ -1045,14 +1111,93 @@ class SignalGenerator:
             or failed_reclaim
             or retest_failed_breakout
         )
+        fade_points = (
+            int(rejection_bar)
+            + int(lower_close)
+            + int(lower_high)
+            + int(rsi_rollover)
+            + int(hist_rollover)
+            + int(volume_fade)
+        )
+        strong_fade_confirmed = bool(
+            failed_reclaim
+            or retest_failed_breakout
+            or fade_points >= 4
+            or (
+                (lower_close or rejection_bar)
+                and (rsi_rollover or hist_rollover)
+                and volume_fade
+            )
+        )
+        fade_ready = bool(
+            strong_fade_confirmed
+            or (
+                below_vah
+                and micro_break_confirmed
+            )
+        )
+        entry_zone_resolved = bool(
+            below_vah
+            or failed_reclaim
+            or retest_failed_breakout
+            or (rejected and fade_ready)
+        )
         continuation_above_fast_value = bool(
             ema20_last > 0
             and close >= ema20_last * (1.0 - max(tol * 0.10, 0.00035))
             and ema20_last >= ema20_prev
             and close >= prev_close * (1.0 - max(tol * 0.12, 0.00035))
+            and volume_spike_last >= max(0.95, volume_spike_prev * 0.92)
             and not failed_reclaim
             and not retest_failed_breakout
-            and not fresh_reaction
+            and not fade_ready
+        )
+        strong_live_continuation = bool(
+            up_closes_last3 >= 2
+            and close >= prev_close * (1.0 - max(tol * 0.08, 0.00025))
+            and close_position_in_candle >= 0.56
+            and volume_spike_last >= max(0.95, volume_spike_prev * 0.90, 0.85)
+            and ema20_last >= ema20_prev
+            and not failed_reclaim
+            and not retest_failed_breakout
+            and not rejection_bar
+            and not lower_high
+            and not volume_fade
+        )
+        high_mtf_continuation = bool(
+            mtf_trend_5m >= max(float(self.config.regime_mtf_trend_5m_max_short) * 4.5, 0.0060)
+            and mtf_rsi_5m >= max(float(self.config.regime_mtf_rsi_5m_max_short) + 5.0, 75.0)
+            and close >= prev_close * (1.0 - max(tol * 0.10, 0.00035))
+            and close_position_in_candle >= 0.52
+            and body_pct >= -max(tol * 0.18, 0.0010)
+            and not failed_reclaim
+            and not retest_failed_breakout
+            and not strong_fade_confirmed
+        )
+        far_from_recent_peak = bool(
+            distance_from_recent_high_pct >= max(atr_pct * 1.35, 0.018 if close < 0.02 else 0.012)
+        )
+        meaningfully_below_vah = bool(
+            close <= vp.vah * (1.0 - max(tol * 0.40, 0.0022 if close < 0.02 else 0.0016))
+        )
+        late_bounce_without_upper_anchor = bool(
+            far_from_recent_peak
+            and close >= prev_close * (1.0 - max(tol * 0.12, 0.00035))
+            and close_position_in_candle >= 0.52
+            and body_pct >= -max(tol * 0.20, 0.0012)
+            and not meaningfully_below_vah
+            and not failed_reclaim
+            and not retest_failed_breakout
+            and not rejection_bar
+            and not strong_fade_confirmed
+        )
+        continuation_above_fast_value = bool(
+            continuation_above_fast_value
+            or strong_live_continuation
+            or live_breakout_extension
+            or first_impulse_volume_climax
+            or high_mtf_continuation
+            or late_bounce_without_upper_anchor
         )
         sweep_entry_ok = bool((failed_reclaim or retest_failed_breakout) and micro_break_confirmed and not acceptance_above_high)
         value_entry_ok = bool(
@@ -1061,6 +1206,8 @@ class SignalGenerator:
             and bool(msb_ok)
             and micro_break_confirmed
             and fresh_reaction_or_reject
+            and (strong_fade_confirmed or below_vah)
+            and entry_zone_resolved
             and not acceptance_above_high
             and not continuation_above_fast_value
         )
@@ -1080,10 +1227,18 @@ class SignalGenerator:
             missing.append("msb_bearish_confirmed")
         if not (fresh_reaction_or_reject or sweep_entry_ok):
             missing.append("fresh_reaction_from_high")
+        if not (fade_ready or sweep_entry_ok):
+            missing.append("fade_confirmation")
+        if not (entry_zone_resolved or sweep_entry_ok):
+            missing.append("resolved_below_vah_or_failed_reclaim")
         if acceptance_above_high:
             missing.append("acceptance_above_swing_high")
         if continuation_above_fast_value:
             missing.append("no_trade_continuation_above_fast_value")
+        if high_mtf_continuation:
+            missing.append("no_trade_high_mtf_continuation")
+        if late_bounce_without_upper_anchor:
+            missing.append("no_trade_late_bounce_without_upper_anchor")
 
         d = {
             "entry_location_passed": 1.0 if passed else 0.0,
@@ -1099,7 +1254,17 @@ class SignalGenerator:
             "acceptance_above_swing_high": 1.0 if acceptance_above_high else 0.0,
             "msb_bearish_confirmed": 1.0 if bool(msb_ok) else 0.0,
             "fresh_reaction_from_high": 1.0 if fresh_reaction else 0.0,
+            "fade_confirmation": 1.0 if fade_ready else 0.0,
+            "resolved_below_vah_or_failed_reclaim": 1.0 if entry_zone_resolved else 0.0,
             "continuation_above_fast_value": 1.0 if continuation_above_fast_value else 0.0,
+            "live_breakout_extension": 1.0 if live_breakout_extension else 0.0,
+            "first_impulse_volume_climax": 1.0 if first_impulse_volume_climax else 0.0,
+            "high_mtf_continuation": 1.0 if high_mtf_continuation else 0.0,
+            "late_bounce_without_upper_anchor": 1.0 if late_bounce_without_upper_anchor else 0.0,
+            "distance_from_recent_high_pct": float(distance_from_recent_high_pct),
+            "meaningfully_below_vah": 1.0 if meaningfully_below_vah else 0.0,
+            "mtf_trend_5m_used": float(mtf_trend_5m),
+            "mtf_rsi_5m_used": float(mtf_rsi_5m),
             "vp_levels_available": 1.0,
             "below_vah": 1.0 if below_vah else 0.0,
         }
@@ -1260,6 +1425,95 @@ class SignalGenerator:
             "vwap_tolerance_pct": float(vwap_tol),
             "funding_tolerance": float(funding_tol),
             "ratio_tolerance": float(self.config.long_short_ratio_tolerance),
+        }
+
+    def _layer4_degraded_structure_guard(
+        self,
+        *,
+        side: str,
+        layer2: dict[str, Any],
+        layer3: dict[str, Any],
+        layer4: dict[str, Any],
+    ) -> tuple[bool, dict[str, Any]]:
+        if side != "SHORT":
+            return False, {
+                "passed": 0.0,
+                "degraded_mode": 1.0,
+                "guard_active": 1.0,
+                "failed_reason": "unsupported_side_not_short",
+                "missing_conditions": "short_context_required",
+            }
+
+        degraded = bool(float(layer4.get("degraded_mode", 0.0) or 0.0))
+        if not degraded or not bool(self.config.degraded_mode_requires_strong_structure):
+            return True, {
+                "passed": 1.0,
+                "degraded_mode": 1.0 if degraded else 0.0,
+                "guard_active": 1.0 if degraded else 0.0,
+                "failed_reason": "none",
+                "missing_conditions": "",
+            }
+
+        failed_reclaim = bool(float(layer2.get("failed_reclaim", 0.0) or 0.0) or float(layer3.get("failed_reclaim", 0.0) or 0.0))
+        retest_failed_breakout = bool(
+            float(layer2.get("retest_failed_breakout", 0.0) or 0.0)
+            or float(layer3.get("retest_failed_breakout", 0.0) or 0.0)
+        )
+        rejection_bar = bool(float(layer2.get("rejection_bar", 0.0) or 0.0))
+        lower_close = bool(float(layer2.get("lower_close_after_peak", 0.0) or 0.0))
+        lower_high = bool(float(layer2.get("lower_high_after_peak", 0.0) or 0.0))
+        sweep_entry_ok = bool(float(layer3.get("sweep_reclaim_entry_ok", 0.0) or 0.0))
+        value_entry_ok = bool(float(layer3.get("value_area_entry_ok", 0.0) or 0.0))
+        fresh_reaction = bool(float(layer3.get("fresh_reaction_from_high", 0.0) or 0.0))
+        rejected_from_vah = bool(float(layer3.get("below_vah_or_rejected_from_vah", 0.0) or 0.0))
+        weakness_strength = float(self._safe(layer2.get("weakness_strength"), 0.0))
+        entry_strength = float(self._safe(layer3.get("entry_location_strength"), 0.0))
+
+        hard_reject = bool(failed_reclaim or retest_failed_breakout or sweep_entry_ok)
+        reaction_rollover = bool((rejection_bar and lower_close) or (lower_close and lower_high) or (rejection_bar and lower_high))
+        strength_ok = bool(
+            weakness_strength >= float(self.config.degraded_mode_min_layer2_strength)
+            and entry_strength >= float(self.config.degraded_mode_min_layer3_strength)
+        )
+        structural_pass = bool(
+            hard_reject
+            or (
+                value_entry_ok
+                and fresh_reaction
+                and rejected_from_vah
+                and reaction_rollover
+                and strength_ok
+            )
+        )
+
+        missing: list[str] = []
+        if not hard_reject:
+            missing.append("hard_upper_reject")
+        if not reaction_rollover:
+            missing.append("reaction_rollover")
+        if not strength_ok:
+            missing.append("structural_strength")
+        if not rejected_from_vah:
+            missing.append("upper_anchor_reject")
+        if not fresh_reaction:
+            missing.append("fresh_reaction")
+        if not (value_entry_ok or sweep_entry_ok):
+            missing.append("qualified_entry_location")
+
+        return structural_pass, {
+            "passed": 1.0 if structural_pass else 0.0,
+            "degraded_mode": 1.0,
+            "guard_active": 1.0,
+            "hard_upper_reject": 1.0 if hard_reject else 0.0,
+            "reaction_rollover": 1.0 if reaction_rollover else 0.0,
+            "structural_strength_ok": 1.0 if strength_ok else 0.0,
+            "upper_anchor_reject": 1.0 if rejected_from_vah else 0.0,
+            "fresh_reaction": 1.0 if fresh_reaction else 0.0,
+            "qualified_entry_location": 1.0 if (value_entry_ok or sweep_entry_ok) else 0.0,
+            "weakness_strength": weakness_strength,
+            "entry_location_strength": entry_strength,
+            "failed_reason": "none" if structural_pass else f"missing:{','.join(missing)}",
+            "missing_conditions": "" if structural_pass else ",".join(missing),
         }
 
     def _layer5_tp_sl_levels(self, df: pd.DataFrame, side: str, vp: VolumeProfileLevels | None) -> tuple[bool, dict[str, Any]]:
@@ -1592,6 +1846,18 @@ class SignalGenerator:
             self.last_diagnostics = trace
             return None
 
+        layer4_guard_ok, layer4_guard = self._layer4_degraded_structure_guard(
+            side=side,
+            layer2=layer2,
+            layer3=layer3,
+            layer4=layer4,
+        )
+        trace["layers"]["layer4_degraded_guard"] = {"passed": layer4_guard_ok, "details": layer4_guard}
+        if not layer4_guard_ok:
+            trace["failed_layer"] = "layer4_degraded_guard"
+            self.last_diagnostics = trace
+            return None
+
         layer5_ok, layer5 = self._layer5_tp_sl_levels(df, side, context.volume_profile)
         trace["layers"]["layer5_tp_sl"] = {"passed": layer5_ok, "details": layer5}
         if not layer5_ok:
@@ -1610,6 +1876,8 @@ class SignalGenerator:
         confidence += 0.10 * abs(float(layer4.get("sentiment", 50.0)) - 50.0) / 50.0
         confidence += 0.10 * float(layer4.get("crowd_extreme", 0.0))
         confidence += 0.20 if context.regime in (MarketRegime.PUMP, MarketRegime.PANIC, MarketRegime.TREND) else 0.05
+        if bool(float(layer4.get("degraded_mode", 0.0) or 0.0)):
+            confidence = min(confidence, float(self.config.degraded_signal_confidence_cap))
         confidence = float(max(0.0, min(confidence, 0.99)))
 
         signal_id = f"{context.symbol.replace('/', '')}-{int(datetime.now(timezone.utc).timestamp() * 1000)}"

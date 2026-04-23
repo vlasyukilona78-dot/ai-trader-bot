@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from tests.v2.fakes import FakeAdapter
 from trading.execution.engine import ExecutionEngine
-from trading.exchange.schemas import OpenOrderSnapshot, OrderSide, PositionSide, PositionSnapshot
+from trading.exchange.schemas import OpenOrderSnapshot, OrderResult, OrderSide, PositionSide, PositionSnapshot
 from trading.market_data.reconciliation import ExchangeSnapshot
 from trading.risk.engine import RiskDecision
 from trading.signals.signal_types import IntentAction, StrategyIntent
@@ -327,6 +327,125 @@ class ExecutionEngineV2Tests(unittest.TestCase):
         )
         self.assertFalse(out.accepted)
         self.assertTrue(out.reason.startswith("state:"))
+
+    def test_exit_ignores_stale_snapshot_when_exchange_position_is_already_flat(self):
+        self.sm.transition("BTCUSDT", TradeState.SHORT, "live")
+        self.adapter.positions = []
+        stale_snapshot = ExchangeSnapshot(
+            symbol="BTCUSDT",
+            account=self.adapter.get_account(),
+            positions=[
+                PositionSnapshot(
+                    symbol="BTCUSDT",
+                    side=PositionSide.SHORT,
+                    qty=1.0,
+                    entry_price=100.0,
+                    liq_price=0.0,
+                    leverage=1.0,
+                    position_idx=0,
+                    stop_loss=101.0,
+                )
+            ],
+            open_orders=[],
+        )
+        intent = StrategyIntent(symbol="BTCUSDT", action=IntentAction.EXIT_SHORT, reason="managed_exit")
+
+        out = self.exec.execute(
+            intent=intent,
+            risk=RiskDecision(approved=True, reason="ok"),
+            snapshot=stale_snapshot,
+            mark_price=100.0,
+        )
+
+        self.assertFalse(out.accepted)
+        self.assertEqual(out.status, "IGNORED")
+        self.assertEqual(out.reason, "no_live_position")
+        self.assertEqual(self.sm.get("BTCUSDT").state, TradeState.FLAT)
+
+    def test_retries_after_leverage_alignment_error(self):
+        self.sm.transition("BTCUSDT", TradeState.FLAT, "init")
+        self.adapter.config = SimpleNamespace(demo=False, testnet=True, dry_run=False, target_entry_leverage=3.0)
+        self.adapter.fail_order_results = [
+            OrderResult(
+                success=False,
+                order_id="",
+                order_link_id="cid",
+                avg_price=0.0,
+                filled_qty=0.0,
+                status="Rejected",
+                raw={"retCode": 110090, "retMsg": "Please adjust your leverage to 6 or below to increase the max. position limit."},
+                error="Order placement failed as your position may exceed the max. limit.",
+            )
+        ]
+        intent = StrategyIntent(symbol="BTCUSDT", action=IntentAction.LONG_ENTRY, reason="x", stop_loss=99.0, take_profit=102.0)
+
+        out = self.exec.execute(
+            intent=intent,
+            risk=RiskDecision(approved=True, reason="ok", quantity=1.0),
+            snapshot=self._snapshot("BTCUSDT"),
+            mark_price=100.0,
+        )
+
+        self.assertTrue(out.accepted)
+        self.assertEqual(len(self.adapter.ensure_leverage_calls), 1)
+        self.assertEqual(self.adapter.ensure_leverage_calls[0]["symbol"], "BTCUSDT")
+
+    def test_retries_after_qty_invalid_with_fresh_rules(self):
+        self.sm.transition("BTCUSDT", TradeState.FLAT, "init")
+        self.adapter.config = SimpleNamespace(demo=False, testnet=True, dry_run=False, target_entry_leverage=3.0)
+        self.adapter.instrument_rules["BTCUSDT"] = self.adapter.instrument_rules["BTCUSDT"].__class__(
+            symbol="BTCUSDT",
+            tick_size=0.1,
+            qty_step=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            max_qty=0.0,
+        )
+        self.adapter.fail_order_results = [
+            OrderResult(
+                success=False,
+                order_id="",
+                order_link_id="cid",
+                avg_price=0.0,
+                filled_qty=0.0,
+                status="Rejected",
+                raw={"retCode": 10001, "retMsg": "Qty invalid"},
+                error="Qty invalid",
+            )
+        ]
+        intent = StrategyIntent(symbol="BTCUSDT", action=IntentAction.LONG_ENTRY, reason="x", stop_loss=99.0, take_profit=102.0)
+
+        out = self.exec.execute(
+            intent=intent,
+            risk=RiskDecision(approved=True, reason="ok", quantity=0.30000000000000004),
+            snapshot=self._snapshot("BTCUSDT"),
+            mark_price=100.0,
+        )
+
+        self.assertTrue(out.accepted)
+        self.assertEqual(self.adapter.force_refresh_calls, ["BTCUSDT"])
+        self.assertAlmostEqual(float(self.adapter.placed_orders[-1].qty), 0.3, places=6)
+
+    def test_entry_revalidates_after_account_refresh_when_snapshot_balance_is_stale(self):
+        self.sm.transition("BTCUSDT", TradeState.FLAT, "init")
+        self.adapter.account = self.adapter.account.__class__(equity_usdt=1000.0, available_balance_usdt=1000.0)
+        stale_snapshot = ExchangeSnapshot(
+            symbol="BTCUSDT",
+            account=self.adapter.account.__class__(equity_usdt=1000.0, available_balance_usdt=0.0),
+            positions=[],
+            open_orders=[],
+        )
+        intent = StrategyIntent(symbol="BTCUSDT", action=IntentAction.SHORT_ENTRY, reason="x", stop_loss=101.0, take_profit=97.0)
+
+        out = self.exec.execute(
+            intent=intent,
+            risk=RiskDecision(approved=True, reason="ok", quantity=1.0),
+            snapshot=stale_snapshot,
+            mark_price=100.0,
+        )
+
+        self.assertTrue(out.accepted)
+        self.assertEqual(out.status, "FILLED")
 
 
 if __name__ == "__main__":

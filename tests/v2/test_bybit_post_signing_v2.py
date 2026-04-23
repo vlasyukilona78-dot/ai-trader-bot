@@ -165,6 +165,20 @@ class BybitPostSigningV2Tests(unittest.TestCase):
         finally:
             client.close()
 
+    def test_set_position_leverage_uses_explicit_buy_and_sell_values(self):
+        client = self._make_client()
+        try:
+            _ = client.set_position_leverage(symbol="BTCUSDT", buy_leverage=3.0, sell_leverage=4.0)
+            kwargs = client._sess.request.call_args.kwargs
+            sent_body = kwargs.get("data")
+            self.assertIsInstance(sent_body, str)
+            payload = json.loads(sent_body)
+            self.assertEqual(payload.get("symbol"), "BTCUSDT")
+            self.assertEqual(payload.get("buyLeverage"), "3.0")
+            self.assertEqual(payload.get("sellLeverage"), "4.0")
+        finally:
+            client.close()
+
 
 if __name__ == "__main__":
     unittest.main()

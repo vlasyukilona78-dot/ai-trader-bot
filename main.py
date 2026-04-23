@@ -6,6 +6,7 @@ import time
 import threading
 from pathlib import Path
 from queue import Empty, Queue
+from typing import TextIO
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 PROJECT_RUNTIME_SITE_PACKAGES = PROJECT_ROOT / ".runtime_env" / "Lib" / "site-packages"
@@ -21,6 +22,30 @@ PROJECT_VENV_PYTHON = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
 PROJECT_RUNTIME_CFG = PROJECT_ROOT / ".runtime_env" / "pyvenv.cfg"
 PROJECT_RUNTIME_LOG_DIR = PROJECT_ROOT / "logs" / "runtime"
 SUPERVISOR_STATE_PATH = PROJECT_RUNTIME_LOG_DIR / "active_supervisor.json"
+
+
+def _emit_supervisor_log(message: str, log_stream: TextIO | None = None) -> None:
+    try:
+        print(message, flush=True)
+    except TypeError:
+        print(message)
+    if log_stream is None:
+        return
+    try:
+        log_stream.write(f"{message}\n")
+        log_stream.flush()
+    except Exception:
+        return
+
+
+def _open_supervisor_run_log() -> tuple[Path, TextIO | None]:
+    PROJECT_RUNTIME_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    path = PROJECT_RUNTIME_LOG_DIR / f"bot_supervisor_live_{stamp}_{os.getpid()}.log"
+    try:
+        return path, path.open("a", encoding="utf-8", buffering=1)
+    except Exception:
+        return path, None
 
 
 def _select_base_python_from_runtime_cfg() -> str | None:
@@ -117,13 +142,15 @@ def _read_active_supervisor_state() -> dict[str, object]:
         return {}
 
 
-def _write_active_supervisor_state(*, pid: int) -> None:
+def _write_active_supervisor_state(*, pid: int, log_path: str = "") -> None:
     PROJECT_RUNTIME_LOG_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
         "pid": int(pid),
         "cwd": str(PROJECT_ROOT),
         "updated_at": int(time.time()),
     }
+    if log_path:
+        payload["log_path"] = str(log_path)
     SUPERVISOR_STATE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -137,7 +164,7 @@ def _clear_active_supervisor_state(*, pid: int) -> None:
         pass
 
 
-def _stop_previous_supervisor_if_needed() -> None:
+def _stop_previous_supervisor_if_needed(log_stream: TextIO | None = None) -> None:
     state = _read_active_supervisor_state()
     previous_pid = int(state.get("pid") or 0)
     if previous_pid <= 0 or previous_pid == os.getpid():
@@ -150,12 +177,19 @@ def _stop_previous_supervisor_if_needed() -> None:
         timeout=20,
     )
     if result.returncode == 0:
-        print(f"[supervisor] stopped previous supervisor pid={previous_pid}")
+        _emit_supervisor_log(f"[supervisor] stopped previous supervisor pid={previous_pid}", log_stream)
         return
     stderr = (result.stderr or "").strip()
     stdout = (result.stdout or "").strip()
     details = stderr or stdout
-    print(f"[supervisor] previous supervisor stop skipped pid={previous_pid} details={details}")
+    if details:
+        details = f"taskkill_failed_exit_code={result.returncode}"
+    else:
+        details = "taskkill_failed"
+    _emit_supervisor_log(
+        f"[supervisor] previous supervisor stop skipped pid={previous_pid} details={details}",
+        log_stream,
+    )
 
 
 def _run_dual_profile_supervisor() -> int:
@@ -163,14 +197,18 @@ def _run_dual_profile_supervisor() -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True, write_through=True)
     except Exception:
         pass
-    _stop_previous_supervisor_if_needed()
-    _write_active_supervisor_state(pid=os.getpid())
+    supervisor_log_path, supervisor_log_stream = _open_supervisor_run_log()
+    _stop_previous_supervisor_if_needed(log_stream=supervisor_log_stream)
+    _write_active_supervisor_state(pid=os.getpid(), log_path=str(supervisor_log_path))
     profiles = ("main", "early")
     out_queue: Queue[tuple[str, str | None]] = Queue()
     processes: dict[str, subprocess.Popen[str]] = {}
     threads: list[threading.Thread] = []
 
-    print("[supervisor] Starting demo profiles: main + early")
+    _emit_supervisor_log(
+        f"[supervisor] Starting demo profiles: main + early log={supervisor_log_path}",
+        supervisor_log_stream,
+    )
     for profile in profiles:
         process = _spawn_profile(profile)
         processes[profile] = process
@@ -181,7 +219,7 @@ def _run_dual_profile_supervisor() -> int:
         )
         thread.start()
         threads.append(thread)
-        print(f"[supervisor] {profile} pid={process.pid}")
+        _emit_supervisor_log(f"[supervisor] {profile} pid={process.pid}", supervisor_log_stream)
 
     active = set(profiles)
     interrupted = False
@@ -192,27 +230,35 @@ def _run_dual_profile_supervisor() -> int:
             except Empty:
                 for profile in list(active):
                     if processes[profile].poll() is not None:
-                        print(f"[supervisor] {profile} exited code={processes[profile].returncode}")
+                        _emit_supervisor_log(
+                            f"[supervisor] {profile} exited code={processes[profile].returncode}",
+                            supervisor_log_stream,
+                        )
                         active.discard(profile)
                 continue
 
             if line is None:
                 code = processes[profile].poll()
-                print(f"[supervisor] {profile} exited code={code}")
+                _emit_supervisor_log(f"[supervisor] {profile} exited code={code}", supervisor_log_stream)
                 active.discard(profile)
                 continue
 
             if line:
-                print(f"[{profile}] {line}")
+                _emit_supervisor_log(f"[{profile}] {line}", supervisor_log_stream)
     except KeyboardInterrupt:
         interrupted = True
-        print("[supervisor] Stopping child profiles...")
+        _emit_supervisor_log("[supervisor] Stopping child profiles...", supervisor_log_stream)
     finally:
         for process in processes.values():
             _terminate_process(process)
         for thread in threads:
             thread.join(timeout=1)
         _clear_active_supervisor_state(pid=os.getpid())
+        if supervisor_log_stream is not None:
+            try:
+                supervisor_log_stream.close()
+            except Exception:
+                pass
 
     if interrupted:
         return 0

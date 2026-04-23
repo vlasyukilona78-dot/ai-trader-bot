@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import logging
-import math
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Protocol
 
 from trading.exchange.events import NormalizedExchangeEvent
@@ -71,6 +71,7 @@ class BybitAdapterConfig:
     ws_ping_interval_sec: float = 30.0
     ws_ping_timeout_sec: float = 20.0
     ws_symbols: list[str] = field(default_factory=list)
+    target_entry_leverage: float = 3.0
 
 
 @dataclass
@@ -97,6 +98,7 @@ class BybitAdapter:
             recv_window=config.recv_window,
         )
         self._rules_cache: dict[str, _RulesCacheEntry] = {}
+        self._applied_leverage_cache: dict[str, float] = {}
         self._ws_stream: BybitWebSocketStream | None = None
         self._demo_auto_fund_attempted = False
         self._init_ws()
@@ -202,9 +204,16 @@ class BybitAdapter:
     def round_qty(qty: float, qty_step: float) -> float:
         if qty_step <= 0:
             return float(max(qty, 0.0))
-        units = math.floor(max(qty, 0.0) / qty_step)
-        rounded = units * qty_step
-        return float(max(rounded, 0.0))
+        try:
+            qty_d = Decimal(str(max(qty, 0.0)))
+            step_d = Decimal(str(qty_step))
+        except (InvalidOperation, ValueError):
+            return float(max(qty, 0.0))
+        if step_d <= 0:
+            return float(max(qty, 0.0))
+        units = (qty_d / step_d).to_integral_value(rounding=ROUND_DOWN)
+        rounded = (units * step_d).normalize()
+        return float(max(rounded, Decimal("0")))
 
     def set_ws_symbols(self, symbols: list[str]):
         clean = [self.normalize_symbol(s) for s in symbols if s]
@@ -391,14 +400,14 @@ class BybitAdapter:
                 return val
         return 0.0
 
-    def get_instrument_rules(self, symbol: str) -> InstrumentRules:
+    def get_instrument_rules(self, symbol: str, *, force_refresh: bool = False) -> InstrumentRules:
         norm = self.normalize_symbol(symbol)
         now = time.time()
         ttl = max(1, int(self.config.instrument_rules_ttl_sec))
         max_age = max(ttl, int(self.config.instrument_rules_max_age_sec))
 
         entry = self._rules_cache.get(norm)
-        if entry is not None and (now - entry.fetched_at) <= ttl:
+        if not force_refresh and entry is not None and (now - entry.fetched_at) <= ttl:
             return entry.rules
 
         try:
@@ -414,6 +423,36 @@ class BybitAdapter:
             if entry is not None and (now - entry.fetched_at) <= max_age:
                 return entry.rules
             raise InstrumentMetadataError(f"instrument_rules_unavailable:{norm}") from exc
+
+    def ensure_position_leverage(self, symbol: str, leverage: float) -> bool:
+        target = float(leverage or 0.0)
+        if target <= 0:
+            return False
+        norm = self.normalize_symbol(symbol)
+        cached = float(self._applied_leverage_cache.get(norm, 0.0) or 0.0)
+        if abs(cached - target) <= 1e-9:
+            return True
+        resp = self.client.set_position_leverage(
+            symbol=norm,
+            buy_leverage=target,
+            sell_leverage=target,
+        )
+        ret_code = int(resp.get("retCode", 1)) if isinstance(resp, dict) else 1
+        ret_msg = str(resp.get("retMsg", "") if isinstance(resp, dict) else "")
+        normalized_msg = ret_msg.lower()
+        ok = ret_code == 0 or ret_code == 110043 or "not modified" in normalized_msg or "same leverage" in normalized_msg
+        if ok:
+            self._applied_leverage_cache[norm] = target
+            logger.info("bybit leverage aligned symbol=%s leverage=%s retCode=%s", norm, target, ret_code)
+            return True
+        logger.warning(
+            "bybit leverage alignment failed symbol=%s leverage=%s retCode=%s retMsg=%s",
+            norm,
+            target,
+            ret_code,
+            ret_msg,
+        )
+        return False
 
     def get_account_mode_details(self) -> dict[str, Any]:
         payload = self.client.get_account_info()

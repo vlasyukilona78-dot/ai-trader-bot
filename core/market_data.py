@@ -141,7 +141,15 @@ class MarketDataClient:
 
         return sorted(set(symbols))
 
-    def fetch_ohlcv(self, symbol: str, interval: str = "1", limit: int = 300) -> pd.DataFrame:
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        interval: str = "1",
+        limit: int = 300,
+        *,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+    ) -> pd.DataFrame:
         category = self._category_for_symbol(symbol)
         params = {
             "category": category,
@@ -149,6 +157,10 @@ class MarketDataClient:
             "interval": str(interval),
             "limit": int(limit),
         }
+        if start_ms is not None:
+            params["start"] = int(start_ms)
+        if end_ms is not None:
+            params["end"] = int(end_ms)
         payload = self._request_public("/v5/market/kline", params=params)
         if not payload:
             return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])

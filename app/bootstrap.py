@@ -694,13 +694,14 @@ def load_runtime_config() -> RuntimeConfig:
         instrument_rules_max_age_sec=int(os.getenv("INSTRUMENT_RULES_MAX_AGE_SEC", "3600")),
         ws_enabled=_env_bool("WS_ENABLED", True),
         ws_private_enabled=_env_bool("WS_PRIVATE_ENABLED", True),
-        ws_stale_after_sec=int(os.getenv("WS_STALE_AFTER_SEC", "25")),
+        ws_stale_after_sec=int(os.getenv("WS_STALE_AFTER_SEC", "45")),
         ws_reconnect_delay_sec=float(os.getenv("WS_RECONNECT_DELAY_SEC", "1.0")),
         ws_open_timeout_sec=float(os.getenv("WS_OPEN_TIMEOUT_SEC", "12.0")),
         ws_close_timeout_sec=float(os.getenv("WS_CLOSE_TIMEOUT_SEC", "6.0")),
-        ws_ping_interval_sec=float(os.getenv("WS_PING_INTERVAL_SEC", "30.0")),
-        ws_ping_timeout_sec=float(os.getenv("WS_PING_TIMEOUT_SEC", "20.0")),
+        ws_ping_interval_sec=float(os.getenv("WS_PING_INTERVAL_SEC", "60.0")),
+        ws_ping_timeout_sec=float(os.getenv("WS_PING_TIMEOUT_SEC", "30.0")),
         ws_symbols=symbols,
+        target_entry_leverage=float(os.getenv("BYBIT_TARGET_ENTRY_LEVERAGE", os.getenv("RISK_MAX_LEVERAGE", "3.0"))),
     )
 
     cfg = RuntimeConfig(
