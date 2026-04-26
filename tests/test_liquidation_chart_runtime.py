@@ -15,12 +15,11 @@ from trading.signals.signal_types import IntentAction, StrategyIntent
 class LiquidationChartRuntimeTests(unittest.TestCase):
     @staticmethod
     def _build_df() -> pd.DataFrame:
-        idx = pd.date_range("2026-03-01", periods=96, freq="min", tz="UTC")
-        close = np.linspace(100.0, 107.0, 96)
-        close[-14:] = [105.8, 106.6, 107.4, 108.8, 108.2, 107.6, 107.8, 107.5, 107.1, 106.9, 106.5, 106.2, 105.9, 105.7]
-        volume = np.linspace(1200.0, 2000.0, 96)
-        volume[-13] = 3600.0
-        volume[-5] = 3100.0
+        idx = pd.date_range("2026-03-01", periods=80, freq="min", tz="UTC")
+        close = np.linspace(100.0, 108.0, 80)
+        close[-1] = 107.6
+        close[-2] = 108.1
+        volume = np.linspace(1200.0, 2000.0, 80)
         df = pd.DataFrame(
             {
                 "open": close - 0.35,
@@ -28,24 +27,22 @@ class LiquidationChartRuntimeTests(unittest.TestCase):
                 "low": close - 0.60,
                 "close": close,
                 "volume": volume,
-                "atr": np.full(96, 0.95),
+                "atr": np.full(80, 0.95),
                 "ema20": pd.Series(close).ewm(span=20, adjust=False).mean().values,
                 "ema50": pd.Series(close).ewm(span=50, adjust=False).mean().values,
                 "vwap": close - 0.25,
-                "rsi": np.linspace(54.0, 61.0, 96),
-                "volume_spike": np.linspace(1.0, 1.35, 96),
+                "rsi": np.linspace(54.0, 61.0, 80),
+                "volume_spike": np.linspace(1.0, 1.35, 80),
                 "bb_upper": close + 0.20,
                 "kc_upper": close + 0.12,
-                "hist": np.linspace(0.20, -0.03, 96),
-                "obv": np.linspace(100.0, 170.0, 96),
-                "cvd": np.linspace(120.0, 180.0, 96),
+                "hist": np.linspace(0.20, -0.03, 80),
+                "obv": np.linspace(100.0, 170.0, 80),
+                "cvd": np.linspace(120.0, 180.0, 80),
             },
             index=idx,
         )
-        df.iloc[-13, df.columns.get_loc("high")] = float(df.iloc[-13]["close"]) + 2.0
-        df.iloc[-5, df.columns.get_loc("low")] = float(df.iloc[-5]["close"]) - 1.8
-        df.iloc[-1, df.columns.get_loc("high")] = float(df.iloc[-1]["close"]) + 1.15
-        df.iloc[-1, df.columns.get_loc("volume_spike")] = 1.10
+        df.iloc[-1, df.columns.get_loc("high")] = float(df.iloc[-1]["close"]) + 1.3
+        df.iloc[-1, df.columns.get_loc("volume_spike")] = 1.18
         df.iloc[-1, df.columns.get_loc("obv")] = float(df.iloc[-2]["obv"]) - 1.2
         df.iloc[-1, df.columns.get_loc("cvd")] = float(df.iloc[-2]["cvd"]) - 1.1
         return df
@@ -68,7 +65,11 @@ class LiquidationChartRuntimeTests(unittest.TestCase):
                     },
                     "layer2_weakness_confirmation": {
                         "passed": False,
-                        "details": {"weakness_strength": 0.72},
+                        "details": {
+                            "weakness_strength": 0.72,
+                            "failed_reclaim": 1.0,
+                            "retest_failed_breakout": 1.0,
+                        },
                     },
                 }
             },

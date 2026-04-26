@@ -52,10 +52,13 @@ REQUIRED_MODEL_FEATURES = [
     "close_ret_20",
     "mtf_rsi_5m",
     "mtf_rsi_15m",
+    "mtf_rsi_1h",
     "mtf_atr_norm_5m",
     "mtf_atr_norm_15m",
+    "mtf_atr_norm_1h",
     "mtf_trend_5m",
     "mtf_trend_15m",
+    "mtf_trend_1h",
 ]
 
 
@@ -140,13 +143,13 @@ def sanitize_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     numeric_cols = list(out.select_dtypes(include=[np.number]).columns)
     for col in numeric_cols:
         series = pd.to_numeric(out[col], errors="coerce")
-        if col == "rsi":
+        if col in {"rsi", "mtf_rsi_5m", "mtf_rsi_15m", "mtf_rsi_1h"}:
             out[col] = series.clip(lower=0.0, upper=100.0).fillna(50.0)
         elif col == "volume_spike":
             out[col] = series.clip(lower=0.0, upper=30.0).fillna(1.0)
-        elif col in {"atr", "atr_norm"}:
+        elif col in {"atr", "atr_norm", "mtf_atr_norm_5m", "mtf_atr_norm_15m", "mtf_atr_norm_1h"}:
             out[col] = series.clip(lower=0.0).fillna(0.0)
-        elif col in {"vwap_dist", "close_ret_5", "close_ret_20", "mtf_trend_5m", "mtf_trend_15m"}:
+        elif col in {"vwap_dist", "close_ret_5", "close_ret_20", "mtf_trend_5m", "mtf_trend_15m", "mtf_trend_1h"}:
             out[col] = series.clip(lower=-1.0, upper=1.0).fillna(0.0)
         elif col in {"hist", "obv", "cvd"}:
             out[col] = series.ffill().bfill().fillna(0.0)
@@ -156,17 +159,109 @@ def sanitize_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def assess_feature_frame_quality(
+    df: pd.DataFrame,
+    *,
+    recent_window: int = 96,
+    severe_gap_multiple: float = 3.0,
+    max_recent_gap_ratio: float = 0.05,
+    max_recent_zero_volume_ratio: float = 0.10,
+    min_recent_zero_volume_count: int = 3,
+) -> dict[str, float | str | bool]:
+    report: dict[str, float | str | bool] = {
+        "usable": True,
+        "reason": "",
+        "expected_bar_seconds": 0.0,
+        "severe_gap_threshold_seconds": 0.0,
+        "latest_gap_seconds": 0.0,
+        "max_recent_gap_seconds": 0.0,
+        "recent_gap_ratio": 0.0,
+        "recent_severe_gap_count": 0.0,
+        "total_severe_gap_count": 0.0,
+        "recent_zero_volume_count": 0.0,
+        "recent_zero_volume_ratio": 0.0,
+    }
+    if df.empty or len(df.index) < 3:
+        report["usable"] = False
+        report["reason"] = "insufficient_frame_rows"
+        return report
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return report
+
+    ordered = df.sort_index()
+    if not ordered.index.is_monotonic_increasing:
+        report["usable"] = False
+        report["reason"] = "non_monotonic_index"
+        return report
+
+    diffs = ordered.index.to_series().diff().dt.total_seconds().dropna()
+    positive_diffs = diffs[diffs > 0]
+    if positive_diffs.empty:
+        report["usable"] = False
+        report["reason"] = "invalid_time_index"
+        return report
+
+    expected_bar_seconds = float(positive_diffs.median())
+    severe_gap_threshold = expected_bar_seconds * max(1.5, float(severe_gap_multiple))
+    severe_mask = diffs >= severe_gap_threshold
+    recent_diffs = diffs.tail(min(len(diffs), max(4, int(recent_window))))
+    recent_severe_count = int((recent_diffs >= severe_gap_threshold).sum()) if not recent_diffs.empty else 0
+    recent_gap_ratio = float(recent_severe_count / len(recent_diffs)) if len(recent_diffs) > 0 else 0.0
+    latest_gap_seconds = float(recent_diffs.iloc[-1]) if not recent_diffs.empty else 0.0
+    max_recent_gap_seconds = float(recent_diffs.max()) if not recent_diffs.empty else 0.0
+
+    report.update(
+        {
+            "expected_bar_seconds": expected_bar_seconds,
+            "severe_gap_threshold_seconds": severe_gap_threshold,
+            "latest_gap_seconds": latest_gap_seconds,
+            "max_recent_gap_seconds": max_recent_gap_seconds,
+            "recent_gap_ratio": recent_gap_ratio,
+            "recent_severe_gap_count": float(recent_severe_count),
+            "total_severe_gap_count": float(int(severe_mask.sum())),
+        }
+    )
+
+    recent_frame = ordered.tail(min(len(ordered), max(4, int(recent_window))))
+    if "volume" in recent_frame.columns:
+        recent_volume = pd.to_numeric(recent_frame["volume"], errors="coerce").fillna(0.0)
+        recent_zero_volume_count = int((recent_volume <= 0.0).sum())
+        recent_zero_volume_ratio = (
+            float(recent_zero_volume_count / len(recent_volume)) if len(recent_volume) > 0 else 0.0
+        )
+        report["recent_zero_volume_count"] = float(recent_zero_volume_count)
+        report["recent_zero_volume_ratio"] = recent_zero_volume_ratio
+
+    if latest_gap_seconds >= severe_gap_threshold:
+        report["usable"] = False
+        report["reason"] = "latest_gap_exceeds_threshold"
+    elif recent_severe_count >= 2 or recent_gap_ratio > float(max_recent_gap_ratio):
+        report["usable"] = False
+        report["reason"] = "recent_gap_cluster"
+    elif (
+        float(report.get("recent_zero_volume_ratio", 0.0) or 0.0) > float(max_recent_zero_volume_ratio)
+        and float(report.get("recent_zero_volume_count", 0.0) or 0.0) >= float(min_recent_zero_volume_count)
+    ):
+        report["usable"] = False
+        report["reason"] = "recent_zero_volume_cluster"
+
+    return report
+
+
 def compute_mtf_feature_snapshot(df: pd.DataFrame) -> dict[str, float]:
     values = {
         "mtf_rsi_5m": 50.0,
         "mtf_rsi_15m": 50.0,
+        "mtf_rsi_1h": 50.0,
         "mtf_atr_norm_5m": 0.0,
         "mtf_atr_norm_15m": 0.0,
+        "mtf_atr_norm_1h": 0.0,
         "mtf_trend_5m": 0.0,
         "mtf_trend_15m": 0.0,
+        "mtf_trend_1h": 0.0,
     }
 
-    for rule, key_suffix in (("5min", "5m"), ("15min", "15m")):
+    for rule, key_suffix in (("5min", "5m"), ("15min", "15m"), ("1h", "1h")):
         mtf = _resample_ohlcv(df[["open", "high", "low", "close", "volume"]], rule=rule)
         if len(mtf) < 30:
             continue

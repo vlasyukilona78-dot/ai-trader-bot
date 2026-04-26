@@ -301,10 +301,15 @@ def _remember_cached_alert(
     now_ts: float,
     cooldown_sec: int,
 ) -> None:
-    cache[symbol] = {
-        "key": key,
-        "next_allowed_ts": now_ts + max(60, cooldown_sec),
-    }
+    cached = cache.get(symbol)
+    payload = dict(cached) if isinstance(cached, Mapping) else {}
+    payload.update(
+        {
+            "key": key,
+            "next_allowed_ts": now_ts + max(60, cooldown_sec),
+        }
+    )
+    cache[symbol] = payload
 
 
 def _should_emit_symbol_rate_limited_alert(
@@ -811,11 +816,18 @@ def _should_block_live_main_short_continuation(intent, enriched: pd.DataFrame | 
         _as_float(layer2.get("retest_failed_breakout"), 0.0)
         or _as_float(layer3.get("retest_failed_breakout"), 0.0)
     )
+    recent_upper_anchor_touch = bool(_as_float(layer3.get("recent_upper_anchor_touch"), 0.0))
+    recent_upper_anchor_reject = bool(_as_float(layer3.get("recent_upper_anchor_reject"), 0.0))
+    reject_from_upper_anchor = bool(_as_float(layer3.get("reject_from_upper_anchor"), 0.0))
     acceptance_above_high = bool(
         _as_float(layer2.get("acceptance_above_swing_high"), 0.0)
         or _as_float(layer3.get("acceptance_above_swing_high"), 0.0)
     )
-    if failed_reclaim or retest_failed_breakout or acceptance_above_high:
+    anchored_failure = bool(
+        (failed_reclaim or retest_failed_breakout)
+        and (recent_upper_anchor_touch or recent_upper_anchor_reject or reject_from_upper_anchor)
+    )
+    if anchored_failure or acceptance_above_high:
         return False
 
     row = enriched.iloc[-1]
@@ -826,11 +838,23 @@ def _should_block_live_main_short_continuation(intent, enriched: pd.DataFrame | 
         return False
     high = _as_float(row.get("high"), close)
     low = _as_float(row.get("low"), close)
+    prev_high = _as_float(prev.get("high"), high)
     open_px = _as_float(row.get("open"), close)
     candle_range = max(high - low, 1e-8)
     close_position_in_candle = max(0.0, min(1.0, (close - low) / candle_range))
     recent_peak = _current_recent_peak_price(enriched, fallback_price=high)
+    recent_high_24_series = pd.to_numeric(
+        enriched.tail(min(len(enriched), 24))["high"],
+        errors="coerce",
+    ).dropna()
+    recent_high_24 = _as_float(recent_high_24_series.max() if not recent_high_24_series.empty else high, high)
     recent_close_tail = pd.to_numeric(enriched.tail(4)["close"], errors="coerce").dropna()
+    recent_low_tail = pd.to_numeric(enriched.tail(5)["low"], errors="coerce").dropna()
+    recent_support_reference = (
+        float(recent_low_tail.tail(5).iloc[:-1].min())
+        if len(recent_low_tail) >= 2
+        else float(recent_low_tail.min()) if not recent_low_tail.empty else low
+    )
     up_closes_last3 = 0
     if len(recent_close_tail) >= 2:
         recent_close_values = recent_close_tail.to_numpy(dtype=float)
@@ -847,10 +871,51 @@ def _should_block_live_main_short_continuation(intent, enriched: pd.DataFrame | 
     ema20 = _as_float(row.get("ema20"), close)
     ema20_prev = _as_float(prev.get("ema20"), ema20)
     vah = _as_float(row.get("vah"), 0.0)
+    mtf_trend_5m = _as_float(row.get("mtf_trend_5m"), 0.0)
+    mtf_trend_15m = _as_float(row.get("mtf_trend_15m"), 0.0)
+    mtf_rsi_5m = _as_float(row.get("mtf_rsi_5m"), 50.0)
+    mtf_rsi_15m = _as_float(row.get("mtf_rsi_15m"), 50.0)
     atr = max(_as_float(row.get("atr"), close * 0.01), close * 0.0015, 1e-8)
     atr_pct = atr / max(close, 1e-8)
+    bb_upper = _as_float(row.get("bb_upper"), 0.0)
+    kc_upper = _as_float(row.get("kc_upper"), 0.0)
+    upper_band_ref = max(bb_upper, kc_upper, 0.0)
+    above_fast_upper_band = bool(
+        upper_band_ref > 0
+        and close >= upper_band_ref * (1.0 - max(atr_pct * 0.18, 0.00045))
+    )
     near_peak = close >= recent_peak * (0.994 if close < 0.05 else 0.996)
     near_vah = vah > 0 and abs(close - vah) / max(close, 1e-8) <= max(atr_pct * 0.40, 0.0022)
+    meaningfully_below_vah = bool(
+        vah > 0
+        and close <= vah * (1.0 - max(atr_pct * 0.32, 0.0011 if close < 0.05 else 0.00085))
+    )
+    far_from_recent_peak = bool(
+        recent_peak > 0
+        and (recent_peak - close) / max(recent_peak, 1e-8) >= max(atr_pct * 0.78, 0.0085 if close < 0.05 else 0.0052)
+    )
+    recent_high_tail = pd.to_numeric(enriched.tail(4)["high"], errors="coerce").dropna()
+    upper_anchor_touch_tolerance = min(
+        max(
+            atr_pct * 0.72,
+            0.0052 if close < 0.02 else 0.0032,
+        ),
+        0.0105 if close < 0.02 else 0.0062,
+    )
+    upper_anchor_levels: list[float] = []
+    if vah > 0:
+        upper_anchor_levels.append(vah)
+    if recent_high_24 > 0 and (vah <= 0 or recent_high_24 >= vah * (1.0 - max(atr_pct * 0.45, 0.0014))):
+        upper_anchor_levels.append(recent_high_24)
+    live_recent_upper_anchor_touch = bool(
+        upper_anchor_levels
+        and len(recent_high_tail) > 0
+        and any(
+            abs(high_px - anchor_level) / max(anchor_level, 1e-8) <= upper_anchor_touch_tolerance
+            for high_px in recent_high_tail.tail(3).to_numpy(dtype=float)
+            for anchor_level in upper_anchor_levels
+        )
+    )
     strong_upper_reversal_bar = bool(
         (high - max(open_px, close)) / candle_range >= 0.24
         and (close <= open_px or close < prev_close)
@@ -859,6 +924,20 @@ def _should_block_live_main_short_continuation(intent, enriched: pd.DataFrame | 
     volume_fade = bool(
         volume_spike <= max(prev_volume_spike * 0.93, prev_volume_spike - 0.18)
         or volume_spike <= max(0.95, prev_volume_spike * 0.86)
+    )
+    recent_upper_anchor_touch = bool(recent_upper_anchor_touch or live_recent_upper_anchor_touch)
+    recent_upper_anchor_reject = bool(
+        recent_upper_anchor_reject
+        or (
+            recent_upper_anchor_touch
+            and (
+                strong_upper_reversal_bar
+                or close < prev_close
+                or high < prev_high
+                or momentum_rollover
+                or volume_fade
+            )
+        )
     )
     live_continuation = bool(
         up_closes_last3 >= 2
@@ -870,7 +949,110 @@ def _should_block_live_main_short_continuation(intent, enriched: pd.DataFrame | 
         and not momentum_rollover
         and not strong_upper_reversal_bar
     )
-    return bool(live_continuation and (near_peak or near_vah))
+    mtf_reacceleration = bool(
+        (
+            (mtf_trend_5m >= 0.0060 and mtf_rsi_5m >= 74.0)
+            or (mtf_trend_15m >= 0.0044 and mtf_rsi_15m >= 68.0)
+        )
+        and close >= prev_close * (1.0 - max(atr_pct * 0.16, 0.00035))
+        and close_position_in_candle >= 0.48
+        and ema20 >= ema20_prev
+        and not volume_fade
+        and not momentum_rollover
+        and not strong_upper_reversal_bar
+    )
+    late_rebound_without_trigger = bool(
+        far_from_recent_peak
+        and meaningfully_below_vah
+        and close >= ema20 * (1.0 - max(atr_pct * 0.18, 0.00045))
+        and close_position_in_candle >= 0.46
+        and (up_closes_last3 >= 2 or close >= prev_close * (1.0 - max(atr_pct * 0.14, 0.00035)))
+        and volume_spike >= max(0.22, prev_volume_spike * 0.70)
+        and not volume_fade
+        and not momentum_rollover
+        and not strong_upper_reversal_bar
+    )
+    downside_displacement_tolerance = max(atr_pct * 0.18, 0.00045 if close < 0.02 else 0.00030)
+    downside_displacement_confirmed = bool(
+        recent_support_reference > 0
+        and close <= recent_support_reference * (1.0 - downside_displacement_tolerance)
+    ) or bool(
+        close <= prev_close * (1.0 - downside_displacement_tolerance * 0.75)
+        and close_position_in_candle <= 0.34
+    )
+    late_pullback_without_downside_displacement = bool(
+        far_from_recent_peak
+        and meaningfully_below_vah
+        and close <= ema20 * (1.0 + max(atr_pct * 0.18, 0.00055))
+        and close_position_in_candle <= 0.48
+        and (close - open_px) / max(close, 1e-8) <= max(atr_pct * 0.06, 0.00045)
+        and volume_spike <= max(1.35, prev_volume_spike * 1.06)
+        and not downside_displacement_confirmed
+    )
+    green_hold_without_downside_displacement = bool(
+        (recent_upper_anchor_touch or above_fast_upper_band)
+        and not downside_displacement_confirmed
+        and max(0.0, (recent_high_24 - close) / max(recent_high_24, 1e-8)) <= max(
+            atr_pct * 1.20,
+            0.0068 if close < 0.05 else 0.0046,
+        )
+        and close >= ema20 * (1.0 - max(atr_pct * 0.10, 0.00035))
+        and close_position_in_candle >= 0.70
+        and (close - open_px) / max(close, 1e-8) >= max(atr_pct * 0.025, 0.00018)
+        and (high - max(open_px, close)) / candle_range <= 0.30
+        and (
+            mtf_reacceleration
+            or above_fast_upper_band
+            or volume_spike >= max(0.62, prev_volume_spike * 0.78)
+        )
+        and not failed_reclaim
+        and not retest_failed_breakout
+        and not strong_upper_reversal_bar
+    )
+    bullish_rebound_without_reject = bool(
+        far_from_recent_peak
+        and meaningfully_below_vah
+        and close >= ema20 * (1.0 - max(atr_pct * 0.18, 0.00045))
+        and close_position_in_candle >= 0.60
+        and (close - open_px) / max(close, 1e-8) >= max(atr_pct * 0.06, 0.00045)
+        and up_closes_last3 >= 2
+        and volume_spike >= max(0.36, prev_volume_spike * 0.74)
+        and not volume_fade
+        and not momentum_rollover
+        and not strong_upper_reversal_bar
+    )
+    shallow_plateau_reclaim = bool(
+        recent_upper_anchor_touch
+        and recent_upper_anchor_reject
+        and close_position_in_candle >= 0.52
+        and close >= prev_close * (1.0 - max(atr_pct * 0.08, 0.00025))
+        and high >= prev_high * (1.0 - max(atr_pct * 0.08, 0.00025))
+        and not strong_upper_reversal_bar
+    )
+    plateau_continuation_near_high = bool(
+        recent_upper_anchor_touch
+        and (not recent_upper_anchor_reject or shallow_plateau_reclaim)
+        and max(0.0, (recent_high_24 - close) / max(recent_high_24, 1e-8)) <= max(
+            atr_pct * 0.48,
+            0.0032 if close < 0.05 else 0.0021,
+        )
+        and close >= ema20 * (1.0 - max(atr_pct * 0.14, 0.00035))
+        and close_position_in_candle >= 0.56
+        and (close - open_px) / max(close, 1e-8) >= -max(atr_pct * 0.08, 0.00040)
+        and (high - max(open_px, close)) / candle_range <= 0.34
+        and (up_closes_last3 >= 2 or close >= prev_close * (1.0 - max(atr_pct * 0.08, 0.00025)))
+        and volume_spike >= max(0.32, prev_volume_spike * 0.72)
+        and not strong_upper_reversal_bar
+    )
+    return bool(
+        (live_continuation and (near_peak or near_vah))
+        or (mtf_reacceleration and (near_peak or near_vah or far_from_recent_peak))
+        or late_rebound_without_trigger
+        or late_pullback_without_downside_displacement
+        or green_hold_without_downside_displacement
+        or bullish_rebound_without_reject
+        or plateau_continuation_near_high
+    )
 
 
 def _refresh_symbol_decision_live(
@@ -1058,6 +1240,10 @@ def _build_higher_timeframe_chart(
                 extras=context_extras,
             )
             context_enriched = context_bundle.enriched
+            try:
+                context_enriched.attrs.update(getattr(context_frame.ohlcv, "attrs", {}) or {})
+            except Exception:
+                pass
         except Exception:
             context_enriched = context_frame.ohlcv
 
@@ -1426,6 +1612,10 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
     prev_hist = _as_float(prev.get("hist"), hist)
     mtf_trend_5m = _as_float(row.get("mtf_trend_5m"), 0.0)
     mtf_rsi_5m = _as_float(row.get("mtf_rsi_5m"), 50.0)
+    mtf_trend_15m = _as_float(row.get("mtf_trend_15m"), 0.0)
+    mtf_rsi_15m = _as_float(row.get("mtf_rsi_15m"), 50.0)
+    mtf_trend_1h = _as_float(row.get("mtf_trend_1h"), 0.0)
+    mtf_rsi_1h = _as_float(row.get("mtf_rsi_1h"), 50.0)
     recent_peak_window = min(len(enriched), 32 if close < 0.02 else 26)
     pump_context_window = min(len(enriched), 56 if close < 0.02 else 42)
     recent_high_series = enriched.tail(recent_peak_window)["high"] if "high" in enriched.columns else pd.Series([high])
@@ -1696,9 +1886,20 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         and rsi >= prev_rsi * 0.998
         and not liquidation_map.swept_above
     )
-    mtf_continuation_drive = bool(
+    mtf_5m_continuation_drive = bool(
         mtf_trend_5m >= _early_config_float("EARLY_WATCH_MTF_TREND_RISK_MIN", 0.0060)
         and mtf_rsi_5m >= _early_config_float("EARLY_WATCH_MTF_RSI_RISK_MIN", 75.0)
+    )
+    mtf_15m_continuation_drive = bool(
+        mtf_trend_15m >= _early_config_float("EARLY_WATCH_MTF_TREND_15M_RISK_MIN", 0.0046)
+        and mtf_rsi_15m >= _early_config_float("EARLY_WATCH_MTF_RSI_15M_RISK_MIN", 69.0)
+    )
+    mtf_1h_continuation_drive = bool(
+        mtf_trend_1h >= _early_config_float("EARLY_WATCH_MTF_TREND_1H_RISK_MIN", 0.0038)
+        and mtf_rsi_1h >= _early_config_float("EARLY_WATCH_MTF_RSI_1H_RISK_MIN", 64.0)
+    )
+    mtf_continuation_drive = bool(
+        (mtf_5m_continuation_drive or mtf_15m_continuation_drive or mtf_1h_continuation_drive)
         and close >= prev_close * (1.0 - (0.0012 if close < 0.02 else 0.0008))
         and close_position_in_candle >= 0.54
         and not real_rollover
@@ -1721,8 +1922,12 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         continuation_structure_score += 0.45
     if close >= ema20_last * (1.0015 if close < 0.02 else 1.0010) and ema20_slope > 0:
         continuation_structure_score += 0.35
-    if mtf_continuation_drive:
-        continuation_structure_score += 0.70
+    if mtf_5m_continuation_drive:
+        continuation_structure_score += 0.55
+    if mtf_15m_continuation_drive:
+        continuation_structure_score += 0.60
+    if mtf_1h_continuation_drive:
+        continuation_structure_score += 0.50
     lower_close_followthrough = (
         close < prev_close
         and prev_close <= prev2_close * 1.0006
@@ -2023,7 +2228,26 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
             or real_rollover
         )
     )
+    shallow_reject_pullback_floor = max(
+        minimum_reversal_pullback * 1.08,
+        atr_pct * 0.84,
+        0.0015 if close < 0.02 else 0.0010,
+    )
+    shallow_reject_without_displacement = bool(
+        recent_upper_anchor_touch
+        and (
+            recent_upper_anchor_reject
+            or micro_reversal_near_peak
+            or terminal_rejection_bar
+        )
+        and pullback_from_peak_pct < shallow_reject_pullback_floor
+        and close >= signal_peak_reference * (1.0 - max(shallow_reject_pullback_floor * 0.72, 0.0010 if close < 0.02 else 0.0007))
+        and not liquidation_map.swept_above
+        and not recent_upper_liq_reaction
+    )
     if fresh_live_continuation_without_reject:
+        return None
+    if shallow_reject_without_displacement:
         return None
     if not upper_rejection_zone_ready:
         return None
@@ -3610,12 +3834,17 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
     prev_hist = _as_float(prev.get("hist"), hist)
     mtf_trend_5m = _as_float(row.get("mtf_trend_5m"), 0.0)
     mtf_rsi_5m = _as_float(row.get("mtf_rsi_5m"), 50.0)
+    mtf_trend_15m = _as_float(row.get("mtf_trend_15m"), 0.0)
+    mtf_rsi_15m = _as_float(row.get("mtf_rsi_15m"), 50.0)
+    mtf_trend_1h = _as_float(row.get("mtf_trend_1h"), 0.0)
+    mtf_rsi_1h = _as_float(row.get("mtf_rsi_1h"), 50.0)
     prev_close = _as_float(prev.get("close"), close)
     open_px = _as_float(row.get("open"), close)
     high_px = max(_as_float(row.get("high"), close), close, open_px)
     low_px = min(_as_float(row.get("low"), close), close, open_px)
     candle_range = max(high_px - low_px, close * 0.0004, 1e-8)
     upper_wick = max(high_px - max(open_px, close), 0.0)
+    upper_wick_share = upper_wick / candle_range
     close_position_in_candle = max(0.0, min(1.0, (close - low_px) / candle_range))
     recent_close_tail = (
         pd.to_numeric(enriched.tail(4)["close"], errors="coerce").dropna()
@@ -3645,9 +3874,44 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
     weakness_strength = max(_as_float(layer2.get("weakness_strength"), 0.0), 0.0)
     distance_from_high_pct = max(0.0, (recent_high - close) / max(recent_high, 1e-8))
     range_position = min(1.0, max(0.0, (close - recent_low) / max(recent_high - recent_low, 1e-8)))
-    first_reaction = close < prev_close or hist < prev_hist or rsi < prev_rsi
-    momentum_rollover = hist < prev_hist or rsi < prev_rsi
+    atr_pct = atr / max(close, 1e-8)
+    minimum_reversal_pullback = max(
+        atr_pct * 0.68,
+        0.0014 if close < 0.02 else 0.0009,
+    )
+    price_rejection_near_high = bool(
+        (
+            close < prev_close
+            and close_position_in_candle <= 0.72
+        )
+        or (
+            close < open_px
+            and close_position_in_candle <= 0.70
+        )
+        or (
+            upper_wick_share >= 0.24
+            and close_position_in_candle <= 0.72
+            and close <= prev_close * (1.0 + (0.0004 if close < 0.02 else 0.00025))
+        )
+        or (
+            distance_from_high_pct >= minimum_reversal_pullback
+            and close_position_in_candle <= 0.64
+        )
+    )
+    momentum_rollover_count = int(hist < prev_hist) + int(rsi < prev_rsi)
+    momentum_rollover = momentum_rollover_count >= 1
     volume_fade = recent_volume_spike > 0.0 and volume_spike <= recent_volume_spike * 0.92
+    if volume_fade:
+        momentum_rollover_count += 1
+    first_reaction = bool(
+        failed_reclaim
+        or retest_failed_breakout
+        or (
+            price_rejection_near_high
+            and momentum_rollover_count >= 2
+            and distance_from_high_pct >= minimum_reversal_pullback * 0.70
+        )
+    )
 
     if clean_pump_pct < max(pump_min, 0.04):
         return None
@@ -3662,7 +3926,6 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
     if max(volume_spike, recent_volume_spike) < (0.12 if close < 0.02 else 0.095):
         return None
     has_structural_failure = failed_reclaim or retest_failed_breakout
-    atr_pct = atr / max(close, 1e-8)
     vah_reject_tolerance = max(
         atr_pct * 1.15,
         0.0048 if close < 0.02 else 0.0030,
@@ -3843,7 +4106,8 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
     live_pump_weakening = bool(
         first_reaction
         and recent_upper_anchor_touch
-        and momentum_rollover
+        and price_rejection_near_high
+        and (momentum_rollover_count >= 2 or (momentum_rollover and strong_upper_reversal_bar))
         and (
             volume_fade
             or weakness_strength >= 0.66
@@ -3857,18 +4121,61 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
             or value_room_to_poc
             or value_room_to_val
         )
+        and (
+            recent_upper_anchor_reject
+            or strong_upper_reversal_bar
+            or has_structural_failure
+        )
     )
-    high_mtf_continuation_watch = bool(
+    shallow_reject_pullback_floor = max(
+        minimum_reversal_pullback * 1.08,
+        atr_pct * 0.82,
+        0.0015 if close < 0.02 else 0.0010,
+    )
+    shallow_reject_without_displacement = bool(
+        recent_upper_anchor_touch
+        and recent_upper_anchor_reject
+        and first_reaction
+        and distance_from_high_pct < shallow_reject_pullback_floor
+        and close >= recent_high * (1.0 - max(shallow_reject_pullback_floor * 0.72, 0.0010 if close < 0.02 else 0.0007))
+        and not has_structural_failure
+        and not liquidation_map.swept_above
+        and not recent_upper_liq_reaction
+        and not strong_upper_reversal_bar
+    )
+    mtf_5m_continuation_watch = bool(
         mtf_trend_5m >= _early_config_float("EARLY_APPROVED_MTF_TREND_RISK_MIN", 0.0060)
         and mtf_rsi_5m >= _early_config_float("EARLY_APPROVED_MTF_RSI_RISK_MIN", 75.0)
+    )
+    mtf_15m_continuation_watch = bool(
+        mtf_trend_15m >= _early_config_float("EARLY_APPROVED_MTF_TREND_15M_RISK_MIN", 0.0046)
+        and mtf_rsi_15m >= _early_config_float("EARLY_APPROVED_MTF_RSI_15M_RISK_MIN", 69.0)
+    )
+    mtf_1h_continuation_watch = bool(
+        mtf_trend_1h >= _early_config_float("EARLY_APPROVED_MTF_TREND_1H_RISK_MIN", 0.0038)
+        and mtf_rsi_1h >= _early_config_float("EARLY_APPROVED_MTF_RSI_1H_RISK_MIN", 64.0)
+    )
+    high_mtf_continuation_watch = bool(
+        (mtf_5m_continuation_watch or mtf_15m_continuation_watch or mtf_1h_continuation_watch)
         and close >= prev_close * (1.0 - (0.0012 if close < 0.02 else 0.0008))
         and close_position_in_candle >= 0.52
         and not has_structural_failure
         and not liquidation_map.swept_above
         and not recent_upper_liq_reaction
         and not volume_fade
+        and not price_rejection_near_high
     )
     if high_mtf_continuation_watch and not live_pump_weakening:
+        return None
+    if shallow_reject_without_displacement:
+        return None
+    if (
+        not has_structural_failure
+        and not price_rejection_near_high
+        and not liquidation_map.swept_above
+        and not recent_upper_liq_reaction
+        and not live_pump_weakening
+    ):
         return None
     if not recent_upper_anchor_reject and not (has_structural_failure and first_reaction) and not live_pump_weakening:
         return None
@@ -4137,6 +4444,20 @@ def _build_approved_early_candidate(*, symbol: str, timeframe: str, mode: str, e
         quality_score = min(quality_score, 7.15 if near_vah_resistance else 6.95)
     if phase == "WATCH" and volume_spike < (0.20 if close < 0.02 else 0.13):
         quality_score = min(quality_score, 6.85)
+    soft_anchor_reject_without_followthrough = bool(
+        phase == "WATCH"
+        and not has_structural_failure
+        and recent_upper_anchor_touch
+        and recent_upper_anchor_reject
+        and up_closes_last3 >= 2
+        and close >= prev_close * (1.0 - (0.0010 if close < 0.02 else 0.0007))
+        and close_position_in_candle >= 0.52
+        and not volume_fade
+        and not strong_upper_reversal_bar
+        and not liquidation_map.swept_above
+    )
+    if soft_anchor_reject_without_followthrough:
+        return None
     wait_for = (
         "подтверждение полноценного входа"
         if phase == "SETUP"

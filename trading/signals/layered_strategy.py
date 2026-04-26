@@ -7,7 +7,7 @@ from dataclasses import replace
 
 from core.market_regime import detect_market_regime
 from core.signal_generator import SignalConfig, SignalContext, SignalGenerator
-from core.feature_engineering import sanitize_feature_frame
+from core.feature_engineering import assess_feature_frame_quality, sanitize_feature_frame
 from core.volume_profile import compute_volume_profile
 from trading.exchange.schemas import PositionSide
 from trading.portfolio.positions import first_effective_position_for_symbol
@@ -492,6 +492,7 @@ class LayeredPumpStrategy(StrategyInterface):
         risk_distance = max(current_stop - entry_price, atr * 0.85, entry_price * 0.0012)
         reward_distance = max(entry_price - close, 0.0)
         reward_r = reward_distance / max(risk_distance, 1e-9)
+        adverse_r = max(close - entry_price, 0.0) / max(risk_distance, 1e-9)
 
         holding_minutes = 0.0
         if context.synced_state_updated_at:
@@ -548,35 +549,146 @@ class LayeredPumpStrategy(StrategyInterface):
         rebound_confirmed = bounce_strength >= 2 and (rsi_turning_up or hist_turning_up)
         reclaiming_entry = close >= entry_price * (1.0 - max(atr_pct * 0.18, 0.0007))
         bullish_reclaim = close_above_ema20 and close_above_vwap and bounce_strength >= 3
-        stagnation_exit = holding_minutes >= 14.0 and reward_r < 0.15 and rebound_confirmed and close_above_ema20
-        fast_fail_exit = holding_minutes >= 5.0 and reward_r < 0.10 and close_above_ema20 and close_above_vwap and rebound_confirmed
+        tail3 = enriched.tail(3)
+        acceptance_entry_count = 0
+        acceptance_ema20_count = 0
+        acceptance_vwap_count = 0
+        up_close_count = 0
+        if not tail3.empty:
+            entry_acceptance_floor = entry_price * (1.0 - max(atr_pct * 0.10, 0.0006))
+            ema_acceptance_pad = max(atr_pct * 0.08, 0.0005)
+            vwap_acceptance_pad = max(atr_pct * 0.08, 0.0005)
+            if "close" in tail3.columns:
+                tail_close = tail3["close"].astype(float)
+                acceptance_entry_count = int((tail_close >= entry_acceptance_floor).sum())
+                up_close_count = int((tail_close.diff().fillna(0.0) > 0.0).sum())
+                if "ema20" in tail3.columns:
+                    acceptance_ema20_count = int(
+                        (tail_close >= (tail3["ema20"].astype(float) * (1.0 + ema_acceptance_pad))).sum()
+                    )
+                if "vwap" in tail3.columns:
+                    acceptance_vwap_count = int(
+                        (tail_close >= (tail3["vwap"].astype(float) * (1.0 + vwap_acceptance_pad))).sum()
+                    )
+        cfg = self._generator.config
+        stagnation_exit = (
+            holding_minutes >= float(cfg.managed_exit_stagnation_min_hold_minutes)
+            and reward_r < float(cfg.managed_exit_stagnation_max_reward_r)
+            and rebound_confirmed
+            and close_above_ema20
+        )
+        fast_fail_exit = (
+            holding_minutes >= float(cfg.managed_exit_fast_fail_min_hold_minutes)
+            and reward_r < float(cfg.managed_exit_fast_fail_max_reward_r)
+            and close_above_ema20
+            and close_above_vwap
+            and rebound_confirmed
+        )
         no_progress_exit = (
-            holding_minutes >= 10.0
-            and best_reward_r < 0.18
-            and reward_r < 0.06
+            holding_minutes >= float(cfg.managed_exit_no_progress_min_hold_minutes)
+            and best_reward_r < float(cfg.managed_exit_no_progress_max_best_r)
+            and reward_r < float(cfg.managed_exit_no_progress_max_reward_r)
             and reclaiming_entry
             and bounce_strength >= 2
             and not close_above_vwap
         )
+        no_downside_reclaim_exit = (
+            holding_minutes >= float(cfg.managed_exit_no_downside_min_hold_minutes)
+            and best_reward_r < float(cfg.managed_exit_no_downside_max_best_r)
+            and reward_r <= 0.05
+            and acceptance_entry_count >= 2
+            and acceptance_ema20_count >= 2
+            and acceptance_vwap_count >= 2
+            and up_close_count >= 2
+            and close_above_ema20
+            and close_above_vwap
+            and rebound_confirmed
+        )
+        adverse_acceptance_exit = (
+            holding_minutes >= float(cfg.managed_exit_adverse_acceptance_min_hold_minutes)
+            and best_reward_r <= float(cfg.managed_exit_adverse_acceptance_max_best_r)
+            and adverse_r >= float(cfg.managed_exit_adverse_acceptance_min_adverse_r)
+            and acceptance_entry_count >= 2
+            and acceptance_ema20_count >= 2
+            and acceptance_vwap_count >= 2
+            and close_above_ema20
+            and close_above_vwap
+            and (rebound_confirmed or bullish_reclaim or up_close_count >= 2)
+        )
+        roundtrip_reclaim_exit = (
+            holding_minutes >= float(cfg.managed_exit_roundtrip_min_hold_minutes)
+            and best_reward_r >= float(cfg.managed_exit_roundtrip_min_best_r)
+            and reward_r <= float(cfg.managed_exit_roundtrip_max_reward_r)
+            and reclaiming_entry
+            and acceptance_entry_count >= 2
+            and up_close_count >= 2
+            and rebound_confirmed
+            and (close_above_ema20 or close_above_vwap)
+        )
         profit_giveback_exit = (
-            holding_minutes >= 6.0
-            and best_reward_r >= 0.55
-            and reward_r >= 0.12
-            and reward_r <= max(0.12, best_reward_r * 0.42)
-            and reward_retention <= 0.45
+            holding_minutes >= float(cfg.managed_exit_profit_giveback_min_hold_minutes)
+            and best_reward_r >= float(cfg.managed_exit_profit_giveback_min_best_r)
+            and reward_r >= float(cfg.managed_exit_profit_giveback_min_reward_r)
+            and reward_r <= max(float(cfg.managed_exit_profit_giveback_min_reward_r), best_reward_r * 0.42)
+            and reward_retention <= float(cfg.managed_exit_profit_giveback_retention_max)
             and rebound_confirmed
             and (close_above_ema20 or close_above_vwap or reclaiming_entry)
         )
-        time_decay_exit = holding_minutes >= 18.0 and reward_r < 0.12 and rebound_confirmed and (close_above_ema20 or close_above_vwap)
-        target_bounce_exit = target_zone_touched and reward_r >= 0.32 and (bullish_reclaim or rebound_confirmed)
-        profit_protect_exit = reward_r >= 0.85 and rebound_confirmed and (close_above_ema20 or close_above_vwap)
-        hard_reclaim_exit = reward_r >= 0.15 and reclaiming_entry and close_above_ema20 and close_above_vwap and bounce_strength >= 4
+        acceptance_reclaim_exit = (
+            holding_minutes >= float(cfg.managed_exit_acceptance_min_hold_minutes)
+            and best_reward_r >= float(cfg.managed_exit_acceptance_min_best_r)
+            and reward_r
+            <= max(
+                float(cfg.managed_exit_acceptance_min_reward_r_floor),
+                best_reward_r * float(cfg.managed_exit_acceptance_reward_retention_mult),
+            )
+            and acceptance_entry_count >= 2
+            and acceptance_ema20_count >= 2
+            and acceptance_vwap_count >= 2
+            and up_close_count >= 2
+            and (rebound_confirmed or bullish_reclaim)
+        )
+        time_decay_exit = (
+            holding_minutes >= float(cfg.managed_exit_time_decay_min_hold_minutes)
+            and reward_r < float(cfg.managed_exit_time_decay_max_reward_r)
+            and rebound_confirmed
+            and (close_above_ema20 or close_above_vwap)
+        )
+        target_bounce_exit = (
+            target_zone_touched
+            and reward_r >= float(cfg.managed_exit_target_zone_min_reward_r)
+            and (bullish_reclaim or rebound_confirmed)
+        )
+        profit_protect_exit = (
+            reward_r >= float(cfg.managed_exit_profit_reclaim_min_reward_r)
+            and rebound_confirmed
+            and (close_above_ema20 or close_above_vwap)
+        )
+        hard_reclaim_exit = (
+            reward_r >= float(cfg.managed_exit_reclaim_invalidation_min_reward_r)
+            and reclaiming_entry
+            and close_above_ema20
+            and close_above_vwap
+            and bounce_strength >= 4
+        )
 
         exit_type = ""
         reason = ""
         if hard_reclaim_exit:
             exit_type = "reclaim_invalidation"
             reason = "managed_exit_reclaim_invalidation"
+        elif acceptance_reclaim_exit:
+            exit_type = "acceptance_reclaim"
+            reason = "managed_exit_acceptance_reclaim"
+        elif roundtrip_reclaim_exit:
+            exit_type = "roundtrip_reclaim"
+            reason = "managed_exit_roundtrip_reclaim"
+        elif no_downside_reclaim_exit:
+            exit_type = "no_downside_reclaim"
+            reason = "managed_exit_no_downside_reclaim"
+        elif adverse_acceptance_exit:
+            exit_type = "adverse_acceptance"
+            reason = "managed_exit_adverse_acceptance"
         elif target_bounce_exit:
             exit_type = "target_zone_bounce"
             reason = "managed_exit_target_zone_bounce"
@@ -616,6 +728,7 @@ class LayeredPumpStrategy(StrategyInterface):
             "managed_exit_reason": reason,
             "managed_exit_details": {
                 "reward_r": float(reward_r),
+                "adverse_r": float(adverse_r),
                 "best_reward_r": float(best_reward_r),
                 "reward_retention": float(reward_retention),
                 "holding_minutes": float(holding_minutes),
@@ -631,6 +744,10 @@ class LayeredPumpStrategy(StrategyInterface):
                 "hist_turning_up": 1.0 if hist_turning_up else 0.0,
                 "reclaiming_entry": 1.0 if reclaiming_entry else 0.0,
                 "bounce_strength": float(bounce_strength),
+                "acceptance_entry_count": float(acceptance_entry_count),
+                "acceptance_ema20_count": float(acceptance_ema20_count),
+                "acceptance_vwap_count": float(acceptance_vwap_count),
+                "up_close_count": float(up_close_count),
             },
         }
         return StrategyIntent(
@@ -658,6 +775,20 @@ class LayeredPumpStrategy(StrategyInterface):
 
             enriched = compute_indicators(df)
         enriched = sanitize_feature_frame(enriched)
+        frame_quality = assess_feature_frame_quality(enriched)
+        if not bool(frame_quality.get("usable", True)):
+            layer_trace = {"failed_layer": "data_quality_guard", "layers": {}}
+            self._audit.record(layer_trace, signal_side=None)
+            return StrategyIntent(
+                symbol=context.symbol,
+                action=IntentAction.HOLD,
+                reason=f"data_quality_guard_{frame_quality.get('reason') or 'blocked'}",
+                metadata={
+                    "layer_failed": "data_quality_guard",
+                    "layer_trace": layer_trace,
+                    "frame_quality": frame_quality,
+                },
+            )
 
         regime = detect_market_regime(enriched)
         vp = compute_volume_profile(enriched)

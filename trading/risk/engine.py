@@ -1,7 +1,9 @@
 ﻿from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 from trading.exchange.schemas import AccountSnapshot, InstrumentRules, PositionSide, PositionSnapshot
 from trading.risk.limits import RiskLimits
@@ -19,6 +21,10 @@ class RiskDecision:
     quantity: float = 0.0
     notional: float = 0.0
     implied_leverage: float = 0.0
+    risk_amount_usdt: float = 0.0
+    effective_stop_loss: float = 0.0
+    execution_cost_buffer_bps_used: float = 0.0
+    quality_penalty_bps_used: float = 0.0
 
 
 @dataclass
@@ -124,6 +130,21 @@ class RiskEngine:
         candidate = max_qty - max(step_buffer, pct_buffer)
         return candidate if candidate > 0 else max_qty
 
+    @staticmethod
+    def _round_qty_down(qty: float, qty_step: float) -> float:
+        if qty_step <= 0:
+            return max(float(qty), 0.0)
+        try:
+            qty_d = Decimal(str(max(qty, 0.0)))
+            step_d = Decimal(str(qty_step))
+        except (InvalidOperation, ValueError):
+            return 0.0
+        if step_d <= 0:
+            return 0.0
+        steps = (qty_d / step_d).to_integral_value(rounding=ROUND_DOWN)
+        rounded = steps * step_d
+        return float(max(rounded, Decimal("0")))
+
     def _global_guards(self, account: AccountSnapshot) -> tuple[bool, str]:
         self._roll_session_if_needed()
         now_ts = self._now_ts()
@@ -141,6 +162,119 @@ class RiskEngine:
             return False, "consecutive_loss_halt"
 
         return True, "ok"
+
+    @staticmethod
+    def _safe_float(value: object, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _extract_layer_details(intent: StrategyIntent, layer_name: str) -> Mapping[str, object]:
+        metadata = intent.metadata if isinstance(intent.metadata, Mapping) else {}
+        trace = metadata.get("layer_trace", {})
+        if not isinstance(trace, Mapping):
+            return {}
+        layers = trace.get("layers", {})
+        if not isinstance(layers, Mapping):
+            return {}
+        layer_entry = layers.get(layer_name, {})
+        if not isinstance(layer_entry, Mapping):
+            return {}
+        details = layer_entry.get("details", {})
+        return details if isinstance(details, Mapping) else {}
+
+    def _resolve_execution_cost_buffer_bps(
+        self,
+        *,
+        intent: StrategyIntent,
+        mark_price: float,
+        rules: InstrumentRules,
+    ) -> tuple[float, float]:
+        base_bps = max(float(getattr(self.limits, "execution_cost_buffer_bps", 0.0) or 0.0), 0.0)
+        quality_penalty_bps = 0.0
+
+        layer1 = self._extract_layer_details(intent, "layer1_pump_detection")
+        layer2 = self._extract_layer_details(intent, "layer2_weakness_confirmation")
+        layer3 = self._extract_layer_details(intent, "layer3_entry_location")
+        layer4 = self._extract_layer_details(intent, "layer4_fake_filter")
+        metadata = intent.metadata if isinstance(intent.metadata, Mapping) else {}
+
+        confidence = self._safe_float(getattr(intent, "confidence", 0.0), 0.0)
+        volume_spike = self._safe_float(layer1.get("volume_spike"), self._safe_float(metadata.get("volume_spike"), 0.0))
+        clean_pump_pct = self._safe_float(layer1.get("clean_pump_pct"), self._safe_float(metadata.get("clean_pump_pct"), 0.0))
+        layer2_strength = self._safe_float(
+            layer2.get("weakness_strength"),
+            self._safe_float(metadata.get("weakness_strength"), 0.0),
+        )
+        layer3_strength = self._safe_float(
+            layer3.get("entry_location_strength"),
+            self._safe_float(metadata.get("entry_location_strength"), 0.0),
+        )
+        degraded_mode = bool(
+            self._safe_float(layer4.get("degraded_mode"), self._safe_float(metadata.get("degraded_mode"), 0.0))
+        )
+
+        spread_bps = self._safe_float(metadata.get("spread_bps"), 0.0)
+        turnover24h = max(
+            self._safe_float(metadata.get("turnover24h_usdt"), 0.0),
+            self._safe_float(metadata.get("quote_turnover_24h"), 0.0),
+            self._safe_float(metadata.get("turnover24h"), 0.0),
+            self._safe_float(metadata.get("daily_turnover_usdt"), 0.0),
+        )
+
+        if confidence > 0.0:
+            if confidence < 0.64:
+                quality_penalty_bps += 5.0
+            elif confidence < 0.76:
+                quality_penalty_bps += 2.5
+
+        if layer3_strength > 0.0:
+            if layer3_strength < 0.70:
+                quality_penalty_bps += 6.0
+            elif layer3_strength < 0.80:
+                quality_penalty_bps += 3.0
+
+        if layer2_strength > 0.0:
+            if layer2_strength < 0.66:
+                quality_penalty_bps += 4.0
+            elif layer2_strength < 0.76:
+                quality_penalty_bps += 2.0
+
+        if volume_spike > 0.0:
+            if volume_spike < 0.55:
+                quality_penalty_bps += 5.0
+            elif volume_spike < 0.90:
+                quality_penalty_bps += 2.5
+
+        if clean_pump_pct > 0.0 and clean_pump_pct < 0.05:
+            quality_penalty_bps += 2.0
+
+        if degraded_mode:
+            quality_penalty_bps += 4.0
+
+        if turnover24h > 0.0:
+            if turnover24h < 300_000.0:
+                quality_penalty_bps += 8.0
+            elif turnover24h < 1_000_000.0:
+                quality_penalty_bps += 4.0
+
+        if spread_bps > 0.0:
+            if spread_bps >= 15.0:
+                quality_penalty_bps += 5.0
+            elif spread_bps >= 8.0:
+                quality_penalty_bps += 2.5
+
+        if mark_price > 0.0 and rules.tick_size > 0.0:
+            tick_bps = (rules.tick_size / max(mark_price, 1e-9)) * 10000.0
+            if tick_bps >= 8.0:
+                quality_penalty_bps += 2.5
+            elif tick_bps >= 4.0:
+                quality_penalty_bps += 1.0
+
+        total_bps = min(base_bps + quality_penalty_bps, max(base_bps + 20.0, 35.0))
+        return float(total_bps), float(quality_penalty_bps)
 
     def evaluate(
         self,
@@ -198,7 +332,12 @@ class RiskEngine:
             return RiskDecision(approved=False, reason="max_symbol_exposure")
 
         stop_loss = float(intent.stop_loss or 0.0)
-        execution_cost_pct = max(float(getattr(self.limits, "execution_cost_buffer_bps", 0.0) or 0.0), 0.0) / 10000.0
+        execution_cost_buffer_bps_used, quality_penalty_bps_used = self._resolve_execution_cost_buffer_bps(
+            intent=intent,
+            mark_price=mark_price,
+            rules=rules,
+        )
+        execution_cost_pct = execution_cost_buffer_bps_used / 10000.0
         effective_stop_loss = stop_loss
         if execution_cost_pct > 0.0:
             execution_cost_distance = mark_price * execution_cost_pct
@@ -206,6 +345,7 @@ class RiskEngine:
                 effective_stop_loss = max(stop_loss - execution_cost_distance, 1e-9)
             else:
                 effective_stop_loss = stop_loss + execution_cost_distance
+        risk_amount_usdt = equity * max(self.limits.max_risk_per_trade_pct, 0.0)
         raw_qty = position_size_for_stop(
             equity_usdt=equity,
             risk_pct=self.limits.max_risk_per_trade_pct,
@@ -241,7 +381,7 @@ class RiskEngine:
         qty = min(raw_qty, qty_cap_by_notional)
         if rules.max_qty > 0:
             qty = min(qty, self._safe_max_qty(rules))
-        qty = int(qty / rules.qty_step) * rules.qty_step if rules.qty_step > 0 else qty
+        qty = self._round_qty_down(qty, rules.qty_step)
         if qty < rules.min_qty:
             return RiskDecision(approved=False, reason="below_min_qty_after_limits")
 
@@ -282,6 +422,10 @@ class RiskEngine:
             quantity=float(qty),
             notional=float(notional),
             implied_leverage=float(implied_leverage),
+            risk_amount_usdt=float(risk_amount_usdt),
+            effective_stop_loss=float(effective_stop_loss),
+            execution_cost_buffer_bps_used=float(execution_cost_buffer_bps_used),
+            quality_penalty_bps_used=float(quality_penalty_bps_used),
         )
 
 

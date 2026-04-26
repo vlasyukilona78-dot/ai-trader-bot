@@ -29,6 +29,9 @@ class BybitClient:
         timeout: int = 12,
         recv_window: int = 20000,
         category: str = "linear",
+        tpsl_mode: str | None = None,
+        sl_trigger_by: str | None = None,
+        tp_trigger_by: str | None = None,
     ):
         self.api_key = str(api_key or "").strip()
         self.api_secret = str(api_secret or "").strip()
@@ -38,6 +41,9 @@ class BybitClient:
         self.timeout = timeout
         self.recv_window = str(recv_window)
         self.category = category
+        self.tpsl_mode = self._normalize_tpsl_mode(tpsl_mode)
+        self.sl_trigger_by = self._normalize_trigger_by(sl_trigger_by, default="")
+        self.tp_trigger_by = self._normalize_trigger_by(tp_trigger_by, default="")
         self.base_url = resolve_private_http_base_url(testnet=bool(sandbox), demo=bool(demo))
         self.public_base_url = resolve_public_http_base_url(testnet=bool(sandbox))
         self._private_auth_invalid = False
@@ -105,6 +111,17 @@ class BybitClient:
 
     def _normalize_symbol(self, symbol: str) -> str:
         return symbol.replace("/", "").upper()
+
+    @staticmethod
+    def _normalize_trigger_by(value: str | None, *, default: str = "MarkPrice") -> str:
+        allowed = {"LastPrice", "MarkPrice", "IndexPrice"}
+        candidate = str(value or default).strip()
+        return candidate if candidate in allowed else default
+
+    @staticmethod
+    def _normalize_tpsl_mode(value: str | None) -> str:
+        candidate = str(value or "").strip().title()
+        return candidate if candidate in {"Full", "Partial"} else ""
 
     @staticmethod
     def _canonical_query(params: dict[str, Any] | None) -> str:
@@ -538,16 +555,9 @@ class BybitClient:
             return {"retCode": 0, "retMsg": "dry_run_simulation", "result": {"symbol": self._normalize_symbol(symbol)}}
 
         normalized_symbol = self._normalize_symbol(symbol)
-        trigger_by_allowed = {"LastPrice", "MarkPrice", "IndexPrice"}
-        sl_trigger_by = str(os.getenv("BYBIT_SL_TRIGGER_BY", "MarkPrice") or "MarkPrice").strip()
-        tp_trigger_by = str(os.getenv("BYBIT_TP_TRIGGER_BY", "MarkPrice") or "MarkPrice").strip()
-        if sl_trigger_by not in trigger_by_allowed:
-            sl_trigger_by = "MarkPrice"
-        if tp_trigger_by not in trigger_by_allowed:
-            tp_trigger_by = "MarkPrice"
-        explicit_tpsl_mode = str(os.getenv("BYBIT_TPSL_MODE", "") or "").strip().title()
-        if explicit_tpsl_mode not in {"", "Full", "Partial"}:
-            explicit_tpsl_mode = ""
+        sl_trigger_by = self.sl_trigger_by or self._normalize_trigger_by(os.getenv("BYBIT_SL_TRIGGER_BY", "MarkPrice"))
+        tp_trigger_by = self.tp_trigger_by or self._normalize_trigger_by(os.getenv("BYBIT_TP_TRIGGER_BY", "MarkPrice"))
+        explicit_tpsl_mode = self.tpsl_mode or self._normalize_tpsl_mode(os.getenv("BYBIT_TPSL_MODE", ""))
 
         body: dict[str, Any] = {
             "category": self.category,

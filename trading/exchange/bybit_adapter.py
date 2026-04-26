@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any, Protocol
 
 from trading.exchange.events import NormalizedExchangeEvent
@@ -72,6 +72,9 @@ class BybitAdapterConfig:
     ws_ping_timeout_sec: float = 20.0
     ws_symbols: list[str] = field(default_factory=list)
     target_entry_leverage: float = 3.0
+    tpsl_mode: str = ""
+    sl_trigger_by: str = "MarkPrice"
+    tp_trigger_by: str = "MarkPrice"
 
 
 @dataclass
@@ -96,6 +99,9 @@ class BybitAdapter:
             demo=config.demo,
             dry_run=config.dry_run,
             recv_window=config.recv_window,
+            tpsl_mode=config.tpsl_mode,
+            sl_trigger_by=config.sl_trigger_by,
+            tp_trigger_by=config.tp_trigger_by,
         )
         self._rules_cache: dict[str, _RulesCacheEntry] = {}
         self._applied_leverage_cache: dict[str, float] = {}
@@ -212,6 +218,21 @@ class BybitAdapter:
         if step_d <= 0:
             return float(max(qty, 0.0))
         units = (qty_d / step_d).to_integral_value(rounding=ROUND_DOWN)
+        rounded = (units * step_d).normalize()
+        return float(max(rounded, Decimal("0")))
+
+    @staticmethod
+    def round_price(price: float, tick_size: float) -> float:
+        if tick_size <= 0:
+            return float(max(price, 0.0))
+        try:
+            price_d = Decimal(str(max(price, 0.0)))
+            step_d = Decimal(str(tick_size))
+        except (InvalidOperation, ValueError):
+            return float(max(price, 0.0))
+        if step_d <= 0:
+            return float(max(price, 0.0))
+        units = (price_d / step_d).to_integral_value(rounding=ROUND_HALF_UP)
         rounded = (units * step_d).normalize()
         return float(max(rounded, Decimal("0")))
 
@@ -571,10 +592,25 @@ class BybitAdapter:
         position_idx: int,
         qty: float | None = None,
     ) -> ProtectiveOrderResult:
+        rounded_stop_loss = float(stop_loss)
+        rounded_take_profit = float(take_profit) if take_profit is not None else None
+        try:
+            rules = self.get_instrument_rules(symbol)
+            rounded_candidate = self.round_price(stop_loss, rules.tick_size)
+            if rounded_candidate > 0:
+                rounded_stop_loss = rounded_candidate
+            if take_profit is not None:
+                tp_candidate = self.round_price(take_profit, rules.tick_size)
+                if tp_candidate > 0:
+                    rounded_take_profit = tp_candidate
+        except Exception:
+            rounded_stop_loss = float(stop_loss)
+            rounded_take_profit = float(take_profit) if take_profit is not None else None
+
         resp = self.client.set_trading_stop(
             symbol=self.normalize_symbol(symbol),
-            stop_loss=float(stop_loss),
-            take_profit=float(take_profit) if take_profit is not None else None,
+            stop_loss=rounded_stop_loss,
+            take_profit=rounded_take_profit,
             position_idx=int(position_idx),
             qty=float(qty) if qty is not None and qty > 0 else None,
         )

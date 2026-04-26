@@ -8,10 +8,14 @@ Usage (comparison BEFORE vs AFTER):
 Usage (comparison + operator triage):
   powershell -ExecutionPolicy Bypass -File .\scripts\observation\summarize_observation.ps1 -AuditExtractFile .\logs\observation\after.log -CompareAuditExtractFile .\logs\observation\before.log -OutJson .\logs\observation\comparison_latest.json -PrintTriage
 
+Usage (comparison + quality drill-down attached):
+  powershell -ExecutionPolicy Bypass -File .\scripts\observation\summarize_observation.ps1 -AuditExtractFile .\logs\observation\after.log -CompareAuditExtractFile .\logs\observation\before.log -SignalQualityJson .\logs\observation\signal_quality_latest.json -ExitQualityJson .\logs\observation\exit_quality_latest.json -OutJson .\logs\observation\comparison_latest.json -PrintTriage
+
 Output includes:
   - normalized rates and blocker dominance metrics
   - comparison BEFORE / AFTER / DELTA
   - calibration guardrail recommendation payload
+  - optional quality guidance / quality overview when signal/exit quality JSON is supplied
 #>
 
 [CmdletBinding()]
@@ -33,7 +37,16 @@ param(
 
     [Parameter()]
     [ValidateRange(0, 20)]
-    [int]$TriageMaxActions = 4
+    [int]$TriageMaxActions = 4,
+
+    [Parameter()]
+    [string]$SignalQualityJson = "",
+
+    [Parameter()]
+    [string]$ExitQualityJson = "",
+
+    [Parameter()]
+    [string]$ObservationTimeframe = "1"
 )
 
 Set-StrictMode -Version Latest
@@ -90,6 +103,57 @@ function Invoke-PythonCommand {
     }
 }
 
+function Build-QualityOverviewFromGuidance {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$GuidancePayload
+    )
+
+    if ($null -eq $GuidancePayload) {
+        return $null
+    }
+
+    $metrics = $GuidancePayload.PSObject.Properties["metrics"]
+    if ($null -eq $metrics) {
+        return $null
+    }
+
+    $metricPayload = $metrics.Value
+    if ($null -eq $metricPayload) {
+        return $null
+    }
+
+    $signalTotal = 0
+    $signalMainVerdict = ""
+    $signalEarlyVerdict = ""
+    $exitTotal = 0
+    $exitMainVerdict = ""
+    $exitEarlyVerdict = ""
+
+    $prop = $metricPayload.PSObject.Properties["signal_total_count"]
+    if ($null -ne $prop) { $signalTotal = [int]$prop.Value }
+    $prop = $metricPayload.PSObject.Properties["signal_main_top_verdict"]
+    if ($null -ne $prop) { $signalMainVerdict = [string]$prop.Value }
+    $prop = $metricPayload.PSObject.Properties["signal_early_top_verdict"]
+    if ($null -ne $prop) { $signalEarlyVerdict = [string]$prop.Value }
+    $prop = $metricPayload.PSObject.Properties["exit_total_count"]
+    if ($null -ne $prop) { $exitTotal = [int]$prop.Value }
+    $prop = $metricPayload.PSObject.Properties["exit_main_top_verdict"]
+    if ($null -ne $prop) { $exitMainVerdict = [string]$prop.Value }
+    $prop = $metricPayload.PSObject.Properties["exit_early_top_verdict"]
+    if ($null -ne $prop) { $exitEarlyVerdict = [string]$prop.Value }
+
+    return [pscustomobject]@{
+        signal_total_count         = $signalTotal
+        signal_main_top_verdict    = $signalMainVerdict
+        signal_early_top_verdict   = $signalEarlyVerdict
+        exit_total_count           = $exitTotal
+        exit_main_top_verdict      = $exitMainVerdict
+        exit_early_top_verdict     = $exitEarlyVerdict
+    }
+}
+
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "../..")
 Push-Location $repoRoot
 try {
@@ -97,6 +161,9 @@ try {
     Assert-ConcretePathValue -ParameterName "CompareAuditExtractFile" -Value $CompareAuditExtractFile
     Assert-ConcretePathValue -ParameterName "OutJson" -Value $OutJson
     Assert-ConcretePathValue -ParameterName "PythonPath" -Value $PythonPath
+    Assert-ConcretePathValue -ParameterName "SignalQualityJson" -Value $SignalQualityJson
+    Assert-ConcretePathValue -ParameterName "ExitQualityJson" -Value $ExitQualityJson
+    Assert-ConcretePathValue -ParameterName "ObservationTimeframe" -Value $ObservationTimeframe
 
     if (-not (Test-Path $PythonPath)) {
         throw "Python executable not found: $PythonPath"
@@ -106,6 +173,12 @@ try {
     }
     if (-not [string]::IsNullOrWhiteSpace($CompareAuditExtractFile) -and -not (Test-Path $CompareAuditExtractFile)) {
         throw "Compare audit extract not found: $CompareAuditExtractFile"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($SignalQualityJson) -and -not (Test-Path $SignalQualityJson)) {
+        throw "Signal quality JSON not found: $SignalQualityJson"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExitQualityJson) -and -not (Test-Path $ExitQualityJson)) {
+        throw "Exit quality JSON not found: $ExitQualityJson"
     }
 
     $py = @"
@@ -192,6 +265,100 @@ if __name__ == "__main__":
                 Write-Host $result.stderr
             }
             throw
+        }
+
+        if ((-not [string]::IsNullOrWhiteSpace($SignalQualityJson)) -or (-not [string]::IsNullOrWhiteSpace($ExitQualityJson))) {
+            $guidanceScript = Join-Path $PSScriptRoot "build_quality_guidance.py"
+            if (-not (Test-Path $guidanceScript)) {
+                throw "Quality guidance script not found: $guidanceScript"
+            }
+
+            $guidanceArgs = @($guidanceScript, "--timeframe", [string]$ObservationTimeframe)
+            if (-not [string]::IsNullOrWhiteSpace($SignalQualityJson)) {
+                $guidanceArgs += @("--signal-json", $SignalQualityJson)
+            }
+            if (-not [string]::IsNullOrWhiteSpace($ExitQualityJson)) {
+                $guidanceArgs += @("--exit-json", $ExitQualityJson)
+            }
+
+            $guidanceResult = Invoke-PythonCommand -Exe $PythonPath -Args $guidanceArgs
+            if ($guidanceResult.exit_code -ne 0) {
+                if (-not [string]::IsNullOrWhiteSpace($guidanceResult.stdout)) {
+                    Write-Host "[summarize_observation] quality guidance stdout (non-zero exit):"
+                    Write-Host $guidanceResult.stdout
+                }
+                if (-not [string]::IsNullOrWhiteSpace($guidanceResult.stderr)) {
+                    Write-Host "[summarize_observation] quality guidance stderr (non-zero exit):"
+                    Write-Host $guidanceResult.stderr
+                }
+                throw ("Python quality guidance failed (exit_code={0})" -f $guidanceResult.exit_code)
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($guidanceResult.stdout)) {
+                try {
+                $guidancePayload = $guidanceResult.stdout | ConvertFrom-Json -ErrorAction Stop
+                }
+                catch {
+                    Write-Host "[summarize_observation] failed to parse quality guidance JSON stdout:"
+                    Write-Host $guidanceResult.stdout
+                    if (-not [string]::IsNullOrWhiteSpace($guidanceResult.stderr)) {
+                        Write-Host "[summarize_observation] quality guidance stderr while parsing JSON:"
+                        Write-Host $guidanceResult.stderr
+                    }
+                    throw
+                }
+
+                $report | Add-Member -Force -NotePropertyName "quality_guidance" -NotePropertyValue $guidancePayload
+                $qualityOverview = Build-QualityOverviewFromGuidance -GuidancePayload $guidancePayload
+                if ($null -ne $qualityOverview) {
+                    $report | Add-Member -Force -NotePropertyName "quality_overview" -NotePropertyValue $qualityOverview
+                }
+
+                $recommendationProp = $report.PSObject.Properties["calibration_recommendation"]
+                if ($null -ne $recommendationProp -and $null -ne $recommendationProp.Value) {
+                    $recommendationPayload = $recommendationProp.Value
+                    $entryFocusProp = $guidancePayload.PSObject.Properties["entry_focus"]
+                    $entryPriorityProp = $guidancePayload.PSObject.Properties["entry_priority"]
+                    $exitFocusProp = $guidancePayload.PSObject.Properties["exit_focus"]
+                    $exitPriorityProp = $guidancePayload.PSObject.Properties["exit_priority"]
+
+                    if ($null -ne $entryFocusProp) {
+                        $recommendationPayload | Add-Member -Force -NotePropertyName "QUALITY_ENTRY_FOCUS" -NotePropertyValue ([string]$entryFocusProp.Value)
+                    }
+                    if ($null -ne $entryPriorityProp) {
+                        $recommendationPayload | Add-Member -Force -NotePropertyName "QUALITY_ENTRY_PRIORITY" -NotePropertyValue ([string]$entryPriorityProp.Value)
+                    }
+                    if ($null -ne $exitFocusProp) {
+                        $recommendationPayload | Add-Member -Force -NotePropertyName "QUALITY_EXIT_FOCUS" -NotePropertyValue ([string]$exitFocusProp.Value)
+                    }
+                    if ($null -ne $exitPriorityProp) {
+                        $recommendationPayload | Add-Member -Force -NotePropertyName "QUALITY_EXIT_PRIORITY" -NotePropertyValue ([string]$exitPriorityProp.Value)
+                    }
+
+                    $existingActions = New-Object System.Collections.Generic.List[string]
+                    $existingActionsProp = $recommendationPayload.PSObject.Properties["RUNBOOK_ACTIONS"]
+                    if ($null -ne $existingActionsProp -and $null -ne $existingActionsProp.Value) {
+                        foreach ($item in @($existingActionsProp.Value)) {
+                            $text = [string]$item
+                            if (-not [string]::IsNullOrWhiteSpace($text) -and -not $existingActions.Contains($text)) {
+                                $existingActions.Add($text)
+                            }
+                        }
+                    }
+
+                    $guidanceActionsProp = $guidancePayload.PSObject.Properties["runbook_actions"]
+                    if ($null -ne $guidanceActionsProp -and $null -ne $guidanceActionsProp.Value) {
+                        foreach ($item in @($guidanceActionsProp.Value)) {
+                            $text = [string]$item
+                            if (-not [string]::IsNullOrWhiteSpace($text) -and -not $existingActions.Contains($text)) {
+                                $existingActions.Add($text)
+                            }
+                        }
+                    }
+
+                    $recommendationPayload | Add-Member -Force -NotePropertyName "RUNBOOK_ACTIONS" -NotePropertyValue @($existingActions.ToArray())
+                }
+            }
         }
 
         if (-not [string]::IsNullOrWhiteSpace($OutJson)) {

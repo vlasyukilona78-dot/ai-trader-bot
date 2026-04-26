@@ -453,6 +453,97 @@ class ExecutionEngine:
             status=status,
         )
 
+    @staticmethod
+    def _json_safe(value: Any) -> Any:
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, dict):
+            return {str(k): ExecutionEngine._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [ExecutionEngine._json_safe(item) for item in value]
+        return str(value)
+
+    @classmethod
+    def _build_persisted_decision_raw(
+        cls,
+        *,
+        intent: StrategyIntent,
+        risk: RiskDecision,
+        outcome: ExecutionOutcome,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if isinstance(outcome.raw, dict):
+            payload.update(cls._json_safe(outcome.raw))
+
+        intent_metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+        safe_metadata = cls._json_safe(intent_metadata)
+        payload["intent_context"] = {
+            "symbol": str(intent.symbol),
+            "action": intent.action.value,
+            "reason": str(intent.reason),
+            "confidence": float(intent.confidence),
+            "created_at": float(intent.created_at),
+            "stop_loss": float(intent.stop_loss or 0.0),
+            "take_profit": float(intent.take_profit or 0.0),
+            "metadata": safe_metadata,
+        }
+        payload["risk_context"] = {
+            "approved": bool(risk.approved),
+            "reason": str(risk.reason),
+            "quantity": float(risk.quantity),
+            "notional": float(risk.notional),
+            "implied_leverage": float(risk.implied_leverage),
+            "risk_amount_usdt": float(risk.risk_amount_usdt),
+            "effective_stop_loss": float(risk.effective_stop_loss),
+            "execution_cost_buffer_bps_used": float(risk.execution_cost_buffer_bps_used),
+            "quality_penalty_bps_used": float(risk.quality_penalty_bps_used),
+        }
+        payload["execution_context"] = {
+            "accepted": bool(outcome.accepted),
+            "status": str(outcome.status),
+            "reason": str(outcome.reason),
+            "filled_qty": float(outcome.filled_qty),
+            "avg_price": float(outcome.avg_price),
+            "realized_pnl": float(outcome.realized_pnl),
+            "stopped_out": bool(outcome.stopped_out),
+        }
+
+        if intent.take_profit:
+            payload.setdefault("tp_price", float(intent.take_profit))
+        if intent.stop_loss:
+            payload.setdefault("sl_price", float(intent.stop_loss))
+        if outcome.filled_qty > 0:
+            payload["filled_qty"] = float(outcome.filled_qty)
+        if outcome.avg_price > 0:
+            if intent.action in (IntentAction.LONG_ENTRY, IntentAction.SHORT_ENTRY):
+                payload.setdefault("entry_price", float(outcome.avg_price))
+            if intent.action in (IntentAction.EXIT_LONG, IntentAction.EXIT_SHORT):
+                payload["exit_price"] = float(outcome.avg_price)
+        if intent.action in (IntentAction.EXIT_LONG, IntentAction.EXIT_SHORT) or outcome.realized_pnl != 0.0:
+            payload["realized_pnl"] = float(outcome.realized_pnl)
+        if outcome.stopped_out:
+            payload["stopped_out"] = True
+
+        for key in (
+            "entry_price",
+            "entry",
+            "entry_px",
+            "take_profit",
+            "tp",
+            "take_profit_price",
+            "stop_loss",
+            "sl",
+            "stop_loss_price",
+            "exit_type",
+            "managed_exit",
+            "managed_exit_reason",
+            "managed_exit_details",
+        ):
+            if key in intent_metadata:
+                payload[key] = cls._json_safe(intent_metadata.get(key))
+
+        return payload
+
     def _persist_decision(
         self,
         *,
@@ -473,7 +564,7 @@ class ExecutionEngine:
             order_id=outcome.order_id,
             order_link_id=outcome.order_link_id,
             ts=time.time(),
-            raw=outcome.raw,
+            raw=self._build_persisted_decision_raw(intent=intent, risk=risk, outcome=outcome),
         )
 
     def _symbol_inflight_entries(self, symbol: str):

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from backtesting.metrics import summarize_trades
+from backtesting.metrics import build_equity_curve, summarize_trades
 from core.indicators import compute_indicators
 from core.market_regime import detect_market_regime
 from core.signal_generator import SignalConfig, SignalContext, SignalGenerator
@@ -105,8 +105,11 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
 
     enriched = compute_indicators(df)
     trades: list[dict] = []
+    equity = float(cfg.initial_equity)
 
     for i in range(80, len(enriched) - 2):
+        if equity <= 0.0:
+            break
         hist = enriched.iloc[: i + 1]
         vp = compute_volume_profile(hist)
         regime = detect_market_regime(hist)
@@ -142,7 +145,8 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
         risk_per_unit = abs(entry - signal.sl)
         if risk_per_unit <= 0:
             continue
-        risk_usdt = cfg.initial_equity * cfg.risk_per_trade
+        equity_before = max(equity, 0.0)
+        risk_usdt = equity_before * cfg.risk_per_trade
         qty = risk_usdt / risk_per_unit
 
         # execution costs
@@ -155,7 +159,8 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
 
         cost = abs(entry * qty) * total_cost_pct
         pnl = gross - cost
-        ret = pnl / max(cfg.initial_equity, 1e-9)
+        ret = pnl / max(equity_before, 1e-9)
+        equity_after = max(0.0, equity_before + pnl)
 
         trades.append(
             {
@@ -167,12 +172,18 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
                 "tp": signal.tp,
                 "sl": signal.sl,
                 "qty": qty,
+                "risk_usdt": risk_usdt,
+                "gross_pnl": gross,
+                "execution_cost": cost,
                 "pnl": pnl,
                 "ret": ret,
+                "equity_before": equity_before,
+                "equity_after": equity_after,
                 "confidence": signal.confidence,
                 "reason": exit_reason,
             }
         )
+        equity = equity_after
 
     trades_df = pd.DataFrame(trades)
     stats = summarize_trades(trades_df, initial_equity=cfg.initial_equity)
@@ -221,6 +232,7 @@ def parse_args():
     parser.add_argument("--max-hold", type=int, default=120)
     parser.add_argument("--fee-bps", type=float, default=5.0)
     parser.add_argument("--slippage-bps", type=float, default=2.0)
+    parser.add_argument("--equity-out", default="", help="Optional path to save equity curve CSV")
     return parser.parse_args()
 
 
@@ -241,10 +253,17 @@ if __name__ == "__main__":
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     trades_df.to_csv(out_path, index=False)
+    if str(args.equity_out).strip():
+        equity_curve = build_equity_curve(trades_df, initial_equity=float(args.equity))
+        equity_out_path = Path(args.equity_out)
+        equity_out_path.parent.mkdir(parents=True, exist_ok=True)
+        equity_curve.to_frame(name="equity").to_csv(equity_out_path, index_label="step")
 
     print("Backtest complete")
     for k, v in metrics.items():
         print(f"{k}: {v}")
     print(f"trades_csv: {out_path}")
+    if str(args.equity_out).strip():
+        print(f"equity_csv: {Path(args.equity_out)}")
 
 

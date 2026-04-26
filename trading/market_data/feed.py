@@ -92,8 +92,26 @@ class MarketDataFeed:
         liq_high = None
         liq_low = None
         if include_liquidations:
+            current_price = mark_price
+            if current_price <= 0:
+                try:
+                    current_price = float(ohlcv.iloc[-1]["close"])
+                except Exception:
+                    current_price = 0.0
+            heatmap_bands = self._client.fetch_liquidation_heatmap_bands(symbol, current_price=current_price)
+            if heatmap_bands:
+                ohlcv.attrs["coinglass_liquidation_bands"] = heatmap_bands
+                ohlcv.attrs["liquidation_feed_bands"] = heatmap_bands
+                above = [row for row in heatmap_bands if str(row.get("side")) == "above"]
+                below = [row for row in heatmap_bands if str(row.get("side")) == "below"]
+                if above:
+                    liq_high = float(max(above, key=lambda row: float(row.get("weight", 0.0))).get("level", 0.0))
+                if below:
+                    liq_low = float(max(below, key=lambda row: float(row.get("weight", 0.0))).get("level", 0.0))
             liq_feed = self._client.fetch_recent_liquidations(symbol)
-            liq_high, liq_low = self._client.liquidation_clusters_from_feed(liq_feed)
+            bybit_high, bybit_low = self._client.liquidation_clusters_from_feed(liq_feed)
+            liq_high = liq_high if liq_high is not None else bybit_high
+            liq_low = liq_low if liq_low is not None else bybit_low
             if liq_high is None and liq_low is None:
                 liq_high, liq_low = self._client.estimate_liquidation_clusters(ohlcv)
         return MarketFrame(

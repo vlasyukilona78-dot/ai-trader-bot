@@ -21,6 +21,9 @@ class BybitHttpClient:
         dry_run: bool,
         recv_window: int = 20000,
         category: str = "linear",
+        tpsl_mode: str | None = None,
+        sl_trigger_by: str | None = None,
+        tp_trigger_by: str | None = None,
     ):
         if _BybitClient is None:
             raise RuntimeError("bybit_client_dependency_missing")
@@ -32,6 +35,9 @@ class BybitHttpClient:
             dry_run=bool(dry_run),
             recv_window=recv_window,
             category=category,
+            tpsl_mode=tpsl_mode,
+            sl_trigger_by=sl_trigger_by,
+            tp_trigger_by=tp_trigger_by,
         )
 
     def close(self):

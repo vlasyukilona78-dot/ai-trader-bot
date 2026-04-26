@@ -56,6 +56,11 @@ class BybitAdapterV2Tests(unittest.TestCase):
         self.assertEqual(BybitAdapter.round_qty(0.009, 0.01), 0.0)
         self.assertEqual(BybitAdapter.round_qty(0.30000000000000004, 0.1), 0.3)
 
+    def test_round_price_aligns_to_tick_size(self):
+        self.assertEqual(BybitAdapter.round_price(100.06, 0.1), 100.1)
+        self.assertEqual(BybitAdapter.round_price(98.94, 0.1), 98.9)
+        self.assertEqual(BybitAdapter.round_price(0.30000000000000004, 0.1), 0.3)
+
     def test_order_side_parsing_accepts_long_short_aliases(self):
         self.assertEqual(BybitAdapter._parse_order_side("LONG").value, "BUY")
         self.assertEqual(BybitAdapter._parse_order_side("SHORT").value, "SELL")
@@ -144,6 +149,36 @@ class BybitAdapterV2Tests(unittest.TestCase):
         ok = BybitAdapter.ensure_position_leverage(adapter, "BTCUSDT", 3.0)
         self.assertTrue(ok)
         self.assertEqual(adapter._applied_leverage_cache["BTCUSDT"], 3.0)
+
+    def test_set_protective_orders_rounds_prices_to_tick_size(self):
+        class FakeClient:
+            def __init__(self):
+                self.kwargs = None
+
+            def set_trading_stop(self, **kwargs):
+                self.kwargs = dict(kwargs)
+                return {"retCode": 0, "retMsg": "OK", "result": {}}
+
+        adapter = object.__new__(BybitAdapter)
+        adapter.client = FakeClient()
+        adapter.get_instrument_rules = lambda symbol: InstrumentRules(
+            symbol=symbol,
+            tick_size=0.1,
+            qty_step=0.01,
+            min_qty=0.01,
+            min_notional=5.0,
+        )
+        result = BybitAdapter.set_protective_orders(
+            adapter,
+            "BTCUSDT",
+            stop_loss=100.06,
+            take_profit=98.94,
+            position_idx=2,
+            qty=0.5,
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(adapter.client.kwargs["stop_loss"], 100.1)
+        self.assertEqual(adapter.client.kwargs["take_profit"], 98.9)
 
 
 if __name__ == "__main__":

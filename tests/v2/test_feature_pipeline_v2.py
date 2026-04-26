@@ -12,7 +12,12 @@ except Exception:
     HAS_NUMPY_PANDAS = False
 
 if HAS_NUMPY_PANDAS:
-    from core.feature_engineering import REQUIRED_MODEL_FEATURES, sanitize_feature_frame
+    from core.feature_engineering import (
+        REQUIRED_MODEL_FEATURES,
+        assess_feature_frame_quality,
+        compute_mtf_feature_snapshot,
+        sanitize_feature_frame,
+    )
     from trading.features.pipeline import FeaturePipeline
     from trading.features.validators import FeatureValidationError, assert_no_future_rows
 else:
@@ -48,6 +53,18 @@ class FeaturePipelineV2Tests(unittest.TestCase):
         for name in REQUIRED_MODEL_FEATURES:
             self.assertTrue(np.isfinite(float(bundle.row.values[name])))
 
+    def test_compute_mtf_feature_snapshot_populates_one_hour_context(self):
+        df = self._build_df(n=2200)
+
+        snapshot = compute_mtf_feature_snapshot(df)
+
+        self.assertIn("mtf_rsi_1h", snapshot)
+        self.assertIn("mtf_atr_norm_1h", snapshot)
+        self.assertIn("mtf_trend_1h", snapshot)
+        self.assertTrue(np.isfinite(float(snapshot["mtf_rsi_1h"])))
+        self.assertTrue(np.isfinite(float(snapshot["mtf_atr_norm_1h"])))
+        self.assertTrue(np.isfinite(float(snapshot["mtf_trend_1h"])))
+
     def test_sanitize_feature_frame_repairs_inf_and_duplicate_rows(self):
         df = self._build_df(n=16)
         broken = pd.concat([df.iloc[:8], df.iloc[7:]], axis=0)
@@ -61,6 +78,31 @@ class FeaturePipelineV2Tests(unittest.TestCase):
         self.assertTrue(np.isfinite(float(out["volume_spike"].iloc[-1])))
         self.assertTrue(np.isfinite(float(out["rsi"].iloc[-1])))
         self.assertTrue(np.isfinite(float(out["hist"].iloc[-1])))
+
+    def test_assess_feature_frame_quality_blocks_severe_recent_gap_cluster(self):
+        df = self._build_df(n=48)
+        broken = df.drop(df.index[[30, 31, 40, 41]])
+        out = assess_feature_frame_quality(broken, recent_window=24, severe_gap_multiple=3.0, max_recent_gap_ratio=0.05)
+
+        self.assertFalse(bool(out["usable"]))
+        self.assertIn(str(out["reason"]), {"latest_gap_exceeds_threshold", "recent_gap_cluster"})
+        self.assertGreater(float(out["recent_severe_gap_count"]), 0.0)
+
+    def test_assess_feature_frame_quality_blocks_recent_zero_volume_cluster(self):
+        df = self._build_df(n=48)
+        df.loc[df.index[-6:], "volume"] = 0.0
+
+        out = assess_feature_frame_quality(
+            df,
+            recent_window=24,
+            max_recent_zero_volume_ratio=0.10,
+            min_recent_zero_volume_count=3,
+        )
+
+        self.assertFalse(bool(out["usable"]))
+        self.assertEqual(str(out["reason"]), "recent_zero_volume_cluster")
+        self.assertGreaterEqual(float(out["recent_zero_volume_count"]), 3.0)
+        self.assertGreater(float(out["recent_zero_volume_ratio"]), 0.10)
 
 
 if __name__ == "__main__":

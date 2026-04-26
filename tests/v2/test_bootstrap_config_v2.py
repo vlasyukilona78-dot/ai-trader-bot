@@ -9,6 +9,11 @@ from app.bootstrap import ConfigError, _discover_linear_usdt_symbols, _quality_s
 
 
 class BootstrapConfigV2Tests(unittest.TestCase):
+    def setUp(self):
+        self._dotenv_patcher = patch("app.bootstrap._load_dotenv_file", return_value=None)
+        self._dotenv_patcher.start()
+        self.addCleanup(self._dotenv_patcher.stop)
+
     def test_discovery_uses_cached_universe_when_public_requests_fail(self):
         class _FailingClient:
             def __init__(self, *args, **kwargs):
@@ -200,6 +205,24 @@ class BootstrapConfigV2Tests(unittest.TestCase):
             self.assertEqual(cfg.adapter.api_key, "main_k")
             self.assertEqual(cfg.adapter.api_secret, "main_s")
             self.assertEqual(cfg.runtime_db_path, "data/runtime/v2_demo_runtime_main.db")
+
+    def test_demo_mode_reads_explicit_tpsl_runtime_settings(self):
+        env = {
+            "BOT_RUNTIME_MODE": "demo",
+            "BYBIT_TESTNET": "false",
+            "BYBIT_API_KEY": "k",
+            "BYBIT_API_SECRET": "s",
+            "BYBIT_TPSL_MODE": "partial",
+            "BYBIT_SL_TRIGGER_BY": "LastPrice",
+            "BYBIT_TP_TRIGGER_BY": "IndexPrice",
+            "FEATURE_RUNTIME_ENABLED": "false",
+            "WS_ENABLED": "false",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_runtime_config()
+            self.assertEqual(cfg.adapter.tpsl_mode, "Partial")
+            self.assertEqual(cfg.adapter.sl_trigger_by, "LastPrice")
+            self.assertEqual(cfg.adapter.tp_trigger_by, "IndexPrice")
 
     def test_demo_mode_uses_profile_specific_demo_credentials_for_early(self):
         env = {

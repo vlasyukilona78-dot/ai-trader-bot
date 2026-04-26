@@ -74,11 +74,22 @@ def _safe_int(value: Any, default: int = 0) -> int:
             return default
 
 
+def _as_mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
 def _rate(num: float | int, den: float | int) -> float:
     den_value = _safe_float(den, 0.0)
     if den_value <= 0.0:
         return 0.0
     return _safe_float(num, 0.0) / den_value
+
+
+def _sorted_numeric_mapping(counter: Mapping[str, Any]) -> dict[str, int]:
+    if not isinstance(counter, Mapping):
+        return {}
+    pairs = ((str(key), _safe_int(value)) for key, value in counter.items())
+    return dict(sorted(pairs, key=lambda item: (-item[1], item[0])))
 
 
 def _extract_literal(msg: str, key: str) -> str | None:
@@ -912,6 +923,278 @@ def recommend_calibration_step(
         why_not = ["Only one meaningful blocker detected in the current layer."]
     recommendation["WHY_NOT_OTHERS"] = why_not
     return _finalize_recommendation(recommendation, after_summary, before_summary)
+
+
+def _quality_profile_summary(summary_root: Mapping[str, Any], profile: str) -> Mapping[str, Any]:
+    return _as_mapping(summary_root.get(str(profile)))
+
+
+def _quality_verdict_counts(profile_summary: Mapping[str, Any]) -> dict[str, int]:
+    return _sorted_numeric_mapping(_as_mapping(profile_summary.get("verdict_counts")))
+
+
+def _top_quality_verdict(profile_summary: Mapping[str, Any]) -> str:
+    verdict_counts = _quality_verdict_counts(profile_summary)
+    top_name, _ = _top_key_count(verdict_counts)
+    return top_name
+
+
+def _sum_quality_verdicts(verdict_counts: Mapping[str, Any], names: tuple[str, ...]) -> int:
+    return sum(_safe_int(verdict_counts.get(name, 0)) for name in names)
+
+
+def build_quality_guidance(
+    signal_quality: Mapping[str, Any] | None = None,
+    exit_quality: Mapping[str, Any] | None = None,
+    *,
+    observation_timeframe: str = "1",
+) -> dict[str, Any]:
+    signal_summary_root = _as_mapping(_as_mapping(signal_quality).get("summary"))
+    exit_summary_root = _as_mapping(_as_mapping(exit_quality).get("summary"))
+
+    signal_main = _quality_profile_summary(signal_summary_root, "main")
+    signal_early = _quality_profile_summary(signal_summary_root, "early")
+    exit_main = _quality_profile_summary(exit_summary_root, "main")
+    exit_early = _quality_profile_summary(exit_summary_root, "early")
+
+    signal_main_count = _safe_int(signal_main.get("count", 0))
+    signal_early_count = _safe_int(signal_early.get("count", 0))
+    exit_main_count = _safe_int(exit_main.get("count", 0))
+    exit_early_count = _safe_int(exit_early.get("count", 0))
+
+    signal_main_verdicts = _quality_verdict_counts(signal_main)
+    signal_early_verdicts = _quality_verdict_counts(signal_early)
+    exit_main_verdicts = _quality_verdict_counts(exit_main)
+    exit_early_verdicts = _quality_verdict_counts(exit_early)
+
+    signal_total = signal_main_count + signal_early_count
+    exit_total = exit_main_count + exit_early_count
+
+    entry_focus = "insufficient_signal_quality_data"
+    entry_priority = "low"
+    entry_reasons: list[str] = []
+    entry_actions: list[str] = []
+
+    early_too_early_rate = _rate(_sum_quality_verdicts(signal_early_verdicts, ("too_early",)), signal_early_count)
+    early_continuation_trap_rate = _rate(
+        _sum_quality_verdicts(signal_early_verdicts, ("continuation_trap", "late_or_weak")),
+        signal_early_count,
+    )
+    early_worked_rate = _rate(_sum_quality_verdicts(signal_early_verdicts, ("worked",)), signal_early_count)
+    main_late_or_failed_rate = _rate(
+        _sum_quality_verdicts(signal_main_verdicts, ("late_or_weak", "continuation_trap", "failed")),
+        signal_main_count,
+    )
+    main_weak_rate = _rate(
+        _sum_quality_verdicts(signal_main_verdicts, ("weak", "late_or_weak")),
+        signal_main_count,
+    )
+    main_worked_rate = _rate(_sum_quality_verdicts(signal_main_verdicts, ("worked",)), signal_main_count)
+    signal_avg_adverse_15 = max(
+        _safe_float(signal_main.get("avg_adverse_excursion_15m_pct", 0.0)),
+        _safe_float(signal_early.get("avg_adverse_excursion_15m_pct", 0.0)),
+    )
+
+    if signal_total <= 0:
+        entry_reasons.append("No recent signal-quality window is available yet.")
+        entry_actions.append("Collect another observation window before tuning entry logic.")
+    elif signal_early_count >= 3 and early_too_early_rate >= 0.35:
+        entry_focus = "tighten_early_confirmation"
+        entry_priority = "high"
+        entry_reasons.extend(
+            [
+                f"Early profile is dominated by too_early outcomes ({early_too_early_rate:.3f} share).",
+                "Current early alerts are firing before downside proves itself structurally.",
+            ]
+        )
+        entry_actions.extend(
+            [
+                "Tighten early alerts around the first real weakness bar instead of raw peak proximity alone.",
+                "Require failed continuation / failed retake evidence before promoting early alerts aggressively.",
+            ]
+        )
+    elif signal_main_count >= 3 and main_late_or_failed_rate >= 0.40:
+        entry_focus = "tighten_main_continuation_filter"
+        entry_priority = "high"
+        entry_reasons.extend(
+            [
+                f"Main profile is dominated by late_or_weak / continuation / failed outcomes ({main_late_or_failed_rate:.3f} share).",
+                "Current main entries are still too exposed to live continuation after the first trigger.",
+            ]
+        )
+        entry_actions.extend(
+            [
+                "Strengthen failed-continuation gating before confirming a full short entry.",
+                "Do not confirm main entry unless upside continuation clearly loses acceptance after the first rejection.",
+            ]
+        )
+    elif signal_main_count >= 3 and main_worked_rate < 0.40 and main_weak_rate >= 0.25:
+        entry_focus = "improve_main_entry_timing"
+        entry_priority = "medium"
+        entry_reasons.extend(
+            [
+                f"Main worked rate is still weak ({main_worked_rate:.3f}) while weak/late outcomes remain elevated ({main_weak_rate:.3f}).",
+                "Signals are appearing, but the confirmation point still arrives later than ideal.",
+            ]
+        )
+        entry_actions.extend(
+            [
+                "Reduce dependence on slow retest-style confirmation when the first rollover is already visible.",
+                "Bias main entry toward the first failed retake near the upper level instead of waiting deep into the fade.",
+            ]
+        )
+    elif signal_early_count >= 3 and early_worked_rate < 0.40 and early_continuation_trap_rate >= 0.30:
+        entry_focus = "tighten_early_continuation_filter"
+        entry_priority = "medium"
+        entry_reasons.extend(
+            [
+                f"Early worked rate is modest ({early_worked_rate:.3f}) while continuation-style misses remain elevated ({early_continuation_trap_rate:.3f}).",
+                "The early profile still overestimates reversal quality when upside acceptance is not fully lost.",
+            ]
+        )
+        entry_actions.extend(
+            [
+                "Increase the penalty for early alerts that still sit inside clean upside acceptance.",
+                "Prefer early alerts only when RSI/volume weaken together with visible loss of breakout acceptance.",
+            ]
+        )
+    else:
+        entry_focus = "entry_quality_stable"
+        entry_priority = "low"
+        entry_reasons.extend(
+            [
+                f"Signal window is currently balanced enough (main worked={main_worked_rate:.3f}, early worked={early_worked_rate:.3f}).",
+                f"Average early adverse excursion remains manageable ({signal_avg_adverse_15:.3f}% over 15m).",
+            ]
+        )
+        entry_actions.append("Keep entry logic stable and prefer reviewing exits before another entry tweak.")
+
+    exit_focus = "insufficient_exit_quality_data"
+    exit_priority = "low"
+    exit_reasons: list[str] = []
+    exit_actions: list[str] = []
+
+    exit_timely_rate = _rate(
+        _sum_quality_verdicts(exit_main_verdicts, ("timely",))
+        + _sum_quality_verdicts(exit_early_verdicts, ("timely",)),
+        exit_total,
+    )
+    exit_too_early_rate = _rate(
+        _sum_quality_verdicts(exit_main_verdicts, ("too_early",))
+        + _sum_quality_verdicts(exit_early_verdicts, ("too_early",)),
+        exit_total,
+    )
+    exit_late_rate = _rate(
+        _sum_quality_verdicts(exit_main_verdicts, ("late_or_bad", "stopped_then_reversed", "cut_before_reversal"))
+        + _sum_quality_verdicts(exit_early_verdicts, ("late_or_bad", "stopped_then_reversed", "cut_before_reversal")),
+        exit_total,
+    )
+    exit_protective_rate = _rate(
+        _sum_quality_verdicts(exit_main_verdicts, ("protective_exit",))
+        + _sum_quality_verdicts(exit_early_verdicts, ("protective_exit",)),
+        exit_total,
+    )
+    avg_further_60 = max(
+        _safe_float(exit_main.get("avg_further_favorable_60m_pct", 0.0)),
+        _safe_float(exit_early.get("avg_further_favorable_60m_pct", 0.0)),
+    )
+    avg_rebound_60 = max(
+        _safe_float(exit_main.get("avg_rebound_60m_pct", 0.0)),
+        _safe_float(exit_early.get("avg_rebound_60m_pct", 0.0)),
+    )
+    stopped_out_rate = max(
+        _safe_float(exit_main.get("stopped_out_rate", 0.0)),
+        _safe_float(exit_early.get("stopped_out_rate", 0.0)),
+    )
+
+    if exit_total <= 0:
+        exit_reasons.append("No recent exit-quality window is available yet.")
+        exit_actions.append("Collect filled exits before tuning managed-exit logic.")
+    elif exit_too_early_rate >= 0.35 or (avg_further_60 - avg_rebound_60) >= 0.75:
+        exit_focus = "loosen_managed_exit_hold"
+        exit_priority = "high"
+        exit_reasons.extend(
+            [
+                f"Too-early exits are elevated ({exit_too_early_rate:.3f} share).",
+                f"Post-exit downside still dominates rebound ({avg_further_60:.3f}% vs {avg_rebound_60:.3f}% over 60m).",
+            ]
+        )
+        exit_actions.extend(
+            [
+                "Delay aggressive protective exits until the short has either failed structurally or produced a real downside impulse.",
+                "Do not rush break-even or acceptance-based exits while post-exit downside still dominates the rebound profile.",
+            ]
+        )
+    elif exit_late_rate >= 0.30 or exit_protective_rate >= 0.35 or stopped_out_rate >= 0.40:
+        exit_focus = "tighten_invalidation_and_time_stop"
+        exit_priority = "high"
+        exit_reasons.extend(
+            [
+                f"Late/protective exits remain elevated (late={exit_late_rate:.3f}, protective={exit_protective_rate:.3f}).",
+                f"Stopped-out rate is still meaningful ({stopped_out_rate:.3f}).",
+            ]
+        )
+        exit_actions.extend(
+            [
+                "Tighten structural invalidation when price reclaims entry / VWAP / EMA20 with acceptance.",
+                "Add or shorten time-stop logic when the short stops producing downside after the first rejection.",
+            ]
+        )
+    elif exit_timely_rate >= 0.50:
+        exit_focus = "exit_quality_stable"
+        exit_priority = "low"
+        exit_reasons.extend(
+            [
+                f"Timely exits dominate the recent window ({exit_timely_rate:.3f} share).",
+                "Managed exits look stable enough to keep the current hold logic for now.",
+            ]
+        )
+        exit_actions.append("Keep managed exits stable and prioritize entry-quality work first.")
+    else:
+        exit_focus = "monitor_exit_mix"
+        exit_priority = "medium"
+        exit_reasons.extend(
+            [
+                "Exit verdict mix is still mixed and not clearly dominated by one failure pattern.",
+                "Collect another exit-quality window before making a large managed-exit change.",
+            ]
+        )
+        exit_actions.append("Observe another comparable exit window before changing TP/SL or managed-exit rules.")
+
+    runbook_actions: list[str] = []
+    runbook_actions.extend(entry_actions[:2])
+    for action in exit_actions[:2]:
+        if action not in runbook_actions:
+            runbook_actions.append(action)
+
+    status = "ok" if signal_total > 0 or exit_total > 0 else "no_quality_data"
+    return {
+        "status": status,
+        "observation_timeframe": str(observation_timeframe),
+        "entry_focus": entry_focus,
+        "entry_priority": entry_priority,
+        "entry_reasons": entry_reasons,
+        "exit_focus": exit_focus,
+        "exit_priority": exit_priority,
+        "exit_reasons": exit_reasons,
+        "runbook_actions": runbook_actions,
+        "metrics": {
+            "signal_total_count": signal_total,
+            "exit_total_count": exit_total,
+            "signal_main_top_verdict": _top_quality_verdict(signal_main),
+            "signal_early_top_verdict": _top_quality_verdict(signal_early),
+            "exit_main_top_verdict": _top_quality_verdict(exit_main),
+            "exit_early_top_verdict": _top_quality_verdict(exit_early),
+            "early_too_early_rate": round(early_too_early_rate, 3),
+            "main_late_or_failed_rate": round(main_late_or_failed_rate, 3),
+            "exit_too_early_rate": round(exit_too_early_rate, 3),
+            "exit_late_rate": round(exit_late_rate, 3),
+            "exit_protective_rate": round(exit_protective_rate, 3),
+            "exit_timely_rate": round(exit_timely_rate, 3),
+            "avg_exit_further_favorable_60m_pct": round(avg_further_60, 3),
+            "avg_exit_rebound_60m_pct": round(avg_rebound_60, 3),
+        },
+    }
 
 
 def compare_observation_windows(before_summary: Mapping[str, Any], after_summary: Mapping[str, Any]) -> dict[str, Any]:

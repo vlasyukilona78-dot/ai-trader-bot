@@ -50,8 +50,10 @@ class SignalConfig:
     regime_soft_pass_enabled: bool = False
     regime_strong_trend_adx: float = 30.0
     regime_mtf_hard_filter_enabled: bool = True
+    regime_mtf_trend_1h_max_short: float = 0.0020
     regime_mtf_trend_15m_max_short: float = 0.0020
     regime_mtf_trend_5m_max_short: float = 0.0014
+    regime_mtf_rsi_1h_max_short: float = 60.0
     regime_mtf_rsi_15m_max_short: float = 64.0
     regime_mtf_rsi_5m_max_short: float = 70.0
     fake_filter_lsr_extreme_soft: float = 1.01
@@ -61,6 +63,44 @@ class SignalConfig:
     degraded_mode_min_layer3_strength: float = 0.74
     degraded_signal_confidence_cap: float = 0.70
     allow_long_entries: bool = False
+    late_reclaim_block_reclaim_ratio: float = 0.68
+    late_reclaim_block_min_pullback_atr_mult: float = 0.75
+    shallow_reject_block_reclaim_ratio: float = 0.76
+    shallow_reject_block_min_pullback_atr_mult: float = 0.92
+    plateau_continuation_block_max_dist_atr_mult: float = 0.48
+    plateau_continuation_block_min_closepos: float = 0.56
+    plateau_continuation_block_max_upper_wick_ratio: float = 0.34
+    green_hold_block_max_dist_atr_mult: float = 1.20
+    green_hold_block_min_closepos: float = 0.70
+    green_hold_block_max_upper_wick_ratio: float = 0.30
+    managed_exit_no_downside_min_hold_minutes: float = 7.0
+    managed_exit_no_downside_max_best_r: float = 0.22
+    managed_exit_adverse_acceptance_min_hold_minutes: float = 4.0
+    managed_exit_adverse_acceptance_min_adverse_r: float = 0.06
+    managed_exit_adverse_acceptance_max_best_r: float = 0.20
+    managed_exit_roundtrip_min_hold_minutes: float = 9.0
+    managed_exit_roundtrip_min_best_r: float = 0.32
+    managed_exit_roundtrip_max_reward_r: float = 0.06
+    managed_exit_fast_fail_min_hold_minutes: float = 5.0
+    managed_exit_fast_fail_max_reward_r: float = 0.10
+    managed_exit_no_progress_min_hold_minutes: float = 10.0
+    managed_exit_no_progress_max_best_r: float = 0.18
+    managed_exit_no_progress_max_reward_r: float = 0.06
+    managed_exit_profit_giveback_min_hold_minutes: float = 6.0
+    managed_exit_profit_giveback_min_best_r: float = 0.55
+    managed_exit_profit_giveback_min_reward_r: float = 0.12
+    managed_exit_profit_giveback_retention_max: float = 0.45
+    managed_exit_acceptance_min_hold_minutes: float = 8.0
+    managed_exit_acceptance_min_best_r: float = 0.35
+    managed_exit_acceptance_reward_retention_mult: float = 0.65
+    managed_exit_acceptance_min_reward_r_floor: float = 0.18
+    managed_exit_time_decay_min_hold_minutes: float = 18.0
+    managed_exit_time_decay_max_reward_r: float = 0.12
+    managed_exit_stagnation_min_hold_minutes: float = 14.0
+    managed_exit_stagnation_max_reward_r: float = 0.15
+    managed_exit_target_zone_min_reward_r: float = 0.32
+    managed_exit_profit_reclaim_min_reward_r: float = 0.85
+    managed_exit_reclaim_invalidation_min_reward_r: float = 0.15
 
 
 @dataclass
@@ -194,10 +234,16 @@ class SignalGenerator:
         htf_uptrend_structure = ema20 >= ema50 and close >= ema20
         htf_strong_uptrend = htf_uptrend_structure and adx >= htf_trend_threshold
         mtf_hard_enabled = bool(self.config.regime_mtf_hard_filter_enabled)
+        mtf_trend_1h = self._safe(last.get("mtf_trend_1h"), 0.0)
         mtf_trend_5m = self._safe(last.get("mtf_trend_5m"), 0.0)
         mtf_trend_15m = self._safe(last.get("mtf_trend_15m"), 0.0)
+        mtf_rsi_1h = self._safe(last.get("mtf_rsi_1h"), 50.0)
         mtf_rsi_5m = self._safe(last.get("mtf_rsi_5m"), 50.0)
         mtf_rsi_15m = self._safe(last.get("mtf_rsi_15m"), 50.0)
+        mtf_1h_strong_up = (
+            mtf_trend_1h >= float(self.config.regime_mtf_trend_1h_max_short)
+            and mtf_rsi_1h >= float(self.config.regime_mtf_rsi_1h_max_short)
+        )
         mtf_15m_strong_up = (
             mtf_trend_15m >= float(self.config.regime_mtf_trend_15m_max_short)
             and mtf_rsi_15m >= float(self.config.regime_mtf_rsi_15m_max_short)
@@ -206,7 +252,9 @@ class SignalGenerator:
             mtf_trend_5m >= float(self.config.regime_mtf_trend_5m_max_short)
             and mtf_rsi_5m >= float(self.config.regime_mtf_rsi_5m_max_short)
         )
-        mtf_short_context_ok = not (mtf_hard_enabled and (mtf_15m_strong_up or mtf_5m_continuation_up))
+        mtf_short_context_ok = not (
+            mtf_hard_enabled and (mtf_1h_strong_up or mtf_15m_strong_up or mtf_5m_continuation_up)
+        )
         if regime == MarketRegime.PANIC:
             htf_direction_context = "panic_regime"
             htf_trend_ok = False
@@ -294,10 +342,9 @@ class SignalGenerator:
         soft_pass_candidate = bool(
             (not strict_passed)
             and (not degraded)
-            and (
-                (htf_trend_ok and mtf_short_context_ok and (int(stretched) + int(vol_ok) + int(news_ok) >= 2))
-                or ((not htf_trend_ok) and mtf_short_context_ok and stretched and vol_ok and news_ok)
-            )
+            and htf_trend_ok
+            and mtf_short_context_ok
+            and (int(stretched) + int(vol_ok) + int(news_ok) >= 2)
         )
         soft_pass_used = bool(
             self.config.regime_soft_pass_enabled
@@ -305,7 +352,7 @@ class SignalGenerator:
             and (not degraded)
             and mtf_short_context_ok
             and (
-                (len(missing) == 1 and missing[0] in ("stretched_from_vwap", "htf_trend_ok"))
+                (len(missing) == 1 and missing[0] == "stretched_from_vwap")
                 or sweep_soft_pass_candidate
             )
         )
@@ -329,8 +376,10 @@ class SignalGenerator:
             "htf_trend_metric_used": float(adx),
             "htf_trend_threshold_used": float(htf_trend_threshold),
             "htf_trend_direction_context": str(htf_direction_context),
+            "mtf_trend_1h_used": float(mtf_trend_1h),
             "mtf_trend_5m_used": float(mtf_trend_5m),
             "mtf_trend_15m_used": float(mtf_trend_15m),
+            "mtf_rsi_1h_used": float(mtf_rsi_1h),
             "mtf_rsi_5m_used": float(mtf_rsi_5m),
             "mtf_rsi_15m_used": float(mtf_rsi_15m),
             "mtf_hard_filter_enabled": 1.0 if mtf_hard_enabled else 0.0,
@@ -857,9 +906,15 @@ class SignalGenerator:
         close_ref = self._safe(ref.get("close"), close_last)
         recent_high = float(pd.to_numeric(df.tail(lb + 3).get("high"), errors="coerce").max())
         price_up = close_last > close_ref
-        near = close_last >= max(close_ref, recent_high) * (1.0 - max(float(self.config.entry_tolerance_pct) * 4.0, 0.05))
+        near_high_tolerance = max(
+            float(self.config.entry_tolerance_pct) * 4.0,
+            0.0065 if close_last < 0.02 else 0.0045,
+        )
+        broad_near_high_tolerance = max(float(self.config.entry_tolerance_pct) * 4.0, 0.05)
+        strict_near = close_last >= max(close_ref, recent_high) * (1.0 - near_high_tolerance)
+        broad_near = close_last >= max(close_ref, recent_high) * (1.0 - broad_near_high_tolerance)
         sweep_ctx = self._short_sweep_reclaim_context(df)
-        price_ctx = price_up or near
+        price_ctx = price_up
 
         obv_div = self._safe(last.get("obv"), 0.0) < self._safe(ref.get("obv"), 0.0)
         cvd_div = self._safe(last.get("cvd"), 0.0) < self._safe(ref.get("cvd"), 0.0)
@@ -875,12 +930,59 @@ class SignalGenerator:
         failed_reclaim = bool(sweep_ctx.get("failed_reclaim"))
         retest_failed_breakout = bool(sweep_ctx.get("retest_failed_breakout"))
         acceptance_above_high = bool(sweep_ctx.get("acceptance_above_high"))
+        prev_close = self._safe(prev.get("close"), close_last)
+        last_open = self._safe(last.get("open"), close_last)
+        last_high = self._safe(last.get("high"), close_last)
+        last_low = self._safe(last.get("low"), close_last)
+        candle_range = max(last_high - last_low, max(close_last, 1e-8) * 0.0004, 1e-8)
+        upper_wick_share = max(last_high - max(last_open, close_last), 0.0) / candle_range
+        close_position_in_candle = max(0.0, min(1.0, (close_last - last_low) / candle_range))
+        pullback_from_recent_high_pct = max(0.0, (recent_high - close_last) / max(recent_high, 1e-8))
+        price_rejection_near_high = bool(
+            rejection_bar
+            or lower_close
+            or lower_high
+            or (
+                close_last < prev_close
+                and close_position_in_candle <= 0.70
+                and pullback_from_recent_high_pct >= max(
+                    near_high_tolerance * 0.40,
+                    0.0012 if close_last < 0.02 else 0.0008,
+                )
+            )
+            or (
+                upper_wick_share >= 0.24
+                and close_position_in_candle <= 0.68
+                and close_last <= prev_close * (1.0 + max(float(self.config.entry_tolerance_pct) * 0.12, 0.0003))
+            )
+        )
+        late_near_high_context = bool(broad_near and not strict_near)
+        near = bool(strict_near or (late_near_high_context and price_rejection_near_high))
+        price_ctx = bool(price_up or near)
+        recent_close_tail = pd.to_numeric(df.tail(4).get("close"), errors="coerce").dropna()
+        recent_close_values = recent_close_tail.to_numpy(dtype=float) if len(recent_close_tail) else np.array([], dtype=float)
+        continuation_steps_up = 0
+        if recent_close_values.size >= 2:
+            continuation_step_tolerance = max(float(self.config.entry_tolerance_pct) * 0.08, 0.00015)
+            continuation_steps_up = int(
+                sum(
+                    curr >= prev_px * (1.0 - continuation_step_tolerance)
+                    for prev_px, curr in zip(recent_close_values[:-1], recent_close_values[1:])
+                )
+            )
+        persistent_continuation = bool(
+            recent_close_values.size >= 3
+            and continuation_steps_up >= max(recent_close_values.size - 2, 2)
+        )
 
         flow_points = int(obv_div) + int(cvd_div)
         rollover_points = int(rsi_rollover) + int(hist_rollover) + int(lower_close) + int(lower_high) + int(rejection_bar)
-        rollover_confirm = bool(failed_reclaim or retest_failed_breakout or rollover_points >= 2)
+        rollover_confirm = bool(
+            failed_reclaim
+            or retest_failed_breakout
+            or (price_rejection_near_high and rollover_points >= 2)
+        )
         flow_confirm = bool(obv_div or cvd_div)
-        prev_close = self._safe(prev.get("close"), close_last)
         clean_breakout_continuation = bool(
             price_ctx
             and not failed_reclaim
@@ -892,6 +994,10 @@ class SignalGenerator:
             and close_last >= prev_close * (1.0 - max(float(self.config.entry_tolerance_pct) * 0.25, 0.0003))
             and rsi_last >= rsi_prev
             and hist_last >= hist_prev
+            and (
+                (close_position_in_candle >= 0.60 and upper_wick_share <= 0.22)
+                or persistent_continuation
+            )
         )
         passed = bool(
             price_ctx
@@ -900,14 +1006,14 @@ class SignalGenerator:
             and (
                 failed_reclaim
                 or retest_failed_breakout
-                or (flow_confirm and rollover_points >= 1)
-                or rollover_points >= 3
-                or (flow_confirm and bool(sweep_ctx.get("near_sweep_level")))
+                or (flow_confirm and price_rejection_near_high and rollover_points >= 1)
+                or (price_rejection_near_high and rollover_points >= 2)
+                or (flow_confirm and bool(sweep_ctx.get("near_sweep_level")) and price_rejection_near_high)
             )
         )
         core_strength_points = int(price_ctx) + int(obv_div) + int(cvd_div)
-        confirmation_points = int(rollover_confirm) if core_strength_points > 0 else 0
-        strength = (core_strength_points + confirmation_points) / 4.0
+        confirmation_points = (int(rollover_confirm) + int(price_rejection_near_high)) if core_strength_points > 0 else 0
+        strength = (core_strength_points + confirmation_points) / 5.0
         missing = []
         if not price_ctx:
             missing.append("price_up_or_near_high")
@@ -917,6 +1023,8 @@ class SignalGenerator:
             missing.append("cvd_bearish_divergence")
         if not rollover_confirm and not flow_confirm:
             missing.append("weakness_confirmation")
+        if not price_rejection_near_high and not (failed_reclaim or retest_failed_breakout):
+            missing.append("rejection_from_high")
         if clean_breakout_continuation:
             missing.append("no_trade_breakout_continuation")
         if acceptance_above_high:
@@ -927,6 +1035,7 @@ class SignalGenerator:
             "price_up_or_near_high": 1.0 if price_ctx else 0.0,
             "price_up": 1.0 if price_up else 0.0,
             "near_high_context": 1.0 if near else 0.0,
+            "late_near_high_context": 1.0 if late_near_high_context else 0.0,
             "obv_bearish_divergence": 1.0 if obv_div else 0.0,
             "cvd_bearish_divergence": 1.0 if cvd_div else 0.0,
             "rsi_rollover": 1.0 if rsi_rollover else 0.0,
@@ -936,6 +1045,10 @@ class SignalGenerator:
             "rejection_bar": 1.0 if rejection_bar else 0.0,
             "failed_reclaim": 1.0 if failed_reclaim else 0.0,
             "retest_failed_breakout": 1.0 if retest_failed_breakout else 0.0,
+            "price_rejection_near_high": 1.0 if price_rejection_near_high else 0.0,
+            "close_position_in_candle": float(close_position_in_candle),
+            "upper_wick_share": float(upper_wick_share),
+            "pullback_from_recent_high_pct": float(pullback_from_recent_high_pct),
             "no_trade_breakout_continuation": 1.0 if clean_breakout_continuation else 0.0,
             "acceptance_above_swing_high": 1.0 if acceptance_above_high else 0.0,
             "close_last_used": float(close_last),
@@ -1066,8 +1179,38 @@ class SignalGenerator:
         ).dropna()
         recent_high_24 = float(recent_high_series.max()) if not recent_high_series.empty else last_high
         distance_from_recent_high_pct = max(0.0, (recent_high_24 - close) / max(recent_high_24, 1e-8))
+        recent_high_tail = pd.to_numeric(df.tail(4)["high"], errors="coerce").dropna()
+        recent_low_tail = pd.to_numeric(df.tail(5)["low"], errors="coerce").dropna()
+        recent_support_reference = (
+            float(recent_low_tail.tail(5).iloc[:-1].min())
+            if len(recent_low_tail) >= 2
+            else float(recent_low_tail.min()) if not recent_low_tail.empty else last_low
+        )
+        upper_anchor_touch_tolerance = min(
+            max(
+                atr_pct * 0.72,
+                0.0052 if close < 0.02 else 0.0032,
+            ),
+            0.0105 if close < 0.02 else 0.0062,
+        )
+        upper_anchor_levels = [vp.vah]
+        if recent_high_24 > 0 and recent_high_24 >= vp.vah * (1.0 - max(tol * 0.45, 0.0014)):
+            upper_anchor_levels.append(recent_high_24)
+        recent_upper_anchor_touch = bool(
+            upper_anchor_levels
+            and len(recent_high_tail) > 0
+            and any(
+                abs(high_px - anchor_level) / max(anchor_level, 1e-8) <= upper_anchor_touch_tolerance
+                for high_px in recent_high_tail.tail(3).to_numpy(dtype=float)
+                for anchor_level in upper_anchor_levels
+            )
+        )
+        mtf_trend_1h = self._safe(last.get("mtf_trend_1h"), 0.0)
         mtf_trend_5m = self._safe(last.get("mtf_trend_5m"), 0.0)
+        mtf_trend_15m = self._safe(last.get("mtf_trend_15m"), 0.0)
+        mtf_rsi_1h = self._safe(last.get("mtf_rsi_1h"), 50.0)
         mtf_rsi_5m = self._safe(last.get("mtf_rsi_5m"), 50.0)
+        mtf_rsi_15m = self._safe(last.get("mtf_rsi_15m"), 50.0)
         bb_upper = self._safe(last.get("bb_upper"), 0.0)
         kc_upper = self._safe(last.get("kc_upper"), 0.0)
         upper_band_ref = max(bb_upper, kc_upper, 0.0)
@@ -1129,12 +1272,42 @@ class SignalGenerator:
                 and volume_fade
             )
         )
+        independent_fade_confirmed = bool(
+            fade_points >= 4
+            or (
+                (lower_close or rejection_bar)
+                and (rsi_rollover or hist_rollover)
+                and volume_fade
+            )
+        )
         fade_ready = bool(
             strong_fade_confirmed
             or (
                 below_vah
                 and micro_break_confirmed
             )
+        )
+        recent_upper_anchor_reject = bool(
+            recent_upper_anchor_touch
+            and (
+                rejection_bar
+                or lower_close
+                or lower_high
+                or (rsi_rollover and hist_rollover)
+                or volume_fade
+            )
+        )
+        upper_anchor_context = bool(
+            failed_reclaim
+            or retest_failed_breakout
+            or rejected
+            or recent_upper_anchor_touch
+        )
+        upper_anchor_reject_context = bool(
+            failed_reclaim
+            or retest_failed_breakout
+            or rejected
+            or recent_upper_anchor_reject
         )
         entry_zone_resolved = bool(
             below_vah
@@ -1164,9 +1337,20 @@ class SignalGenerator:
             and not lower_high
             and not volume_fade
         )
-        high_mtf_continuation = bool(
+        mtf_1h_continuation = bool(
+            mtf_trend_1h >= max(float(self.config.regime_mtf_trend_1h_max_short) * 1.8, 0.0036)
+            and mtf_rsi_1h >= max(float(self.config.regime_mtf_rsi_1h_max_short) + 4.0, 64.0)
+        )
+        mtf_15m_continuation = bool(
+            mtf_trend_15m >= max(float(self.config.regime_mtf_trend_15m_max_short) * 2.2, 0.0044)
+            and mtf_rsi_15m >= max(float(self.config.regime_mtf_rsi_15m_max_short) + 4.0, 68.0)
+        )
+        mtf_5m_continuation = bool(
             mtf_trend_5m >= max(float(self.config.regime_mtf_trend_5m_max_short) * 4.5, 0.0060)
             and mtf_rsi_5m >= max(float(self.config.regime_mtf_rsi_5m_max_short) + 5.0, 75.0)
+        )
+        high_mtf_continuation = bool(
+            (mtf_1h_continuation or mtf_15m_continuation or mtf_5m_continuation)
             and close >= prev_close * (1.0 - max(tol * 0.10, 0.00035))
             and close_position_in_candle >= 0.52
             and body_pct >= -max(tol * 0.18, 0.0010)
@@ -1180,6 +1364,164 @@ class SignalGenerator:
         meaningfully_below_vah = bool(
             close <= vp.vah * (1.0 - max(tol * 0.40, 0.0022 if close < 0.02 else 0.0016))
         )
+        recent_reaction_low = (
+            float(recent_low_tail.tail(4).min())
+            if not recent_low_tail.empty
+            else last_low
+        )
+        recent_upper_anchor_reference = vp.vah
+        if recent_upper_anchor_touch and len(recent_high_tail) > 0:
+            touched_anchor_highs = [
+                high_px
+                for high_px in recent_high_tail.tail(4).to_numpy(dtype=float)
+                if any(
+                    abs(high_px - anchor_level) / max(anchor_level, 1e-8) <= upper_anchor_touch_tolerance
+                    for anchor_level in upper_anchor_levels
+                )
+            ]
+            if touched_anchor_highs:
+                recent_upper_anchor_reference = max(vp.vah, max(touched_anchor_highs))
+            else:
+                recent_upper_anchor_reference = max(vp.vah, float(recent_high_tail.tail(3).max()))
+        recent_pullback_depth_pct = max(0.0, (recent_high_24 - recent_reaction_low) / max(recent_high_24, 1e-8))
+        recent_pullback_reclaim_ratio = (
+            max(0.0, min(1.0, (close - recent_reaction_low) / max(recent_high_24 - recent_reaction_low, 1e-8)))
+            if recent_high_24 > recent_reaction_low
+            else 1.0
+        )
+        recent_anchor_pullback_depth_pct = max(
+            0.0,
+            (recent_upper_anchor_reference - recent_reaction_low) / max(recent_upper_anchor_reference, 1e-8),
+        )
+        recent_anchor_reclaim_ratio = (
+            max(
+                0.0,
+                min(
+                    1.0,
+                    (close - recent_reaction_low) / max(recent_upper_anchor_reference - recent_reaction_low, 1e-8),
+                ),
+            )
+            if recent_upper_anchor_reference > recent_reaction_low
+            else 1.0
+        )
+        recent_reaction_seen = bool(
+            recent_pullback_depth_pct >= max(
+                atr_pct * float(self.config.late_reclaim_block_min_pullback_atr_mult),
+                0.0022 if close < 0.02 else 0.0015,
+            )
+        )
+        late_reclaim_after_recent_reaction = bool(
+            recent_reaction_seen
+            and recent_pullback_reclaim_ratio >= float(self.config.late_reclaim_block_reclaim_ratio)
+            and recent_upper_anchor_touch
+            and up_closes_last3 >= 2
+            and close >= prev_close * (1.0 - max(tol * 0.08, 0.00025))
+            and close_position_in_candle >= 0.54
+            and not failed_reclaim
+            and not retest_failed_breakout
+            and not rejection_bar
+            and not lower_close
+            and not lower_high
+            and not recent_upper_anchor_reject
+            and not volume_fade
+            and not meaningfully_below_vah
+        )
+        late_rebound_below_vah_without_trigger = bool(
+            not recent_upper_anchor_touch
+            and distance_from_recent_high_pct >= max(atr_pct * 0.78, 0.0085 if close < 0.05 else 0.0052)
+            and close <= vp.vah * (1.0 - max(tol * 0.25, 0.0011 if close < 0.05 else 0.00085))
+            and ema20_last > 0
+            and close >= ema20_last * (1.0 - max(tol * 0.22, 0.00045))
+            and close_position_in_candle >= 0.46
+            and (up_closes_last3 >= 2 or close >= prev_close * (1.0 - max(tol * 0.10, 0.00030)))
+            and volume_spike_last >= max(0.22, volume_spike_prev * 0.72)
+            and not failed_reclaim
+            and not retest_failed_breakout
+            and not recent_upper_anchor_reject
+            and not strong_fade_confirmed
+        )
+        downside_displacement_tolerance = max(atr_pct * 0.18, 0.00045 if close < 0.02 else 0.00030)
+        downside_displacement_confirmed = bool(
+            recent_support_reference > 0
+            and close <= recent_support_reference * (1.0 - downside_displacement_tolerance)
+        ) or bool(
+            lower_close
+            and close_position_in_candle <= 0.34
+            and close <= prev_close * (1.0 - downside_displacement_tolerance * 0.75)
+        )
+        late_pullback_without_downside_displacement = bool(
+            far_from_recent_peak
+            and meaningfully_below_vah
+            and ema20_last > 0
+            and close <= ema20_last * (1.0 + max(tol * 0.18, 0.00055))
+            and close_position_in_candle <= 0.48
+            and body_pct <= max(tol * 0.06, 0.00045)
+            and volume_spike_last <= max(1.35, volume_spike_prev * 1.06)
+            and not failed_reclaim
+            and not retest_failed_breakout
+            and not recent_upper_anchor_reject
+            and not downside_displacement_confirmed
+        )
+        green_hold_without_downside_displacement = bool(
+            (recent_upper_anchor_touch or above_fast_upper_band)
+            and not downside_displacement_confirmed
+            and distance_from_recent_high_pct <= max(
+                atr_pct * float(self.config.green_hold_block_max_dist_atr_mult),
+                0.0068 if close < 0.05 else 0.0046,
+            )
+            and ema20_last > 0
+            and close >= ema20_last * (1.0 - max(tol * 0.10, 0.00035))
+            and close_position_in_candle >= float(self.config.green_hold_block_min_closepos)
+            and body_pct >= max(tol * 0.025, 0.00018)
+            and upper_wick_ratio <= float(self.config.green_hold_block_max_upper_wick_ratio)
+            and (
+                mtf_5m_continuation
+                or mtf_15m_continuation
+                or above_fast_upper_band
+                or volume_spike_last >= max(0.62, volume_spike_prev * 0.78)
+            )
+            and not failed_reclaim
+            and not retest_failed_breakout
+            and not lower_close
+            and not lower_high
+            and not strong_fade_confirmed
+        )
+        bullish_rebound_below_vah_without_reject = bool(
+            far_from_recent_peak
+            and meaningfully_below_vah
+            and ema20_last > 0
+            and close >= ema20_last * (1.0 - max(tol * 0.18, 0.00045))
+            and close_position_in_candle >= 0.60
+            and body_pct >= max(tol * 0.06, 0.00045)
+            and up_closes_last3 >= 2
+            and volume_spike_last >= max(0.36, volume_spike_prev * 0.74)
+            and not failed_reclaim
+            and not retest_failed_breakout
+            and not rejection_bar
+            and not lower_close
+            and not lower_high
+            and not recent_upper_anchor_reject
+            and not independent_fade_confirmed
+        )
+        unanchored_failed_reclaim_rebound = bool(
+            (failed_reclaim or retest_failed_breakout)
+            and not recent_upper_anchor_touch
+            and not rejected
+            and far_from_recent_peak
+            and meaningfully_below_vah
+            and ema20_last > 0
+            and close >= ema20_last * (1.0 - max(tol * 0.18, 0.00045))
+            and close_position_in_candle >= 0.52
+            and body_pct >= -max(tol * 0.14, 0.0009)
+            and up_closes_last3 >= 1
+            and (
+                volume_spike_last >= max(0.52, volume_spike_prev * 0.80)
+                or mtf_5m_continuation
+                or mtf_15m_continuation
+            )
+            and not recent_upper_anchor_reject
+            and not independent_fade_confirmed
+        )
         late_bounce_without_upper_anchor = bool(
             far_from_recent_peak
             and close >= prev_close * (1.0 - max(tol * 0.12, 0.00035))
@@ -1191,6 +1533,54 @@ class SignalGenerator:
             and not rejection_bar
             and not strong_fade_confirmed
         )
+        shallow_reject_pullback_floor = max(
+            atr_pct * float(self.config.shallow_reject_block_min_pullback_atr_mult),
+            0.0024 if close < 0.02 else 0.0016,
+        )
+        shallow_reject_without_displacement = bool(
+            recent_upper_anchor_touch
+            and recent_upper_anchor_reject
+            and recent_anchor_pullback_depth_pct < shallow_reject_pullback_floor
+            and (
+                recent_anchor_reclaim_ratio >= float(self.config.shallow_reject_block_reclaim_ratio)
+                or close >= recent_upper_anchor_reference * (1.0 - max(shallow_reject_pullback_floor * 0.72, 0.0010 if close < 0.02 else 0.0007))
+            )
+            and close >= ema20_last * (1.0 - max(tol * 0.18, 0.00045))
+            and not meaningfully_below_vah
+            and not failed_reclaim
+            and not retest_failed_breakout
+        )
+        shallow_plateau_reclaim = bool(
+            recent_upper_anchor_touch
+            and recent_upper_anchor_reject
+            and recent_anchor_pullback_depth_pct < shallow_reject_pullback_floor * 1.35
+            and recent_anchor_reclaim_ratio >= max(float(self.config.shallow_reject_block_reclaim_ratio) - 0.12, 0.62)
+            and not failed_reclaim
+            and not retest_failed_breakout
+            and not lower_close
+            and not lower_high
+            and not strong_fade_confirmed
+        )
+        plateau_continuation_near_high = bool(
+            recent_upper_anchor_touch
+            and (not recent_upper_anchor_reject or shallow_plateau_reclaim)
+            and distance_from_recent_high_pct <= max(
+                atr_pct * float(self.config.plateau_continuation_block_max_dist_atr_mult),
+                0.0032 if close < 0.05 else 0.0021,
+            )
+            and ema20_last > 0
+            and close >= ema20_last * (1.0 - max(tol * 0.14, 0.00035))
+            and close_position_in_candle >= float(self.config.plateau_continuation_block_min_closepos)
+            and body_pct >= -max(tol * 0.08, 0.00040)
+            and upper_wick_ratio <= float(self.config.plateau_continuation_block_max_upper_wick_ratio)
+            and (up_closes_last3 >= 2 or close >= prev_close * (1.0 - max(tol * 0.08, 0.00025)))
+            and volume_spike_last >= max(0.32, volume_spike_prev * 0.72)
+            and not failed_reclaim
+            and not retest_failed_breakout
+            and not lower_close
+            and not lower_high
+            and not strong_fade_confirmed
+        )
         continuation_above_fast_value = bool(
             continuation_above_fast_value
             or strong_live_continuation
@@ -1198,11 +1588,26 @@ class SignalGenerator:
             or first_impulse_volume_climax
             or high_mtf_continuation
             or late_bounce_without_upper_anchor
+            or late_reclaim_after_recent_reaction
+            or late_rebound_below_vah_without_trigger
+            or late_pullback_without_downside_displacement
+            or green_hold_without_downside_displacement
+            or bullish_rebound_below_vah_without_reject
+            or unanchored_failed_reclaim_rebound
+            or shallow_reject_without_displacement
+            or plateau_continuation_near_high
         )
-        sweep_entry_ok = bool((failed_reclaim or retest_failed_breakout) and micro_break_confirmed and not acceptance_above_high)
+        sweep_entry_ok = bool(
+            (failed_reclaim or retest_failed_breakout)
+            and micro_break_confirmed
+            and not acceptance_above_high
+            and not continuation_above_fast_value
+        )
         value_entry_ok = bool(
             trigger_ctx
             and value_ctx
+            and upper_anchor_context
+            and upper_anchor_reject_context
             and bool(msb_ok)
             and micro_break_confirmed
             and fresh_reaction_or_reject
@@ -1223,6 +1628,10 @@ class SignalGenerator:
             missing.append("below_vah_or_rejected_from_vah")
         if not (value_ctx or sweep_entry_ok):
             missing.append("near_poc_or_value_area_context")
+        if not (upper_anchor_context or sweep_entry_ok):
+            missing.append("upper_anchor_context")
+        if not (upper_anchor_reject_context or sweep_entry_ok):
+            missing.append("reject_from_upper_anchor")
         if not (bool(msb_ok) or sweep_entry_ok):
             missing.append("msb_bearish_confirmed")
         if not (fresh_reaction_or_reject or sweep_entry_ok):
@@ -1239,6 +1648,22 @@ class SignalGenerator:
             missing.append("no_trade_high_mtf_continuation")
         if late_bounce_without_upper_anchor:
             missing.append("no_trade_late_bounce_without_upper_anchor")
+        if late_reclaim_after_recent_reaction:
+            missing.append("no_trade_late_reclaim_after_reaction")
+        if late_rebound_below_vah_without_trigger:
+            missing.append("no_trade_late_rebound_below_vah_without_trigger")
+        if late_pullback_without_downside_displacement:
+            missing.append("no_trade_late_pullback_without_downside_displacement")
+        if green_hold_without_downside_displacement:
+            missing.append("no_trade_green_hold_without_downside_displacement")
+        if bullish_rebound_below_vah_without_reject:
+            missing.append("no_trade_bullish_rebound_below_vah_without_reject")
+        if unanchored_failed_reclaim_rebound:
+            missing.append("no_trade_unanchored_failed_reclaim_rebound")
+        if shallow_reject_without_displacement:
+            missing.append("no_trade_shallow_reject_without_displacement")
+        if plateau_continuation_near_high:
+            missing.append("no_trade_plateau_near_high_continuation")
 
         d = {
             "entry_location_passed": 1.0 if passed else 0.0,
@@ -1247,6 +1672,10 @@ class SignalGenerator:
             "entry_location_strength": float(strength),
             "below_vah_or_rejected_from_vah": 1.0 if below_or_rej else 0.0,
             "near_poc_or_value_area_context": 1.0 if poc_ctx else 0.0,
+            "upper_anchor_context": 1.0 if upper_anchor_context else 0.0,
+            "reject_from_upper_anchor": 1.0 if upper_anchor_reject_context else 0.0,
+            "recent_upper_anchor_touch": 1.0 if recent_upper_anchor_touch else 0.0,
+            "recent_upper_anchor_reject": 1.0 if recent_upper_anchor_reject else 0.0,
             "failed_reclaim": 1.0 if failed_reclaim else 0.0,
             "retest_failed_breakout": 1.0 if retest_failed_breakout else 0.0,
             "sweep_reclaim_entry_ok": 1.0 if sweep_entry_ok else 0.0,
@@ -1261,9 +1690,24 @@ class SignalGenerator:
             "first_impulse_volume_climax": 1.0 if first_impulse_volume_climax else 0.0,
             "high_mtf_continuation": 1.0 if high_mtf_continuation else 0.0,
             "late_bounce_without_upper_anchor": 1.0 if late_bounce_without_upper_anchor else 0.0,
+            "late_reclaim_after_recent_reaction": 1.0 if late_reclaim_after_recent_reaction else 0.0,
+            "late_rebound_below_vah_without_trigger": 1.0 if late_rebound_below_vah_without_trigger else 0.0,
+            "late_pullback_without_downside_displacement": 1.0 if late_pullback_without_downside_displacement else 0.0,
+            "green_hold_without_downside_displacement": 1.0 if green_hold_without_downside_displacement else 0.0,
+            "bullish_rebound_below_vah_without_reject": 1.0 if bullish_rebound_below_vah_without_reject else 0.0,
+            "unanchored_failed_reclaim_rebound": 1.0 if unanchored_failed_reclaim_rebound else 0.0,
+            "shallow_reject_without_displacement": 1.0 if shallow_reject_without_displacement else 0.0,
+            "plateau_continuation_near_high": 1.0 if plateau_continuation_near_high else 0.0,
+            "recent_pullback_depth_pct": float(recent_pullback_depth_pct),
+            "recent_pullback_reclaim_ratio": float(recent_pullback_reclaim_ratio),
             "distance_from_recent_high_pct": float(distance_from_recent_high_pct),
             "meaningfully_below_vah": 1.0 if meaningfully_below_vah else 0.0,
+            "downside_displacement_confirmed": 1.0 if downside_displacement_confirmed else 0.0,
+            "mtf_trend_1h_used": float(mtf_trend_1h),
+            "mtf_rsi_1h_used": float(mtf_rsi_1h),
             "mtf_trend_5m_used": float(mtf_trend_5m),
+            "mtf_trend_15m_used": float(mtf_trend_15m),
+            "mtf_rsi_15m_used": float(mtf_rsi_15m),
             "mtf_rsi_5m_used": float(mtf_rsi_5m),
             "vp_levels_available": 1.0,
             "below_vah": 1.0 if below_vah else 0.0,

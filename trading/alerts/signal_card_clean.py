@@ -36,6 +36,14 @@ _BULLET = "\u2022"
 _MOJIBAKE_REPLACEMENTS = {
     "Р РЋРЎвЂљР В°РЎР‚РЎв‚¬Р С‘Р в„– Р СћР В¤": "\u0421\u0442\u0430\u0440\u0448\u0438\u0439 \u0422\u0424",
     "HTF РЎС“РЎР‚Р С•Р Р†Р Р…Р С‘ + Р С”Р В°РЎР‚РЎвЂљР В° Р В»Р С‘Р С”Р Р†Р С‘Р Т‘Р В°РЎвЂ Р С‘Р в„–": "HTF \u0443\u0440\u043e\u0432\u043d\u0438 + \u043a\u0430\u0440\u0442\u0430 \u043b\u0438\u043a\u0432\u0438\u0434\u0430\u0446\u0438\u0439",
+    "РїР°РјРї СѓР¶Рµ РµСЃС‚СЊ": "\u043f\u0430\u043c\u043f \u0443\u0436\u0435 \u0435\u0441\u0442\u044c",
+    "РїРёРє РїР°РјРїР° СЃРѕРІСЃРµРј СЃРІРµР¶РёР№": "\u043f\u0438\u043a \u043f\u0430\u043c\u043f\u0430 \u0441\u043e\u0432\u0441\u0435\u043c \u0441\u0432\u0435\u0436\u0438\u0439",
+    "С†РµРЅР° РµС‰С‘ Сѓ РІРµСЂС€РёРЅС‹ РїР°РјРїР°": "\u0446\u0435\u043d\u0430 \u0435\u0449\u0451 \u0443 \u0432\u0435\u0440\u0448\u0438\u043d\u044b \u043f\u0430\u043c\u043f\u0430",
+    "РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·": "\u043f\u043e\u0448\u043b\u0430 \u043f\u0435\u0440\u0432\u0430\u044f \u0440\u0435\u0430\u043a\u0446\u0438\u044f \u0432\u043d\u0438\u0437",
+    "РЅРёР¶Рµ РµСЃС‚СЊ Р»РёРєРІРёРґР°С†РёРѕРЅРЅС‹Р№ РјР°РіРЅРёС‚": "\u043d\u0438\u0436\u0435 \u0435\u0441\u0442\u044c \u043b\u0438\u043a\u0432\u0438\u0434\u0430\u0446\u0438\u043e\u043d\u043d\u044b\u0439 \u043c\u0430\u0433\u043d\u0438\u0442",
+    "РІРµСЂС…РЅСЋСЋ Р»РёРєРІРёРґРЅРѕСЃС‚СЊ СѓР¶Рµ СЃРЅСЏР»Рё": "\u0432\u0435\u0440\u0445\u043d\u044e\u044e \u043b\u0438\u043a\u0432\u0438\u0434\u043d\u043e\u0441\u0442\u044c \u0443\u0436\u0435 \u0441\u043d\u044f\u043b\u0438",
+    "РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ СЃР»Р°Р±РѕСЃС‚Рё Рё РІС…РѕРґР°": "\u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u0435 \u0441\u043b\u0430\u0431\u043e\u0441\u0442\u0438 \u0438 \u0432\u0445\u043e\u0434\u0430",
+    "РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ СЃР»Р°Р±РѕСЃС‚Рё Рё РІС…Рѕда": "\u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u0435 \u0441\u043b\u0430\u0431\u043e\u0441\u0442\u0438 \u0438 \u0432\u0445\u043e\u0434\u0430",
 }
 _ESCAPED_UNICODE_RE = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f]")
@@ -78,6 +86,18 @@ def _normalize_human_text(value: Any) -> str:
     for source, target in _MOJIBAKE_REPLACEMENTS.items():
         normalized = normalized.replace(source, target)
     return normalized
+
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        key = item.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(key)
+    return unique
 
 
 def _resolve_pump_caption_metrics(
@@ -210,7 +230,9 @@ def build_early_signal_caption(
     asset = _base_asset(symbol)
     clean_phase_label = _normalize_human_text(_normalize_early_phase_label(phase_label))
     clean_quality_grade = _normalize_human_text(quality_grade)
-    clean_triggers = [item for item in (_normalize_human_text(t) for t in (triggers or [])) if item]
+    clean_triggers = _dedupe_preserve_order(
+        [item for item in (_normalize_human_text(t) for t in (triggers or [])) if item]
+    )
     clean_wait_for = _normalize_human_text(wait_for)
 
     lines = [

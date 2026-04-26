@@ -127,6 +127,17 @@ def _env_first_nonempty(*names: str) -> str:
     return ""
 
 
+def _normalize_trigger_by(value: str | None, *, default: str = "MarkPrice") -> str:
+    allowed = {"LastPrice", "MarkPrice", "IndexPrice"}
+    candidate = str(value or default).strip()
+    return candidate if candidate in allowed else default
+
+
+def _normalize_tpsl_mode(value: str | None) -> str:
+    candidate = str(value or "").strip().title()
+    return candidate if candidate in {"", "Full", "Partial"} else ""
+
+
 def _resolve_signal_profile_env() -> str:
     raw = str(os.getenv("BOT_SIGNAL_PROFILE", "both")).strip().lower()
     if raw in {"main", "early"}:
@@ -702,6 +713,9 @@ def load_runtime_config() -> RuntimeConfig:
         ws_ping_timeout_sec=float(os.getenv("WS_PING_TIMEOUT_SEC", "30.0")),
         ws_symbols=symbols,
         target_entry_leverage=float(os.getenv("BYBIT_TARGET_ENTRY_LEVERAGE", os.getenv("RISK_MAX_LEVERAGE", "3.0"))),
+        tpsl_mode=_normalize_tpsl_mode(os.getenv("BYBIT_TPSL_MODE", "")),
+        sl_trigger_by=_normalize_trigger_by(os.getenv("BYBIT_SL_TRIGGER_BY", "MarkPrice")),
+        tp_trigger_by=_normalize_trigger_by(os.getenv("BYBIT_TP_TRIGGER_BY", "MarkPrice")),
     )
 
     cfg = RuntimeConfig(

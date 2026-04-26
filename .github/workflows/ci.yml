@@ -2,9 +2,9 @@ name: AI Trader CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
   test:
@@ -17,7 +17,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
@@ -29,15 +29,17 @@ jobs:
         run: |
           mkdir -p logs || true
           python - <<EOF
-          import os, joblib
+          import os
+          import joblib
+
           if os.path.exists("scaler.pkl"):
               scaler = joblib.load("scaler.pkl")
               print("Scaler features:", getattr(scaler, "n_features_in_", "?"))
           else:
-              print("⚠️ scaler.pkl not found — skipping check")
+              print("scaler.pkl not found - skipping check")
           EOF
 
       - name: Run unit tests
         run: |
           pip install pytest
-          pytest -q --disable-warnings || true
+          pytest -q --disable-warnings

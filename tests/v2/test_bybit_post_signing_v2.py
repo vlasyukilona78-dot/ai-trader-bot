@@ -165,6 +165,42 @@ class BybitPostSigningV2Tests(unittest.TestCase):
         finally:
             client.close()
 
+    def test_trading_stop_prefers_explicit_client_config_over_env(self):
+        client = BybitClient(
+            api_key="test_key",
+            api_secret="test_secret",
+            sandbox=True,
+            dry_run=False,
+            recv_window=5000,
+            tpsl_mode="Partial",
+            sl_trigger_by="LastPrice",
+            tp_trigger_by="IndexPrice",
+        )
+        client._sess.request = MagicMock(return_value=_FakeResponse({"retCode": 0, "retMsg": "OK", "result": {}}))
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "BYBIT_SL_TRIGGER_BY": "MarkPrice",
+                    "BYBIT_TP_TRIGGER_BY": "MarkPrice",
+                    "BYBIT_TPSL_MODE": "Full",
+                },
+                clear=False,
+            ):
+                _ = client.set_trading_stop(
+                    symbol="BTCUSDT",
+                    stop_loss=95.0,
+                    take_profit=90.0,
+                    position_idx=2,
+                    qty=0.5,
+                )
+            payload = json.loads(client._sess.request.call_args.kwargs["data"])
+            self.assertEqual(payload.get("tpslMode"), "Partial")
+            self.assertEqual(payload.get("slTriggerBy"), "LastPrice")
+            self.assertEqual(payload.get("tpTriggerBy"), "IndexPrice")
+        finally:
+            client.close()
+
     def test_set_position_leverage_uses_explicit_buy_and_sell_values(self):
         client = self._make_client()
         try:

@@ -130,6 +130,54 @@ def _resolve_explicit_start_index(
     return max(len(close_series) - 30, 0)
 
 
+def _is_feed_source(source: object) -> bool:
+    return str(source or "").strip().lower() in {"feed", "coinglass", "external"}
+
+
+def _timestamp_to_sample_index(sample: pd.DataFrame, value: object) -> int | None:
+    if value is None or sample.empty:
+        return None
+    try:
+        numeric = float(value)
+        if math.isfinite(numeric) and numeric > 0:
+            if numeric > 10_000_000_000:
+                numeric /= 1000.0
+            ts = pd.Timestamp.fromtimestamp(numeric, tz="UTC")
+        else:
+            ts = pd.Timestamp(value)
+    except Exception:
+        try:
+            ts = pd.Timestamp(value)
+        except Exception:
+            return None
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    try:
+        index = sample.index
+        if getattr(index, "tz", None) is None:
+            index = index.tz_localize("UTC")
+        else:
+            index = index.tz_convert("UTC")
+        pos = index.get_indexer([ts], method="nearest")[0]
+    except Exception:
+        return None
+    if pos < 0:
+        return None
+    return int(min(max(pos, 0), len(sample) - 1))
+
+
+def _feed_bands_from_attrs(frame: pd.DataFrame) -> list[dict[str, object]]:
+    attrs = getattr(frame, "attrs", None)
+    if not isinstance(attrs, dict):
+        return []
+    raw = attrs.get("liquidation_feed_bands") or attrs.get("coinglass_liquidation_bands")
+    if not isinstance(raw, list):
+        return []
+    return [dict(item) for item in raw if isinstance(item, dict)]
+
+
 def _merge_candidates(
     candidates: list[dict[str, float | int | str]],
     *,
@@ -165,7 +213,7 @@ def _merge_candidates(
         ) / total_weight
         hit["weight"] = total_weight
         hit["start_index"] = min(int(hit["start_index"]), int(candidate["start_index"]))
-        if str(hit.get("source", "synthetic")) != "feed" and str(candidate.get("source", "synthetic")) == "feed":
+        if not _is_feed_source(hit.get("source", "synthetic")) and _is_feed_source(candidate.get("source", "synthetic")):
             hit["source"] = "feed"
         hit_closed = hit.get("closed_index")
         candidate_closed = candidate.get("closed_index")
@@ -217,7 +265,7 @@ def _prune_bands(bands: tuple[LiquidationBand, ...], *, sample_len: int) -> tupl
 
     kept: list[LiquidationBand] = []
     for band in bands:
-        if band.source == "feed":
+        if _is_feed_source(band.source):
             kept.append(band)
             continue
         duration = max(int(band.end_index) - int(band.start_index) + 1, 1)
@@ -239,9 +287,13 @@ def build_liquidation_map(
     lookback: int = 120,
     liquidation_cluster_high: float | None = None,
     liquidation_cluster_low: float | None = None,
+    liquidation_bands: list[dict[str, object]] | tuple[dict[str, object], ...] | None = None,
 ) -> LiquidationMap:
     if frame is None or frame.empty:
         return LiquidationMap((), None, None, 0.0, 0.0, False, False, 0.0)
+
+    explicit_feed_bands = list(liquidation_bands or [])
+    attr_feed_bands = _feed_bands_from_attrs(frame)
 
     sample = frame.tail(max(30, lookback)).copy()
     if sample.empty:
@@ -336,6 +388,56 @@ def build_liquidation_map(
                     "source": "synthetic",
                 }
             )
+
+    feed_rows = explicit_feed_bands + attr_feed_bands
+    for row in feed_rows:
+        level = _safe_float(row.get("level") or row.get("price"), 0.0)
+        if level <= 0:
+            continue
+        side_raw = str(row.get("side") or "").strip().lower()
+        side = side_raw if side_raw in {"above", "below"} else ("above" if level >= close else "below")
+        weight = max(_safe_float(row.get("weight"), 2.8), 0.1)
+        start_index = None
+        end_index = None
+        if row.get("start_index") is not None:
+            start_index = int(max(0, min(_safe_float(row.get("start_index"), 0.0), sample_len - 1)))
+        if row.get("end_index") is not None:
+            end_index = int(max(0, min(_safe_float(row.get("end_index"), sample_len - 1), sample_len - 1)))
+        if start_index is None:
+            start_index = _timestamp_to_sample_index(sample, row.get("start_ts") or row.get("start_time"))
+        if end_index is None:
+            end_index = _timestamp_to_sample_index(sample, row.get("end_ts") or row.get("end_time"))
+        if start_index is None:
+            start_index = _resolve_explicit_start_index(
+                side=side,
+                level=level,
+                close_series=close_series,
+                high_series=high_series,
+                low_series=low_series,
+            )
+        if end_index is None:
+            end_index = sample_len - 1
+        start_index = int(max(0, min(start_index, sample_len - 1)))
+        end_index = int(max(start_index, min(int(end_index), sample_len - 1)))
+        closed_index = _resolve_close_index(
+            side=side,
+            level=level,
+            start_index=start_index,
+            close_series=close_series,
+            high_series=high_series,
+            low_series=low_series,
+        )
+        candidates.append(
+            {
+                "level": level,
+                "weight": weight,
+                "side": side,
+                "start_index": start_index,
+                "end_index": closed_index if closed_index is not None else end_index,
+                "closed_index": closed_index,
+                "source": str(row.get("source") or "coinglass"),
+            }
+        )
 
     explicit_high = _safe_float(liquidation_cluster_high, 0.0)
     if explicit_high > 0:

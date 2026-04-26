@@ -39,6 +39,24 @@ def _after_summary(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     return _as_mapping(after.get("summary"))
 
 
+def _quality_overview(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    return _as_mapping(payload.get("quality_overview"))
+
+
+def _quality_guidance(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    return _as_mapping(payload.get("quality_guidance"))
+
+
+def _format_quality_line(*, label: str, total_count: int, main_verdict: str, early_verdict: str) -> str | None:
+    if total_count <= 0 and not main_verdict and not early_verdict:
+        return None
+    return (
+        f"{label}: total={total_count} "
+        f"main={main_verdict or 'n/a'} "
+        f"early={early_verdict or 'n/a'}"
+    )
+
+
 def exit_code_for_recommendation(recommendation: Mapping[str, Any]) -> int:
     if bool(recommendation.get("SAFE_TO_CONTINUE", False)):
         return 0
@@ -56,6 +74,8 @@ def exit_code_for_recommendation(recommendation: Mapping[str, Any]) -> int:
 def format_triage_lines(payload: Mapping[str, Any], *, max_actions: int) -> list[str]:
     recommendation = _recommendation(payload)
     after_summary = _after_summary(payload)
+    quality_overview = _quality_overview(payload)
+    quality_guidance = _quality_guidance(payload)
 
     verdict = str(recommendation.get("ACTION_VERDICT", "")).strip() or "unknown"
     stop_reason = str(recommendation.get("STOP_REASON", "")).strip() or "none"
@@ -68,6 +88,47 @@ def format_triage_lines(payload: Mapping[str, Any], *, max_actions: int) -> list
         f"STOP_REASON: {stop_reason}",
         f"TOP_COMBINATION: {top_combination}",
     ]
+
+    signal_line = _format_quality_line(
+        label="SIGNAL_OVERVIEW",
+        total_count=int(quality_overview.get("signal_total_count", 0) or 0),
+        main_verdict=str(quality_overview.get("signal_main_top_verdict", "") or "").strip(),
+        early_verdict=str(quality_overview.get("signal_early_top_verdict", "") or "").strip(),
+    )
+    if signal_line:
+        lines.append(signal_line)
+
+    exit_line = _format_quality_line(
+        label="EXIT_OVERVIEW",
+        total_count=int(quality_overview.get("exit_total_count", 0) or 0),
+        main_verdict=str(quality_overview.get("exit_main_top_verdict", "") or "").strip(),
+        early_verdict=str(quality_overview.get("exit_early_top_verdict", "") or "").strip(),
+    )
+    if exit_line:
+        lines.append(exit_line)
+
+    entry_focus = str(quality_guidance.get("entry_focus", "") or "").strip()
+    entry_priority = str(quality_guidance.get("entry_priority", "") or "").strip()
+    if entry_focus:
+        lines.append(
+            f"QUALITY_ENTRY: {entry_focus} priority={entry_priority or 'n/a'}"
+        )
+
+    exit_focus = str(quality_guidance.get("exit_focus", "") or "").strip()
+    exit_priority = str(quality_guidance.get("exit_priority", "") or "").strip()
+    if exit_focus:
+        lines.append(
+            f"QUALITY_EXIT: {exit_focus} priority={exit_priority or 'n/a'}"
+        )
+
+    guidance_actions = quality_guidance.get("runbook_actions", [])
+    if isinstance(guidance_actions, list):
+        for idx, action in enumerate(
+            [str(item).strip() for item in guidance_actions if str(item).strip()][:2],
+            start=1,
+        ):
+            lines.append(f"QUALITY_ACTION {idx}: {action}")
+
     for idx, action in enumerate(actions[: max(max_actions, 0)], start=1):
         lines.append(f"ACTION {idx}: {action}")
     return lines

@@ -80,6 +80,61 @@ function Get-RecommendationExitCode {
     return 14
 }
 
+function Get-IntegerValue {
+    param(
+        [Parameter()]
+        $Value
+    )
+
+    try {
+        return [int]$Value
+    }
+    catch {
+        return 0
+    }
+}
+
+function Get-QualityOverviewLine {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Label,
+        [Parameter()]
+        $TotalCount,
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$MainVerdict,
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$EarlyVerdict
+    )
+
+    $total = Get-IntegerValue -Value $TotalCount
+    $mainText = Get-TextValue -Value $MainVerdict -Default "n/a"
+    $earlyText = Get-TextValue -Value $EarlyVerdict -Default "n/a"
+    if ($total -le 0 -and $mainText -eq "n/a" -and $earlyText -eq "n/a") {
+        return ""
+    }
+    return ("{0}: total={1} main={2} early={3}" -f $Label, $total, $mainText, $earlyText)
+}
+
+function Get-ObjectPropertyValue {
+    param(
+        [Parameter()]
+        $Object,
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    if ($null -eq $Object) {
+        return $null
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+    return $property.Value
+}
+
 if (-not (Test-Path $ComparisonJson)) {
     throw "Calibration result JSON not found: $ComparisonJson"
 }
@@ -103,12 +158,58 @@ $topCombination = if ($null -eq $afterSummary) {
 else {
     Get-TextValue -Value $afterSummary.top_regime_filter_blocker_combination -Default "none"
 }
+$qualityOverview = Get-ObjectPropertyValue -Object $payload -Name "quality_overview"
+$qualityGuidance = Get-ObjectPropertyValue -Object $payload -Name "quality_guidance"
 
 $lines = @(
     "VERDICT: $verdict",
     "STOP_REASON: $stopReason",
     "TOP_COMBINATION: $topCombination"
 )
+
+$signalOverviewLine = Get-QualityOverviewLine `
+    -Label "SIGNAL_OVERVIEW" `
+    -TotalCount (Get-ObjectPropertyValue -Object $qualityOverview -Name "signal_total_count") `
+    -MainVerdict ([string](Get-ObjectPropertyValue -Object $qualityOverview -Name "signal_main_top_verdict")) `
+    -EarlyVerdict ([string](Get-ObjectPropertyValue -Object $qualityOverview -Name "signal_early_top_verdict"))
+if (-not [string]::IsNullOrWhiteSpace($signalOverviewLine)) {
+    $lines += $signalOverviewLine
+}
+
+$exitOverviewLine = Get-QualityOverviewLine `
+    -Label "EXIT_OVERVIEW" `
+    -TotalCount (Get-ObjectPropertyValue -Object $qualityOverview -Name "exit_total_count") `
+    -MainVerdict ([string](Get-ObjectPropertyValue -Object $qualityOverview -Name "exit_main_top_verdict")) `
+    -EarlyVerdict ([string](Get-ObjectPropertyValue -Object $qualityOverview -Name "exit_early_top_verdict"))
+if (-not [string]::IsNullOrWhiteSpace($exitOverviewLine)) {
+    $lines += $exitOverviewLine
+}
+
+$entryFocus = Get-TextValue -Value (Get-ObjectPropertyValue -Object $qualityGuidance -Name "entry_focus") -Default ""
+$entryPriority = Get-TextValue -Value (Get-ObjectPropertyValue -Object $qualityGuidance -Name "entry_priority") -Default "n/a"
+if (-not [string]::IsNullOrWhiteSpace($entryFocus)) {
+    $lines += ("QUALITY_ENTRY: {0} priority={1}" -f $entryFocus, $entryPriority)
+}
+
+$exitFocus = Get-TextValue -Value (Get-ObjectPropertyValue -Object $qualityGuidance -Name "exit_focus") -Default ""
+$exitPriority = Get-TextValue -Value (Get-ObjectPropertyValue -Object $qualityGuidance -Name "exit_priority") -Default "n/a"
+if (-not [string]::IsNullOrWhiteSpace($exitFocus)) {
+    $lines += ("QUALITY_EXIT: {0} priority={1}" -f $exitFocus, $exitPriority)
+}
+
+$guidanceActions = @()
+$rawGuidanceActions = Get-ObjectPropertyValue -Object $qualityGuidance -Name "runbook_actions"
+if ($null -ne $rawGuidanceActions) {
+    foreach ($item in @($rawGuidanceActions)) {
+        $text = Get-TextValue -Value $item -Default ""
+        if (-not [string]::IsNullOrWhiteSpace($text)) {
+            $guidanceActions += $text
+        }
+    }
+}
+for ($index = 0; $index -lt [Math]::Min(2, $guidanceActions.Count); $index++) {
+    $lines += "QUALITY_ACTION $($index + 1): $($guidanceActions[$index])"
+}
 
 $actions = @()
 if ($null -ne $recommendation.RUNBOOK_ACTIONS -and $recommendation.RUNBOOK_ACTIONS -isnot [string]) {

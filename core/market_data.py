@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 import requests
+from core.coinglass_liquidation import CoinglassLiquidationClient, load_coinglass_liquidation_config
 from trading.exchange.bybit_endpoints import resolve_public_http_base_url
 
 
@@ -40,10 +41,15 @@ class MarketDataClient:
         self._session.trust_env = False
         self._session.headers.update({"User-Agent": "crypto-ai-bot/2.0", "Accept": "application/json"})
         self._symbol_categories: dict[str, str] = {}
+        self._coinglass_liquidations = CoinglassLiquidationClient(load_coinglass_liquidation_config())
 
     def close(self):
         try:
             self._session.close()
+        except Exception:
+            pass
+        try:
+            self._coinglass_liquidations.close()
         except Exception:
             pass
 
@@ -286,6 +292,20 @@ class MarketDataClient:
             return rows if isinstance(rows, list) else []
         return []
 
+    def fetch_liquidation_heatmap_bands(
+        self,
+        symbol: str,
+        *,
+        current_price: float,
+    ) -> list[dict[str, float | int | str]]:
+        try:
+            return self._coinglass_liquidations.fetch_heatmap_bands(
+                symbol,
+                current_price=float(current_price),
+            )
+        except Exception:
+            return []
+
     def fetch_sentiment_index(self, url: str | None = None) -> float | None:
         target = url or self.sentiment_url
         try:
@@ -364,8 +384,25 @@ class MarketDataClient:
         liq_high: float | None = None
         liq_low: float | None = None
         if include_liquidations:
+            current_price = 0.0
+            try:
+                current_price = float(ohlcv.iloc[-1]["close"])
+            except Exception:
+                current_price = 0.0
+            heatmap_bands = self.fetch_liquidation_heatmap_bands(symbol, current_price=current_price)
+            if heatmap_bands:
+                ohlcv.attrs["coinglass_liquidation_bands"] = heatmap_bands
+                ohlcv.attrs["liquidation_feed_bands"] = heatmap_bands
+                above = [row for row in heatmap_bands if str(row.get("side")) == "above"]
+                below = [row for row in heatmap_bands if str(row.get("side")) == "below"]
+                if above:
+                    liq_high = float(max(above, key=lambda row: float(row.get("weight", 0.0))).get("level", 0.0))
+                if below:
+                    liq_low = float(max(below, key=lambda row: float(row.get("weight", 0.0))).get("level", 0.0))
             liq_feed = self.fetch_recent_liquidations(symbol)
-            liq_high, liq_low = self.liquidation_clusters_from_feed(liq_feed)
+            bybit_high, bybit_low = self.liquidation_clusters_from_feed(liq_feed)
+            liq_high = liq_high if liq_high is not None else bybit_high
+            liq_low = liq_low if liq_low is not None else bybit_low
             if liq_high is None and liq_low is None:
                 liq_high, liq_low = self.estimate_liquidation_clusters(ohlcv)
 

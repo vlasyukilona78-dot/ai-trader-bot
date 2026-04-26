@@ -15,6 +15,8 @@ try:
         _build_higher_timeframe_chart,
         _current_recent_peak_price,
         _format_chart_timeframe_label,
+        _remember_cached_alert,
+        _should_block_live_main_short_continuation,
         _should_block_recent_main_short_reentry,
         _strategy_audit_log_payload,
     )
@@ -36,6 +38,7 @@ try:
         CalibrationGuardrails,
         aggregate_observation,
         assess_window_quality,
+        build_quality_guidance,
         compare_observation_windows,
         recommend_calibration_step,
     )
@@ -82,8 +85,16 @@ class SignalGeneratorTests(unittest.TestCase):
         df.iloc[-1, df.columns.get_loc("obv")] = 900.0
         df["cvd"] = np.linspace(80.0, 1100.0, n)
         df.iloc[-1, df.columns.get_loc("cvd")] = 850.0
+        df["hist"] = np.linspace(0.0012, 0.0004, n)
         df["vwap"] = 104.0
+        df["vah"] = 109.0
         df["atr"] = 1.8
+        df["mtf_trend_5m"] = 0.0
+        df["mtf_trend_15m"] = 0.0
+        df["mtf_trend_1h"] = 0.0
+        df["mtf_rsi_5m"] = 50.0
+        df["mtf_rsi_15m"] = 50.0
+        df["mtf_rsi_1h"] = 50.0
 
         # MSB helper: force bearish EMA20 cross on the last bar.
         df["ema20"] = 108.5
@@ -305,6 +316,52 @@ class SignalGeneratorTests(unittest.TestCase):
 
         self.assertIn("Памп по раннему окну", caption)
         self.assertNotIn("Чистый памп стратегии: 3.96%", caption)
+
+    def test_build_early_signal_caption_clean_repairs_mojibake_and_dedupes_triggers(self):
+        idx = pd.date_range("2026-01-01", periods=16, freq="min", tz="UTC")
+        close = np.linspace(0.081, 0.089, len(idx))
+        enriched = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.01,
+                "low": close * 0.992,
+                "close": close,
+                "rsi": np.linspace(68.0, 81.0, len(close)),
+                "volume_spike": np.linspace(0.7, 1.6, len(close)),
+            },
+            index=idx,
+        )
+
+        caption = build_early_signal_caption_clean(
+            symbol="PLAYSOUTUSDT",
+            timeframe="1",
+            mode="demo",
+            phase_label="Р РђРќРќРР™ РЁРћР Рў: РќРђР‘Р›Р®Р”Р•РќРР•",
+            price=float(close[-1]),
+            trace_meta={},
+            watch_score=6.5,
+            watch_max_score=8.0,
+            quality_score=8.1,
+            quality_max_score=10.0,
+            quality_grade="A",
+            continuation_risk=1.2,
+            continuation_max_score=4.0,
+            triggers=[
+                "РїРёРє РїР°РјРїР° СЃРѕРІСЃРµРј СЃРІРµР¶РёР№",
+                "РїРёРє РїР°РјРїР° СЃРѕРІСЃРµРј СЃРІРµР¶РёР№",
+                "РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·",
+                "РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·",
+            ],
+            wait_for="РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ СЃР»Р°Р±РѕСЃС‚Рё Рё РІС…РѕРґР°",
+            enriched=enriched,
+        )
+
+        self.assertIn("РАННИЙ ШОРТ: НАБЛЮДЕНИЕ", caption)
+        self.assertIn("пик пампа совсем свежий", caption)
+        self.assertIn("пошла первая реакция вниз", caption)
+        self.assertIn("подтверждение слабости и входа", caption)
+        self.assertEqual(caption.count("пик пампа совсем свежий"), 1)
+        self.assertEqual(caption.count("пошла первая реакция вниз"), 1)
 
     def test_compute_price_view_bounds_ignores_isolated_recent_wick(self):
         df = self._build_df()
@@ -878,7 +935,7 @@ class SignalGeneratorTests(unittest.TestCase):
             intent=intent,
         )
 
-        self.assertIsNone(candidate)
+        self.assertIsNone(candidate, msg=str(candidate))
 
     def test_build_early_watch_candidate_skips_when_current_volume_is_too_thin_without_reject_cluster(self):
         n = 72
@@ -1090,6 +1147,174 @@ class SignalGeneratorTests(unittest.TestCase):
 
         self.assertIsNone(candidate)
 
+    def test_build_approved_early_candidate_skips_indicator_rollover_without_price_reject(self):
+        n = 72
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.0403)
+        close[24:64] = np.linspace(0.0403, 0.04245, 40)
+        close[64:69] = np.array([0.04240, 0.04243, 0.04241, 0.04244, 0.04243])
+        close[69:] = np.array([0.04242, 0.04242, 0.04241])
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.9995,
+                "high": close * 1.0042,
+                "low": close * 0.9968,
+                "close": close,
+                "volume": np.linspace(24.0, 33.0, n),
+                "volume_spike": np.concatenate([np.full(n - 5, 0.96), np.array([1.28, 1.18, 1.12, 1.06, 1.02])]),
+                "rsi": np.concatenate([np.full(n - 4, 58.0), np.array([80.0, 78.0, 76.5, 75.0])]),
+                "hist": np.concatenate([np.full(n - 4, 0.00018), np.array([0.00046, 0.00035, 0.00028, 0.00022])]),
+                "obv": np.linspace(140.0, 340.0, n),
+                "cvd": np.linspace(120.0, 312.0, n),
+                "bb_upper": close * 1.0028,
+                "kc_upper": close * 1.0022,
+                "ema20": np.linspace(0.0406, 0.0420, n),
+                "ema50": np.linspace(0.0405, 0.0414, n),
+                "vwap": np.linspace(0.04055, 0.04165, n),
+                "atr": np.full(n, 0.00020),
+                "poc": np.full(n, 0.04130),
+                "vah": np.full(n, 0.04246),
+                "val": np.full(n, 0.04095),
+            },
+            index=idx,
+        )
+        df.iloc[-2, df.columns.get_loc("open")] = 0.04230
+        df.iloc[-2, df.columns.get_loc("high")] = 0.04246
+        df.iloc[-2, df.columns.get_loc("low")] = 0.04228
+        df.iloc[-2, df.columns.get_loc("close")] = 0.04242
+        df.iloc[-1, df.columns.get_loc("open")] = 0.04231
+        df.iloc[-1, df.columns.get_loc("high")] = 0.04247
+        df.iloc[-1, df.columns.get_loc("low")] = 0.04229
+        df.iloc[-1, df.columns.get_loc("close")] = 0.04241
+
+        intent = SimpleNamespace(
+            action=IntentAction.SHORT_ENTRY,
+            metadata={
+                "layer_trace": {
+                    "layers": {
+                        "layer1_pump_detection": {
+                            "details": {
+                                "clean_pump_pct": 0.051,
+                                "clean_pump_min_pct_used": 0.04,
+                                "volume_spike": 1.02,
+                                "rsi": 75.0,
+                            },
+                        },
+                        "layer2_weakness_confirmation": {
+                            "details": {
+                                "weakness_strength": 0.74,
+                                "failed_reclaim": 0.0,
+                                "retest_failed_breakout": 0.0,
+                                "acceptance_above_swing_high": 0.0,
+                            },
+                        },
+                        "layer3_entry_location": {
+                            "details": {
+                                "failed_reclaim": 0.0,
+                                "retest_failed_breakout": 0.0,
+                                "acceptance_above_swing_high": 0.0,
+                            },
+                        },
+                    }
+                },
+            },
+        )
+
+        candidate = _build_approved_early_candidate(
+            symbol="APRUSDT",
+            timeframe="1",
+            mode="demo",
+            enriched=df,
+            intent=intent,
+        )
+
+        self.assertIsNone(candidate)
+
+    def test_build_approved_early_candidate_skips_shallow_reject_without_displacement(self):
+        n = 72
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.0403)
+        close[24:64] = np.linspace(0.0403, 0.04246, 40)
+        close[64:69] = np.array([0.04244, 0.04247, 0.04249, 0.04250, 0.04251])
+        close[69:] = np.array([0.04250, 0.04249, 0.04248])
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.9994,
+                "high": close * 1.0046,
+                "low": close * 0.9968,
+                "close": close,
+                "volume": np.linspace(24.0, 33.0, n),
+                "volume_spike": np.concatenate([np.full(n - 5, 0.98), np.array([1.48, 1.34, 1.22, 1.10, 0.96])]),
+                "rsi": np.concatenate([np.full(n - 4, 58.0), np.array([82.0, 79.5, 77.0, 75.0])]),
+                "hist": np.concatenate([np.full(n - 4, 0.00018), np.array([0.00048, 0.00037, 0.00029, 0.00023])]),
+                "obv": np.linspace(140.0, 340.0, n),
+                "cvd": np.linspace(120.0, 312.0, n),
+                "bb_upper": close * 1.0028,
+                "kc_upper": close * 1.0022,
+                "ema20": np.linspace(0.0406, 0.04202, n),
+                "ema50": np.linspace(0.0405, 0.04142, n),
+                "vwap": np.linspace(0.04055, 0.04168, n),
+                "atr": np.full(n, 0.00020),
+                "poc": np.full(n, 0.04132),
+                "vah": np.full(n, 0.04250),
+                "val": np.full(n, 0.04095),
+            },
+            index=idx,
+        )
+        df.iloc[-2, df.columns.get_loc("open")] = 0.04250
+        df.iloc[-2, df.columns.get_loc("high")] = 0.04256
+        df.iloc[-2, df.columns.get_loc("low")] = 0.04242
+        df.iloc[-2, df.columns.get_loc("close")] = 0.04249
+        df.iloc[-1, df.columns.get_loc("open")] = 0.04250
+        df.iloc[-1, df.columns.get_loc("high")] = 0.04255
+        df.iloc[-1, df.columns.get_loc("low")] = 0.04245
+        df.iloc[-1, df.columns.get_loc("close")] = 0.04248
+
+        intent = SimpleNamespace(
+            action=IntentAction.SHORT_ENTRY,
+            metadata={
+                "layer_trace": {
+                    "layers": {
+                        "layer1_pump_detection": {
+                            "details": {
+                                "clean_pump_pct": 0.053,
+                                "clean_pump_min_pct_used": 0.04,
+                                "volume_spike": 0.96,
+                                "rsi": 75.0,
+                            },
+                        },
+                        "layer2_weakness_confirmation": {
+                            "details": {
+                                "weakness_strength": 0.82,
+                                "failed_reclaim": 0.0,
+                                "retest_failed_breakout": 0.0,
+                                "acceptance_above_swing_high": 0.0,
+                            },
+                        },
+                        "layer3_entry_location": {
+                            "details": {
+                                "failed_reclaim": 0.0,
+                                "retest_failed_breakout": 0.0,
+                                "acceptance_above_swing_high": 0.0,
+                            },
+                        },
+                    }
+                },
+            },
+        )
+
+        candidate = _build_approved_early_candidate(
+            symbol="APRUSDT",
+            timeframe="1",
+            mode="demo",
+            enriched=df,
+            intent=intent,
+        )
+
+        self.assertIsNone(candidate)
+
     def test_build_early_watch_candidate_skips_late_pullback_after_pump(self):
         n = 72
         idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
@@ -1194,6 +1419,79 @@ class SignalGeneratorTests(unittest.TestCase):
                                 "volume_spike_threshold_used": 2.0,
                                 "volume_spike": 2.0,
                                 "rsi": 73.0,
+                            },
+                        },
+                    }
+                },
+            }
+        )
+
+        candidate = _build_early_watch_candidate(
+            symbol="TESTUSDT",
+            timeframe="1",
+            mode="paper",
+            enriched=df,
+            intent=intent,
+        )
+
+        self.assertIsNone(candidate)
+
+    def test_build_early_watch_candidate_skips_shallow_reject_without_displacement(self):
+        n = 72
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.00212)
+        close[28:64] = np.linspace(0.00212, 0.00280, 36)
+        close[64:70] = np.linspace(0.00280, 0.002818, 6)
+        close[70] = 0.002816
+        close[71] = 0.002814
+
+        df = pd.DataFrame(
+            {
+                "open": close * 0.9992,
+                "high": close * 1.0088,
+                "low": close * 0.9932,
+                "close": close,
+                "volume": np.linspace(20.0, 28.0, n),
+                "volume_spike": np.concatenate([np.full(n - 5, 1.08), np.array([2.4, 1.95, 1.58, 1.32, 1.16])]),
+                "rsi": np.concatenate([np.full(n - 4, 56.0), np.array([71.0, 68.5, 66.0, 64.5])]),
+                "hist": np.concatenate([np.full(n - 4, 0.00010), np.array([0.00040, 0.00029, 0.00020, 0.00015])]),
+                "obv": np.linspace(100.0, 320.0, n),
+                "cvd": np.linspace(90.0, 300.0, n),
+                "bb_upper": close * 1.003,
+                "kc_upper": close * 1.002,
+                "ema20": np.linspace(0.00214, 0.00266, n),
+                "ema50": np.linspace(0.00212, 0.00252, n),
+                "vwap": np.linspace(0.00213, 0.00258, n),
+                "atr": np.full(n, 0.00005),
+                "poc": np.full(n, 0.00260),
+                "vah": np.full(n, 0.00282),
+                "val": np.full(n, 0.00252),
+            },
+            index=idx,
+        )
+        df.iloc[-2, df.columns.get_loc("open")] = 0.002817
+        df.iloc[-2, df.columns.get_loc("high")] = 0.002826
+        df.iloc[-2, df.columns.get_loc("low")] = 0.002810
+        df.iloc[-2, df.columns.get_loc("close")] = 0.002816
+        df.iloc[-1, df.columns.get_loc("open")] = 0.002816
+        df.iloc[-1, df.columns.get_loc("high")] = 0.002823
+        df.iloc[-1, df.columns.get_loc("low")] = 0.002809
+        df.iloc[-1, df.columns.get_loc("close")] = 0.002814
+
+        intent = SimpleNamespace(
+            metadata={
+                "layer_failed": "layer1_pump_detection",
+                "layer_trace": {
+                    "layers": {
+                        "regime_filter": {"passed": True, "details": {}},
+                        "layer1_pump_detection": {
+                            "passed": False,
+                            "details": {
+                                "clean_pump_pct": 0.052,
+                                "clean_pump_min_pct_used": 0.04,
+                                "volume_spike_threshold_used": 2.0,
+                                "volume_spike": 1.16,
+                                "rsi": 64.5,
                             },
                         },
                     }
@@ -2039,6 +2337,32 @@ class SignalGeneratorTests(unittest.TestCase):
             },
         )
 
+    def test_layer2_weakness_blocks_late_near_high_without_rejection(self):
+        df = self._build_df()
+        if "hist" not in df.columns:
+            df["hist"] = 0.0
+        df.iloc[-2, df.columns.get_loc("open")] = 108.00
+        df.iloc[-2, df.columns.get_loc("high")] = 108.35
+        df.iloc[-2, df.columns.get_loc("low")] = 107.92
+        df.iloc[-2, df.columns.get_loc("close")] = 108.10
+        df.iloc[-2, df.columns.get_loc("rsi")] = 72.0
+        df.iloc[-2, df.columns.get_loc("hist")] = 0.11
+        df.iloc[-1, df.columns.get_loc("open")] = 108.05
+        df.iloc[-1, df.columns.get_loc("high")] = 108.78
+        df.iloc[-1, df.columns.get_loc("low")] = 108.00
+        df.iloc[-1, df.columns.get_loc("close")] = 108.18
+        df.iloc[-1, df.columns.get_loc("rsi")] = 71.5
+        df.iloc[-1, df.columns.get_loc("hist")] = 0.09
+
+        signal_gen = SignalGenerator(SignalConfig())
+
+        passed, layer2 = signal_gen._layer2_weakness_confirmation(df, "SHORT")
+
+        self.assertFalse(passed)
+        self.assertEqual(layer2.get("late_near_high_context"), 1.0)
+        self.assertEqual(layer2.get("price_rejection_near_high"), 0.0)
+        self.assertIn("price_up_or_near_high", str(layer2.get("missing_conditions", "")))
+
     def test_layer3_entry_location_semantics_pass(self):
         df = self._build_df()
         signal_gen = SignalGenerator(SignalConfig())
@@ -2054,10 +2378,19 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertIn("msb_bearish_confirmed", layer3)
         self.assertIn("entry_location_strength", layer3)
 
-    def test_layer3_entry_location_passes_when_price_is_below_vah_without_explicit_rejection(self):
+    def test_layer3_entry_location_passes_when_price_is_below_vah_after_recent_upper_anchor_reject(self):
         df = self._build_df()
-        df.iloc[-2, df.columns.get_loc("close")] = 107.0
-        df.iloc[-1, df.columns.get_loc("close")] = 108.4
+        if "hist" not in df.columns:
+            df["hist"] = 0.0
+        if "volume_spike" not in df.columns:
+            df["volume_spike"] = 1.0
+        df.iloc[-3:, df.columns.get_loc("open")] = [108.70, 108.82, 108.62]
+        df.iloc[-3:, df.columns.get_loc("high")] = [108.98, 109.03, 108.88]
+        df.iloc[-3:, df.columns.get_loc("low")] = [108.32, 108.28, 108.10]
+        df.iloc[-3:, df.columns.get_loc("close")] = [108.82, 108.58, 108.34]
+        df.iloc[-3:, df.columns.get_loc("rsi")] = [72.0, 69.0, 66.0]
+        df.iloc[-3:, df.columns.get_loc("hist")] = [0.16, 0.11, 0.06]
+        df.iloc[-3:, df.columns.get_loc("volume_spike")] = [1.05, 0.92, 0.80]
         signal_gen = SignalGenerator(SignalConfig())
         vp = VolumeProfileLevels(poc=108.0, vah=109.0, val=98.0)
 
@@ -2066,6 +2399,8 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertTrue(passed)
         self.assertEqual(layer3.get("entry_location_passed"), 1.0)
         self.assertEqual(layer3.get("below_vah_or_rejected_from_vah"), 1.0)
+        self.assertEqual(layer3.get("recent_upper_anchor_touch"), 1.0)
+        self.assertEqual(layer3.get("reject_from_upper_anchor"), 1.0)
 
     def test_layer3_entry_location_semantics_fail(self):
         df = self._build_df()
@@ -2169,6 +2504,68 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(layer3.get("entry_location_passed"), 0.0)
         self.assertIn("no_trade_continuation_above_fast_value", str(layer3.get("missing_conditions", "")))
 
+    def test_layer3_entry_location_blocks_late_reclaim_after_recent_reaction(self):
+        n = 40
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.linspace(108.20, 109.05, n)
+        close[-10:] = [108.90, 109.18, 109.52, 109.98, 109.18, 109.34, 109.58, 109.86, 109.98, 110.04]
+        df = pd.DataFrame(
+            {
+                "open": close * 0.9992,
+                "high": close * 1.0024,
+                "low": close * 0.9978,
+                "close": close,
+                "volume": np.linspace(10.0, 14.0, n),
+            },
+            index=idx,
+        )
+        df.iloc[-10:, df.columns.get_loc("open")] = [108.82, 109.02, 109.36, 109.82, 109.10, 109.22, 109.46, 109.70, 109.92, 109.96]
+        df.iloc[-10:, df.columns.get_loc("high")] = [109.02, 109.30, 109.66, 110.10, 109.26, 109.46, 109.74, 109.92, 110.00, 110.08]
+        df.iloc[-10:, df.columns.get_loc("low")] = [108.74, 108.96, 109.28, 109.74, 109.00, 109.18, 109.40, 109.64, 109.84, 109.92]
+        df["rsi"] = np.linspace(56.0, 64.0, n)
+        df.iloc[-10:, df.columns.get_loc("rsi")] = [62.0, 65.0, 69.0, 73.0, 60.0, 61.0, 64.0, 67.0, 70.0, 72.0]
+        df["hist"] = np.linspace(0.03, 0.10, n)
+        df.iloc[-10:, df.columns.get_loc("hist")] = [0.08, 0.11, 0.15, 0.20, 0.08, 0.09, 0.11, 0.13, 0.15, 0.16]
+        df["volume_spike"] = 0.92
+        df.iloc[-10:, df.columns.get_loc("volume_spike")] = [0.96, 1.00, 1.06, 1.10, 0.82, 0.86, 0.92, 0.98, 1.01, 1.05]
+        df["ema20"] = np.linspace(108.10, 109.76, n)
+        df["ema50"] = np.linspace(108.00, 109.22, n)
+        df["atr"] = 0.24
+        signal_gen = SignalGenerator(SignalConfig())
+        vp = VolumeProfileLevels(poc=109.0, vah=110.05, val=107.5)
+
+        passed, layer3 = signal_gen._layer3_entry_location(df, "SHORT", vp)
+
+        self.assertFalse(passed)
+        self.assertEqual(layer3.get("entry_location_passed"), 0.0)
+        self.assertEqual(layer3.get("late_reclaim_after_recent_reaction"), 1.0)
+        self.assertIn("no_trade_late_reclaim_after_reaction", str(layer3.get("missing_conditions", "")))
+
+    def test_layer3_entry_location_blocks_shallow_reject_without_displacement(self):
+        df = self._build_df()
+        if "hist" not in df.columns:
+            df["hist"] = 0.0
+        if "volume_spike" not in df.columns:
+            df["volume_spike"] = 1.0
+        df.iloc[-5:, df.columns.get_loc("open")] = [108.91, 108.96, 108.99, 108.98, 108.99]
+        df.iloc[-5:, df.columns.get_loc("high")] = [109.00, 109.03, 109.04, 109.03, 109.03]
+        df.iloc[-5:, df.columns.get_loc("low")] = [108.90, 108.92, 108.93, 108.92, 108.93]
+        df.iloc[-5:, df.columns.get_loc("close")] = [108.97, 108.99, 108.98, 108.95, 108.94]
+        df.iloc[-5:, df.columns.get_loc("rsi")] = [73.0, 72.0, 70.5, 69.0, 68.0]
+        df.iloc[-5:, df.columns.get_loc("hist")] = [0.18, 0.16, 0.13, 0.11, 0.09]
+        df.iloc[-5:, df.columns.get_loc("volume_spike")] = [1.06, 1.02, 0.97, 0.92, 0.88]
+        signal_gen = SignalGenerator(SignalConfig())
+        vp = VolumeProfileLevels(poc=108.2, vah=109.0, val=98.0)
+
+        passed, layer3 = signal_gen._layer3_entry_location(df, "SHORT", vp)
+
+        self.assertFalse(passed)
+        self.assertEqual(layer3.get("entry_location_passed"), 0.0)
+        self.assertEqual(layer3.get("recent_upper_anchor_touch"), 1.0)
+        self.assertEqual(layer3.get("recent_upper_anchor_reject"), 1.0)
+        self.assertEqual(layer3.get("shallow_reject_without_displacement"), 1.0, msg=str(layer3))
+        self.assertIn("no_trade_shallow_reject_without_displacement", str(layer3.get("missing_conditions", "")))
+
     def test_layer3_entry_location_blocks_high_mtf_continuation_without_rollover(self):
         df = self._build_df()
         if "hist" not in df.columns:
@@ -2196,6 +2593,39 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(layer3.get("high_mtf_continuation"), 1.0)
         self.assertIn("no_trade_high_mtf_continuation", str(layer3.get("missing_conditions", "")))
 
+    def test_layer3_entry_location_blocks_fifteen_and_one_hour_continuation_without_rollover(self):
+        df = self._build_df()
+        if "hist" not in df.columns:
+            df["hist"] = 0.0
+        if "volume_spike" not in df.columns:
+            df["volume_spike"] = 1.0
+        df["mtf_trend_15m"] = 0.0
+        df["mtf_rsi_15m"] = 50.0
+        df["mtf_trend_1h"] = 0.0
+        df["mtf_rsi_1h"] = 50.0
+        df.iloc[-3:, df.columns.get_loc("open")] = [107.9, 108.2, 108.45]
+        df.iloc[-3:, df.columns.get_loc("high")] = [108.5, 108.8, 109.05]
+        df.iloc[-3:, df.columns.get_loc("low")] = [107.7, 108.1, 108.35]
+        df.iloc[-3:, df.columns.get_loc("close")] = [108.25, 108.52, 108.86]
+        df.iloc[-3:, df.columns.get_loc("rsi")] = [70.0, 73.5, 77.0]
+        df.iloc[-3:, df.columns.get_loc("hist")] = [0.12, 0.17, 0.22]
+        df.iloc[-3:, df.columns.get_loc("volume_spike")] = [0.88, 0.95, 1.04]
+        df.iloc[-1, df.columns.get_loc("mtf_trend_15m")] = 0.0048
+        df.iloc[-1, df.columns.get_loc("mtf_rsi_15m")] = 69.5
+        df.iloc[-1, df.columns.get_loc("mtf_trend_1h")] = 0.0040
+        df.iloc[-1, df.columns.get_loc("mtf_rsi_1h")] = 66.0
+        signal_gen = SignalGenerator(SignalConfig())
+        vp = VolumeProfileLevels(poc=108.3, vah=109.1, val=100.0)
+
+        passed, layer3 = signal_gen._layer3_entry_location(df, "SHORT", vp)
+
+        self.assertFalse(passed)
+        self.assertEqual(layer3.get("entry_location_passed"), 0.0)
+        self.assertEqual(layer3.get("high_mtf_continuation"), 1.0)
+        self.assertGreater(float(layer3.get("mtf_trend_15m_used", 0.0)), 0.004)
+        self.assertGreater(float(layer3.get("mtf_trend_1h_used", 0.0)), 0.003)
+        self.assertIn("no_trade_high_mtf_continuation", str(layer3.get("missing_conditions", "")))
+
     def test_layer3_entry_location_blocks_late_bounce_far_from_upper_anchor(self):
         df = self._build_df()
         if "hist" not in df.columns:
@@ -2220,6 +2650,225 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(layer3.get("entry_location_passed"), 0.0)
         self.assertEqual(layer3.get("late_bounce_without_upper_anchor"), 1.0)
         self.assertIn("no_trade_late_bounce_without_upper_anchor", str(layer3.get("missing_conditions", "")))
+
+    def test_layer3_entry_location_blocks_late_rebound_below_vah_without_trigger(self):
+        df = self._build_df()
+        if "hist" not in df.columns:
+            df["hist"] = 0.0
+        if "volume_spike" not in df.columns:
+            df["volume_spike"] = 1.0
+        df.iloc[-9, df.columns.get_loc("high")] = 113.2
+        df.iloc[-9, df.columns.get_loc("close")] = 112.9
+        df.iloc[-4:, df.columns.get_loc("open")] = [107.0, 107.35, 107.65, 107.92]
+        df.iloc[-4:, df.columns.get_loc("high")] = [107.52, 107.82, 108.05, 108.18]
+        df.iloc[-4:, df.columns.get_loc("low")] = [106.95, 107.28, 107.60, 107.88]
+        df.iloc[-4:, df.columns.get_loc("close")] = [107.34, 107.62, 107.94, 108.12]
+        df.iloc[-4:, df.columns.get_loc("ema20")] = [106.8, 107.0, 107.22, 107.44]
+        df.iloc[-4:, df.columns.get_loc("rsi")] = [46.0, 49.0, 51.0, 53.0]
+        df.iloc[-4:, df.columns.get_loc("hist")] = [-0.07, -0.05, -0.03, -0.01]
+        df.iloc[-4:, df.columns.get_loc("volume_spike")] = [0.28, 0.33, 0.38, 0.42]
+        signal_gen = SignalGenerator(SignalConfig())
+        vp = VolumeProfileLevels(poc=107.3, vah=109.6, val=100.0)
+
+        passed, layer3 = signal_gen._layer3_entry_location(df, "SHORT", vp)
+
+        self.assertFalse(passed)
+        self.assertEqual(layer3.get("entry_location_passed"), 0.0)
+        self.assertEqual(layer3.get("late_rebound_below_vah_without_trigger"), 1.0)
+        self.assertIn(
+            "no_trade_late_rebound_below_vah_without_trigger",
+            str(layer3.get("missing_conditions", "")),
+        )
+
+    def test_layer3_entry_location_blocks_late_pullback_without_downside_displacement(self):
+        df = self._build_df()
+        if "hist" not in df.columns:
+            df["hist"] = 0.0
+        if "volume_spike" not in df.columns:
+            df["volume_spike"] = 1.0
+        df.iloc[-9, df.columns.get_loc("high")] = 113.2
+        df.iloc[-9, df.columns.get_loc("close")] = 112.9
+        df.iloc[-4:, df.columns.get_loc("open")] = [107.26, 107.22, 107.18, 107.14]
+        df.iloc[-4:, df.columns.get_loc("high")] = [107.34, 107.28, 107.22, 107.18]
+        df.iloc[-4:, df.columns.get_loc("low")] = [107.08, 107.06, 107.05, 107.04]
+        df.iloc[-4:, df.columns.get_loc("close")] = [107.18, 107.14, 107.12, 107.10]
+        df.iloc[-4:, df.columns.get_loc("ema20")] = [107.40, 107.32, 107.24, 107.16]
+        df.iloc[-4:, df.columns.get_loc("rsi")] = [46.0, 44.0, 43.0, 42.0]
+        df.iloc[-4:, df.columns.get_loc("hist")] = [-0.09, -0.08, -0.07, -0.06]
+        df.iloc[-4:, df.columns.get_loc("volume_spike")] = [0.72, 0.78, 0.84, 0.88]
+        signal_gen = SignalGenerator(SignalConfig())
+        vp = VolumeProfileLevels(poc=107.4, vah=109.6, val=100.0)
+
+        passed, layer3 = signal_gen._layer3_entry_location(df, "SHORT", vp)
+
+        self.assertFalse(passed)
+        self.assertEqual(layer3.get("entry_location_passed"), 0.0)
+        self.assertEqual(layer3.get("late_pullback_without_downside_displacement"), 1.0, msg=str(layer3))
+        self.assertEqual(layer3.get("downside_displacement_confirmed"), 0.0, msg=str(layer3))
+        self.assertIn(
+            "no_trade_late_pullback_without_downside_displacement",
+            str(layer3.get("missing_conditions", "")),
+        )
+
+    def test_layer3_entry_location_blocks_unanchored_failed_reclaim_rebound(self):
+        df = self._build_df()
+        if "hist" not in df.columns:
+            df["hist"] = 0.0
+        if "volume_spike" not in df.columns:
+            df["volume_spike"] = 1.0
+        df.iloc[-9, df.columns.get_loc("high")] = 113.2
+        df.iloc[-9, df.columns.get_loc("close")] = 112.9
+        df.iloc[-4:, df.columns.get_loc("open")] = [107.02, 107.32, 107.62, 107.88]
+        df.iloc[-4:, df.columns.get_loc("high")] = [107.48, 107.76, 108.00, 108.15]
+        df.iloc[-4:, df.columns.get_loc("low")] = [106.96, 107.26, 107.56, 107.84]
+        df.iloc[-4:, df.columns.get_loc("close")] = [107.34, 107.60, 107.90, 108.08]
+        df.iloc[-4:, df.columns.get_loc("ema20")] = [106.82, 107.00, 107.20, 107.42]
+        df.iloc[-4:, df.columns.get_loc("vwap")] = [107.92, 107.94, 107.96, 107.98]
+        df.iloc[-4:, df.columns.get_loc("rsi")] = [46.0, 49.0, 51.0, 53.0]
+        df.iloc[-4:, df.columns.get_loc("hist")] = [-0.07, -0.05, -0.03, -0.01]
+        df.iloc[-4:, df.columns.get_loc("volume_spike")] = [0.60, 0.66, 0.72, 0.78]
+        df.iloc[-4:, df.columns.get_loc("mtf_trend_5m")] = [0.0057, 0.0058, 0.0060, 0.0062]
+        df.iloc[-4:, df.columns.get_loc("mtf_trend_15m")] = [0.0040, 0.0041, 0.0042, 0.0044]
+        signal_gen = SignalGenerator(SignalConfig())
+        signal_gen._short_sweep_reclaim_context = lambda _df: {
+            "failed_reclaim": True,
+            "retest_failed_breakout": False,
+            "acceptance_above_high": False,
+            "rejection_bar": False,
+            "lower_close": False,
+            "lower_high": False,
+            "post_peak_followthrough": False,
+            "near_sweep_level": True,
+        }
+        signal_gen._layer3_msb_confirmation = lambda **_kwargs: (True, {"msb_ok": 1.0})
+        vp = VolumeProfileLevels(poc=107.3, vah=109.6, val=100.0)
+
+        passed, layer3 = signal_gen._layer3_entry_location(df, "SHORT", vp)
+
+        self.assertFalse(passed)
+        self.assertEqual(layer3.get("unanchored_failed_reclaim_rebound"), 1.0)
+        self.assertIn(
+            "no_trade_unanchored_failed_reclaim_rebound",
+            str(layer3.get("missing_conditions", "")),
+        )
+
+    def test_layer3_entry_location_blocks_bullish_rebound_below_vah_without_reject(self):
+        df = self._build_df()
+        if "hist" not in df.columns:
+            df["hist"] = 0.0
+        if "volume_spike" not in df.columns:
+            df["volume_spike"] = 1.0
+        df.iloc[-9, df.columns.get_loc("high")] = 113.0
+        df.iloc[-9, df.columns.get_loc("close")] = 112.7
+        df.iloc[-4:, df.columns.get_loc("open")] = [107.00, 107.28, 107.56, 107.84]
+        df.iloc[-4:, df.columns.get_loc("high")] = [107.42, 107.70, 107.96, 108.18]
+        df.iloc[-4:, df.columns.get_loc("low")] = [106.95, 107.24, 107.50, 107.78]
+        df.iloc[-4:, df.columns.get_loc("close")] = [107.30, 107.58, 107.88, 108.14]
+        df.iloc[-4:, df.columns.get_loc("ema20")] = [106.84, 107.02, 107.22, 107.44]
+        df.iloc[-4:, df.columns.get_loc("vwap")] = [107.90, 107.93, 107.96, 107.99]
+        df.iloc[-4:, df.columns.get_loc("rsi")] = [47.0, 49.0, 51.0, 53.0]
+        df.iloc[-4:, df.columns.get_loc("hist")] = [-0.08, -0.05, -0.03, -0.01]
+        df.iloc[-4:, df.columns.get_loc("volume_spike")] = [0.42, 0.48, 0.56, 0.66]
+        signal_gen = SignalGenerator(SignalConfig())
+        vp = VolumeProfileLevels(poc=107.3, vah=109.6, val=100.0)
+
+        passed, layer3 = signal_gen._layer3_entry_location(df, "SHORT", vp)
+
+        self.assertFalse(passed)
+        self.assertEqual(layer3.get("bullish_rebound_below_vah_without_reject"), 1.0)
+        self.assertIn(
+            "no_trade_bullish_rebound_below_vah_without_reject",
+            str(layer3.get("missing_conditions", "")),
+        )
+
+    def test_layer3_entry_location_blocks_plateau_continuation_near_high(self):
+        df = self._build_df()
+        if "hist" not in df.columns:
+            df["hist"] = 0.0
+        if "volume_spike" not in df.columns:
+            df["volume_spike"] = 1.0
+        df.iloc[-24:-6, df.columns.get_loc("open")] = np.linspace(108.10, 108.88, 18)
+        df.iloc[-24:-6, df.columns.get_loc("high")] = np.linspace(108.24, 109.08, 18)
+        df.iloc[-24:-6, df.columns.get_loc("low")] = np.linspace(108.02, 108.78, 18)
+        df.iloc[-24:-6, df.columns.get_loc("close")] = np.linspace(108.18, 108.98, 18)
+        df.iloc[-24:-6, df.columns.get_loc("ema20")] = np.linspace(107.96, 108.70, 18)
+        df.iloc[-6:, df.columns.get_loc("open")] = [108.74, 108.96, 109.08, 109.14, 109.16, 109.17]
+        df.iloc[-6:, df.columns.get_loc("high")] = [109.01, 109.14, 109.19, 109.22, 109.23, 109.24]
+        df.iloc[-6:, df.columns.get_loc("low")] = [108.70, 108.92, 109.02, 109.10, 109.14, 109.15]
+        df.iloc[-6:, df.columns.get_loc("close")] = [108.98, 109.12, 109.18, 109.20, 109.22, 109.23]
+        df.iloc[-6:, df.columns.get_loc("ema20")] = [108.46, 108.60, 108.76, 108.92, 109.04, 109.10]
+        df.iloc[-6:, df.columns.get_loc("rsi")] = [65.0, 66.0, 67.0, 68.0, 69.0, 70.0]
+        df.iloc[-6:, df.columns.get_loc("hist")] = [0.09, 0.10, 0.11, 0.12, 0.13, 0.14]
+        df.iloc[-6:, df.columns.get_loc("volume_spike")] = [0.56, 0.62, 0.68, 0.74, 0.80, 0.86]
+        signal_gen = SignalGenerator(SignalConfig())
+        vp = VolumeProfileLevels(poc=108.5, vah=109.18, val=100.0)
+
+        passed, layer3 = signal_gen._layer3_entry_location(df, "SHORT", vp)
+
+        self.assertFalse(passed)
+        self.assertEqual(layer3.get("plateau_continuation_near_high"), 1.0, msg=str(layer3))
+        self.assertIn(
+            "no_trade_plateau_near_high_continuation",
+            str(layer3.get("missing_conditions", "")),
+        )
+
+    def test_layer3_entry_location_blocks_green_hold_without_downside_displacement(self):
+        df = self._build_df()
+        if "hist" not in df.columns:
+            df["hist"] = 0.0
+        if "volume_spike" not in df.columns:
+            df["volume_spike"] = 1.0
+        df.iloc[-24:-4, df.columns.get_loc("open")] = np.linspace(107.80, 108.72, 20)
+        df.iloc[-24:-4, df.columns.get_loc("high")] = np.linspace(108.02, 109.02, 20)
+        df.iloc[-24:-4, df.columns.get_loc("low")] = np.linspace(107.68, 108.60, 20)
+        df.iloc[-24:-4, df.columns.get_loc("close")] = np.linspace(107.96, 108.92, 20)
+        df.iloc[-24:-4, df.columns.get_loc("ema20")] = np.linspace(107.70, 108.62, 20)
+        df.iloc[-4:, df.columns.get_loc("open")] = [108.78, 108.92, 109.02, 109.08]
+        df.iloc[-4:, df.columns.get_loc("high")] = [109.08, 109.18, 109.23, 109.28]
+        df.iloc[-4:, df.columns.get_loc("low")] = [108.70, 108.86, 108.96, 108.95]
+        df.iloc[-4:, df.columns.get_loc("close")] = [109.02, 109.12, 109.18, 109.24]
+        df.iloc[-4:, df.columns.get_loc("ema20")] = [108.68, 108.76, 108.86, 108.95]
+        df.iloc[-4:, df.columns.get_loc("bb_upper")] = [108.88, 109.00, 109.06, 109.12]
+        df.iloc[-4:, df.columns.get_loc("kc_upper")] = [108.84, 108.96, 109.02, 109.08]
+        df.iloc[-4:, df.columns.get_loc("rsi")] = [69.0, 71.0, 73.0, 75.0]
+        df.iloc[-4:, df.columns.get_loc("hist")] = [0.08, 0.09, 0.10, 0.11]
+        df.iloc[-4:, df.columns.get_loc("volume_spike")] = [0.70, 0.78, 0.86, 0.92]
+        df.iloc[-4:, df.columns.get_loc("mtf_trend_5m")] = [0.0058, 0.0061, 0.0064, 0.0068]
+        df.iloc[-4:, df.columns.get_loc("mtf_rsi_5m")] = [72.0, 74.0, 76.0, 78.0]
+        signal_gen = SignalGenerator(SignalConfig())
+        vp = VolumeProfileLevels(poc=108.2, vah=109.18, val=100.0)
+
+        passed, layer3 = signal_gen._layer3_entry_location(df, "SHORT", vp)
+
+        self.assertFalse(passed)
+        self.assertEqual(layer3.get("green_hold_without_downside_displacement"), 1.0, msg=str(layer3))
+        self.assertIn(
+            "no_trade_green_hold_without_downside_displacement",
+            str(layer3.get("missing_conditions", "")),
+        )
+
+    def test_layer3_entry_location_blocks_value_entry_without_recent_upper_anchor_context(self):
+        df = self._build_df()
+        if "hist" not in df.columns:
+            df["hist"] = 0.0
+        if "volume_spike" not in df.columns:
+            df["volume_spike"] = 1.0
+        df.iloc[-4:, df.columns.get_loc("open")] = [107.65, 107.85, 108.02, 108.12]
+        df.iloc[-4:, df.columns.get_loc("high")] = [108.08, 108.22, 108.34, 108.46]
+        df.iloc[-4:, df.columns.get_loc("low")] = [107.48, 107.72, 107.96, 108.00]
+        df.iloc[-4:, df.columns.get_loc("close")] = [107.92, 108.08, 108.22, 108.38]
+        df.iloc[-4:, df.columns.get_loc("rsi")] = [61.0, 63.0, 64.0, 65.0]
+        df.iloc[-4:, df.columns.get_loc("hist")] = [0.05, 0.06, 0.07, 0.08]
+        df.iloc[-4:, df.columns.get_loc("volume_spike")] = [0.82, 0.84, 0.86, 0.88]
+        signal_gen = SignalGenerator(SignalConfig())
+        vp = VolumeProfileLevels(poc=108.2, vah=109.2, val=98.0)
+
+        passed, layer3 = signal_gen._layer3_entry_location(df, "SHORT", vp)
+
+        self.assertFalse(passed)
+        self.assertEqual(layer3.get("entry_location_passed"), 0.0)
+        self.assertEqual(layer3.get("upper_anchor_context"), 0.0)
+        self.assertIn("upper_anchor_context", str(layer3.get("missing_conditions", "")))
 
     def test_live_price_overlay_updates_current_bucket_close_without_dropping_history(self):
         now_bucket = pd.Timestamp.utcnow().floor("1min")
@@ -2265,6 +2914,189 @@ class SignalGeneratorTests(unittest.TestCase):
             atr=1.8,
             cooldown_sec=900,
         )
+
+        self.assertTrue(blocked)
+
+    def test_cached_alert_preserves_recent_main_short_reentry_payload(self):
+        cache = {
+            "BTCUSDT": {
+                "main_short_entry_ts": 1_800_000_000.0,
+                "main_short_entry_price": 108.4,
+                "main_short_peak_price": 109.2,
+                "main_short_atr": 1.8,
+            }
+        }
+
+        _remember_cached_alert(
+            cache,
+            symbol="BTCUSDT",
+            key="sig|1",
+            now_ts=1_800_000_120.0,
+            cooldown_sec=900,
+        )
+
+        self.assertIn("BTCUSDT", cache)
+        self.assertEqual(cache["BTCUSDT"].get("key"), "sig|1")
+        self.assertGreater(float(cache["BTCUSDT"].get("next_allowed_ts", 0.0)), 1_800_000_120.0)
+        self.assertEqual(float(cache["BTCUSDT"].get("main_short_entry_price", 0.0)), 108.4)
+        self.assertEqual(float(cache["BTCUSDT"].get("main_short_peak_price", 0.0)), 109.2)
+
+    def test_live_main_short_continuation_blocks_late_rebound_below_vah_without_trigger(self):
+        df = self._build_df()
+        if "vah" not in df.columns:
+            df["vah"] = 0.0
+        df.iloc[-9, df.columns.get_loc("high")] = 113.1
+        df.iloc[-9, df.columns.get_loc("close")] = 112.8
+        df.iloc[-4:, df.columns.get_loc("open")] = [107.05, 107.32, 107.58, 107.86]
+        df.iloc[-4:, df.columns.get_loc("high")] = [107.45, 107.72, 107.96, 108.10]
+        df.iloc[-4:, df.columns.get_loc("low")] = [106.98, 107.26, 107.52, 107.80]
+        df.iloc[-4:, df.columns.get_loc("close")] = [107.30, 107.56, 107.86, 108.05]
+        df.iloc[-4:, df.columns.get_loc("ema20")] = [106.84, 107.02, 107.20, 107.40]
+        df.iloc[-4:, df.columns.get_loc("vah")] = [109.5, 109.5, 109.5, 109.5]
+        df.iloc[-4:, df.columns.get_loc("rsi")] = [46.0, 48.0, 50.0, 52.0]
+        df.iloc[-4:, df.columns.get_loc("hist")] = [-0.08, -0.06, -0.04, -0.02]
+        df.iloc[-4:, df.columns.get_loc("volume_spike")] = [1.02, 1.06, 1.10, 1.14]
+        df.iloc[-4:, df.columns.get_loc("mtf_trend_5m")] = [0.0058, 0.0059, 0.0061, 0.0064]
+        df.iloc[-4:, df.columns.get_loc("mtf_rsi_5m")] = [69.0, 71.0, 73.0, 75.0]
+        intent = SimpleNamespace(action=IntentAction.SHORT_ENTRY, metadata={})
+
+        blocked = _should_block_live_main_short_continuation(intent, df)
+
+        self.assertTrue(blocked)
+
+    def test_live_main_short_continuation_does_not_bypass_unanchored_failed_reclaim(self):
+        df = self._build_df()
+        if "vah" not in df.columns:
+            df["vah"] = 0.0
+        df.iloc[-9, df.columns.get_loc("high")] = 113.1
+        df.iloc[-9, df.columns.get_loc("close")] = 112.8
+        df.iloc[-4:, df.columns.get_loc("open")] = [107.05, 107.32, 107.58, 107.86]
+        df.iloc[-4:, df.columns.get_loc("high")] = [107.45, 107.72, 107.96, 108.10]
+        df.iloc[-4:, df.columns.get_loc("low")] = [106.98, 107.26, 107.52, 107.80]
+        df.iloc[-4:, df.columns.get_loc("close")] = [107.30, 107.56, 107.86, 108.05]
+        df.iloc[-4:, df.columns.get_loc("ema20")] = [106.84, 107.02, 107.20, 107.40]
+        df.iloc[-4:, df.columns.get_loc("vwap")] = [107.90, 107.92, 107.94, 107.96]
+        df.iloc[-4:, df.columns.get_loc("vah")] = [109.5, 109.5, 109.5, 109.5]
+        df.iloc[-4:, df.columns.get_loc("rsi")] = [46.0, 48.0, 50.0, 52.0]
+        df.iloc[-4:, df.columns.get_loc("hist")] = [-0.08, -0.06, -0.04, -0.02]
+        df.iloc[-4:, df.columns.get_loc("volume_spike")] = [1.02, 1.06, 1.10, 1.14]
+        df.iloc[-4:, df.columns.get_loc("mtf_trend_5m")] = [0.0058, 0.0059, 0.0061, 0.0064]
+        df.iloc[-4:, df.columns.get_loc("mtf_rsi_5m")] = [69.0, 71.0, 73.0, 75.0]
+        intent = SimpleNamespace(
+            action=IntentAction.SHORT_ENTRY,
+            metadata={
+                "layer_trace": {
+                    "layers": {
+                        "layer2_weakness_confirmation": {"details": {"failed_reclaim": 1.0}},
+                        "layer3_entry_location": {
+                            "details": {
+                                "recent_upper_anchor_touch": 0.0,
+                                "recent_upper_anchor_reject": 0.0,
+                                "reject_from_upper_anchor": 0.0,
+                            }
+                        },
+                    }
+                }
+            },
+        )
+
+        blocked = _should_block_live_main_short_continuation(intent, df)
+
+        self.assertTrue(blocked)
+
+    def test_live_main_short_continuation_blocks_bullish_rebound_below_vah_without_reject(self):
+        df = self._build_df()
+        if "vah" not in df.columns:
+            df["vah"] = 0.0
+        df.iloc[-9, df.columns.get_loc("high")] = 113.1
+        df.iloc[-9, df.columns.get_loc("close")] = 112.8
+        df.iloc[-4:, df.columns.get_loc("open")] = [107.04, 107.32, 107.60, 107.88]
+        df.iloc[-4:, df.columns.get_loc("high")] = [107.46, 107.74, 107.98, 108.16]
+        df.iloc[-4:, df.columns.get_loc("low")] = [106.98, 107.28, 107.54, 107.82]
+        df.iloc[-4:, df.columns.get_loc("close")] = [107.30, 107.58, 107.88, 108.12]
+        df.iloc[-4:, df.columns.get_loc("ema20")] = [106.84, 107.02, 107.20, 107.40]
+        df.iloc[-4:, df.columns.get_loc("vah")] = [109.5, 109.5, 109.5, 109.5]
+        df.iloc[-4:, df.columns.get_loc("rsi")] = [47.0, 49.0, 51.0, 53.0]
+        df.iloc[-4:, df.columns.get_loc("hist")] = [-0.08, -0.06, -0.04, -0.02]
+        df.iloc[-4:, df.columns.get_loc("volume_spike")] = [0.98, 1.02, 1.06, 1.12]
+        df.iloc[-4:, df.columns.get_loc("mtf_trend_5m")] = [0.0055, 0.0057, 0.0059, 0.0061]
+        df.iloc[-4:, df.columns.get_loc("mtf_rsi_5m")] = [68.0, 70.0, 72.0, 74.0]
+        intent = SimpleNamespace(action=IntentAction.SHORT_ENTRY, metadata={})
+
+        blocked = _should_block_live_main_short_continuation(intent, df)
+
+        self.assertTrue(blocked)
+
+    def test_live_main_short_continuation_blocks_late_pullback_without_downside_displacement(self):
+        df = self._build_df()
+        if "vah" not in df.columns:
+            df["vah"] = 0.0
+        df.iloc[-9, df.columns.get_loc("high")] = 113.1
+        df.iloc[-9, df.columns.get_loc("close")] = 112.8
+        df.iloc[-4:, df.columns.get_loc("open")] = [107.26, 107.22, 107.18, 107.14]
+        df.iloc[-4:, df.columns.get_loc("high")] = [107.34, 107.28, 107.22, 107.18]
+        df.iloc[-4:, df.columns.get_loc("low")] = [107.08, 107.06, 107.05, 107.04]
+        df.iloc[-4:, df.columns.get_loc("close")] = [107.18, 107.14, 107.12, 107.10]
+        df.iloc[-4:, df.columns.get_loc("ema20")] = [107.40, 107.32, 107.24, 107.16]
+        df.iloc[-4:, df.columns.get_loc("vah")] = [109.5, 109.5, 109.5, 109.5]
+        df.iloc[-4:, df.columns.get_loc("rsi")] = [46.0, 44.0, 43.0, 42.0]
+        df.iloc[-4:, df.columns.get_loc("hist")] = [-0.09, -0.08, -0.07, -0.06]
+        df.iloc[-4:, df.columns.get_loc("volume_spike")] = [0.72, 0.78, 0.84, 0.88]
+        intent = SimpleNamespace(action=IntentAction.SHORT_ENTRY, metadata={})
+
+        blocked = _should_block_live_main_short_continuation(intent, df)
+
+        self.assertTrue(blocked)
+
+    def test_live_main_short_continuation_blocks_plateau_continuation_near_high(self):
+        df = self._build_df()
+        if "vah" not in df.columns:
+            df["vah"] = 0.0
+        df.iloc[-24:-6, df.columns.get_loc("open")] = np.linspace(108.10, 108.88, 18)
+        df.iloc[-24:-6, df.columns.get_loc("high")] = np.linspace(108.24, 109.08, 18)
+        df.iloc[-24:-6, df.columns.get_loc("low")] = np.linspace(108.02, 108.78, 18)
+        df.iloc[-24:-6, df.columns.get_loc("close")] = np.linspace(108.18, 108.98, 18)
+        df.iloc[-24:-6, df.columns.get_loc("ema20")] = np.linspace(107.96, 108.70, 18)
+        df.iloc[-6:, df.columns.get_loc("open")] = [108.74, 108.96, 109.08, 109.14, 109.16, 109.17]
+        df.iloc[-6:, df.columns.get_loc("high")] = [109.01, 109.14, 109.19, 109.22, 109.23, 109.24]
+        df.iloc[-6:, df.columns.get_loc("low")] = [108.70, 108.92, 109.02, 109.10, 109.14, 109.15]
+        df.iloc[-6:, df.columns.get_loc("close")] = [108.98, 109.12, 109.18, 109.20, 109.22, 109.23]
+        df.iloc[-6:, df.columns.get_loc("ema20")] = [108.46, 108.60, 108.76, 108.92, 109.04, 109.10]
+        df.iloc[-6:, df.columns.get_loc("vah")] = [109.18, 109.18, 109.18, 109.18, 109.18, 109.18]
+        df.iloc[-6:, df.columns.get_loc("rsi")] = [65.0, 66.0, 67.0, 68.0, 69.0, 70.0]
+        df.iloc[-6:, df.columns.get_loc("hist")] = [0.09, 0.10, 0.11, 0.12, 0.13, 0.14]
+        df.iloc[-6:, df.columns.get_loc("volume_spike")] = [0.56, 0.62, 0.68, 0.74, 0.80, 0.86]
+        intent = SimpleNamespace(action=IntentAction.SHORT_ENTRY, metadata={})
+
+        blocked = _should_block_live_main_short_continuation(intent, df)
+
+        self.assertTrue(blocked)
+
+    def test_live_main_short_continuation_blocks_green_hold_without_downside_displacement(self):
+        df = self._build_df()
+        if "vah" not in df.columns:
+            df["vah"] = 0.0
+        df.iloc[-24:-4, df.columns.get_loc("open")] = np.linspace(107.80, 108.72, 20)
+        df.iloc[-24:-4, df.columns.get_loc("high")] = np.linspace(108.02, 109.02, 20)
+        df.iloc[-24:-4, df.columns.get_loc("low")] = np.linspace(107.68, 108.60, 20)
+        df.iloc[-24:-4, df.columns.get_loc("close")] = np.linspace(107.96, 108.92, 20)
+        df.iloc[-24:-4, df.columns.get_loc("ema20")] = np.linspace(107.70, 108.62, 20)
+        df.iloc[-4:, df.columns.get_loc("open")] = [108.78, 108.92, 109.02, 109.08]
+        df.iloc[-4:, df.columns.get_loc("high")] = [109.08, 109.18, 109.23, 109.28]
+        df.iloc[-4:, df.columns.get_loc("low")] = [108.70, 108.86, 108.96, 108.95]
+        df.iloc[-4:, df.columns.get_loc("close")] = [109.02, 109.12, 109.18, 109.24]
+        df.iloc[-4:, df.columns.get_loc("ema20")] = [108.68, 108.76, 108.86, 108.95]
+        df.iloc[-4:, df.columns.get_loc("bb_upper")] = [108.88, 109.00, 109.06, 109.12]
+        df.iloc[-4:, df.columns.get_loc("kc_upper")] = [108.84, 108.96, 109.02, 109.08]
+        df.iloc[-4:, df.columns.get_loc("vah")] = [109.18, 109.18, 109.18, 109.18]
+        df.iloc[-4:, df.columns.get_loc("rsi")] = [69.0, 71.0, 73.0, 75.0]
+        df.iloc[-4:, df.columns.get_loc("hist")] = [0.08, 0.09, 0.10, 0.11]
+        df.iloc[-4:, df.columns.get_loc("volume_spike")] = [0.70, 0.78, 0.86, 0.92]
+        df.iloc[-4:, df.columns.get_loc("mtf_trend_5m")] = [0.0058, 0.0061, 0.0064, 0.0068]
+        df.iloc[-4:, df.columns.get_loc("mtf_rsi_5m")] = [72.0, 74.0, 76.0, 78.0]
+        intent = SimpleNamespace(action=IntentAction.SHORT_ENTRY, metadata={})
+
+        blocked = _should_block_live_main_short_continuation(intent, df)
 
         self.assertTrue(blocked)
 
@@ -2841,7 +3673,8 @@ class SignalGeneratorTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(intent.action, IntentAction.HOLD)
+        if intent.action != IntentAction.HOLD:
+            self.fail(f"unexpected_intent={intent.action} metadata={intent.metadata}")
         self.assertEqual(intent.reason, "long_disabled_for_short_on_pump")
 
     def test_layer4_live_source_quality_with_canonical_inputs(self):
@@ -3086,6 +3919,84 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(intent.action, IntentAction.EXIT_SHORT)
         self.assertEqual(intent.metadata.get("exit_type"), "failed_followthrough")
 
+    def test_layered_strategy_respects_managed_exit_hold_threshold_overrides(self):
+        n = 120
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.linspace(112.0, 111.0, n)
+        close[-6:] = [111.15, 111.28, 111.44, 111.63, 111.84, 112.05]
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.006,
+                "low": close * 0.994,
+                "close": close,
+                "volume": np.linspace(8.0, 13.0, n),
+            },
+            index=idx,
+        )
+        df["rsi"] = np.linspace(44.0, 59.0, n)
+        df["volume_spike"] = 1.18
+        df["bb_upper"] = close * 1.018
+        df["bb_lower"] = close * 0.982
+        df["kc_upper"] = close * 1.015
+        df["kc_lower"] = close * 0.985
+        df["obv"] = np.linspace(1100.0, 970.0, n)
+        df["cvd"] = np.linspace(1060.0, 940.0, n)
+        df["vwap"] = np.linspace(111.7, 111.35, n)
+        df["atr"] = 0.62
+        df["ema20"] = np.linspace(111.8, 111.4, n)
+        df["ema50"] = np.linspace(112.2, 111.7, n)
+        df["hist"] = np.linspace(-0.12, 0.04, n)
+        df["poc"] = 110.8
+        df["vah"] = 112.4
+        df["val"] = 110.2
+        df["adx"] = 16.0
+
+        exchange = ExchangeSnapshot(
+            symbol="BTC/USDT",
+            account=AccountSnapshot(equity_usdt=1000.0, available_balance_usdt=1000.0),
+            positions=[
+                PositionSnapshot(
+                    symbol="BTC/USDT",
+                    side=PositionSide.SHORT,
+                    qty=1.0,
+                    entry_price=112.0,
+                    liq_price=120.0,
+                    leverage=3.0,
+                    position_idx=2,
+                    stop_loss=114.0,
+                )
+            ],
+            open_orders=[],
+        )
+
+        strategy = LayeredPumpStrategy(
+            SignalConfig(
+                managed_exit_fast_fail_min_hold_minutes=30.0,
+                managed_exit_no_progress_min_hold_minutes=30.0,
+                managed_exit_no_downside_min_hold_minutes=30.0,
+                managed_exit_roundtrip_min_hold_minutes=30.0,
+                managed_exit_acceptance_min_hold_minutes=30.0,
+                managed_exit_time_decay_min_hold_minutes=30.0,
+                managed_exit_stagnation_min_hold_minutes=30.0,
+                managed_exit_target_zone_min_reward_r=999.0,
+                managed_exit_profit_reclaim_min_reward_r=999.0,
+                managed_exit_reclaim_invalidation_min_reward_r=999.0,
+            )
+        )
+        intent = strategy.generate(
+            StrategyContext(
+                symbol="BTC/USDT",
+                market_ohlcv=df,
+                mark_price=float(df.iloc[-1]["close"]),
+                exchange=exchange,
+                synced_state=TradeState.SHORT,
+                synced_state_updated_at=float(pd.Timestamp.now(tz="UTC").timestamp() - (11.0 * 60.0)),
+            )
+        )
+
+        self.assertEqual(intent.action, IntentAction.HOLD)
+
     def test_layered_strategy_managed_exit_short_on_profit_giveback(self):
         n = 120
         idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
@@ -3153,6 +4064,77 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(intent.action, IntentAction.EXIT_SHORT)
         self.assertEqual(intent.metadata.get("exit_type"), "profit_giveback")
 
+    def test_layered_strategy_managed_exit_short_on_acceptance_reclaim(self):
+        n = 120
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.linspace(112.0, 111.3, n)
+        close[-14:] = [111.15, 111.00, 110.82, 110.65, 110.55, 110.48, 110.62, 110.88, 111.14, 111.42, 111.76, 112.08, 112.24, 112.36]
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.006,
+                "low": close * 0.994,
+                "close": close,
+                "volume": np.linspace(8.0, 13.5, n),
+            },
+            index=idx,
+        )
+        df["rsi"] = np.linspace(41.0, 56.0, n)
+        df.loc[df.index[-6]:, "rsi"] = [49.5, 51.0, 52.8, 54.2, 55.6, 57.0]
+        df["volume_spike"] = 1.12
+        df["bb_upper"] = close * 1.018
+        df["bb_lower"] = close * 0.982
+        df["kc_upper"] = close * 1.015
+        df["kc_lower"] = close * 0.985
+        df["obv"] = np.linspace(1185.0, 980.0, n)
+        df["cvd"] = np.linspace(1140.0, 955.0, n)
+        df["vwap"] = np.linspace(112.0, 111.55, n)
+        df["ema20"] = np.linspace(111.9, 111.62, n)
+        df["ema50"] = np.linspace(112.2, 111.84, n)
+        df["atr"] = 0.60
+        df["hist"] = np.linspace(-0.20, 0.05, n)
+        df["poc"] = 110.9
+        df["vah"] = 112.5
+        df["val"] = 110.2
+        df["adx"] = 15.0
+
+        exchange = ExchangeSnapshot(
+            symbol="BTC/USDT",
+            account=AccountSnapshot(equity_usdt=1000.0, available_balance_usdt=1000.0),
+            positions=[
+                PositionSnapshot(
+                    symbol="BTC/USDT",
+                    side=PositionSide.SHORT,
+                    qty=1.0,
+                    entry_price=112.0,
+                    liq_price=120.0,
+                    leverage=3.0,
+                    position_idx=2,
+                    stop_loss=114.0,
+                )
+            ],
+            open_orders=[],
+        )
+
+        strategy = LayeredPumpStrategy(SignalConfig())
+        intent = strategy.generate(
+            StrategyContext(
+                symbol="BTC/USDT",
+                market_ohlcv=df,
+                mark_price=float(df.iloc[-1]["close"]),
+                exchange=exchange,
+                synced_state=TradeState.SHORT,
+                synced_state_updated_at=float(idx[-20].timestamp()),
+            )
+        )
+
+        self.assertEqual(intent.action, IntentAction.EXIT_SHORT)
+        self.assertEqual(intent.metadata.get("exit_type"), "acceptance_reclaim")
+        details = intent.metadata.get("managed_exit_details", {})
+        self.assertGreaterEqual(float(details.get("acceptance_entry_count", 0.0)), 2.0)
+        self.assertGreaterEqual(float(details.get("acceptance_ema20_count", 0.0)), 2.0)
+        self.assertGreaterEqual(float(details.get("acceptance_vwap_count", 0.0)), 2.0)
+
     def test_layered_strategy_managed_exit_short_on_no_progress_rebound(self):
         n = 120
         idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
@@ -3219,6 +4201,210 @@ class SignalGeneratorTests(unittest.TestCase):
 
         self.assertEqual(intent.action, IntentAction.EXIT_SHORT)
         self.assertEqual(intent.metadata.get("exit_type"), "no_progress_rebound")
+
+    def test_layered_strategy_managed_exit_short_on_no_downside_reclaim(self):
+        n = 120
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.linspace(112.0, 111.92, n)
+        close[-8:] = [111.88, 111.86, 111.91, 112.02, 112.12, 112.24, 112.31, 112.36]
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.005,
+                "low": close * 0.995,
+                "close": close,
+                "volume": np.linspace(8.0, 12.5, n),
+            },
+            index=idx,
+        )
+        df["rsi"] = np.linspace(45.0, 56.0, n)
+        df.loc[df.index[-6]:, "rsi"] = [50.2, 51.1, 52.4, 53.8, 55.0, 56.4]
+        df["volume_spike"] = 1.04
+        df["bb_upper"] = close * 1.014
+        df["bb_lower"] = close * 0.986
+        df["kc_upper"] = close * 1.012
+        df["kc_lower"] = close * 0.988
+        df["obv"] = np.linspace(1090.0, 1018.0, n)
+        df["cvd"] = np.linspace(1050.0, 992.0, n)
+        df["vwap"] = np.linspace(111.98, 111.92, n)
+        df["atr"] = 0.50
+        df["ema20"] = np.linspace(111.96, 111.90, n)
+        df["ema50"] = np.linspace(112.10, 111.98, n)
+        df["hist"] = np.linspace(-0.06, 0.03, n)
+        df["poc"] = 111.20
+        df["vah"] = 112.55
+        df["val"] = 110.85
+        df["adx"] = 14.0
+
+        exchange = ExchangeSnapshot(
+            symbol="BTC/USDT",
+            account=AccountSnapshot(equity_usdt=1000.0, available_balance_usdt=1000.0),
+            positions=[
+                PositionSnapshot(
+                    symbol="BTC/USDT",
+                    side=PositionSide.SHORT,
+                    qty=1.0,
+                    entry_price=112.0,
+                    liq_price=120.0,
+                    leverage=3.0,
+                    position_idx=2,
+                    stop_loss=114.0,
+                )
+            ],
+            open_orders=[],
+        )
+
+        strategy = LayeredPumpStrategy(SignalConfig())
+        intent = strategy.generate(
+            StrategyContext(
+                symbol="BTC/USDT",
+                market_ohlcv=df,
+                mark_price=float(df.iloc[-1]["close"]),
+                exchange=exchange,
+                synced_state=TradeState.SHORT,
+                synced_state_updated_at=float(idx[-16].timestamp()),
+            )
+        )
+
+        self.assertEqual(intent.action, IntentAction.EXIT_SHORT)
+        self.assertEqual(intent.metadata.get("exit_type"), "no_downside_reclaim")
+
+    def test_layered_strategy_managed_exit_short_on_adverse_acceptance(self):
+        n = 120
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.linspace(112.0, 112.04, n)
+        close[-8:] = [111.98, 111.94, 112.05, 112.16, 112.27, 112.35, 112.43, 112.52]
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.004,
+                "low": close * 0.9985,
+                "close": close,
+                "volume": np.linspace(8.0, 12.5, n),
+            },
+            index=idx,
+        )
+        df["rsi"] = np.linspace(45.0, 57.0, n)
+        df.loc[df.index[-6]:, "rsi"] = [50.5, 51.6, 52.8, 54.1, 55.4, 56.8]
+        df["volume_spike"] = 1.06
+        df["bb_upper"] = close * 1.014
+        df["bb_lower"] = close * 0.986
+        df["kc_upper"] = close * 1.012
+        df["kc_lower"] = close * 0.988
+        df["obv"] = np.linspace(1090.0, 1028.0, n)
+        df["cvd"] = np.linspace(1050.0, 1002.0, n)
+        df["vwap"] = np.linspace(111.90, 111.96, n)
+        df["atr"] = 0.50
+        df["ema20"] = np.linspace(111.92, 112.02, n)
+        df["ema50"] = np.linspace(112.10, 112.02, n)
+        df["hist"] = np.linspace(-0.06, 0.035, n)
+        df["poc"] = 111.20
+        df["vah"] = 112.60
+        df["val"] = 110.85
+        df["adx"] = 14.0
+
+        exchange = ExchangeSnapshot(
+            symbol="BTC/USDT",
+            account=AccountSnapshot(equity_usdt=1000.0, available_balance_usdt=1000.0),
+            positions=[
+                PositionSnapshot(
+                    symbol="BTC/USDT",
+                    side=PositionSide.SHORT,
+                    qty=1.0,
+                    entry_price=112.0,
+                    liq_price=120.0,
+                    leverage=3.0,
+                    position_idx=2,
+                    stop_loss=114.0,
+                )
+            ],
+            open_orders=[],
+        )
+
+        strategy = LayeredPumpStrategy(SignalConfig(managed_exit_no_downside_min_hold_minutes=30.0))
+        intent = strategy.generate(
+            StrategyContext(
+                symbol="BTC/USDT",
+                market_ohlcv=df,
+                mark_price=float(df.iloc[-1]["close"]),
+                exchange=exchange,
+                synced_state=TradeState.SHORT,
+                synced_state_updated_at=float(pd.Timestamp.now(tz="UTC").timestamp() - (10.0 * 60.0)),
+            )
+        )
+
+        self.assertEqual(intent.action, IntentAction.EXIT_SHORT)
+        self.assertEqual(intent.metadata.get("exit_type"), "adverse_acceptance")
+        details = intent.metadata.get("managed_exit_details", {})
+        self.assertGreaterEqual(float(details.get("adverse_r", 0.0)), 0.06)
+        self.assertLessEqual(float(details.get("best_reward_r", 999.0)), 0.20)
+
+    def test_layered_strategy_managed_exit_short_on_roundtrip_reclaim(self):
+        n = 120
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.linspace(112.0, 111.10, n)
+        close[-12:] = [111.22, 111.08, 110.96, 111.14, 111.38, 111.62, 111.78, 111.86, 111.92, 111.98, 112.02, 112.04]
+        df = pd.DataFrame(
+            {
+                "open": close * 0.998,
+                "high": close * 1.005,
+                "low": close * 0.995,
+                "close": close,
+                "volume": np.linspace(8.0, 12.5, n),
+            },
+            index=idx,
+        )
+        df["rsi"] = np.linspace(44.0, 56.0, n)
+        df.loc[df.index[-6]:, "rsi"] = [49.8, 51.0, 52.2, 53.1, 54.0, 55.0]
+        df["volume_spike"] = 1.06
+        df["bb_upper"] = close * 1.014
+        df["bb_lower"] = close * 0.986
+        df["kc_upper"] = close * 1.012
+        df["kc_lower"] = close * 0.988
+        df["obv"] = np.linspace(1090.0, 1006.0, n)
+        df["cvd"] = np.linspace(1050.0, 984.0, n)
+        df["vwap"] = np.linspace(112.16, 112.10, n)
+        df["atr"] = 0.52
+        df["ema20"] = np.linspace(111.82, 111.76, n)
+        df["ema50"] = np.linspace(112.18, 112.02, n)
+        df["hist"] = np.linspace(-0.08, 0.02, n)
+        df["poc"] = 111.22
+        df["vah"] = 112.48
+        df["val"] = 110.84
+        df["adx"] = 14.0
+
+        exchange = ExchangeSnapshot(
+            symbol="BTC/USDT",
+            account=AccountSnapshot(equity_usdt=1000.0, available_balance_usdt=1000.0),
+            positions=[
+                PositionSnapshot(
+                    symbol="BTC/USDT",
+                    side=PositionSide.SHORT,
+                    qty=1.0,
+                    entry_price=112.0,
+                    liq_price=120.0,
+                    leverage=3.0,
+                    position_idx=2,
+                    stop_loss=114.0,
+                )
+            ],
+            open_orders=[],
+        )
+
+        strategy = LayeredPumpStrategy(SignalConfig())
+        intent = strategy.generate(
+            StrategyContext(
+                symbol="BTC/USDT",
+                market_ohlcv=df,
+                mark_price=float(df.iloc[-1]["close"]),
+                exchange=exchange,
+                synced_state=TradeState.SHORT,
+                synced_state_updated_at=float(idx[-18].timestamp()),
+            )
+        )
+
+        self.assertEqual(intent.action, IntentAction.EXIT_SHORT)
+        self.assertEqual(intent.metadata.get("exit_type"), "roundtrip_reclaim")
 
     def test_signal_generator_prefers_structural_tp2_as_protective_take_profit(self):
         df = self._build_df()
@@ -4891,7 +6077,7 @@ class SignalGeneratorTests(unittest.TestCase):
 
         self.assertFalse(passed)
         self.assertEqual(regime_diag.get("htf_trend_ok"), 0.0)
-        self.assertEqual(regime_diag.get("soft_pass_candidate"), 1.0)
+        self.assertEqual(regime_diag.get("soft_pass_candidate"), 0.0)
         self.assertEqual(regime_diag.get("soft_pass_used"), 0.0)
         self.assertIn("htf_trend_ok", str(regime_diag.get("missing_conditions", "")))
         self.assertEqual(regime_diag.get("htf_trend_direction_context"), "strong_uptrend")
@@ -5356,7 +6542,7 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(runtime_diag.get("failed_reason"), "none")
         self.assertEqual(runtime_diag.get("missing_conditions"), "")
 
-    def test_runtime_default_regime_soft_pass_allows_htf_only_miss(self):
+    def test_runtime_default_regime_soft_pass_does_not_bypass_htf_only_miss(self):
         df = self._build_df()
         df["adx"] = 40.0
         df["ema20"] = 108.5
@@ -5372,15 +6558,14 @@ class SignalGeneratorTests(unittest.TestCase):
         runtime_passed, runtime_diag = runtime_gen._regime_filter(df, MarketRegime.PUMP, news_veto=False, news_source="live_api")
 
         self.assertFalse(base_passed)
-        self.assertTrue(runtime_passed)
+        self.assertFalse(runtime_passed)
         self.assertEqual(base_diag.get("htf_trend_ok"), 0.0)
         self.assertEqual(runtime_diag.get("htf_trend_ok"), 0.0)
         self.assertIn("htf_trend_ok", str(base_diag.get("missing_conditions", "")))
-        self.assertEqual(runtime_diag.get("soft_pass_candidate"), 1.0)
-        self.assertEqual(runtime_diag.get("soft_pass_used"), 1.0)
-        self.assertEqual(runtime_diag.get("soft_pass_reason"), "htf_trend_ok")
-        self.assertEqual(runtime_diag.get("failed_reason"), "none")
-        self.assertEqual(runtime_diag.get("missing_conditions"), "")
+        self.assertEqual(runtime_diag.get("soft_pass_used"), 0.0)
+        self.assertEqual(runtime_diag.get("soft_pass_reason"), "")
+        self.assertIn("htf_trend_ok", str(runtime_diag.get("missing_conditions", "")))
+        self.assertEqual(runtime_diag.get("failed_reason"), "missing:htf_trend_ok")
 
     def test_regime_filter_vwap_behavior_uses_runtime_soft_pass(self):
         df = self._build_df()
@@ -6207,6 +7392,114 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(str(rec.get("STOP_REASON", "")), "previous_validated_window_missing")
         self.assertIn("Locate the most recent validated BEFORE window for this calibration branch.", rec.get("RUNBOOK_ACTIONS", []))
 
+    def test_build_quality_guidance_prioritizes_entry_and_exit_problems(self):
+        signal_quality = {
+            "summary": {
+                "main": {
+                    "count": 5,
+                    "verdict_counts": {
+                        "late_or_weak": 2,
+                        "continuation_trap": 1,
+                        "worked": 2,
+                    },
+                    "avg_adverse_excursion_15m_pct": 0.82,
+                },
+                "early": {
+                    "count": 4,
+                    "verdict_counts": {
+                        "too_early": 2,
+                        "continuation_trap": 1,
+                        "worked": 1,
+                    },
+                    "avg_adverse_excursion_15m_pct": 1.05,
+                },
+            }
+        }
+        exit_quality = {
+            "summary": {
+                "main": {
+                    "count": 4,
+                    "verdict_counts": {
+                        "too_early": 2,
+                        "timely": 1,
+                        "mixed": 1,
+                    },
+                    "avg_further_favorable_60m_pct": 1.35,
+                    "avg_rebound_60m_pct": 0.42,
+                    "stopped_out_rate": 0.0,
+                },
+                "early": {
+                    "count": 1,
+                    "verdict_counts": {
+                        "protective_exit": 1,
+                    },
+                    "avg_further_favorable_60m_pct": 0.3,
+                    "avg_rebound_60m_pct": 0.8,
+                    "stopped_out_rate": 0.0,
+                },
+            }
+        }
+
+        guidance = build_quality_guidance(signal_quality, exit_quality, observation_timeframe="1")
+        self.assertEqual(str(guidance.get("status", "")), "ok")
+        self.assertEqual(str(guidance.get("entry_focus", "")), "tighten_early_confirmation")
+        self.assertEqual(str(guidance.get("entry_priority", "")), "high")
+        self.assertEqual(str(guidance.get("exit_focus", "")), "loosen_managed_exit_hold")
+        self.assertEqual(str(guidance.get("exit_priority", "")), "high")
+        self.assertIn("Tighten early alerts", " ".join(guidance.get("runbook_actions", [])))
+
+    def test_build_quality_guidance_marks_stable_windows(self):
+        signal_quality = {
+            "summary": {
+                "main": {
+                    "count": 4,
+                    "verdict_counts": {
+                        "worked": 3,
+                        "weak": 1,
+                    },
+                    "avg_adverse_excursion_15m_pct": 0.24,
+                },
+                "early": {
+                    "count": 3,
+                    "verdict_counts": {
+                        "worked": 2,
+                        "late_or_weak": 1,
+                    },
+                    "avg_adverse_excursion_15m_pct": 0.31,
+                },
+            }
+        }
+        exit_quality = {
+            "summary": {
+                "main": {
+                    "count": 4,
+                    "verdict_counts": {
+                        "timely": 3,
+                        "mixed": 1,
+                    },
+                    "avg_further_favorable_60m_pct": 0.4,
+                    "avg_rebound_60m_pct": 0.55,
+                    "stopped_out_rate": 0.0,
+                },
+                "early": {
+                    "count": 2,
+                    "verdict_counts": {
+                        "timely": 1,
+                        "protective_exit": 1,
+                    },
+                    "avg_further_favorable_60m_pct": 0.25,
+                    "avg_rebound_60m_pct": 0.33,
+                    "stopped_out_rate": 0.0,
+                },
+            }
+        }
+
+        guidance = build_quality_guidance(signal_quality, exit_quality, observation_timeframe="5")
+        self.assertEqual(str(guidance.get("entry_focus", "")), "entry_quality_stable")
+        self.assertEqual(str(guidance.get("exit_focus", "")), "exit_quality_stable")
+        self.assertEqual(str(guidance.get("metrics", {}).get("signal_main_top_verdict", "")), "worked")
+        self.assertEqual(str(guidance.get("metrics", {}).get("exit_main_top_verdict", "")), "timely")
+
     def _run_triage_calibration_result(self, payload: dict) -> subprocess.CompletedProcess[str]:
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         python_exe = os.path.join(repo_root, ".venv", "Scripts", "python.exe")
@@ -6368,6 +7661,110 @@ class SignalGeneratorTests(unittest.TestCase):
                 "ACTION 2: Review blocker combination 'stretched_from_vwap + volatility_regime_ok' as the current overlap driver.",
                 "ACTION 3: Collect another comparable window before attempting a single-threshold tweak.",
                 "ACTION 4: Do not tune one regime threshold while blocker overlap remains co-dominant.",
+            ],
+        )
+
+    def test_triage_calibration_result_includes_quality_overview_when_present(self):
+        payload = {
+            "after": {
+                "summary": {
+                    "top_regime_filter_blocker_combination": "stretched_from_vwap + volatility_regime_ok",
+                }
+            },
+            "quality_overview": {
+                "signal_total_count": 5,
+                "signal_main_top_verdict": "worked",
+                "signal_early_top_verdict": "late_or_weak",
+                "exit_total_count": 3,
+                "exit_main_top_verdict": "timely",
+                "exit_early_top_verdict": "protective_exit",
+            },
+            "quality_guidance": {
+                "entry_focus": "tighten_early_confirmation",
+                "entry_priority": "high",
+                "exit_focus": "loosen_managed_exit_hold",
+                "exit_priority": "medium",
+                "runbook_actions": [
+                    "Tighten early alerts around the first real weakness bar instead of raw peak proximity alone.",
+                    "Delay aggressive protective exits until the short has either failed structurally or produced a real downside impulse.",
+                ],
+            },
+            "calibration_recommendation": {
+                "SAFE_TO_CONTINUE": False,
+                "ACTION_VERDICT": "co_dominant_overlap",
+                "STOP_REASON": "co_dominant_regime_blockers",
+                "RUNBOOK_ACTIONS": [
+                    "Pause threshold changes for this branch.",
+                ],
+            },
+        }
+
+        proc = self._run_triage_calibration_result(payload)
+        self.assertEqual(proc.returncode, 10, msg=proc.stderr)
+        self.assertEqual(
+            proc.stdout.strip().splitlines(),
+            [
+                "VERDICT: co_dominant_overlap",
+                "STOP_REASON: co_dominant_regime_blockers",
+                "TOP_COMBINATION: stretched_from_vwap + volatility_regime_ok",
+                "SIGNAL_OVERVIEW: total=5 main=worked early=late_or_weak",
+                "EXIT_OVERVIEW: total=3 main=timely early=protective_exit",
+                "QUALITY_ENTRY: tighten_early_confirmation priority=high",
+                "QUALITY_EXIT: loosen_managed_exit_hold priority=medium",
+                "QUALITY_ACTION 1: Tighten early alerts around the first real weakness bar instead of raw peak proximity alone.",
+                "QUALITY_ACTION 2: Delay aggressive protective exits until the short has either failed structurally or produced a real downside impulse.",
+                "ACTION 1: Pause threshold changes for this branch.",
+            ],
+        )
+
+    def test_triage_calibration_result_ps1_includes_quality_overview_when_present(self):
+        payload = {
+            "after": {
+                "summary": {
+                    "top_regime_filter_blocker_combination": "stretched_from_vwap + volatility_regime_ok",
+                }
+            },
+            "quality_overview": {
+                "signal_total_count": 4,
+                "signal_main_top_verdict": "worked",
+                "signal_early_top_verdict": "too_early",
+                "exit_total_count": 2,
+                "exit_main_top_verdict": "timely",
+                "exit_early_top_verdict": "",
+            },
+            "quality_guidance": {
+                "entry_focus": "tighten_main_continuation_filter",
+                "entry_priority": "high",
+                "exit_focus": "exit_quality_stable",
+                "exit_priority": "low",
+                "runbook_actions": [
+                    "Strengthen failed-continuation gating before confirming a full short entry.",
+                ],
+            },
+            "calibration_recommendation": {
+                "SAFE_TO_CONTINUE": False,
+                "ACTION_VERDICT": "co_dominant_overlap",
+                "STOP_REASON": "co_dominant_regime_blockers",
+                "RUNBOOK_ACTIONS": [
+                    "Pause threshold changes for this branch.",
+                ],
+            },
+        }
+
+        proc = self._run_triage_calibration_result_ps1(payload)
+        self.assertEqual(proc.returncode, 10, msg=proc.stderr)
+        self.assertEqual(
+            proc.stdout.strip().splitlines(),
+            [
+                "VERDICT: co_dominant_overlap",
+                "STOP_REASON: co_dominant_regime_blockers",
+                "TOP_COMBINATION: stretched_from_vwap + volatility_regime_ok",
+                "SIGNAL_OVERVIEW: total=4 main=worked early=too_early",
+                "EXIT_OVERVIEW: total=2 main=timely early=n/a",
+                "QUALITY_ENTRY: tighten_main_continuation_filter priority=high",
+                "QUALITY_EXIT: exit_quality_stable priority=low",
+                "QUALITY_ACTION 1: Strengthen failed-continuation gating before confirming a full short entry.",
+                "ACTION 1: Pause threshold changes for this branch.",
             ],
         )
 
@@ -7112,6 +8509,93 @@ class SignalGeneratorTests(unittest.TestCase):
                 payload = json.load(fh)
             self.assertEqual(str(payload["calibration_recommendation"]["ACTION_VERDICT"]), "co_dominant_overlap")
 
+    def test_summarize_observation_attaches_quality_guidance_when_json_provided(self):
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        ps_exe = r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe"
+        script_path = os.path.join(repo_root, "scripts", "observation", "summarize_observation.ps1")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audit_file = os.path.join(tmpdir, "audit.log")
+            with open(audit_file, "w", encoding="utf-8") as fh:
+                fh.write("{}\n")
+
+            signal_json = os.path.join(tmpdir, "signal_quality.json")
+            with open(signal_json, "w", encoding="utf-8") as fh:
+                json.dump({"summary": {"main": {"count": 3}, "early": {"count": 2}}}, fh)
+
+            exit_json = os.path.join(tmpdir, "exit_quality.json")
+            with open(exit_json, "w", encoding="utf-8") as fh:
+                json.dump({"summary": {"main": {"count": 2}, "early": {"count": 1}}}, fh)
+
+            out_json = os.path.join(tmpdir, "comparison.json")
+            fake_python = os.path.join(tmpdir, "fake_python_quality.cmd")
+            with open(fake_python, "w", encoding="utf-8") as fh:
+                fh.write("@echo off\r\n")
+                fh.write("if /I \"%~nx1\"==\"build_quality_guidance.py\" (\r\n")
+                fh.write("  echo {\"status\":\"ok\",\"entry_focus\":\"tighten_main_continuation_filter\",\"entry_priority\":\"high\",\"exit_focus\":\"loosen_managed_exit_hold\",\"exit_priority\":\"high\",\"runbook_actions\":[\"Strengthen failed-continuation gating before confirming a full short entry.\"],\"metrics\":{\"signal_total_count\":5,\"signal_main_top_verdict\":\"late_or_weak\",\"signal_early_top_verdict\":\"too_early\",\"exit_total_count\":3,\"exit_main_top_verdict\":\"too_early\",\"exit_early_top_verdict\":\"timely\"}}\r\n")
+                fh.write("  exit /b 0\r\n")
+                fh.write(")\r\n")
+                fh.write(
+                    "echo {\"after\":{\"file\":\"ok\",\"summary\":{\"samples\":1,\"top_regime_filter_blocker_combination\":\"stretched_from_vwap + volatility_regime_ok\"}},\"calibration_recommendation\":{\"SAFE_TO_CONTINUE\":false,\"ACTION_VERDICT\":\"co_dominant_overlap\",\"RUNBOOK_ACTIONS\":[\"Pause threshold changes for this branch.\"],\"NEXT_TARGET_LAYER\":\"none\",\"NEXT_TARGET_SUBCONDITION\":\"none\",\"WHY_THIS_TARGET\":\"\",\"WHY_NOT_OTHERS\":[],\"REQUIRED_WINDOW_QUALITY\":{},\"STOP_REASON\":\"co_dominant_regime_blockers\"}}\r\n"
+                )
+                fh.write("exit /b 0\r\n")
+
+            proc = subprocess.run(
+                [
+                    ps_exe,
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    script_path,
+                    "-AuditExtractFile",
+                    audit_file,
+                    "-SignalQualityJson",
+                    signal_json,
+                    "-ExitQualityJson",
+                    exit_json,
+                    "-ObservationTimeframe",
+                    "5",
+                    "-OutJson",
+                    out_json,
+                    "-PythonPath",
+                    fake_python,
+                    "-PrintTriage",
+                ],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            self.assertIn("QUALITY_ENTRY: tighten_main_continuation_filter priority=high", proc.stdout)
+            self.assertIn("QUALITY_EXIT: loosen_managed_exit_hold priority=high", proc.stdout)
+
+            with open(out_json, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+
+            self.assertEqual(str(payload["quality_guidance"]["entry_focus"]), "tighten_main_continuation_filter")
+            self.assertEqual(str(payload["quality_guidance"]["exit_focus"]), "loosen_managed_exit_hold")
+            self.assertEqual(int(payload["quality_overview"]["signal_total_count"]), 5)
+            self.assertEqual(str(payload["quality_overview"]["signal_main_top_verdict"]), "late_or_weak")
+            self.assertEqual(int(payload["quality_overview"]["exit_total_count"]), 3)
+            self.assertEqual(str(payload["quality_overview"]["exit_early_top_verdict"]), "timely")
+            self.assertEqual(
+                str(payload["calibration_recommendation"]["QUALITY_ENTRY_FOCUS"]),
+                "tighten_main_continuation_filter",
+            )
+            self.assertEqual(
+                str(payload["calibration_recommendation"]["QUALITY_EXIT_FOCUS"]),
+                "loosen_managed_exit_hold",
+            )
+            self.assertIn(
+                "Pause threshold changes for this branch.",
+                payload["calibration_recommendation"]["RUNBOOK_ACTIONS"],
+            )
+            self.assertIn(
+                "Strengthen failed-continuation gating before confirming a full short entry.",
+                payload["calibration_recommendation"]["RUNBOOK_ACTIONS"],
+            )
+
     def test_collect_observation_window_prints_triage_when_requested(self):
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         ps_exe = r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -7126,6 +8610,18 @@ class SignalGeneratorTests(unittest.TestCase):
                 fh.write("@echo off\r\n")
                 fh.write("if \"%~1\"==\"-m\" (\r\n")
                 fh.write("  echo {\"ts\":\"2026-03-15T00:00:00+00:00\",\"msg\":\"strategy_audit_compact={\\\"top_regime_filter_blocker\\\":\\\"stretched_from_vwap\\\"}\"}\r\n")
+                fh.write("  exit /b 0\r\n")
+                fh.write(")\r\n")
+                fh.write("if /I \"%~nx1\"==\"analyze_recent_signal_quality.py\" (\r\n")
+                fh.write("  echo {\"main\":[],\"early\":[],\"summary\":{\"main\":{\"count\":2,\"verdict_counts\":{\"worked\":2,\"late_or_weak\":1}},\"early\":{\"count\":1,\"verdict_counts\":{\"too_early\":1}}}}\r\n")
+                fh.write("  exit /b 0\r\n")
+                fh.write(")\r\n")
+                fh.write("if /I \"%~nx1\"==\"analyze_recent_exit_quality.py\" (\r\n")
+                fh.write("  echo {\"main\":[],\"early\":[],\"summary\":{\"main\":{\"count\":1,\"verdict_counts\":{\"timely\":1}},\"early\":{\"count\":0,\"verdict_counts\":{}}}}\r\n")
+                fh.write("  exit /b 0\r\n")
+                fh.write(")\r\n")
+                fh.write("if /I \"%~nx1\"==\"build_quality_guidance.py\" (\r\n")
+                fh.write("  echo {\"status\":\"ok\",\"entry_focus\":\"tighten_early_confirmation\",\"entry_priority\":\"high\",\"exit_focus\":\"exit_quality_stable\",\"exit_priority\":\"low\",\"runbook_actions\":[\"Tighten early alerts around the first real weakness bar instead of raw peak proximity alone.\"]}\r\n")
                 fh.write("  exit /b 0\r\n")
                 fh.write(")\r\n")
                 fh.write(
@@ -7170,6 +8666,96 @@ class SignalGeneratorTests(unittest.TestCase):
             self.assertEqual(int(payload["max_runs"]), 1)
             self.assertEqual(int(payload["runs"]), 1)
             self.assertEqual(str(payload["summary"]["calibration_recommendation"]["ACTION_VERDICT"]), "co_dominant_overlap")
+            self.assertEqual(str(payload["signal_quality"]["status"]), "ok")
+            self.assertEqual(int(payload["signal_quality"]["summary"]["main"]["count"]), 2)
+            self.assertEqual(str(payload["exit_quality"]["status"]), "ok")
+            self.assertEqual(int(payload["exit_quality"]["summary"]["main"]["count"]), 1)
+            self.assertEqual(int(payload["quality_overview"]["signal_total_count"]), 3)
+            self.assertEqual(str(payload["quality_overview"]["signal_main_top_verdict"]), "worked")
+            self.assertEqual(str(payload["quality_overview"]["signal_early_top_verdict"]), "too_early")
+            self.assertEqual(str(payload["quality_overview"]["exit_main_top_verdict"]), "timely")
+            self.assertEqual(str(payload["quality_guidance"]["entry_focus"]), "tighten_early_confirmation")
+
+    def test_summarize_runtime_window_after_process_collects_quality_overview(self):
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        ps_exe = r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe"
+        script_path = os.path.join(
+            repo_root,
+            "scripts",
+            "observation",
+            "summarize_runtime_window_after_process.ps1",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = os.path.join(tmpdir, "observation")
+            os.makedirs(out_dir, exist_ok=True)
+            runtime_log = os.path.join(tmpdir, "runtime.log")
+            with open(runtime_log, "w", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "ts": "2026-03-15T00:00:00+00:00",
+                            "msg": "strategy_audit_compact={'top_regime_filter_blocker':'stretched_from_vwap'}",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+
+            fake_python = os.path.join(tmpdir, "fake_python_summary.cmd")
+            with open(fake_python, "w", encoding="utf-8") as fh:
+                fh.write("@echo off\r\n")
+                fh.write("if /I \"%~nx1\"==\"analyze_recent_signal_quality.py\" (\r\n")
+                fh.write("  echo {\"main\":[],\"early\":[],\"summary\":{\"main\":{\"count\":3,\"verdict_counts\":{\"worked\":2,\"late_or_weak\":1}},\"early\":{\"count\":1,\"verdict_counts\":{\"too_early\":1}}}}\r\n")
+                fh.write("  exit /b 0\r\n")
+                fh.write(")\r\n")
+                fh.write("if /I \"%~nx1\"==\"analyze_recent_exit_quality.py\" (\r\n")
+                fh.write("  echo {\"main\":[],\"early\":[],\"summary\":{\"main\":{\"count\":2,\"verdict_counts\":{\"timely\":1,\"too_early\":1}},\"early\":{\"count\":1,\"verdict_counts\":{\"protective_exit\":1}}}}\r\n")
+                fh.write("  exit /b 0\r\n")
+                fh.write(")\r\n")
+                fh.write("if /I \"%~nx1\"==\"build_quality_guidance.py\" (\r\n")
+                fh.write("  echo {\"status\":\"ok\",\"entry_focus\":\"tighten_main_continuation_filter\",\"entry_priority\":\"high\",\"exit_focus\":\"loosen_managed_exit_hold\",\"exit_priority\":\"high\",\"runbook_actions\":[\"Strengthen failed-continuation gating before confirming a full short entry.\",\"Delay aggressive protective exits until the short has either failed structurally or produced a real downside impulse.\"]}\r\n")
+                fh.write("  exit /b 0\r\n")
+                fh.write(")\r\n")
+                fh.write(
+                    "echo {\"after\":{\"file\":\"ok\",\"summary\":{\"samples\":1}},\"calibration_recommendation\":{\"SAFE_TO_CONTINUE\":true,\"ACTION_VERDICT\":\"stable_target\",\"RUNBOOK_ACTIONS\":[],\"NEXT_TARGET_LAYER\":\"layer1\",\"NEXT_TARGET_SUBCONDITION\":\"clean_pump_pct\",\"WHY_THIS_TARGET\":\"\",\"WHY_NOT_OTHERS\":[],\"REQUIRED_WINDOW_QUALITY\":{}}}\r\n"
+                )
+                fh.write("exit /b 0\r\n")
+
+            proc = subprocess.run(
+                [
+                    ps_exe,
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    script_path,
+                    "-RuntimeLog",
+                    runtime_log,
+                    "-PythonPath",
+                    fake_python,
+                    "-OutDir",
+                    out_dir,
+                    "-ObservationTimeframe",
+                    "5",
+                ],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            payload = json.loads(proc.stdout)
+            self.assertEqual(str(payload["summary"]["calibration_recommendation"]["ACTION_VERDICT"]), "stable_target")
+            self.assertEqual(str(payload["signal_quality"]["status"]), "ok")
+            self.assertEqual(str(payload["exit_quality"]["status"]), "ok")
+            self.assertEqual(str(payload["quality_overview"]["observation_timeframe"]), "5")
+            self.assertEqual(int(payload["quality_overview"]["signal_total_count"]), 4)
+            self.assertEqual(int(payload["quality_overview"]["exit_total_count"]), 3)
+            self.assertEqual(str(payload["quality_overview"]["signal_main_top_verdict"]), "worked")
+            self.assertEqual(str(payload["quality_overview"]["signal_early_top_verdict"]), "too_early")
+            self.assertEqual(str(payload["quality_overview"]["exit_early_top_verdict"]), "protective_exit")
+            self.assertEqual(str(payload["quality_guidance"]["entry_focus"]), "tighten_main_continuation_filter")
+            self.assertEqual(str(payload["quality_guidance"]["exit_focus"]), "loosen_managed_exit_hold")
 
     def test_review_regime_diagnostics_handles_missing_fields_safely(self):
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))

@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 
 from tests.v2.fakes import FakeAdapter
@@ -181,8 +182,11 @@ class ExecutionEngineV2Tests(unittest.TestCase):
         self.assertGreaterEqual(len(self.adapter.placed_orders), 2)
 
     def test_entry_caps_qty_with_exchange_safety_margin_before_validation(self):
-        self.adapter.instrument_rules["BTCUSDT"].max_qty = 1000.0
-        self.adapter.instrument_rules["BTCUSDT"].qty_step = 1.0
+        self.adapter.instrument_rules["BTCUSDT"] = replace(
+            self.adapter.instrument_rules["BTCUSDT"],
+            max_qty=1000.0,
+            qty_step=1.0,
+        )
         self.sm.transition("BTCUSDT", TradeState.FLAT, "init")
         intent = StrategyIntent(symbol="BTCUSDT", action=IntentAction.LONG_ENTRY, reason="x", stop_loss=99.0, take_profit=102.0)
 
