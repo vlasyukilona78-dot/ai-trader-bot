@@ -33,9 +33,20 @@ class TelegramClientV2Tests(unittest.TestCase):
         self.assertEqual([name for name, _ in client._transports], ["proxy", "direct"])
 
     def test_uses_direct_only_when_proxy_missing(self):
-        with patch.dict(os.environ, {}, clear=True):
+        with patch.dict(os.environ, {"TELEGRAM_AUTO_LOCAL_PROXY": "0"}, clear=True):
             client = TelegramClient(token="t", chat_id="c")
         self.assertEqual([name for name, _ in client._transports], ["direct"])
+
+    def test_auto_detects_local_proxy_when_explicit_proxy_missing(self):
+        env = {
+            "TELEGRAM_AUTO_LOCAL_PROXY": "1",
+            "TELEGRAM_LOCAL_PROXY_PORTS": "10801",
+            "TELEGRAM_LOCAL_PROXY_HOSTS": "127.0.0.1",
+        }
+        with patch.dict(os.environ, env, clear=True), patch.object(TelegramClient, "_proxy_reachable", return_value=True):
+            client = TelegramClient(token="t", chat_id="c")
+        self.assertEqual(client._configured_proxy_url, "http://127.0.0.1:10801")
+        self.assertEqual([name for name, _ in client._transports], ["proxy", "direct"])
 
     def test_send_text_falls_back_to_direct_when_proxy_transport_fails(self):
         with patch.dict(os.environ, {"TELEGRAM_PROXY_URL": "socks5://127.0.0.1:1080"}, clear=False):

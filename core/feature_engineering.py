@@ -137,6 +137,14 @@ def sanitize_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
         out[col] = pd.to_numeric(out[col], errors="coerce")
     if core_price_cols:
         out = out.dropna(subset=[col for col in ("open", "high", "low", "close") if col in out.columns])
+    ohlc_cols = [col for col in ("open", "high", "low", "close") if col in out.columns]
+    if ohlc_cols:
+        positive_mask = (out[ohlc_cols] > 0.0).all(axis=1)
+        out = out.loc[positive_mask].copy()
+    if {"open", "high", "low", "close"}.issubset(out.columns):
+        ohlc = out[["open", "high", "low", "close"]]
+        out["high"] = ohlc.max(axis=1)
+        out["low"] = ohlc.min(axis=1)
     if "volume" in out.columns:
         out["volume"] = out["volume"].fillna(0.0).clip(lower=0.0)
 

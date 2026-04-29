@@ -11,11 +11,16 @@ try:
     from alerts.chart_generator import _compute_price_view_bounds, _slice_entry_chart_frame, build_signal_chart
     from app.main import (
         _build_approved_early_candidate,
+        _build_clean_context_chart_caption,
         _build_early_watch_candidate,
         _build_higher_timeframe_chart,
         _current_recent_peak_price,
+        _enrich_intent_with_runtime_market_metadata,
         _format_chart_timeframe_label,
         _remember_cached_alert,
+        _scan_live_price_overlay_enabled,
+        _send_alerts,
+        _send_photo_alerts,
         _should_block_live_main_short_continuation,
         _should_block_recent_main_short_reentry,
         _strategy_audit_log_payload,
@@ -31,7 +36,7 @@ try:
     from trading.market_data.feed import MarketDataFeed
     from trading.market_data.reconciliation import ExchangeSnapshot
     from trading.signals.layered_strategy import LayeredPumpStrategy
-    from trading.signals.signal_types import IntentAction
+    from trading.signals.signal_types import IntentAction, StrategyIntent
     from trading.signals.runtime_source_adapter import build_runtime_signal_inputs
     from trading.signals.strategy_audit import StrategyAuditCollector
     from trading.signals.calibration_control import (
@@ -163,6 +168,35 @@ class SignalGeneratorTests(unittest.TestCase):
     def test_format_chart_timeframe_label_formats_hours_cleanly(self):
         self.assertEqual(_format_chart_timeframe_label("1"), "1m")
         self.assertEqual(_format_chart_timeframe_label("240"), "4h")
+
+    def test_enrich_intent_with_runtime_market_metadata_preserves_existing_metadata(self):
+        intent = StrategyIntent(
+            symbol="TESTUSDT",
+            action=IntentAction.SHORT_ENTRY,
+            reason="layered_short_entry",
+            stop_loss=1.05,
+            take_profit=0.95,
+            confidence=0.81,
+            metadata={"spread_bps": 7.0, "custom": "keep"},
+            created_at=123.0,
+        )
+
+        enriched = _enrich_intent_with_runtime_market_metadata(
+            intent,
+            {
+                "spread_bps": 15.0,
+                "turnover24h_usdt": 250000.0,
+                "funding_rate": 0.0004,
+                "open_interest_abs": 999999.0,
+            },
+        )
+
+        self.assertEqual(enriched.created_at, 123.0)
+        self.assertEqual(enriched.metadata.get("spread_bps"), 7.0)
+        self.assertEqual(enriched.metadata.get("turnover24h_usdt"), 250000.0)
+        self.assertEqual(enriched.metadata.get("funding_rate"), 0.0004)
+        self.assertNotIn("open_interest_abs", enriched.metadata)
+        self.assertEqual(enriched.metadata.get("custom"), "keep")
 
     def test_build_higher_timeframe_chart_returns_png_bytes(self):
         class _FakeFrame:
@@ -362,6 +396,46 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertIn("подтверждение слабости и входа", caption)
         self.assertEqual(caption.count("пик пампа совсем свежий"), 1)
         self.assertEqual(caption.count("пошла первая реакция вниз"), 1)
+
+    def test_outbound_alerts_repair_mojibake_before_delivery(self):
+        class _FakeAlerter:
+            def __init__(self):
+                self.text = ""
+                self.caption = ""
+
+            def send(self, text, reply_markup=None):
+                self.text = text
+                return True
+
+            def send_photo(self, caption, image_bytes, filename="signal.png", reply_markup=None):
+                self.caption = caption
+                return True
+
+        text_alerter = _FakeAlerter()
+        attempted, sent = _send_alerts(
+            [text_alerter],
+            "<b>Р РђРќРќРР™ РЁРћР Рў: HTF РљРћРќРўР•РљРЎРў</b>\n"
+            "HTF РЎС“РЎР‚Р С•Р Р†Р Р…Р С‘ + Р С”Р В°РЎР‚РЎвЂљР В° Р В»Р С‘Р С”Р Р†Р С‘Р Т‘Р В°РЎвЂ Р С‘Р в„–",
+        )
+        self.assertEqual((attempted, sent), (1, 1))
+        self.assertIn("РАННИЙ ШОРТ: HTF КОНТЕКСТ", text_alerter.text)
+        self.assertIn("HTF уровни + карта ликвидаций", text_alerter.text)
+        self.assertNotIn("Р ", text_alerter.text)
+
+        photo_alerter = _FakeAlerter()
+        attempted, sent = _send_photo_alerts(
+            [photo_alerter],
+            _build_clean_context_chart_caption(
+                "RLSUSDT",
+                stage_label="Р РђРќРќРР™ РЁРћР Рў: HTF РљРћРќРўР•РљРЎРў",
+                timeframe_label="4h",
+            ),
+            b"png-bytes",
+        )
+        self.assertEqual((attempted, sent), (1, 1))
+        self.assertIn("РАННИЙ ШОРТ: HTF КОНТЕКСТ", photo_alerter.caption)
+        self.assertIn("HTF уровни + карта ликвидаций", photo_alerter.caption)
+        self.assertNotIn("Р ", photo_alerter.caption)
 
     def test_compute_price_view_bounds_ignores_isolated_recent_wick(self):
         df = self._build_df()
@@ -2871,9 +2945,7 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertIn("upper_anchor_context", str(layer3.get("missing_conditions", "")))
 
     def test_live_price_overlay_updates_current_bucket_close_without_dropping_history(self):
-        now_bucket = pd.Timestamp.utcnow().floor("1min")
-        if now_bucket.tzinfo is None:
-            now_bucket = now_bucket.tz_localize("UTC")
+        now_bucket = pd.Timestamp.now("UTC").floor("1min")
         idx = pd.date_range(end=now_bucket, periods=3, freq="min", tz="UTC")
         ohlcv = pd.DataFrame(
             {
@@ -2892,6 +2964,41 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertAlmostEqual(float(updated.iloc[-1]["close"]), 104.25, places=8)
         self.assertAlmostEqual(float(updated.iloc[-1]["high"]), 104.25, places=8)
         self.assertAlmostEqual(float(updated.iloc[-1]["low"]), 101.0, places=8)
+
+    def test_live_price_overlay_updates_latest_candle_when_rest_lags_one_bucket(self):
+        now_bucket = pd.Timestamp.now("UTC").floor("1min")
+        idx = pd.date_range(end=now_bucket - pd.Timedelta(minutes=1), periods=3, freq="min", tz="UTC")
+        ohlcv = pd.DataFrame(
+            {
+                "open": [100.0, 101.0, 102.0],
+                "high": [101.0, 102.0, 103.0],
+                "low": [99.0, 100.0, 101.0],
+                "close": [100.5, 101.5, 102.5],
+                "volume": [10.0, 11.0, 12.0],
+            },
+            index=idx,
+        )
+        previous_env = os.environ.pop("MARKETDATA_LIVE_OVERLAY_APPEND_NEW_BUCKET", None)
+        try:
+            updated = MarketDataFeed._overlay_live_price_to_ohlcv(ohlcv, mark_price=104.25, timeframe="1")
+        finally:
+            if previous_env is not None:
+                os.environ["MARKETDATA_LIVE_OVERLAY_APPEND_NEW_BUCKET"] = previous_env
+
+        self.assertEqual(len(updated), len(ohlcv))
+        self.assertEqual(updated.index[-1], ohlcv.index[-1])
+        self.assertAlmostEqual(float(updated.iloc[-1]["close"]), 104.25, places=8)
+        self.assertAlmostEqual(float(updated.iloc[-1]["high"]), 104.25, places=8)
+        self.assertAlmostEqual(float(updated.iloc[-1]["volume"]), 12.0, places=8)
+
+    def test_scan_live_price_overlay_defaults_on_for_one_minute_only(self):
+        previous_env = os.environ.pop("MARKETDATA_SCAN_OVERLAY_LIVE_PRICE", None)
+        try:
+            self.assertTrue(_scan_live_price_overlay_enabled("1"))
+            self.assertFalse(_scan_live_price_overlay_enabled("5"))
+        finally:
+            if previous_env is not None:
+                os.environ["MARKETDATA_SCAN_OVERLAY_LIVE_PRICE"] = previous_env
 
     def test_recent_main_short_reentry_guard_blocks_same_pump_reopen_without_new_peak(self):
         df = self._build_df()
@@ -3094,6 +3201,44 @@ class SignalGeneratorTests(unittest.TestCase):
         df.iloc[-4:, df.columns.get_loc("volume_spike")] = [0.70, 0.78, 0.86, 0.92]
         df.iloc[-4:, df.columns.get_loc("mtf_trend_5m")] = [0.0058, 0.0061, 0.0064, 0.0068]
         df.iloc[-4:, df.columns.get_loc("mtf_rsi_5m")] = [72.0, 74.0, 76.0, 78.0]
+        intent = SimpleNamespace(action=IntentAction.SHORT_ENTRY, metadata={})
+
+        blocked = _should_block_live_main_short_continuation(intent, df)
+
+        self.assertTrue(blocked)
+
+    def test_live_main_short_continuation_blocks_stretched_vwap_trap_without_reject(self):
+        n = 72
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.full(n, 0.0810)
+        close[28:62] = np.linspace(0.0810, 0.0864, 34)
+        close[62:] = np.array([0.0865, 0.0867, 0.0869, 0.0870, 0.0871, 0.08725, 0.08730, 0.08734, 0.08737, 0.08740])
+        df = pd.DataFrame(
+            {
+                "open": close * 0.9992,
+                "high": close * 1.0020,
+                "low": close * 0.9975,
+                "close": close,
+                "volume": np.linspace(30.0, 52.0, n),
+                "volume_spike": np.concatenate([np.full(n - 8, 0.92), np.array([0.96, 1.00, 1.02, 1.04, 1.05, 1.06, 1.06, 1.07])]),
+                "rsi": np.concatenate([np.full(n - 5, 57.0), np.array([59.0, 60.5, 61.5, 62.0, 62.4])]),
+                "hist": np.concatenate([np.full(n - 5, 0.00018), np.array([0.00022, 0.00025, 0.00027, 0.00029, 0.00030])]),
+                "bb_upper": close * 1.0018,
+                "kc_upper": close * 1.0015,
+                "ema20": np.linspace(0.0812, 0.0863, n),
+                "ema50": np.linspace(0.0810, 0.0847, n),
+                "vwap": close * 0.958,
+                "atr": close * 0.0042,
+                "poc": np.full(n, 0.0842),
+                "vah": np.full(n, 0.0888),
+                "val": np.full(n, 0.0827),
+                "mtf_trend_5m": np.full(n, 0.0125),
+                "mtf_trend_15m": np.full(n, 0.0064),
+                "mtf_rsi_5m": np.full(n, 63.0),
+                "mtf_rsi_15m": np.full(n, 60.0),
+            },
+            index=idx,
+        )
         intent = SimpleNamespace(action=IntentAction.SHORT_ENTRY, metadata={})
 
         blocked = _should_block_live_main_short_continuation(intent, df)

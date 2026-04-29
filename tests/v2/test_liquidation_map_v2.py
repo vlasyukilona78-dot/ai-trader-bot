@@ -6,6 +6,11 @@ import numpy as np
 import pandas as pd
 
 from alerts.chart_generator import build_signal_chart
+from alerts.chart_generator import _estimate_liquidation_margin_usdt
+from alerts.chart_generator import _fmt_compact_notional
+from alerts.chart_generator import _fmt_liquidation_margin_label
+from alerts.chart_generator import _select_visible_liquidation_bands
+from core.liquidation_map import LiquidationBand
 from core.liquidation_map import build_liquidation_map
 from core.volume_profile import VolumeProfileLevels
 
@@ -46,6 +51,19 @@ class LiquidationMapV2Tests(unittest.TestCase):
 
     def test_chart_renders_with_liquidation_heatmap(self):
         df = self._build_df()
+        df.attrs["coinglass_liquidation_bands"] = [
+            {
+                "level": 109.0,
+                "weight": 5.0,
+                "side": "above",
+                "source": "coinglass",
+                "start_ts": int(df.index[-30].timestamp()),
+                "end_ts": int(df.index[-1].timestamp()),
+                "notional_usdt": 503000.0,
+            }
+        ]
+        liq_map = build_liquidation_map(df)
+        self.assertTrue(any(band.notional_usdt >= 503000.0 for band in liq_map.bands))
         image = build_signal_chart(
             symbol="SUIUSDT",
             df=df,
@@ -56,11 +74,71 @@ class LiquidationMapV2Tests(unittest.TestCase):
             volume_profile=VolumeProfileLevels(poc=104.8, vah=106.9, val=103.7),
             timeframe_label="1m",
             show_trade_levels=True,
-            liquidation_map=build_liquidation_map(df),
+            liquidation_map=liq_map,
             show_liquidation_map=True,
         )
         self.assertIsInstance(image, bytes)
         self.assertGreater(len(image), 1024)
+
+    def test_compact_notional_formatter_matches_chart_labels(self):
+        self.assertEqual(_fmt_compact_notional(77000.0), "77K")
+        self.assertEqual(_fmt_compact_notional(2_000_000.0), "2M")
+        self.assertEqual(_fmt_compact_notional(1_250_000.0), "1.2M")
+        self.assertEqual(_fmt_liquidation_margin_label(margin_usdt=12_500.0, notional_usdt=77_000.0), "12K margin")
+        self.assertEqual(_fmt_liquidation_margin_label(notional_usdt=77_000.0), "77K margin")
+        self.assertEqual(_fmt_liquidation_margin_label(margin_usdt=77_000.0, estimated=True), "~77K margin")
+
+    def test_chart_estimates_missing_liquidation_margin_labels_from_volume(self):
+        df = self._build_df()
+        df["turnover_usdt"] = pd.to_numeric(df["volume"], errors="coerce") * pd.to_numeric(df["close"], errors="coerce")
+        band = LiquidationBand(
+            level=108.7,
+            weight=4.0,
+            intensity=0.80,
+            side="above",
+            start_index=70,
+            end_index=95,
+            source="synthetic",
+        )
+
+        estimate = _estimate_liquidation_margin_usdt(band, df)
+
+        self.assertGreater(estimate, 0.0)
+        self.assertTrue(_fmt_liquidation_margin_label(margin_usdt=estimate, estimated=True).startswith("~"))
+
+    def test_visible_liquidation_bands_prioritize_near_external_notional_levels(self):
+        df = self._build_df()
+        df.attrs["coinglass_liquidation_bands"] = [
+            {
+                "level": 108.7,
+                "weight": 3.2,
+                "side": "above",
+                "source": "coinglass",
+                "start_ts": int(df.index[-34].timestamp()),
+                "end_ts": int(df.index[-1].timestamp()),
+                "notional_usdt": 77_000.0,
+            },
+            {
+                "level": 140.0,
+                "weight": 8.0,
+                "side": "above",
+                "source": "coinglass",
+                "start_ts": int(df.index[-34].timestamp()),
+                "end_ts": int(df.index[-1].timestamp()),
+                "notional_usdt": 3_000_000.0,
+            },
+        ]
+        liq_map = build_liquidation_map(df)
+
+        visible = _select_visible_liquidation_bands(
+            liq_map,
+            frame_len=len(df),
+            last_close=float(df["close"].iloc[-1]),
+            max_bands=4,
+        )
+
+        self.assertTrue(any(abs(band.level - 108.7) < 0.8 and band.notional_usdt >= 77_000.0 for band in visible))
+        self.assertFalse(any(abs(band.level - 140.0) < 0.8 for band in visible))
 
 
 if __name__ == "__main__":

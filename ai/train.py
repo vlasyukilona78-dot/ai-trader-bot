@@ -141,7 +141,9 @@ def _write_artifact_manifest(
     dataset_path: str,
     features: list[str],
     rows: int,
+    metrics: dict[str, object] | None = None,
 ):
+    model_metrics = dict(metrics or {})
     manifest = {
         "version": version,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -150,6 +152,7 @@ def _write_artifact_manifest(
         "rows": int(rows),
         "feature_names": list(features),
         "feature_schema_hash": compute_feature_schema_hash(list(features)),
+        "metrics": model_metrics,
     }
     path = Path(model_dir) / ("manifest.json" if version == "default" else f"manifest_{version}.json")
     path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -167,6 +170,7 @@ def _write_artifact_manifest(
             "action": "register_artifact",
             "version": version,
             "model_type": selected_model_type,
+            "metrics": model_metrics,
         }
     )
     save_registry(model_dir, registry)
@@ -221,13 +225,15 @@ def train_models(
         auc = float("nan")
 
     h_pred = reg.predict(X_test_s)
+    horizon_mae = float(mean_absolute_error(h_test, h_pred))
+    horizon_r2 = float(r2_score(h_test, h_pred))
 
     print("Model type:", selected_model_type)
     print("Classifier report:")
     print(classification_report(y_test, pred, digits=3))
     print("AUC:", round(float(auc), 4) if np.isfinite(auc) else "n/a")
-    print("Horizon MAE:", round(float(mean_absolute_error(h_test, h_pred)), 4))
-    print("Horizon R2:", round(float(r2_score(h_test, h_pred)), 4))
+    print("Horizon MAE:", round(horizon_mae, 4))
+    print("Horizon R2:", round(horizon_r2, 4))
 
     calibrator = _fit_calibrator(y_test, probs)
 
@@ -241,14 +247,6 @@ def train_models(
         joblib.dump(calibrator, Path(model_dir) / f"calibrator{suffix}.pkl")
 
     save_feature_names(features, model_dir=model_dir, regime=regime)
-    _write_artifact_manifest(
-        model_dir=model_dir,
-        version=(regime.lower() if regime else "default"),
-        selected_model_type=selected_model_type,
-        dataset_path=dataset_path,
-        features=features,
-        rows=len(df),
-    )
 
     tscv = TimeSeriesSplit(n_splits=min(5, max(2, len(X) // 80)))
     wf_rows: list[dict[str, float]] = []
@@ -275,7 +273,31 @@ def train_models(
 
     if wf_rows:
         wf = pd.DataFrame(wf_rows)
-        print("Walk-forward AUC mean:", round(float(wf["auc"].mean()), 4))
+        walk_forward_auc_mean = float(wf["auc"].mean())
+        print("Walk-forward AUC mean:", round(walk_forward_auc_mean, 4))
+    else:
+        walk_forward_auc_mean = float("nan")
+
+    metrics = {
+        "train_rows": int(len(X_train)),
+        "test_rows": int(len(X_test)),
+        "target_win_rate": float(y.mean()),
+        "test_auc": float(auc) if np.isfinite(auc) else None,
+        "test_horizon_mae": horizon_mae,
+        "test_horizon_r2": horizon_r2 if np.isfinite(horizon_r2) else None,
+        "walk_forward_auc_mean": walk_forward_auc_mean if np.isfinite(walk_forward_auc_mean) else None,
+        "walk_forward_folds": int(len(wf_rows)),
+        "calibrator_fitted": bool(calibrator is not None),
+    }
+    _write_artifact_manifest(
+        model_dir=model_dir,
+        version=(regime.lower() if regime else "default"),
+        selected_model_type=selected_model_type,
+        dataset_path=dataset_path,
+        features=features,
+        rows=len(df),
+        metrics=metrics,
+    )
 
 
 def parse_args():
@@ -284,6 +306,16 @@ def parse_args():
     parser.add_argument("--model-dir", default="ai/models", help="Output directory for .pkl models")
     parser.add_argument("--model-type", default="auto", choices=["auto", "xgboost", "lightgbm", "sklearn"])
     parser.add_argument("--regime", default="", help="Optional market regime filter: TREND/RANGE/PUMP/PANIC")
+    parser.add_argument(
+        "--with-calibration",
+        action="store_true",
+        help="Compatibility flag. Calibration is fitted automatically when enough out-of-sample labels exist.",
+    )
+    parser.add_argument(
+        "--update-registry",
+        action="store_true",
+        help="Compatibility flag. The registry is updated when the artifact manifest is written.",
+    )
     return parser.parse_args()
 
 

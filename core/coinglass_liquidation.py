@@ -152,10 +152,15 @@ def parse_coinglass_heatmap_bands(
             x_idx = int(_safe_float(row.get("x") or row.get("index_0"), -1.0))
             y_idx = int(_safe_float(row.get("y") or row.get("index_1"), -1.0))
             value = _safe_float(row.get("value") or row.get("liq") or row.get("index_2"), 0.0)
+            margin_value = _safe_float(
+                row.get("margin_usdt") or row.get("marginUsd") or row.get("margin_usd") or row.get("margin"),
+                0.0,
+            )
         elif isinstance(row, (list, tuple)) and len(row) >= 3:
             x_idx = int(_safe_float(row[0], -1.0))
             y_idx = int(_safe_float(row[1], -1.0))
             value = _safe_float(row[2], 0.0)
+            margin_value = 0.0
         else:
             continue
         if x_idx < 0 or y_idx < 0 or y_idx >= len(levels) or value <= 0:
@@ -166,12 +171,14 @@ def parse_coinglass_heatmap_bands(
             {
                 "value_sum": 0.0,
                 "value_max": 0.0,
+                "margin_sum": 0.0,
                 "x_min": x_idx,
                 "x_max": x_idx,
             },
         )
         bucket["value_sum"] = float(bucket["value_sum"]) + value
         bucket["value_max"] = max(float(bucket["value_max"]), value)
+        bucket["margin_sum"] = float(bucket["margin_sum"]) + max(margin_value, 0.0)
         bucket["x_min"] = min(int(bucket["x_min"]), x_idx)
         bucket["x_max"] = max(int(bucket["x_max"]), x_idx)
 
@@ -197,7 +204,11 @@ def parse_coinglass_heatmap_bands(
             "source": "coinglass",
             "x_min": x_min,
             "x_max": x_max,
+            "notional_usdt": float(item["value_sum"]),
         }
+        margin_sum = _safe_float(item.get("margin_sum"), 0.0)
+        if margin_sum > 0:
+            row["margin_usdt"] = float(margin_sum)
         if x_min in x_to_ts:
             row["start_ts"] = int(x_to_ts[x_min])
         if x_max in x_to_ts:

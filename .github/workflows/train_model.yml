@@ -2,8 +2,19 @@ name: Train AI Model
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
+    inputs:
+      dataset:
+        description: "CSV dataset used by ai/train.py"
+        required: true
+        default: "data/processed/online_training_dataset_main.csv"
+      model_dir:
+        description: "Output directory for the V2 model bundle"
+        required: true
+        default: "ai/models"
+      model_type:
+        description: "Model backend: auto, sklearn, xgboost, lightgbm"
+        required: true
+        default: "auto"
 
 jobs:
   train:
@@ -16,33 +27,43 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas numpy scikit-learn joblib; fi
+          python -m pip install -r requirements.txt
 
-      - name: Run model training
+      - name: Validate dataset
         run: |
-          echo "🚀 Starting model training..."
-          python train_ai_fixed.py
-          echo "✅ Training finished"
+          test -f "${{ inputs.dataset }}" || (echo "Missing dataset: ${{ inputs.dataset }}" && exit 1)
 
-      - name: Verify model files
+      - name: Run V2 model training
         run: |
-          echo "🔍 Checking that model files exist..."
-          test -f ai_model_win.pkl || (echo "❌ Missing ai_model_win.pkl" && exit 1)
-          test -f ai_model_horizon.pkl || (echo "❌ Missing ai_model_horizon.pkl" && exit 1)
-          test -f scaler.pkl || (echo "❌ Missing scaler.pkl" && exit 1)
-          echo "✅ All model files found!"
+          python -m ai.train \
+            --dataset "${{ inputs.dataset }}" \
+            --model-dir "${{ inputs.model_dir }}" \
+            --model-type "${{ inputs.model_type }}"
 
-      - name: Upload trained models
+      - name: Verify V2 model bundle
+        run: |
+          python - <<EOF
+          from ai.inference.artifact_loader import validate_artifact_bundle
+
+          bundle = validate_artifact_bundle("${{ inputs.model_dir }}", version="default")
+          print("artifact contract ok", bundle.version, len(bundle.feature_names))
+          EOF
+
+      - name: Upload trained V2 model bundle
         uses: actions/upload-artifact@v4
         with:
-          name: trained-models
+          name: trained-v2-models
           path: |
-            ai_model_win.pkl
-            ai_model_horizon.pkl
-            scaler.pkl
+            ${{ inputs.model_dir }}/model_win.pkl
+            ${{ inputs.model_dir }}/model_horizon.pkl
+            ${{ inputs.model_dir }}/scaler.pkl
+            ${{ inputs.model_dir }}/calibrator.pkl
+            ${{ inputs.model_dir }}/features.pkl
+            ${{ inputs.model_dir }}/manifest.json
+            ${{ inputs.model_dir }}/registry.json
           if-no-files-found: error

@@ -293,6 +293,12 @@ def build_runtime_signal_inputs(
         oi_quality = oi_signal_quality
         oi_degraded_final = oi_signal_degraded
 
+    market_quality: dict[str, Any] = {}
+    for key in ("turnover24h_usdt", "volume24h", "spread_bps", "bid1Price", "ask1Price"):
+        value, _ = _first_payload_float(payload, [key])
+        if value is not None:
+            market_quality[key] = value
+
     return {
         "sentiment_value": sentiment_value,
         "sentiment_source": sentiment_source,
@@ -315,6 +321,7 @@ def build_runtime_signal_inputs(
         "news_source": news_source,
         "news_degraded": news_degraded,
         "news_quality": news_quality,
+        **market_quality,
         # Backward-compatible aliases.
         "sentiment_index": sentiment_value,
         "open_interest": open_interest,

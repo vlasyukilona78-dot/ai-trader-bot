@@ -60,7 +60,36 @@ class TelegramClient:
         return value in {"1", "true", "yes", "on"}
 
     @staticmethod
-    def _resolve_proxy_url() -> str:
+    def _csv_env(name: str, default: tuple[str, ...]) -> list[str]:
+        raw = os.getenv(name)
+        if raw is None:
+            return list(default)
+        values = [part.strip() for part in str(raw).split(",")]
+        return [value for value in values if value]
+
+    @classmethod
+    def _detect_local_proxy_url(cls) -> str:
+        scheme = str(os.getenv("TELEGRAM_LOCAL_PROXY_SCHEME") or "http").strip().lower() or "http"
+        if scheme not in {"http", "socks5", "socks5h"}:
+            scheme = "http"
+        hosts = cls._csv_env("TELEGRAM_LOCAL_PROXY_HOSTS", ("127.0.0.1", "localhost"))
+        ports = cls._csv_env("TELEGRAM_LOCAL_PROXY_PORTS", ("10801", "10809", "7890", "8080"))
+        for host in hosts:
+            for port_raw in ports:
+                try:
+                    port = int(str(port_raw).strip())
+                except (TypeError, ValueError):
+                    continue
+                if port <= 0:
+                    continue
+                candidate = f"{scheme}://{host}:{port}"
+                if cls._proxy_reachable(candidate):
+                    logger.info("telegram auto local proxy detected: %s", candidate)
+                    return candidate
+        return ""
+
+    @classmethod
+    def _resolve_proxy_url(cls) -> str:
         for name in (
             "TELEGRAM_PROXY_URL",
             "BOT_TELEGRAM_PROXY_URL",
@@ -73,6 +102,8 @@ class TelegramClient:
             value = str(raw).strip()
             if value:
                 return value
+        if cls._env_truthy("TELEGRAM_AUTO_LOCAL_PROXY", True):
+            return cls._detect_local_proxy_url()
         return ""
 
     @staticmethod

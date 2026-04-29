@@ -46,6 +46,115 @@ def _fmt_level(value: float) -> str:
     return f"{value:.6f}"
 
 
+def _fmt_compact_notional(value: float) -> str:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not np.isfinite(amount) or amount <= 0:
+        return ""
+    if amount >= 1_000_000_000:
+        return f"{amount / 1_000_000_000:.1f}B".replace(".0B", "B")
+    if amount >= 1_000_000:
+        suffix_value = amount / 1_000_000
+        return f"{suffix_value:.1f}M".replace(".0M", "M") if suffix_value < 10 else f"{suffix_value:.0f}M"
+    if amount >= 1_000:
+        suffix_value = amount / 1_000
+        return f"{suffix_value:.0f}K" if suffix_value >= 10 else f"{suffix_value:.1f}K".replace(".0K", "K")
+    return f"{amount:.0f}"
+
+
+def _fmt_liquidation_margin_label(
+    *,
+    margin_usdt: float = 0.0,
+    notional_usdt: float = 0.0,
+    estimated: bool = False,
+) -> str:
+    margin_label = _fmt_compact_notional(margin_usdt)
+    if margin_label:
+        prefix = "~" if estimated else ""
+        return f"{prefix}{margin_label} margin"
+    notional_label = _fmt_compact_notional(notional_usdt)
+    if not notional_label:
+        return ""
+    prefix = "~" if estimated else ""
+    return f"{prefix}{notional_label} margin"
+
+
+def _quote_volume_usdt_series(frame: pd.DataFrame) -> pd.Series:
+    for column in ("turnover", "turnover_usdt", "quote_volume", "quoteVolume", "volume_usdt", "volumeUsd"):
+        if column not in frame.columns:
+            continue
+        series = (
+            pd.to_numeric(frame[column], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+            .clip(lower=0.0)
+        )
+        if float(series.sum()) > 0.0:
+            return series
+
+    if "volume" not in frame.columns or "close" not in frame.columns:
+        return pd.Series(0.0, index=frame.index, dtype=float)
+
+    volume = (
+        pd.to_numeric(frame["volume"], errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+        .clip(lower=0.0)
+    )
+    close = (
+        pd.to_numeric(frame["close"], errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .ffill()
+        .bfill()
+        .fillna(0.0)
+        .clip(lower=0.0)
+    )
+    return (volume * close).fillna(0.0).clip(lower=0.0)
+
+
+def _estimate_liquidation_margin_usdt(band, frame: pd.DataFrame) -> float:
+    if frame.empty:
+        return 0.0
+    quote_volume = _quote_volume_usdt_series(frame)
+    if quote_volume.empty or float(quote_volume.sum()) <= 0.0:
+        return 0.0
+
+    start_idx = max(0, min(int(getattr(band, "start_index", 0)), len(frame) - 1))
+    end_idx = max(0, min(int(getattr(band, "end_index", start_idx)), len(frame) - 1))
+    if end_idx < start_idx:
+        start_idx, end_idx = end_idx, start_idx
+
+    # Use only the neighborhood that created/sustained the level. This keeps labels
+    # stable and avoids turning a full-window volume spike into a fake huge number.
+    start_idx = max(0, start_idx - 2)
+    end_idx = min(len(frame) - 1, end_idx + 2)
+    segment = quote_volume.iloc[start_idx : end_idx + 1]
+    if segment.empty:
+        return 0.0
+
+    segment_total = float(segment.tail(min(len(segment), 72)).sum())
+    if not np.isfinite(segment_total) or segment_total <= 0.0:
+        return 0.0
+
+    intensity = min(max(float(getattr(band, "intensity", 0.35) or 0.35), 0.12), 1.0)
+    weight = min(max(float(getattr(band, "weight", 1.0) or 1.0), 0.25), 10.0)
+    factor = min(max(0.010 + intensity * 0.040 + weight * 0.0025, 0.010), 0.090)
+    estimate = segment_total * factor
+    if not np.isfinite(estimate) or estimate <= 0.0:
+        return 0.0
+    return min(max(estimate, 1_000.0), segment_total * 0.22)
+
+
+def _format_chart_symbol(symbol: str) -> str:
+    text = str(symbol or "").strip().upper().replace("/", "").replace("-", "")
+    for quote in ("USDT", "USDC", "USD", "BTC", "ETH"):
+        if text.endswith(quote) and len(text) > len(quote):
+            return f"{text[:-len(quote)]}_{quote}"
+    return text or "UNKNOWN"
+
+
 def _price_tick_formatter(value, _pos):
     return _fmt_level(value)
 
@@ -68,8 +177,8 @@ def _draw_candles(ax, frame: pd.DataFrame, x_values):
         high_px = float(row["high"])
         low_px = float(row["low"])
         close_px = float(row["close"])
-        color = "#5ad692" if close_px >= open_px else "#ff8b7a"
-        ax.vlines(x, low_px, high_px, color=color, linewidth=1.12, alpha=0.97, zorder=3)
+        color = "#57c993" if close_px >= open_px else "#d45d5b"
+        ax.vlines(x, low_px, high_px, color=color, linewidth=0.88, alpha=0.92, zorder=3)
         body_low = min(open_px, close_px)
         body_height = max(abs(close_px - open_px), max(close_px * 0.00017, 1e-8))
         ax.add_patch(
@@ -79,23 +188,29 @@ def _draw_candles(ax, frame: pd.DataFrame, x_values):
                 body_height,
                 facecolor=color,
                 edgecolor=color,
-                linewidth=0.8,
-                alpha=0.98,
+                linewidth=0.52,
+                alpha=0.93,
                 zorder=4,
             )
         )
 
 
 def _style_axis(ax, *, is_macd: bool = False):
-    ax.set_facecolor("#101828" if not is_macd else "#0f1726")
-    ax.grid(True, axis="y", linestyle="-", linewidth=0.55, alpha=0.12, color="#d9e2f1")
-    ax.grid(True, axis="x", linestyle="-", linewidth=0.45, alpha=0.06, color="#d9e2f1")
+    ax.set_facecolor("#20293a" if not is_macd else "#1e2738")
+    ax.grid(True, axis="y", linestyle="-", linewidth=0.55, alpha=0.105, color="#cfd8e8")
+    ax.grid(True, axis="x", linestyle="-", linewidth=0.45, alpha=0.050, color="#cfd8e8")
     for spine in ax.spines.values():
-        spine.set_color("#25324b")
-        spine.set_linewidth(0.9)
-    ax.tick_params(colors="#b8c4da", labelsize=7, length=0, pad=4)
-    ax.yaxis.tick_right()
-    ax.yaxis.set_label_position("right")
+        spine.set_color("#475268")
+        spine.set_linewidth(1.05)
+    ax.tick_params(
+        colors="#9aa6b8",
+        labelsize=7,
+        length=0,
+        pad=5,
+        labelleft=True,
+        labelright=True,
+    )
+    ax.yaxis.set_ticks_position("both")
 
 
 def _segment_bounds(
@@ -200,45 +315,8 @@ def _annotate_level(
         va="center",
         fontsize=font_size,
         color=color,
-        bbox={"facecolor": "#0d1726", "edgecolor": "none", "alpha": 0.82, "pad": 1.0},
         zorder=7,
     )
-
-
-def _draw_trade_zone(ax, x_values, *, side: str, entry: float, tp: float, sl: float):
-    if entry <= 0 or tp <= 0 or sl <= 0:
-        return
-    seg_start, seg_end = _segment_bounds(x_values, start_frac=0.80, length_frac=0.11)
-    width = max(seg_end - seg_start, 1e-8)
-    if str(side).upper() == "SHORT":
-        reward_low, reward_high = min(tp, entry), max(tp, entry)
-        risk_low, risk_high = min(entry, sl), max(entry, sl)
-    else:
-        reward_low, reward_high = min(entry, tp), max(entry, tp)
-        risk_low, risk_high = min(sl, entry), max(sl, entry)
-
-    ax.add_patch(
-        Rectangle(
-            (seg_start, reward_low),
-            width,
-            max(reward_high - reward_low, 1e-8),
-            facecolor="#1e7f57",
-            edgecolor="none",
-            alpha=0.10,
-            zorder=1.4,
-        )
-    )
-    ax.add_patch(
-        Rectangle(
-            (seg_start, risk_low),
-            width,
-            max(risk_high - risk_low, 1e-8),
-            facecolor="#9d3850",
-            edgecolor="none",
-            alpha=0.08,
-            zorder=1.35,
-        )
-        )
 
 
 def _liquidation_label_x(ax, seg_start: float, seg_end: float) -> float:
@@ -249,35 +327,130 @@ def _liquidation_label_x(ax, seg_start: float, seg_end: float) -> float:
     return min(ideal, xmax - span * 0.16)
 
 
-def _draw_recent_focus(ax, x_values, *, bars: int = 18):
-    if len(x_values) < 6:
-        return
-    start_idx = max(0, len(x_values) - bars)
-    seg_start = float(x_values[start_idx])
-    seg_end = float(x_values[-1])
-    ax.axvspan(seg_start, seg_end, color="#173149", alpha=0.10, zorder=0.4)
+def _is_external_liquidation_source(item) -> bool:
+    return str(getattr(item, "source", "synthetic") or "").strip().lower() in {"feed", "coinglass", "external"}
 
 
-def _draw_entry_pump_focus(ax, frame: pd.DataFrame, x_values):
-    if frame.empty or len(frame) < 18:
-        return
-    last_close = float(pd.to_numeric(frame["close"], errors="coerce").dropna().iloc[-1])
-    pump_window = _find_recent_entry_pump_window(frame, last_close=last_close)
-    if pump_window is None:
-        return
+def _liquidation_band_render_score(item, *, frame_len: int) -> float:
+    duration = max(int(item.end_index) - int(item.start_index) + 1, 1)
+    active_bonus = 1.30 if item.closed_index is None else 0.88
+    source_bonus = 1.85 if _is_external_liquidation_source(item) else 1.0
+    notional_bonus = min(max(float(getattr(item, "notional_usdt", 0.0) or 0.0) / 250_000.0, 0.0), 1.65)
+    recency_bonus = 1.0
+    if item.closed_index is not None:
+        recency_bonus = 1.15 if int(item.closed_index) >= max(frame_len - 20, 0) else 0.80
+    return item.weight * active_bonus * source_bonus * recency_bonus * (1.0 + notional_bonus) * min(1.0 + duration / 22.0, 2.4)
 
-    pump_start_rel, peak_rel, pump_pct = pump_window
-    if pump_pct < (0.02 if last_close < 0.02 else 0.015):
-        return
 
-    seg_start = float(x_values[max(0, pump_start_rel)])
-    seg_end = float(x_values[min(int(peak_rel), len(x_values) - 1)])
-    if seg_end <= seg_start:
-        return
+def _liquidation_band_active_on_side(band, *, side: str, last_close: float) -> bool:
+    if band.closed_index is not None:
+        return False
+    if side == "above":
+        return band.level > last_close
+    return band.level < last_close
 
-    ax.axvspan(seg_start, seg_end, color="#f2b868", alpha=0.045, zorder=0.55)
-    ax.vlines(seg_start, float(frame.iloc[pump_start_rel]["low"]), float(frame.iloc[pump_start_rel]["high"]), color="#f3bf74", linewidth=0.9, alpha=0.22, zorder=1.9)
-    ax.vlines(seg_end, float(frame.iloc[peak_rel]["low"]), float(frame.iloc[peak_rel]["high"]), color="#f3bf74", linewidth=0.9, alpha=0.24, zorder=1.9)
+
+def _select_visible_liquidation_bands(
+    liq_map: LiquidationMap | None,
+    *,
+    frame_len: int,
+    last_close: float,
+    max_bands: int = 8,
+) -> list:
+    if liq_map is None or not liq_map.bands:
+        return []
+
+    def _distance_ok(band, *, max_dist: float) -> bool:
+        return abs((float(band.level) - last_close) / max(last_close, 1e-8)) <= max_dist
+
+    def _notional_value(band) -> float:
+        try:
+            value = float(getattr(band, "notional_usdt", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        return value if np.isfinite(value) else 0.0
+
+    major_external = sorted(
+        (
+            band
+            for band in liq_map.bands
+            if _is_external_liquidation_source(band)
+            and _notional_value(band) > 0
+            and _distance_ok(band, max_dist=0.82)
+            and max(int(band.end_index) - int(band.start_index) + 1, 1) >= 2
+        ),
+        key=lambda band: (
+            _notional_value(band),
+            _liquidation_band_render_score(band, frame_len=frame_len),
+        ),
+        reverse=True,
+    )[:6]
+
+    def _pick_visible_for_side(side: str) -> list:
+        open_feed = sorted(
+            (
+                band
+                for band in liq_map.bands
+                if band.side == side
+                and _liquidation_band_active_on_side(band, side=side, last_close=last_close)
+                and _is_external_liquidation_source(band)
+                and _distance_ok(band, max_dist=0.34)
+            ),
+            key=lambda band: _liquidation_band_render_score(band, frame_len=frame_len),
+            reverse=True,
+        )[:3]
+        open_synthetic = sorted(
+            (
+                band
+                for band in liq_map.bands
+                if band.side == side
+                and _liquidation_band_active_on_side(band, side=side, last_close=last_close)
+                and not _is_external_liquidation_source(band)
+                and _distance_ok(band, max_dist=0.18)
+            ),
+            key=lambda band: _liquidation_band_render_score(band, frame_len=frame_len),
+            reverse=True,
+        )[:2]
+        recent_closed_feed = sorted(
+            (
+                band
+                for band in liq_map.bands
+                if band.side == side
+                and band.closed_index is not None
+                and _is_external_liquidation_source(band)
+                and int(band.closed_index) >= max(frame_len - 34, 0)
+                and max(int(band.end_index) - int(band.start_index) + 1, 1) >= 8
+                and _distance_ok(band, max_dist=0.26)
+            ),
+            key=lambda band: _liquidation_band_render_score(band, frame_len=frame_len),
+            reverse=True,
+        )[:2]
+        selected_open = open_feed + open_synthetic
+        if selected_open and recent_closed_feed:
+            open_levels = [float(band.level) for band in selected_open]
+            recent_closed_feed = [
+                band
+                for band in recent_closed_feed
+                if min(abs((float(band.level) - level) / max(last_close, 1e-8)) for level in open_levels) > 0.018
+            ]
+        return selected_open + recent_closed_feed
+
+    combined = major_external + _pick_visible_for_side("above") + _pick_visible_for_side("below")
+    deduped: list = []
+    for band in sorted(
+        combined,
+        key=lambda band: _liquidation_band_render_score(band, frame_len=frame_len),
+        reverse=True,
+    ):
+        if any(
+            abs((float(band.level) - float(existing.level)) / max(last_close, 1e-8)) < 0.0045
+            for existing in deduped
+        ):
+            continue
+        deduped.append(band)
+        if len(deduped) >= max_bands:
+            break
+    return deduped
 
 
 def _draw_last_price_marker(ax, x_values, price: float, *, color: str = "#83d6ff"):
@@ -1329,7 +1502,83 @@ def _compute_price_view_bounds(
         return 0.0, 1.0
 
     last_close = float(pd.to_numeric(frame["close"], errors="coerce").dropna().iloc[-1])
-    recent_bars = min(len(frame), 64 if show_liquidation_map else (56 if last_close < 0.02 else 66))
+    if show_liquidation_map:
+        lows_all = pd.to_numeric(frame["low"], errors="coerce").dropna()
+        highs_all = pd.to_numeric(frame["high"], errors="coerce").dropna()
+        if lows_all.empty or highs_all.empty:
+            return 0.0, max(last_close * 1.12, 1.0)
+
+        focus_levels: list[float] = [
+            float(lows_all.min()),
+            float(highs_all.max()),
+            last_close,
+        ]
+        if {"open", "close"}.issubset(frame.columns):
+            body_lows = pd.concat(
+                [
+                    pd.to_numeric(frame["open"], errors="coerce"),
+                    pd.to_numeric(frame["close"], errors="coerce"),
+                ],
+                axis=1,
+            ).min(axis=1)
+            body_highs = pd.concat(
+                [
+                    pd.to_numeric(frame["open"], errors="coerce"),
+                    pd.to_numeric(frame["close"], errors="coerce"),
+                ],
+                axis=1,
+            ).max(axis=1)
+            focus_levels.append(float(body_lows.quantile(0.006)))
+            focus_levels.append(float(body_highs.quantile(0.994)))
+
+        for col in ("ema20", "ema50", "vwap"):
+            if col in frame.columns:
+                series = pd.to_numeric(frame[col], errors="coerce").dropna()
+                if not series.empty:
+                    focus_levels.append(float(series.min()))
+                    focus_levels.append(float(series.max()))
+
+        if volume_profile is not None and show_trade_levels:
+            for value in (volume_profile.val, volume_profile.vah, volume_profile.poc):
+                if value and value > 0:
+                    focus_levels.append(float(value))
+
+        if show_entry_levels:
+            for value in (entry, tp, sl):
+                if value and value > 0:
+                    focus_levels.append(float(value))
+
+        if liquidation_map is not None and liquidation_map.bands:
+            for band in _select_visible_liquidation_bands(
+                liquidation_map,
+                frame_len=len(frame),
+                last_close=last_close,
+                max_bands=12,
+            ):
+                level = float(band.level)
+                if level > 0:
+                    focus_levels.append(level)
+
+        raw_low = min(focus_levels)
+        raw_high = max(focus_levels)
+        robust_low = float(lows_all.quantile(0.006))
+        robust_high = float(highs_all.quantile(0.994))
+        robust_span = max(robust_high - robust_low, _price_scale(last_close) * 0.012)
+        raw_span = max(raw_high - raw_low, robust_span)
+
+        # Keep the wide Coinglass-like context, but avoid one broken wick flattening the entire chart.
+        if raw_span > robust_span * 3.8 and len(frame) >= 80:
+            low = min(robust_low, last_close, *(value for value in focus_levels if value >= robust_low - robust_span * 0.25))
+            high = max(robust_high, last_close, *(value for value in focus_levels if value <= robust_high + robust_span * 0.25))
+        else:
+            low = raw_low
+            high = raw_high
+
+        span = max(high - low, _price_scale(last_close) * 0.018)
+        pad = max(span * 0.075, _price_scale(last_close) * 0.0045)
+        return max(0.0, low - pad), high + pad
+
+    recent_bars = min(len(frame), 156 if show_liquidation_map else (56 if last_close < 0.02 else 66))
     recent = frame.tail(max(24, recent_bars))
     lows = pd.to_numeric(recent["low"], errors="coerce").dropna()
     highs = pd.to_numeric(recent["high"], errors="coerce").dropna()
@@ -1382,6 +1631,31 @@ def _compute_price_view_bounds(
         last_close,
     ]
 
+    if show_liquidation_map:
+        context = frame.tail(min(len(frame), 220))
+        context_lows = pd.to_numeric(context["low"], errors="coerce").dropna()
+        context_highs = pd.to_numeric(context["high"], errors="coerce").dropna()
+        if not context_lows.empty and not context_highs.empty:
+            focus_levels.append(float(context_lows.quantile(0.04)))
+            focus_levels.append(float(context_highs.quantile(0.96)))
+        if {"open", "close"}.issubset(context.columns):
+            context_body_lows = pd.concat(
+                [
+                    pd.to_numeric(context["open"], errors="coerce"),
+                    pd.to_numeric(context["close"], errors="coerce"),
+                ],
+                axis=1,
+            ).min(axis=1)
+            context_body_highs = pd.concat(
+                [
+                    pd.to_numeric(context["open"], errors="coerce"),
+                    pd.to_numeric(context["close"], errors="coerce"),
+                ],
+                axis=1,
+            ).max(axis=1)
+            focus_levels.append(float(context_body_lows.quantile(0.03)))
+            focus_levels.append(float(context_body_highs.quantile(0.97)))
+
     for col in ("ema20", "ema50", "vwap"):
         if col in recent.columns:
             series = pd.to_numeric(recent[col], errors="coerce").dropna()
@@ -1404,15 +1678,16 @@ def _compute_price_view_bounds(
                 focus_levels.append(float(value))
 
     if show_liquidation_map and liquidation_map is not None and liquidation_map.bands:
-        for band in liquidation_map.bands:
+        for band in _select_visible_liquidation_bands(
+            liquidation_map,
+            frame_len=len(frame),
+            last_close=last_close,
+            max_bands=8,
+        ):
             level = float(band.level)
             if level <= 0:
                 continue
-            distance_pct = abs(level - last_close) / max(abs(last_close), 1e-8)
-            if band.closed_index is None and distance_pct <= 0.16:
-                focus_levels.append(level)
-            elif band.closed_index is not None and distance_pct <= 0.10:
-                focus_levels.append(level)
+            focus_levels.append(level)
 
     focus_min = min(focus_levels)
     focus_max = max(focus_levels)
@@ -1541,13 +1816,8 @@ def _configure_time_axis(ax, *, timeframe_label: str, frame: pd.DataFrame):
     tz = _resolve_chart_timezone()
 
     if "h" in tf:
-        if span_minutes <= 24 * 60 * 3:
-            locator = mdates.DayLocator(interval=1, tz=tz)
-        elif span_minutes <= 24 * 60 * 8:
-            locator = mdates.DayLocator(interval=2, tz=tz)
-        else:
-            locator = mdates.DayLocator(interval=3, tz=tz)
-        formatter = mdates.DateFormatter("%m-%d", tz=tz)
+        locator = mdates.AutoDateLocator(minticks=5, maxticks=8, tz=tz)
+        formatter = mdates.DateFormatter("%d.%m %H:%M", tz=tz)
     else:
         if span_minutes <= 105:
             locator = mdates.MinuteLocator(interval=15, tz=tz)
@@ -1567,190 +1837,95 @@ def _draw_liquidation_heatmap(ax, x_values, liq_map: LiquidationMap | None, fram
     if liq_map is None or not liq_map.bands:
         return
 
-    price_span = max(float(frame["high"].max()) - float(frame["low"].min()), 1e-8)
+    axis_low, axis_high = ax.get_ylim()
+    price_span = max(float(axis_high) - float(axis_low), 1e-8)
     last_close = max(float(frame["close"].iloc[-1]), 1e-8)
-    atr_series = pd.to_numeric(frame.get("atr"), errors="coerce") if "atr" in frame.columns else None
-    atr_last = float(atr_series.dropna().iloc[-1]) if atr_series is not None and not atr_series.dropna().empty else 0.0
-    band_half_height = max(price_span * 0.0054, atr_last * 0.24, last_close * 0.0013)
     candle_width = max((x_values[1] - x_values[0]) * 0.60, 1e-6) if len(x_values) >= 2 else 0.00045
     half_step = candle_width / 1.20
-
-    def _band_render_score(item):
-        duration = max(int(item.end_index) - int(item.start_index) + 1, 1)
-        active_bonus = 1.30 if item.closed_index is None else 0.88
-        source_bonus = 1.85 if getattr(item, "source", "synthetic") == "feed" else 1.0
-        recency_bonus = 1.0
-        if item.closed_index is not None:
-            recency_bonus = 1.15 if int(item.closed_index) >= max(len(frame) - 20, 0) else 0.80
-        return item.weight * active_bonus * source_bonus * recency_bonus * min(1.0 + duration / 22.0, 2.4)
-
-    def _is_active_on_price_side(band, side: str) -> bool:
-        if band.closed_index is not None:
-            return False
-        if side == "above":
-            return band.level > last_close
-        return band.level < last_close
-
-    def _pick_visible_for_side(side: str):
-        def _distance_ok(band, *, max_dist: float) -> bool:
-            return abs((band.level - last_close) / max(last_close, 1e-8)) <= max_dist
-
-        open_feed = sorted(
-            (
-                band
-                for band in liq_map.bands
-                if band.side == side
-                and _is_active_on_price_side(band, side)
-                and getattr(band, "source", "synthetic") == "feed"
-                and _distance_ok(band, max_dist=0.22)
-            ),
-            key=_band_render_score,
-            reverse=True,
-        )[:1]
-        open_synthetic = sorted(
-            (
-                band
-                for band in liq_map.bands
-                if band.side == side
-                and _is_active_on_price_side(band, side)
-                and getattr(band, "source", "synthetic") != "feed"
-                and _distance_ok(band, max_dist=0.15)
-            ),
-            key=_band_render_score,
-            reverse=True,
-        )[:1]
-        recent_closed_feed = sorted(
-            (
-                band
-                for band in liq_map.bands
-                if band.side == side
-                and band.closed_index is not None
-                and getattr(band, "source", "synthetic") == "feed"
-                and int(band.closed_index) >= max(len(frame) - 18, 0)
-                and max(int(band.end_index) - int(band.start_index) + 1, 1) >= 8
-                and abs((band.level - last_close) / max(last_close, 1e-8)) <= 0.18
-            ),
-            key=_band_render_score,
-            reverse=True,
-        )[:1]
-        selected_open = open_feed or open_synthetic
-        if selected_open and recent_closed_feed:
-            nearest_open = selected_open[0]
-            if abs((recent_closed_feed[0].level - nearest_open.level) / max(last_close, 1e-8)) <= 0.03:
-                recent_closed_feed = []
-        return selected_open + recent_closed_feed
-
-    visible_bands = sorted(
-        _pick_visible_for_side("above") + _pick_visible_for_side("below"),
-        key=_band_render_score,
+    x_left = float(x_values[0])
+    x_right = float(x_values[-1])
+    x_span = max(x_right - x_left, 1e-8)
+    visible_bands = _select_visible_liquidation_bands(
+        liq_map,
+        frame_len=len(frame),
+        last_close=last_close,
+        max_bands=12,
     )
+    if not visible_bands:
+        return
 
-    for band in visible_bands:
+    for rank, band in enumerate(visible_bands):
         start_idx = max(0, min(int(band.start_index), len(x_values) - 1))
         end_idx = max(0, min(int(band.end_index), len(x_values) - 1))
         seg_start = float(x_values[start_idx]) - half_step
         seg_end = float(x_values[end_idx]) + half_step
-        band_width = max(seg_end - seg_start, 1e-8)
-        is_closed = band.closed_index is not None and band.closed_index < len(frame) - 1
-        duration = max(end_idx - start_idx + 1, 1)
-        duration_boost = min(0.22 + duration / max(len(frame), 1), 0.95)
-        base_alpha = 0.06 + 0.08 * band.intensity + 0.07 * duration_boost
-        hot_alpha = 0.12 + 0.18 * band.intensity + 0.06 * duration_boost
-        if getattr(band, "source", "synthetic") == "feed":
-            base_alpha *= 1.16
-            hot_alpha *= 1.18
+        is_closed = band.closed_index is not None
+        if not is_closed:
+            seg_end = max(seg_end, x_right)
+        if seg_end <= seg_start:
+            seg_end = min(x_right, seg_start + x_span * 0.08)
+
+        external = _is_external_liquidation_source(band)
+        explicit_margin_usdt = float(getattr(band, "margin_usdt", 0.0) or 0.0)
+        explicit_notional_usdt = float(getattr(band, "notional_usdt", 0.0) or 0.0)
+        estimated_margin_usdt = 0.0
+        estimated_label = False
+        if explicit_margin_usdt <= 0.0 and explicit_notional_usdt <= 0.0:
+            estimated_margin_usdt = _estimate_liquidation_margin_usdt(band, frame)
+            estimated_label = estimated_margin_usdt > 0.0
+        margin_label = _fmt_liquidation_margin_label(
+            margin_usdt=explicit_margin_usdt if explicit_margin_usdt > 0.0 else estimated_margin_usdt,
+            notional_usdt=explicit_notional_usdt,
+            estimated=estimated_label,
+        )
+        important = bool(margin_label)
+        if not important and rank >= 6:
+            continue
+
+        if band.side == "above":
+            line_color = "#b86483" if (important and external) else "#9a667f"
+            label_color = "#d7dce8" if important else "#a9b1c2"
+            y_offset = price_span * (0.010 + 0.0025 * (rank % 3))
+            va = "bottom"
         else:
-            base_alpha *= 0.72
-            hot_alpha *= 0.70
+            line_color = "#4c9a72" if (important and external) else "#5f9876"
+            label_color = "#d7dce8" if important else "#a9b1c2"
+            y_offset = -price_span * (0.010 + 0.0025 * (rank % 3))
+            va = "top"
+
+        line_alpha = 0.76 if important else 0.34
         if is_closed:
-            base_alpha *= 0.78
-            hot_alpha *= 0.84
-        hot_width = max(band_width * (0.28 + 0.24 * band.intensity), candle_width * 2.8)
-        hot_start = seg_end - hot_width
-        hot_color = "#ffe3a1" if band.side == "above" else "#ebb0ff"
+            line_alpha *= 0.62
+            line_color = "#8992a2"
 
-        ax.add_patch(
-            Rectangle(
-                (seg_start, band.level - band_half_height),
-                band_width,
-                band_half_height * 2.0,
-                facecolor="#4b1f76",
-                edgecolor="none",
-                alpha=base_alpha,
-                zorder=1,
-            )
-        )
-        ax.add_patch(
-            Rectangle(
-                (hot_start, band.level - band_half_height * 0.74),
-                hot_width,
-                band_half_height * 1.48,
-                facecolor=hot_color,
-                edgecolor="none",
-                alpha=hot_alpha,
-                zorder=2,
-            )
-        )
-
-        if is_closed:
-            ax.vlines(
-                seg_end,
-                band.level - band_half_height * 1.05,
-                band.level + band_half_height * 1.05,
-                color=hot_color,
-                linewidth=1.6,
-                alpha=0.58,
-                zorder=3,
-            )
-            ax.add_patch(
-                Rectangle(
-                    (seg_end, band.level - band_half_height * 1.12),
-                    candle_width * 0.72,
-                    band_half_height * 2.24,
-                    facecolor="#0b1320",
-                    edgecolor="none",
-                    alpha=0.82,
-                    zorder=2.8,
-                )
-            )
-
-    def _label_score(item):
-        duration = max(int(item.end_index) - int(item.start_index) + 1, 1)
-        active_bonus = 1.25 if item.closed_index is None else 0.85
-        return item.weight * active_bonus * min(1.0 + duration / 22.0, 2.25)
-
-    strongest_above = max(
-        (band for band in visible_bands if band.side == "above" and _is_active_on_price_side(band, "above")),
-        key=_label_score,
-        default=None,
-    )
-    strongest_below = max(
-        (band for band in visible_bands if band.side == "below" and _is_active_on_price_side(band, "below")),
-        key=_label_score,
-        default=None,
-    )
-    for band, label, color in (
-        (strongest_above, "LQ UP", "#ffe0ac"),
-        (strongest_below, "LQ DN", "#efc0ff"),
-    ):
-        if band is None:
-            continue
-        duration = max(int(band.end_index) - int(band.start_index) + 1, 1)
-        if duration < 4 and band.weight < 1.9:
-            continue
-        seg_start, seg_end = _segment_bounds(x_values, start_index=band.start_index, end_index=band.end_index)
-        ax.text(
-            _liquidation_label_x(ax, seg_start, seg_end),
+        line_width = 0.66 + 0.32 * min(max(float(band.intensity), 0.0), 1.0)
+        if important:
+            line_width += 0.18
+        ax.hlines(
             band.level,
-            label,
-            ha="right",
-            va="center",
-            fontsize=6.6,
-            color=color,
-            alpha=0.74,
-            bbox={"facecolor": "#120f1c", "edgecolor": "none", "alpha": 0.36, "pad": 0.7},
-            zorder=5,
+            seg_start,
+            seg_end,
+            color=line_color,
+            linewidth=line_width,
+            linestyles=(0, (4.0, 2.4)) if is_closed else "-",
+            alpha=line_alpha,
+            zorder=4.8,
         )
+
+        if margin_label:
+            label_x = min(max(seg_start + x_span * 0.010, x_left + x_span * 0.010), x_right - x_span * 0.070)
+            ax.text(
+                label_x,
+                band.level + y_offset,
+                margin_label,
+                ha="left",
+                va=va,
+                fontsize=7.4,
+                color=label_color,
+                fontweight="bold",
+                alpha=0.94 if important else 0.56,
+                zorder=5.2,
+            )
 
 
 def build_signal_chart(
@@ -1771,7 +1946,12 @@ def build_signal_chart(
         return None
 
     raw_last_close = float(pd.to_numeric(df["close"], errors="coerce").dropna().iloc[-1])
-    source_frame = df.tail(180 if show_liquidation_map else (2520 if raw_last_close < 0.02 else 1840)).copy()
+    if show_liquidation_map:
+        tf = str(timeframe_label or "").strip().lower()
+        htf_tail = 432 if tf in {"1h", "60", "60m"} else 220
+        source_frame = df.tail(htf_tail).copy()
+    else:
+        source_frame = df.tail(2520 if raw_last_close < 0.02 else 1840).copy()
     source_frame = _compute_macd(source_frame)
     source_frame = source_frame.dropna(subset=["open", "high", "low", "close"])
     if source_frame.empty:
@@ -1781,31 +1961,22 @@ def build_signal_chart(
         return None
 
     x_values = mdates.date2num(frame.index.to_pydatetime())
+    fig_size = (18.0, 9.8) if show_liquidation_map else (16.0, 9.2)
     fig, (ax_price, ax_macd) = plt.subplots(
         2,
         1,
-        figsize=(16.2, 11.8),
+        figsize=fig_size,
         sharex=True,
-        facecolor="#0b1320",
-        gridspec_kw={"height_ratios": [7.1, 1.25]},
+        facecolor="#20293a",
+        gridspec_kw={"height_ratios": [6.7, 1.45]},
     )
     _style_axis(ax_price)
     _style_axis(ax_macd, is_macd=True)
 
     _draw_candles(ax_price, frame, x_values)
-    _draw_recent_focus(ax_price, x_values, bars=24 if show_liquidation_map else 20)
-    if not show_liquidation_map:
-        _draw_entry_pump_focus(ax_price, frame, x_values)
 
     if show_liquidation_map:
         liquidation_map = liquidation_map or build_liquidation_map(frame)
-
-    if "ema20" in frame.columns:
-        ax_price.plot(x_values, frame["ema20"], color="#5ea8ff", linewidth=1.08, alpha=0.66, zorder=2.2)
-    if "ema50" in frame.columns:
-        ax_price.plot(x_values, frame["ema50"], color="#d7a35a", linewidth=1.08, alpha=0.58, zorder=2.1)
-    if "vwap" in frame.columns:
-        ax_price.plot(x_values, frame["vwap"], color="#77cfa2", linewidth=1.10, alpha=0.62, zorder=2.15)
 
     y_min, y_max = _compute_price_view_bounds(
         frame,
@@ -1830,9 +2001,6 @@ def build_signal_chart(
         x_pad_frac = 0.072
     x_pad = max((x_right - x_left) * x_pad_frac, 0.00032 if not show_liquidation_map else 0.00045)
     ax_price.set_xlim(x_left, x_right + x_pad)
-
-    if volume_profile is not None and show_trade_levels:
-        ax_price.axhspan(volume_profile.val, volume_profile.vah, color="#1d3554", alpha=0.16, zorder=0)
 
     if show_liquidation_map:
         _draw_liquidation_heatmap(ax_price, x_values, liquidation_map, frame)
@@ -1876,7 +2044,6 @@ def build_signal_chart(
                     length_frac=length_frac,
                 )
     if show_entry_levels and not show_liquidation_map:
-        _draw_trade_zone(ax_price, x_values, side=side, entry=entry, tp=tp, sl=sl)
         _annotate_level(
             ax_price,
             x_values,
@@ -1911,80 +2078,30 @@ def build_signal_chart(
             length_frac=0.10,
         )
 
-    _draw_last_price_marker(ax_price, x_values, float(frame["close"].iloc[-1]))
+    if not show_liquidation_map:
+        _draw_last_price_marker(ax_price, x_values, float(frame["close"].iloc[-1]))
 
     hist = pd.to_numeric(frame["hist"], errors="coerce").fillna(0.0)
-    hist_colors = ["#65d4ac" if value >= 0 else "#f08f7e" for value in hist]
+    hist_delta = hist.diff().fillna(0.0)
+    hist_colors = []
+    for value, delta in zip(hist, hist_delta):
+        if value >= 0:
+            hist_colors.append("#f1d36f" if delta >= 0 else "#69b79a")
+        else:
+            hist_colors.append("#d66772" if delta <= 0 else "#f0c36d")
     if len(x_values) >= 2:
         bar_width = max((x_values[1] - x_values[0]) * 0.66, 1e-6)
     else:
         bar_width = 0.00045
-    ax_macd.bar(x_values, hist, width=bar_width, color=hist_colors, alpha=0.56, zorder=2)
-    ax_macd.plot(x_values, frame["macd"], color="#436dff", linewidth=1.28, alpha=0.98, zorder=3)
-    ax_macd.plot(x_values, frame["signal"], color="#f5a046", linewidth=1.16, alpha=0.98, zorder=3)
-    ax_macd.axhline(0.0, color="#7c8db1", linewidth=0.78, alpha=0.42, zorder=1)
+    ax_macd.bar(x_values, hist, width=bar_width, color=hist_colors, alpha=0.68, zorder=2)
+    ax_macd.plot(x_values, frame["macd"], color="#244cff", linewidth=4.2, alpha=0.18, zorder=2.8)
+    ax_macd.plot(x_values, frame["signal"], color="#ff7b20", linewidth=4.0, alpha=0.16, zorder=2.8)
+    ax_macd.plot(x_values, frame["macd"], color="#2f68ff", linewidth=1.42, alpha=0.98, zorder=3)
+    ax_macd.plot(x_values, frame["signal"], color="#ff8b25", linewidth=1.30, alpha=0.98, zorder=3)
+    ax_macd.axhline(0.0, color="#9fa8bb", linewidth=0.72, alpha=0.34, zorder=1)
 
-    title = f"{symbol} | {timeframe_label}"
-    subtitle = "Входной график: локальные уровни и TP/SL" if not show_liquidation_map else "Контекст: HTF уровни и карта ликвидаций"
-    ax_price.set_title(title, color="#e9eef9", loc="left", fontsize=11.9, pad=10, fontweight="bold")
-    subtitle = "Входной график: локальные уровни и TP/SL" if not show_liquidation_map else "Контекст: HTF уровни и карта ликвидаций"
-    subtitle = "Входной график: локальные уровни и TP/SL" if not show_liquidation_map else "Контекст: HTF уровни и карта ликвидаций"
-    subtitle = (
-        "Входной график: локальные уровни и TP/SL"
-        if not show_liquidation_map
-        else "Контекст: HTF уровни и карта ликвидаций"
-    )
-    subtitle = (
-        "Входной график: локальные уровни и TP/SL"
-        if not show_liquidation_map
-        else "Контекст: HTF уровни и карта ликвидаций"
-    )
-    subtitle = (
-        "Входной график: локальные уровни и TP/SL"
-        if not show_liquidation_map
-        else "Контекст: HTF уровни и карта ликвидаций"
-    )
-    subtitle = (
-        "Входной график: локальные уровни и TP/SL"
-        if not show_liquidation_map
-        else "Контекст: HTF уровни и карта ликвидаций"
-    )
-    subtitle = (
-        "Входной график: локальные уровни и TP/SL"
-        if not show_liquidation_map
-        else "Контекст: HTF уровни и карта ликвидаций"
-    )
-    subtitle = (
-        "Входной график: локальные уровни и TP/SL"
-        if not show_liquidation_map
-        else "Контекст: HTF уровни и карта ликвидаций"
-    )
-    subtitle = (
-        "Входной график: локальные уровни и TP/SL"
-        if not show_liquidation_map
-        else "Контекст: HTF уровни и карта ликвидаций"
-    )
-    ax_price.text(
-        0.015,
-        1.012,
-        subtitle,
-        transform=ax_price.transAxes,
-        ha="left",
-        va="bottom",
-        fontsize=7.9,
-        color="#8ea3c7",
-    )
-    ax_price.text(
-        0.995,
-        0.985,
-        side.upper(),
-        transform=ax_price.transAxes,
-        ha="right",
-        va="top",
-        fontsize=8.4,
-        color="#9fb0cf",
-        bbox={"facecolor": "#111c2c", "edgecolor": "#23324b", "alpha": 0.55, "pad": 1.2},
-    )
+    title = f"{_format_chart_symbol(symbol)}  {timeframe_label}"
+    ax_price.set_title(title, color="#f0f4fb", loc="left", fontsize=12.2, pad=10, fontweight="bold")
 
     _configure_time_axis(ax_macd, timeframe_label=timeframe_label, frame=frame)
     ax_price.yaxis.set_major_formatter(FuncFormatter(_price_tick_formatter))
@@ -1992,10 +2109,10 @@ def build_signal_chart(
     ax_price.yaxis.set_major_locator(MaxNLocator(nbins=5))
     ax_macd.yaxis.set_major_locator(MaxNLocator(nbins=5))
 
-    fig.subplots_adjust(left=0.036, right=0.970, top=0.954, bottom=0.080, hspace=0.050)
+    fig.subplots_adjust(left=0.058, right=0.958, top=0.922, bottom=0.086, hspace=0.090)
 
     buffer = io.BytesIO()
-    fig.savefig(buffer, format="png", dpi=(176 if show_liquidation_map else 182), facecolor=fig.get_facecolor(), bbox_inches="tight", pad_inches=0.10)
+    fig.savefig(buffer, format="png", dpi=(166 if show_liquidation_map else 176), facecolor=fig.get_facecolor(), bbox_inches="tight", pad_inches=0.10)
     plt.close(fig)
     buffer.seek(0)
     return buffer.read()

@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+import logging
 import os
 import runpy
 import sys
@@ -55,6 +56,9 @@ if TYPE_CHECKING:
     from trading.market_data.feed import MarketDataFeed
     from trading.market_data.reconciliation import ExchangeReconciler
     from trading.market_data.ws_reconciliation import ExchangeSyncService
+
+
+APP_LOGGER = logging.getLogger("bot_v2")
 
 
 def _load_dotenv_file(path: str = ".env") -> None:
@@ -193,7 +197,59 @@ def _build_alerters(cfg: RuntimeConfig):
     return out
 
 
+_MOJIBAKE_ALERT_MARKERS = (
+    "Р ",
+    "Р ",
+    "РЎ",
+    "Рќ",
+    "РЁ",
+    "Рћ",
+    "Рљ",
+    "Рў",
+    "Р",
+    "Р™",
+    "Р В",
+    "С“",
+    "С†",
+    "СЂ",
+)
+
+
+def _looks_like_mojibake_alert_text(text: str) -> bool:
+    return any(marker in text for marker in _MOJIBAKE_ALERT_MARKERS)
+
+
+def _normalize_context_stage_label(text: str) -> str | None:
+    upper = text.upper()
+    if "HTF" not in upper or not _looks_like_mojibake_alert_text(text):
+        return None
+    if text.strip().upper().startswith("HTF"):
+        return "HTF уровни + карта ликвидаций"
+    if "LONG" in upper or "Р›" in text:
+        return "<b>ЛОНГ СИГНАЛ: HTF КОНТЕКСТ</b>"
+    if "EARLY" in upper or "РАНН" in upper or "РђРќРќ" in text or "Р РђРќРќ" in text:
+        return "<b>РАННИЙ ШОРТ: HTF КОНТЕКСТ</b>"
+    if "SHORT" in upper or "РЁ" in text or "РћР Рў" in text:
+        return "<b>ШОРТ СИГНАЛ: HTF КОНТЕКСТ</b>"
+    return None
+
+
+def _normalize_outbound_alert_text(text: str) -> str:
+    raw = str(text or "")
+    if not raw:
+        return ""
+    try:
+        normalized_lines: list[str] = []
+        for line in raw.splitlines():
+            cleaned = _normalize_human_text(line)
+            normalized_lines.append(_normalize_context_stage_label(cleaned) or cleaned)
+        return "\n".join(normalized_lines)
+    except Exception:
+        return raw
+
+
 def _send_alerts(alerters, text: str, reply_markup: dict | None = None):
+    text = _normalize_outbound_alert_text(text)
     attempted = 0
     sent = 0
     for alerter in alerters:
@@ -219,6 +275,7 @@ def _send_photo_alerts(
     filename: str = "signal.png",
     reply_markup: dict | None = None,
 ):
+    caption = _normalize_outbound_alert_text(caption)
     attempted = 0
     sent = 0
     for alerter in alerters:
@@ -482,13 +539,38 @@ def _build_alert_chart(
     liquidation_cluster_high: float | None = None,
     liquidation_cluster_low: float | None = None,
 ) -> bytes | None:
+    volume_profile = None
+    liquidation_map = None
+    effective_show_liquidation_map = bool(show_liquidation_map)
     try:
-        volume_profile = compute_volume_profile(enriched)
-        liquidation_map = build_liquidation_map(
-            enriched,
-            liquidation_cluster_high=liquidation_cluster_high,
-            liquidation_cluster_low=liquidation_cluster_low,
+        volume_profile = compute_volume_profile(enriched) if show_trade_levels else None
+    except Exception as exc:
+        APP_LOGGER.warning(
+            "chart_volume_profile_failed symbol=%s timeframe=%s err=%s",
+            symbol,
+            timeframe,
+            exc,
+            extra={"event": "chart_volume_profile_failed"},
         )
+
+    if effective_show_liquidation_map:
+        try:
+            liquidation_map = build_liquidation_map(
+                enriched,
+                liquidation_cluster_high=liquidation_cluster_high,
+                liquidation_cluster_low=liquidation_cluster_low,
+            )
+        except Exception as exc:
+            effective_show_liquidation_map = False
+            APP_LOGGER.warning(
+                "chart_liquidation_map_failed symbol=%s timeframe=%s err=%s",
+                symbol,
+                timeframe,
+                exc,
+                extra={"event": "chart_liquidation_map_failed"},
+            )
+
+    try:
         return build_signal_chart(
             symbol=symbol,
             df=enriched,
@@ -501,9 +583,39 @@ def _build_alert_chart(
             show_trade_levels=show_trade_levels,
             show_entry_levels=show_entry_levels,
             liquidation_map=liquidation_map,
-            show_liquidation_map=show_liquidation_map,
+            show_liquidation_map=effective_show_liquidation_map,
         )
-    except Exception:
+    except Exception as exc:
+        APP_LOGGER.warning(
+            "chart_build_failed symbol=%s timeframe=%s fallback=basic err=%s",
+            symbol,
+            timeframe,
+            exc,
+            extra={"event": "chart_build_failed"},
+        )
+    try:
+        return build_signal_chart(
+            symbol=symbol,
+            df=enriched,
+            side=side,
+            entry=entry,
+            tp=tp,
+            sl=sl,
+            volume_profile=None,
+            timeframe_label=timeframe_label or f"{timeframe}m",
+            show_trade_levels=False,
+            show_entry_levels=show_entry_levels,
+            liquidation_map=None,
+            show_liquidation_map=False,
+        )
+    except Exception as exc:
+        APP_LOGGER.warning(
+            "chart_build_fallback_failed symbol=%s timeframe=%s err=%s",
+            symbol,
+            timeframe,
+            exc,
+            extra={"event": "chart_build_fallback_failed"},
+        )
         return None
 
 
@@ -542,6 +654,13 @@ def _needs_pre_alert_refresh(
         else:
             max_age_sec = min(30, timeframe_minutes * 4)
     return (time.time() - prepared_ts) >= max(2, int(max_age_sec))
+
+
+def _scan_live_price_overlay_enabled(timeframe: str) -> bool:
+    raw = os.getenv("MARKETDATA_SCAN_OVERLAY_LIVE_PRICE")
+    if raw is not None:
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+    return _timeframe_to_minutes(timeframe) <= 1
 
 
 def _analysis_worker_count(candidate_count: int) -> int:
@@ -636,6 +755,52 @@ def _record_parallel_strategy_intent(strategy, intent) -> None:
             return
 
 
+_RUNTIME_MARKET_METADATA_KEYS = (
+    "turnover24h_usdt",
+    "volume24h",
+    "spread_bps",
+    "bid1Price",
+    "ask1Price",
+    "funding_rate",
+    "funding_source",
+    "funding_quality",
+    "long_short_ratio",
+    "long_short_ratio_source",
+    "long_short_ratio_quality",
+    "open_interest_ratio",
+    "oi_signal",
+    "oi_source",
+    "oi_quality",
+)
+
+
+def _enrich_intent_with_runtime_market_metadata(intent, runtime_inputs: Mapping[str, object] | None):
+    if intent is None or not isinstance(runtime_inputs, Mapping):
+        return intent
+    metadata = dict(getattr(intent, "metadata", {}) or {})
+    changed = False
+    for key in _RUNTIME_MARKET_METADATA_KEYS:
+        if key in metadata or key not in runtime_inputs:
+            continue
+        value = runtime_inputs.get(key)
+        if value is None:
+            continue
+        metadata[key] = value
+        changed = True
+    if not changed:
+        return intent
+    return StrategyIntent(
+        symbol=intent.symbol,
+        action=intent.action,
+        reason=intent.reason,
+        stop_loss=intent.stop_loss,
+        take_profit=intent.take_profit,
+        confidence=float(intent.confidence),
+        metadata=metadata,
+        created_at=float(intent.created_at),
+    )
+
+
 def _prepare_symbol_decision(
     *,
     symbol: str,
@@ -693,6 +858,7 @@ def _prepare_symbol_decision(
                 news_degraded=runtime_inputs.get("news_degraded"),
             )
         )
+        intent = _enrich_intent_with_runtime_market_metadata(intent, runtime_inputs)
 
         result.update(
             {
@@ -875,8 +1041,11 @@ def _should_block_live_main_short_continuation(intent, enriched: pd.DataFrame | 
     mtf_trend_15m = _as_float(row.get("mtf_trend_15m"), 0.0)
     mtf_rsi_5m = _as_float(row.get("mtf_rsi_5m"), 50.0)
     mtf_rsi_15m = _as_float(row.get("mtf_rsi_15m"), 50.0)
+    vwap = _as_float(row.get("vwap"), 0.0)
     atr = max(_as_float(row.get("atr"), close * 0.01), close * 0.0015, 1e-8)
     atr_pct = atr / max(close, 1e-8)
+    vwap_extension_pct = max(0.0, (close - vwap) / max(close, 1e-8)) if vwap > 0 else 0.0
+    liquidation_map = build_liquidation_map(enriched)
     bb_upper = _as_float(row.get("bb_upper"), 0.0)
     kc_upper = _as_float(row.get("kc_upper"), 0.0)
     upper_band_ref = max(bb_upper, kc_upper, 0.0)
@@ -980,6 +1149,44 @@ def _should_block_live_main_short_continuation(intent, enriched: pd.DataFrame | 
         close <= prev_close * (1.0 - downside_displacement_tolerance * 0.75)
         and close_position_in_candle <= 0.34
     )
+    hard_reversal_evidence = bool(
+        failed_reclaim
+        or retest_failed_breakout
+        or recent_upper_anchor_reject
+        or strong_upper_reversal_bar
+        or downside_displacement_confirmed
+        or liquidation_map.swept_above
+    )
+    downside_liq_or_value_context = bool(
+        liquidation_map.downside_magnet
+        or (
+            liquidation_map.nearest_below_distance_pct is not None
+            and liquidation_map.nearest_below_distance_pct <= max(atr_pct * 5.0, 0.026 if close < 0.05 else 0.018)
+        )
+    )
+    nearby_unswept_upside_liq = bool(
+        liquidation_map.nearest_above_distance_pct is not None
+        and liquidation_map.nearest_above_distance_pct <= max(atr_pct * 2.4, 0.012 if close < 0.05 else 0.0075)
+        and liquidation_map.upside_risk >= 0.90
+        and not liquidation_map.swept_above
+    )
+    stretched_vwap_continuation_trap = bool(
+        vwap_extension_pct >= max(atr_pct * 2.70, 0.030 if close < 0.05 else 0.022)
+        and (
+            mtf_trend_5m >= 0.010
+            or mtf_trend_15m >= 0.006
+            or up_closes_last3 >= 2
+        )
+        and close >= ema20 * (1.0 - max(atr_pct * 0.12, 0.00035))
+        and close_position_in_candle >= 0.46
+        and not hard_reversal_evidence
+    )
+    upside_liq_continuation_trap = bool(
+        nearby_unswept_upside_liq
+        and close >= prev_close * (1.0 - max(atr_pct * 0.16, 0.00040))
+        and close_position_in_candle >= 0.50
+        and not hard_reversal_evidence
+    )
     late_pullback_without_downside_displacement = bool(
         far_from_recent_peak
         and meaningfully_below_vah
@@ -1052,6 +1259,8 @@ def _should_block_live_main_short_continuation(intent, enriched: pd.DataFrame | 
         or green_hold_without_downside_displacement
         or bullish_rebound_without_reject
         or plateau_continuation_near_high
+        or stretched_vwap_continuation_trap
+        or upside_liq_continuation_trap
     )
 
 
@@ -1216,7 +1425,7 @@ def _build_higher_timeframe_chart(
     runtime_extras: dict[str, object] | None = None,
 ) -> bytes | None:
     context_timeframe = str(os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "240"))
-    context_candles = max(96, _as_int(os.getenv("BOT_ALERT_CONTEXT_CANDLES", "160"), 160))
+    context_candles = max(96, _as_int(os.getenv("BOT_ALERT_CONTEXT_CANDLES", "180"), 180))
     try:
         context_frame = feed.fetch_frame(
             symbol=symbol,
@@ -2072,6 +2281,15 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         )
         and not liquidation_map.swept_above
     )
+    nearby_unswept_upside_liq = bool(
+        liquidation_map.nearest_above_distance_pct is not None
+        and liquidation_map.nearest_above_distance_pct <= max(
+            atr_pct * 2.35,
+            0.0105 if close < 0.02 else 0.0072,
+        )
+        and liquidation_map.upside_risk >= 0.75
+        and not liquidation_map.swept_above
+    )
     resistance_confluence_score = 0.0
     if near_vah_resistance:
         resistance_confluence_score += 1.00
@@ -2286,6 +2504,29 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
             or peak_followthrough_confirmed
             or resistance_confluence_score >= 2.35
         )
+    ):
+        return None
+    upside_liq_failure_evidence = bool(
+        recent_upper_liq_reaction
+        or structure_trigger_confirmed
+        or peak_followthrough_confirmed
+        or micro_reversal_near_peak
+        or recent_upper_anchor_reject
+        or (
+            first_reaction
+            and (momentum_rollover_score >= 1.25 or volume_fade_confirmed or terminal_rejection_bar)
+            and (
+                resistance_confluence_score >= 1.55
+                or downside_confluence_score >= 0.55
+                or lower_liq_target_ready
+            )
+        )
+    )
+    if (
+        nearby_unswept_upside_liq
+        and not upside_liq_failure_evidence
+        and resistance_confluence_score < 2.20
+        and downside_confluence_score < 1.00
     ):
         return None
     upper_zone_distance_candidates = []
@@ -3385,6 +3626,27 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         active_failure_score += 0.30
     if liquidation_map.swept_above:
         active_failure_score += 0.80
+
+    if (
+        nearby_unswept_upside_liq
+        and active_failure_score < 2.55
+        and not upside_liq_failure_evidence
+        and not (strong_peak_prefire or soft_regime_watch)
+    ):
+        return None
+    if (
+        volume_spike < max(0.82, recent_volume_spike * 0.54)
+        and active_failure_score < 2.70
+        and not (
+            liquidation_map.swept_above
+            or recent_upper_liq_reaction
+            or peak_followthrough_confirmed
+            or structure_trigger_confirmed
+            or strong_peak_prefire
+            or soft_regime_watch
+        )
+    ):
+        return None
 
     still_accelerating = (
         close >= signal_peak_reference * 0.999
@@ -5015,6 +5277,7 @@ def run_cycle(
         _as_int(os.getenv("MAIN_SIGNAL_REENTRY_COOLDOWN_SEC", "1800"), 1800),
     )
     bulk_snapshots: dict[str, object] = {}
+    scan_overlay_live_price = _scan_live_price_overlay_enabled(timeframe)
 
     if symbols:
         if analysis_workers > 1 and len(symbols) > 1:
@@ -5031,6 +5294,7 @@ def run_cycle(
                             pipeline=pipeline,
                             timeframe=timeframe,
                             candles_limit=candles_limit,
+                            overlay_live_price=scan_overlay_live_price,
                         ),
                     )
                     for symbol in symbols
@@ -5054,6 +5318,7 @@ def run_cycle(
                     pipeline=pipeline,
                     timeframe=timeframe,
                     candles_limit=candles_limit,
+                    overlay_live_price=scan_overlay_live_price,
                 )
 
     try:
@@ -5409,6 +5674,16 @@ def run_cycle(
                 outcome = execution.execute(intent=intent, risk=decision, snapshot=snapshot, mark_price=mark_price)
 
             if (
+                not observation_only_profile
+                and intent.action in (IntentAction.EXIT_LONG, IntentAction.EXIT_SHORT)
+                and str(outcome.reason or "") == "no_live_position"
+            ):
+                confirm_symbol_flat = getattr(sync, "confirm_symbol_flat", None)
+                if callable(confirm_symbol_flat):
+                    confirm_symbol_flat(symbol, reason="execution_no_live_position")
+                rec_state = execution.state_machine.get(symbol)
+
+            if (
                 signal_profile == "main"
                 and getattr(intent, "action", None) == IntentAction.SHORT_ENTRY
                 and outcome.accepted
@@ -5731,7 +6006,7 @@ def run_cycle(
                                         ),
                                     ),
                                     context_chart_bytes,
-                                    filename=f"{symbol.lower()}_early_4h.png",
+                                    filename=f"{symbol.lower()}_early_htf.png",
                                     reply_markup=reply_markup,
                                 )
                                 attempted += a2
@@ -5961,7 +6236,7 @@ def run_cycle(
                                     ),
                                 ),
                                 context_chart_bytes,
-                                filename=f"{symbol.lower()}_early_4h.png",
+                                filename=f"{symbol.lower()}_early_htf.png",
                                 reply_markup=reply_markup,
                             )
                             attempted += a2
@@ -6130,7 +6405,7 @@ def run_cycle(
                             ),
                         ),
                         context_chart_bytes,
-                        filename=f"{symbol.lower()}_signal_4h.png",
+                        filename=f"{symbol.lower()}_signal_htf.png",
                         reply_markup=reply_markup,
                     )
                     attempted += a2
@@ -6201,7 +6476,15 @@ def main() -> int:
     adapter = BybitAdapter(cfg.adapter)
     adapter.set_ws_symbols(cfg.symbols)
 
-    feed = MarketDataFeed(base_url=resolve_public_http_base_url(testnet=bool(cfg.adapter.testnet)))
+    app_settings = load_settings()
+    default_public_base_url = resolve_public_http_base_url(testnet=bool(cfg.adapter.testnet))
+    configured_public_base_url = str(app_settings.market_data.bybit_base_url or "").strip()
+    feed_base_url = default_public_base_url if cfg.adapter.testnet else (configured_public_base_url or default_public_base_url)
+    feed = MarketDataFeed(
+        base_url=feed_base_url,
+        timeout=int(app_settings.market_data.request_timeout_sec),
+        max_retries=int(app_settings.market_data.max_retries),
+    )
     reconciler = ExchangeReconciler(adapter)
     sync = ExchangeSyncService(
         reconciler,
@@ -6228,7 +6511,6 @@ def main() -> int:
     strategy = _build_strategy(args.strategy)
     counters = MetricsCounter()
     alerters = _build_alerters(cfg)
-    app_settings = load_settings()
     trade_learner = None
     online_retrainer = None
     early_signal_learner = None

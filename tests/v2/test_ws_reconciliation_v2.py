@@ -286,6 +286,44 @@ class WebsocketReconciliationV2Tests(unittest.TestCase):
         health = self.sync.health()
         self.assertFalse(health.snapshot_required)
 
+    def test_confirm_symbol_flat_clears_stale_ws_position_and_forces_poll(self):
+        self.sync.handle_event(NormalizedExchangeEvent(event_type=ExchangeEventType.CONNECTED, ts=time.time()))
+        self.sync.handle_event(
+            NormalizedExchangeEvent(
+                event_type=ExchangeEventType.ACCOUNT,
+                payload={"account": AccountSnapshot(equity_usdt=1000.0, available_balance_usdt=1000.0)},
+                ts=time.time(),
+            )
+        )
+        self.sync.handle_event(
+            NormalizedExchangeEvent(
+                event_type=ExchangeEventType.POSITION,
+                symbol="BTCUSDT",
+                payload={
+                    "position": PositionSnapshot(
+                        symbol="BTCUSDT",
+                        side=PositionSide.SHORT,
+                        qty=1.0,
+                        entry_price=99.0,
+                        liq_price=130.0,
+                        leverage=3.0,
+                        position_idx=0,
+                    )
+                },
+                ts=time.time(),
+            )
+        )
+
+        self.assertEqual(len(self.sync.snapshot("BTCUSDT").positions), 1)
+        self.adapter.positions = []
+
+        self.sync.confirm_symbol_flat("BTCUSDT", reason="execution_no_live_position")
+
+        self.assertTrue(self.sync.health().snapshot_required)
+        snap = self.sync.snapshot("BTCUSDT")
+        self.assertEqual(len(snap.positions), 0)
+        self.assertFalse(self.sync.health().snapshot_required)
+
     def test_reconnecting_event_triggers_fallback_polling(self):
         self.sync.handle_event(NormalizedExchangeEvent(event_type=ExchangeEventType.RECONNECTING, ts=time.time()))
         self.assertTrue(self.sync.health().fallback_polling)

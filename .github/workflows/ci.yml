@@ -22,24 +22,20 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas numpy scikit-learn joblib pytest; fi
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
 
-      - name: Run basic checks
+      - name: Run import checks
         shell: bash
         run: |
-          mkdir -p logs || true
           python - <<EOF
-          import os
-          import joblib
+          from ai.inference.artifact_loader import ArtifactBundle, validate_artifact_bundle
+          from alerts.telegram_client import TelegramClient
+          from trading.market_data.feed import MarketDataFeed
 
-          if os.path.exists("scaler.pkl"):
-              scaler = joblib.load("scaler.pkl")
-              print("Scaler features:", getattr(scaler, "n_features_in_", "?"))
-          else:
-              print("scaler.pkl not found - skipping check")
+          print("imports ok", ArtifactBundle.__name__, validate_artifact_bundle.__name__, TelegramClient.__name__, MarketDataFeed.__name__)
           EOF
 
       - name: Run unit tests
         run: |
-          pip install pytest
-          pytest -q --disable-warnings
+          python -m pytest -q --disable-warnings

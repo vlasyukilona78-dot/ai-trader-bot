@@ -67,7 +67,11 @@ class TelegramCheckpointV2Tests(unittest.TestCase):
                     },
                     "layer2_weakness_confirmation": {
                         "passed": False,
-                        "details": {"weakness_strength": 1.0},
+                        "details": {
+                            "weakness_strength": 1.0,
+                            "failed_reclaim": 1.0,
+                            "retest_failed_breakout": 1.0,
+                        },
                     },
                 }
             },
@@ -89,7 +93,7 @@ class TelegramCheckpointV2Tests(unittest.TestCase):
             enriched=self._build_df(),
         )
         self.assertIn("РАННИЙ ШОРТ", caption)
-        self.assertIn("Pump 5.82%", caption)
+        self.assertIn("Pump 7.60%", caption)
         self.assertIn("Режим: testnet", caption)
         self.assertIn("Контекст по монете #SOL", caption)
 
@@ -155,7 +159,7 @@ class TelegramCheckpointV2Tests(unittest.TestCase):
         self.assertEqual(candidate["phase"], "WATCH")
         self.assertIn("РАННИЙ ШОРТ", candidate["caption"])
 
-    def test_early_watch_candidate_allows_sub_confirmed_clean_pump_when_quality_is_good(self):
+    def test_early_watch_candidate_skips_sub_confirmed_clean_pump_even_when_quality_is_good(self):
         df = self._build_df()
         trace = self._trace_meta()
         trace["layer_trace"]["layers"]["layer1_pump_detection"]["details"]["clean_pump_pct"] = 0.044
@@ -175,8 +179,7 @@ class TelegramCheckpointV2Tests(unittest.TestCase):
             enriched=df,
             intent=intent,
         )
-        self.assertIsNotNone(candidate)
-        self.assertEqual(candidate["phase"], "WATCH")
+        self.assertIsNone(candidate)
 
     def test_early_watch_candidate_skips_when_pump_is_still_accelerating(self):
         df = self._build_df()

@@ -37,6 +37,8 @@ class CoinglassLiquidationV2Tests(unittest.TestCase):
         self.assertTrue(any(row["source"] == "coinglass" for row in bands))
         self.assertTrue(any(row["side"] == "above" and float(row["level"]) == 105.0 for row in bands))
         self.assertFalse(any(float(row["level"]) == 110.0 for row in bands))
+        strong_band = next(row for row in bands if float(row["level"]) == 105.0)
+        self.assertEqual(float(strong_band["notional_usdt"]), 140.0)
 
     def test_liquidation_map_uses_coinglass_bands_from_frame_attrs(self):
         idx = pd.date_range("2026-03-01", periods=80, freq="4h", tz="UTC")
@@ -60,12 +62,16 @@ class CoinglassLiquidationV2Tests(unittest.TestCase):
                 "source": "coinglass",
                 "start_ts": int(idx[-12].timestamp()),
                 "end_ts": int(idx[-1].timestamp()),
+                "notional_usdt": 300000.0,
+                "margin_usdt": 42500.0,
             }
         ]
 
         liq_map = build_liquidation_map(frame)
 
         self.assertTrue(any(band.source in {"coinglass", "feed"} for band in liq_map.bands))
+        self.assertTrue(any(band.notional_usdt >= 300000.0 for band in liq_map.bands))
+        self.assertTrue(any(band.margin_usdt >= 42500.0 for band in liq_map.bands))
         self.assertIsNotNone(liq_map.nearest_above_distance_pct)
         self.assertGreater(liq_map.upside_risk, 0.0)
 

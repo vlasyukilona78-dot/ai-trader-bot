@@ -16,6 +16,8 @@ class LiquidationBand:
     end_index: int
     closed_index: int | None = None
     source: str = "synthetic"
+    notional_usdt: float = 0.0
+    margin_usdt: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -212,6 +214,14 @@ def _merge_candidates(
             float(hit["level"]) * float(hit["weight"]) + level * float(candidate["weight"])
         ) / total_weight
         hit["weight"] = total_weight
+        hit["notional_usdt"] = _safe_float(hit.get("notional_usdt"), 0.0) + _safe_float(
+            candidate.get("notional_usdt"),
+            0.0,
+        )
+        hit["margin_usdt"] = _safe_float(hit.get("margin_usdt"), 0.0) + _safe_float(
+            candidate.get("margin_usdt"),
+            0.0,
+        )
         hit["start_index"] = min(int(hit["start_index"]), int(candidate["start_index"]))
         if not _is_feed_source(hit.get("source", "synthetic")) and _is_feed_source(candidate.get("source", "synthetic")):
             hit["source"] = "feed"
@@ -254,6 +264,8 @@ def _merge_candidates(
                     else None
                 ),
                 source=str(item.get("source") or "synthetic"),
+                notional_usdt=_safe_float(item.get("notional_usdt"), 0.0),
+                margin_usdt=_safe_float(item.get("margin_usdt"), 0.0),
             )
         )
     return tuple(out)
@@ -397,6 +409,20 @@ def build_liquidation_map(
         side_raw = str(row.get("side") or "").strip().lower()
         side = side_raw if side_raw in {"above", "below"} else ("above" if level >= close else "below")
         weight = max(_safe_float(row.get("weight"), 2.8), 0.1)
+        notional_usdt = max(
+            _safe_float(row.get("notional_usdt"), 0.0)
+            or _safe_float(row.get("value_sum"), 0.0)
+            or _safe_float(row.get("amount"), 0.0)
+            or _safe_float(row.get("volume_usdt"), 0.0),
+            0.0,
+        )
+        margin_usdt = max(
+            _safe_float(row.get("margin_usdt"), 0.0)
+            or _safe_float(row.get("marginUsd"), 0.0)
+            or _safe_float(row.get("margin_usd"), 0.0)
+            or _safe_float(row.get("margin"), 0.0),
+            0.0,
+        )
         start_index = None
         end_index = None
         if row.get("start_index") is not None:
@@ -436,6 +462,8 @@ def build_liquidation_map(
                 "end_index": closed_index if closed_index is not None else end_index,
                 "closed_index": closed_index,
                 "source": str(row.get("source") or "coinglass"),
+                "notional_usdt": notional_usdt,
+                "margin_usdt": margin_usdt,
             }
         )
 

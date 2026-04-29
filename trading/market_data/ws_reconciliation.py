@@ -73,6 +73,22 @@ class ExchangeSyncService:
             return
         self._snapshot_required_global = True
 
+    def confirm_symbol_flat(self, symbol: str, *, reason: str = "") -> None:
+        """Drop stale websocket/cache position residue after exchange confirms flat state.
+
+        Execution does a direct live-position check before exits. If that check says the
+        exchange is already flat, websocket state can still contain an old position until
+        the next private update. Clearing the local position cache and forcing a poll
+        prevents the next scan from resurrecting the stale SHORT/LONG state.
+        """
+        norm = self._norm_symbol(symbol)
+        if not norm:
+            return
+        self._positions_by_symbol[norm] = []
+        self._polled_snapshots.pop(norm, None)
+        self._last_poll_ts.pop(norm, None)
+        self._require_snapshot(norm)
+
     def _clear_snapshot_requirement(self, symbol: str):
         norm = self._norm_symbol(symbol)
         if norm:
@@ -397,6 +413,7 @@ class ExchangeSyncService:
         if sample_snapshot is not None:
             self._account = sample_snapshot.account
 
+        healed_snapshots: dict[str, ExchangeSnapshot] = {}
         for norm_symbol, snapshot in snapshots.items():
             effective_positions, _ = split_effective_positions(
                 list(snapshot.positions),
@@ -415,8 +432,9 @@ class ExchangeSyncService:
             self._polled_snapshots[norm_symbol] = healed_snapshot
             self._last_poll_ts[norm_symbol] = now
             self._clear_snapshot_requirement(norm_symbol)
+            healed_snapshots[norm_symbol] = healed_snapshot
 
         if self._snapshot_required_global and not self._snapshot_required_symbols:
             self._snapshot_required_global = False
 
-        return snapshots
+        return healed_snapshots
