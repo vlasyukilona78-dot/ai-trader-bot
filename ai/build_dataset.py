@@ -18,6 +18,13 @@ from core.market_regime import detect_market_regime
 from core.volume_profile import compute_volume_profile
 
 
+def _normalize_side(side: str) -> str:
+    normalized = str(side or "SHORT").strip().upper()
+    if normalized not in {"SHORT", "LONG"}:
+        raise ValueError("side must be SHORT or LONG")
+    return normalized
+
+
 def load_ohlcv(path: str) -> pd.DataFrame:
     csv_path = Path(path)
     if not csv_path.exists():
@@ -42,7 +49,70 @@ def load_ohlcv(path: str) -> pd.DataFrame:
     return df.dropna(subset=["open", "high", "low", "close", "volume"])
 
 
-def build_dataset(df: pd.DataFrame, lookahead: int = 24, atr_mult: float = 1.0, rr: float = 2.0) -> pd.DataFrame:
+def _simulate_directional_outcome(
+    *,
+    future: pd.DataFrame,
+    side: str,
+    entry: float,
+    atr: float,
+    atr_mult: float,
+    rr: float,
+    lookahead: int,
+) -> tuple[int, float, float]:
+    stop_distance = max(float(atr) * float(atr_mult), entry * 0.001)
+    if side == "SHORT":
+        stop = entry + stop_distance
+        take_profit = entry - stop_distance * float(rr)
+    else:
+        stop = entry - stop_distance
+        take_profit = entry + stop_distance * float(rr)
+
+    exit_idx = None
+    exit_price = None
+    for j in range(len(future)):
+        hi = float(future.iloc[j]["high"])
+        lo = float(future.iloc[j]["low"])
+        if side == "SHORT":
+            hit_tp = lo <= take_profit
+            hit_sl = hi >= stop
+        else:
+            hit_tp = hi >= take_profit
+            hit_sl = lo <= stop
+
+        if hit_tp and hit_sl:
+            # Conservative bar model: if both levels are touched in one candle, count the stop first.
+            exit_idx = j + 1
+            exit_price = stop
+            break
+        if hit_tp:
+            exit_idx = j + 1
+            exit_price = take_profit
+            break
+        if hit_sl:
+            exit_idx = j + 1
+            exit_price = stop
+            break
+
+    if exit_idx is None:
+        exit_idx = int(lookahead)
+        exit_price = float(future.iloc[-1]["close"])
+
+    if side == "SHORT":
+        pnl = (entry - float(exit_price)) / max(entry, 1e-9)
+    else:
+        pnl = (float(exit_price) - entry) / max(entry, 1e-9)
+    target_win = 1 if pnl > 0 else 0
+    return int(target_win), float(exit_idx), float(pnl)
+
+
+def build_dataset(
+    df: pd.DataFrame,
+    lookahead: int = 24,
+    atr_mult: float = 1.0,
+    rr: float = 2.0,
+    side: str = "SHORT",
+) -> pd.DataFrame:
+    side = _normalize_side(side)
     enriched = compute_indicators(df)
     rows: list[dict] = []
 
@@ -67,34 +137,20 @@ def build_dataset(df: pd.DataFrame, lookahead: int = 24, atr_mult: float = 1.0, 
 
         entry = float(hist.iloc[-1]["close"])
         atr = float(hist.iloc[-1].get("atr", entry * 0.01) or entry * 0.01)
-        sl_long = entry - atr * atr_mult
-        tp_long = entry + (entry - sl_long) * rr
-
-        exit_idx = None
-        exit_price = None
-        for j in range(len(future)):
-            hi = float(future.iloc[j]["high"])
-            lo = float(future.iloc[j]["low"])
-            if hi >= tp_long:
-                exit_idx = j + 1
-                exit_price = tp_long
-                break
-            if lo <= sl_long:
-                exit_idx = j + 1
-                exit_price = sl_long
-                break
-
-        if exit_idx is None:
-            exit_idx = lookahead
-            exit_price = float(future.iloc[-1]["close"])
-
-        pnl = (exit_price - entry) / max(entry, 1e-9)
-        target_win = 1 if pnl > 0 else 0
-        target_horizon = float(exit_idx)
+        target_win, target_horizon, pnl = _simulate_directional_outcome(
+            future=future,
+            side=side,
+            entry=entry,
+            atr=atr,
+            atr_mult=atr_mult,
+            rr=rr,
+            lookahead=lookahead,
+        )
 
         row = {
             "timestamp": hist.index[-1],
             "market_regime": regime.value,
+            "signal_side": side,
             "target_win": target_win,
             "target_horizon": target_horizon,
             "future_return": pnl,
@@ -113,6 +169,7 @@ def parse_args():
     parser.add_argument("--input", required=True, help="Path to OHLCV CSV")
     parser.add_argument("--output", default="data/processed/training_dataset.csv")
     parser.add_argument("--lookahead", type=int, default=24)
+    parser.add_argument("--side", default="SHORT", choices=["SHORT", "LONG"], help="Outcome side to label")
     return parser.parse_args()
 
 
@@ -123,7 +180,7 @@ if __name__ == "__main__":
     except FileNotFoundError as exc:
         raise SystemExit(str(exc))
 
-    dataset = build_dataset(df, lookahead=int(args.lookahead))
+    dataset = build_dataset(df, lookahead=int(args.lookahead), side=str(args.side))
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     dataset.to_csv(out, index=False)

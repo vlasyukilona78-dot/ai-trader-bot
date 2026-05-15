@@ -6,7 +6,7 @@ from ai.train import train_models
 from ai.training.validate import chronological_split, validate_no_feature_leakage
 
 
-def train_with_validation(dataset_path: str, model_dir: str, model_type: str = "auto"):
+def train_with_validation(dataset_path: str, model_dir: str, model_type: str = "auto", side: str | None = "SHORT"):
     df = pd.read_csv(dataset_path)
     validate_no_feature_leakage(df)
     train_df, val_df, test_df = chronological_split(df)
@@ -16,7 +16,7 @@ def train_with_validation(dataset_path: str, model_dir: str, model_type: str = "
     tmp_path = dataset_path + ".train_only.tmp.csv"
     tmp_dataset.to_csv(tmp_path, index=False)
     try:
-        train_models(dataset_path=tmp_path, model_dir=model_dir, model_type=model_type, regime=None)
+        train_models(dataset_path=tmp_path, model_dir=model_dir, model_type=model_type, regime=None, side=side)
     finally:
         import os
 

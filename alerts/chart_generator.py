@@ -9,6 +9,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as path_effects
 from matplotlib.patches import Rectangle
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 import numpy as np
@@ -73,12 +74,12 @@ def _fmt_liquidation_margin_label(
     margin_label = _fmt_compact_notional(margin_usdt)
     if margin_label:
         prefix = "~" if estimated else ""
-        return f"{prefix}{margin_label} margin"
+        return f"{prefix}{margin_label}"
     notional_label = _fmt_compact_notional(notional_usdt)
     if not notional_label:
         return ""
     prefix = "~" if estimated else ""
-    return f"{prefix}{notional_label} margin"
+    return f"{prefix}{notional_label}"
 
 
 def _quote_volume_usdt_series(frame: pd.DataFrame) -> pd.Series:
@@ -316,7 +317,62 @@ def _annotate_level(
         fontsize=font_size,
         color=color,
         zorder=7,
+        path_effects=[path_effects.withStroke(linewidth=2.2, foreground="#20293a", alpha=0.92)],
     )
+
+
+def _draw_entry_plan_levels(ax, x_values, *, entry: float, tp: float, sl: float, side: str):
+    normalized_side = str(side or "").upper()
+    if normalized_side == "SHORT":
+        levels = [
+            ("SL", sl, "#d8688a", 0.00, "bottom"),
+            ("ENTRY", entry, "#9fc6ff", 0.00, "center"),
+            ("TP", tp, "#58c88a", 0.00, "top"),
+        ]
+    else:
+        levels = [
+            ("TP", tp, "#58c88a", 0.00, "bottom"),
+            ("ENTRY", entry, "#9fc6ff", 0.00, "center"),
+            ("SL", sl, "#d8688a", 0.00, "top"),
+        ]
+    xmin, xmax = ax.get_xlim()
+    x_span = max(xmax - xmin, 1e-8)
+    x_right = float(x_values[-1])
+    axis_low, axis_high = ax.get_ylim()
+    y_span = max(float(axis_high) - float(axis_low), 1e-8)
+    seg_end = min(x_right + x_span * 0.010, xmax - x_span * 0.050)
+    seg_start = max(float(x_values[0]), seg_end - x_span * 0.090)
+    min_length = x_span * 0.045
+    if seg_end - seg_start < min_length:
+        seg_start = max(float(x_values[0]), seg_end - min_length)
+
+    for label, value, color, y_offset_mult, va in levels:
+        if value <= 0:
+            continue
+        label_y = float(value) + y_span * float(y_offset_mult)
+        ax.hlines(
+            value,
+            seg_start,
+            seg_end,
+            color=color,
+            linestyle="-",
+            linewidth=1.18 if label == "ENTRY" else 1.05,
+            alpha=0.90 if label == "ENTRY" else 0.82,
+            zorder=6.4,
+        )
+        ax.text(
+            min(seg_end + x_span * 0.008, xmax - x_span * 0.030),
+            label_y,
+            label,
+            ha="left",
+            va=va,
+            fontsize=7.1,
+            color=color,
+            fontweight="bold",
+            alpha=0.92,
+            zorder=7.0,
+            path_effects=[path_effects.withStroke(linewidth=2.2, foreground="#20293a", alpha=0.92)],
+        )
 
 
 def _liquidation_label_x(ax, seg_start: float, seg_end: float) -> float:
@@ -1854,6 +1910,7 @@ def _draw_liquidation_heatmap(ax, x_values, liq_map: LiquidationMap | None, fram
     if not visible_bands:
         return
 
+    placed_labels: list[float] = []
     for rank, band in enumerate(visible_bands):
         start_idx = max(0, min(int(band.start_index), len(x_values) - 1))
         end_idx = max(0, min(int(band.end_index), len(x_values) - 1))
@@ -1883,24 +1940,24 @@ def _draw_liquidation_heatmap(ax, x_values, liq_map: LiquidationMap | None, fram
             continue
 
         if band.side == "above":
-            line_color = "#b86483" if (important and external) else "#9a667f"
-            label_color = "#d7dce8" if important else "#a9b1c2"
-            y_offset = price_span * (0.010 + 0.0025 * (rank % 3))
+            line_color = "#c16b88" if (important and external) else "#9c6a83"
+            label_color = "#e5ebf6" if important else "#a9b1c2"
+            y_offset = price_span * (0.0068 + 0.0017 * (rank % 3))
             va = "bottom"
         else:
-            line_color = "#4c9a72" if (important and external) else "#5f9876"
-            label_color = "#d7dce8" if important else "#a9b1c2"
-            y_offset = -price_span * (0.010 + 0.0025 * (rank % 3))
+            line_color = "#48a978" if (important and external) else "#5f9876"
+            label_color = "#e5ebf6" if important else "#a9b1c2"
+            y_offset = -price_span * (0.0068 + 0.0017 * (rank % 3))
             va = "top"
 
-        line_alpha = 0.76 if important else 0.34
+        line_alpha = 0.86 if important else 0.42
         if is_closed:
-            line_alpha *= 0.62
-            line_color = "#8992a2"
+            line_alpha *= 0.66
+            line_color = "#8a93a4"
 
-        line_width = 0.66 + 0.32 * min(max(float(band.intensity), 0.0), 1.0)
+        line_width = 0.72 + 0.40 * min(max(float(band.intensity), 0.0), 1.0)
         if important:
-            line_width += 0.18
+            line_width += 0.22
         ax.hlines(
             band.level,
             seg_start,
@@ -1913,18 +1970,27 @@ def _draw_liquidation_heatmap(ax, x_values, liq_map: LiquidationMap | None, fram
         )
 
         if margin_label:
-            label_x = min(max(seg_start + x_span * 0.010, x_left + x_span * 0.010), x_right - x_span * 0.070)
+            label_y = band.level + y_offset
+            for previous_level in placed_labels:
+                if abs(previous_level - label_y) <= price_span * 0.014:
+                    label_y += price_span * (0.011 if band.side == "above" else -0.011)
+            placed_labels.append(label_y)
+            label_x = max(
+                x_left + x_span * 0.018,
+                min(_liquidation_label_x(ax, seg_start, seg_end), x_right - x_span * 0.105),
+            )
             ax.text(
                 label_x,
-                band.level + y_offset,
+                label_y,
                 margin_label,
                 ha="left",
                 va=va,
-                fontsize=7.4,
+                fontsize=8.4,
                 color=label_color,
                 fontweight="bold",
-                alpha=0.94 if important else 0.56,
+                alpha=0.98 if important else 0.68,
                 zorder=5.2,
+                path_effects=[path_effects.withStroke(linewidth=2.4, foreground="#20293a", alpha=0.94)],
             )
 
 
@@ -2044,39 +2110,7 @@ def build_signal_chart(
                     length_frac=length_frac,
                 )
     if show_entry_levels and not show_liquidation_map:
-        _annotate_level(
-            ax_price,
-            x_values,
-            entry,
-            "#74a8ff",
-            "ENTRY",
-            linestyle="-",
-            linewidth=1.0,
-            start_frac=0.82,
-            length_frac=0.09,
-        )
-        _annotate_level(
-            ax_price,
-            x_values,
-            tp,
-            "#2dd07f",
-            "TP",
-            linestyle="-",
-            linewidth=1.0,
-            start_frac=0.84,
-            length_frac=0.08,
-        )
-        _annotate_level(
-            ax_price,
-            x_values,
-            sl,
-            "#ff6f8f",
-            "SL",
-            linestyle="-",
-            linewidth=1.0,
-            start_frac=0.80,
-            length_frac=0.10,
-        )
+        _draw_entry_plan_levels(ax_price, x_values, entry=entry, tp=tp, sl=sl, side=side)
 
     if not show_liquidation_map:
         _draw_last_price_marker(ax_price, x_values, float(frame["close"].iloc[-1]))

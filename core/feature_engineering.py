@@ -175,6 +175,8 @@ def assess_feature_frame_quality(
     max_recent_gap_ratio: float = 0.05,
     max_recent_zero_volume_ratio: float = 0.10,
     min_recent_zero_volume_count: int = 3,
+    max_recent_sparse_zero_volume_ratio: float = 0.70,
+    min_recent_nonzero_volume_count: int = 8,
 ) -> dict[str, float | str | bool]:
     report: dict[str, float | str | bool] = {
         "usable": True,
@@ -188,6 +190,8 @@ def assess_feature_frame_quality(
         "total_severe_gap_count": 0.0,
         "recent_zero_volume_count": 0.0,
         "recent_zero_volume_ratio": 0.0,
+        "recent_trailing_zero_volume_count": 0.0,
+        "recent_nonzero_volume_count": 0.0,
     }
     if df.empty or len(df.index) < 3:
         report["usable"] = False
@@ -234,11 +238,19 @@ def assess_feature_frame_quality(
     if "volume" in recent_frame.columns:
         recent_volume = pd.to_numeric(recent_frame["volume"], errors="coerce").fillna(0.0)
         recent_zero_volume_count = int((recent_volume <= 0.0).sum())
+        recent_nonzero_volume_count = int((recent_volume > 0.0).sum())
         recent_zero_volume_ratio = (
             float(recent_zero_volume_count / len(recent_volume)) if len(recent_volume) > 0 else 0.0
         )
+        trailing_zero_volume_count = 0
+        for value in reversed(recent_volume.tolist()):
+            if float(value) > 0.0:
+                break
+            trailing_zero_volume_count += 1
         report["recent_zero_volume_count"] = float(recent_zero_volume_count)
         report["recent_zero_volume_ratio"] = recent_zero_volume_ratio
+        report["recent_trailing_zero_volume_count"] = float(trailing_zero_volume_count)
+        report["recent_nonzero_volume_count"] = float(recent_nonzero_volume_count)
 
     if latest_gap_seconds >= severe_gap_threshold:
         report["usable"] = False
@@ -246,9 +258,12 @@ def assess_feature_frame_quality(
     elif recent_severe_count >= 2 or recent_gap_ratio > float(max_recent_gap_ratio):
         report["usable"] = False
         report["reason"] = "recent_gap_cluster"
+    elif float(report.get("recent_trailing_zero_volume_count", 0.0) or 0.0) >= float(min_recent_zero_volume_count):
+        report["usable"] = False
+        report["reason"] = "recent_zero_volume_cluster"
     elif (
-        float(report.get("recent_zero_volume_ratio", 0.0) or 0.0) > float(max_recent_zero_volume_ratio)
-        and float(report.get("recent_zero_volume_count", 0.0) or 0.0) >= float(min_recent_zero_volume_count)
+        float(report.get("recent_zero_volume_ratio", 0.0) or 0.0) >= float(max_recent_sparse_zero_volume_ratio)
+        and float(report.get("recent_nonzero_volume_count", 0.0) or 0.0) < float(min_recent_nonzero_volume_count)
     ):
         report["usable"] = False
         report["reason"] = "recent_zero_volume_cluster"

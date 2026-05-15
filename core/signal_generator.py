@@ -98,9 +98,14 @@ class SignalConfig:
     managed_exit_time_decay_max_reward_r: float = 0.12
     managed_exit_stagnation_min_hold_minutes: float = 14.0
     managed_exit_stagnation_max_reward_r: float = 0.15
+    managed_exit_micro_fail_min_hold_minutes: float = 2.0
+    managed_exit_micro_fail_max_best_r: float = 0.12
+    managed_exit_micro_fail_min_adverse_r: float = 0.025
     managed_exit_target_zone_min_reward_r: float = 0.32
     managed_exit_profit_reclaim_min_reward_r: float = 0.85
     managed_exit_reclaim_invalidation_min_reward_r: float = 0.15
+    protective_take_profit_min_rr: float = 0.55
+    protective_take_profit_prefer_first_target: bool = True
 
 
 @dataclass
@@ -1976,7 +1981,8 @@ class SignalGenerator:
 
         atr_sl = max(float(self.config.atr_sl_mult), 0.0)
         rr = max(float(self.config.risk_reward), 0.1)
-        rr_floor = 0.02
+        protective_min_rr = max(0.05, min(float(self.config.protective_take_profit_min_rr), rr * 0.75))
+        rr_floor = max(0.20, protective_min_rr)
         tol = max(float(self.config.entry_tolerance_pct), 0.0)
         base_inv = entry + atr * max(atr_sl * 0.92, 0.98)
         inv_ref = base_inv
@@ -2175,12 +2181,17 @@ class SignalGenerator:
                 final_tp = tp1
                 final_tp_ref = str(tp1_ref or tp_ref)
         else:
-            if tp2 > 0:
+            if bool(self.config.protective_take_profit_prefer_first_target) and tp1 > 0 and tp1_rr >= protective_min_rr:
+                final_tp = tp1
+                final_tp_ref = str(tp1_ref or tp_ref)
+            elif tp2 > 0:
                 final_tp = tp2
                 final_tp_ref = str(tp2_ref or tp_ref)
             elif tp1 > 0:
                 final_tp = tp1
                 final_tp_ref = str(tp1_ref or tp_ref)
+        if final_tp_ref not in {"rr_projection", "rr_tp1"}:
+            fallback_rr = False
         final_tp, sl = self._normalize_levels(entry=entry, tp=final_tp, sl=sl, side="SHORT")
         stop_pct = (sl - entry) / max(entry, 1e-9)
         tp_pct = (entry - final_tp) / max(entry, 1e-9)
@@ -2229,6 +2240,7 @@ class SignalGenerator:
             "stop_distance_pct": float(stop_pct),
             "take_profit_distance_pct": float(tp_pct),
             "risk_reward_ratio": float(rr_val),
+            "protective_take_profit_min_rr": float(protective_min_rr),
             "missing_conditions": ",".join(missing),
             "failed_reason": "none" if passed else f"missing:{','.join(missing)}",
             "tp_sl_strength": float(strength),

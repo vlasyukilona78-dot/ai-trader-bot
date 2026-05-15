@@ -48,6 +48,14 @@ class _FakeMarketDataClient:
         self.derivative_calls += 1
         return 123456.0
 
+    def fetch_open_interest_context(self, symbol: str) -> dict[str, float]:
+        self.derivative_calls += 1
+        return {
+            "open_interest": 123456.0,
+            "open_interest_ratio": 1.42,
+            "oi_signal": 1.42,
+        }
+
 
 class MarketDataFeedV2Tests(unittest.TestCase):
     def _feed(self, client: _FakeMarketDataClient) -> MarketDataFeed:
@@ -78,20 +86,63 @@ class MarketDataFeedV2Tests(unittest.TestCase):
         payload = frame.runtime_payload or {}
         self.assertEqual(payload.get("long_short_ratio"), 1.37)
         self.assertEqual(payload.get("long_short_ratio_source"), "live:bybit:account-ratio")
+        self.assertEqual(payload.get("open_interest"), 123456.0)
+        self.assertEqual(payload.get("open_interest_source"), "live:bybit:open-interest")
+        self.assertEqual(payload.get("open_interest_ratio"), 1.42)
+        self.assertEqual(payload.get("oi_signal"), 1.42)
+        self.assertEqual(payload.get("oi_source"), "live:bybit:open-interest")
+        self.assertEqual(payload.get("oi_degraded"), False)
         self.assertEqual(payload.get("open_interest_abs"), 123456.0)
         self.assertEqual(payload.get("open_interest_abs_source"), "live:bybit:open-interest")
-        self.assertNotIn("open_interest", payload)
+        self.assertEqual(client.derivative_calls, 2)
+
+    def test_fetch_frame_force_derivatives_for_final_candidate_refresh(self):
+        client = _FakeMarketDataClient()
+        with patch.dict(os.environ, {"MARKETDATA_FETCH_DERIVATIVE_CONTEXT": "0"}, clear=False):
+            frame = self._feed(client).fetch_frame("TESTUSDT", "1", 3, include_derivatives=True)
+
+        payload = frame.runtime_payload or {}
+        self.assertEqual(payload.get("long_short_ratio"), 1.37)
+        self.assertEqual(payload.get("open_interest_abs"), 123456.0)
         self.assertEqual(client.derivative_calls, 2)
 
     def test_runtime_source_adapter_preserves_market_quality_payload_for_risk(self):
         client = _FakeMarketDataClient()
-        frame = self._feed(client).fetch_frame("TESTUSDT", "1", 3)
+        frame = self._feed(client).fetch_frame("TESTUSDT", "1", 3, include_derivatives=True)
 
         runtime_inputs = build_runtime_signal_inputs(frame.ohlcv, runtime_payload=frame.runtime_payload)
 
         self.assertEqual(runtime_inputs.get("turnover24h_usdt"), 2500000.0)
         self.assertEqual(runtime_inputs.get("volume24h"), 150000.0)
+        self.assertEqual(runtime_inputs.get("open_interest"), 123456.0)
+        self.assertEqual(runtime_inputs.get("open_interest_ratio"), 1.42)
+        self.assertEqual(runtime_inputs.get("oi_signal"), 1.42)
         self.assertAlmostEqual(float(runtime_inputs.get("spread_bps")), 19.39864209505)
+
+    def test_explicit_live_overlay_without_append_never_adds_zero_volume_bucket(self):
+        last_ts = pd.Timestamp.now("UTC").floor("1min") - pd.Timedelta(minutes=10)
+        index = pd.date_range(last_ts - pd.Timedelta(minutes=2), periods=3, freq="1min", tz="UTC")
+        ohlcv = pd.DataFrame(
+            {
+                "open": [1.0, 1.01, 1.02],
+                "high": [1.02, 1.03, 1.04],
+                "low": [0.99, 1.0, 1.01],
+                "close": [1.01, 1.02, 1.03],
+                "volume": [10.0, 12.0, 14.0],
+            },
+            index=index,
+        )
+
+        updated = MarketDataFeed._overlay_live_price_to_ohlcv(
+            ohlcv,
+            mark_price=1.07,
+            timeframe="1",
+            append_new_bucket=False,
+        )
+
+        self.assertEqual(len(updated), len(ohlcv))
+        self.assertEqual(updated.index[-1], ohlcv.index[-1])
+        self.assertGreater(float(updated["volume"].tail(3).min()), 0.0)
 
 
 if __name__ == "__main__":

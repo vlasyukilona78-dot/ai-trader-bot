@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from trading.execution.idempotency import IdempotencyStore
 from trading.execution.order_validator import OrderValidationError, validate_order_intent
-from trading.exchange.schemas import OpenOrderSnapshot, OrderIntent, OrderResult, OrderSide, PositionSide, PositionSnapshot
+from trading.exchange.schemas import OpenOrderSnapshot, OrderBookQuality, OrderIntent, OrderResult, OrderSide, PositionSide, PositionSnapshot
 from trading.market_data.reconciliation import ExchangeSnapshot
 from trading.portfolio.positions import first_effective_position_for_symbol
 from trading.risk.engine import RiskDecision
@@ -52,6 +52,12 @@ class ExecutionEngine:
         stale_open_order_sec: int = 120,
         max_exchange_retries: int = 2,
         external_recovery_grace_sec: int = 45,
+        entry_orderbook_guard_enabled: bool = True,
+        entry_orderbook_guard_require_live: bool = False,
+        entry_orderbook_limit: int = 50,
+        entry_orderbook_depth_slippage_bps: float = 35.0,
+        max_entry_orderbook_slippage_bps: float = 45.0,
+        min_entry_orderbook_depth_ratio: float = 1.15,
         persistence: RuntimeStore | None = None,
     ):
         self.adapter = adapter
@@ -63,6 +69,12 @@ class ExecutionEngine:
         self.stale_open_order_sec = max(10, int(stale_open_order_sec))
         self.max_exchange_retries = max(1, int(max_exchange_retries))
         self.external_recovery_grace_sec = max(10, int(external_recovery_grace_sec))
+        self.entry_orderbook_guard_enabled = bool(entry_orderbook_guard_enabled)
+        self.entry_orderbook_guard_require_live = bool(entry_orderbook_guard_require_live)
+        self.entry_orderbook_limit = max(1, int(entry_orderbook_limit))
+        self.entry_orderbook_depth_slippage_bps = max(0.0, float(entry_orderbook_depth_slippage_bps))
+        self.max_entry_orderbook_slippage_bps = max(0.0, float(max_entry_orderbook_slippage_bps))
+        self.min_entry_orderbook_depth_ratio = max(0.0, float(min_entry_orderbook_depth_ratio))
         self.persistence = persistence
         self._lock = threading.Lock()
         self._idempotency = IdempotencyStore(ttl_sec=idempotency_ttl_sec)
@@ -387,6 +399,62 @@ class ExecutionEngine:
             if last.success:
                 return last
         return last
+
+    def _entry_orderbook_guard(self, order_intent: OrderIntent) -> tuple[bool, str, dict[str, Any]]:
+        if not self.entry_orderbook_guard_enabled:
+            return True, "disabled", {}
+        quality_fn = getattr(self.adapter, "get_orderbook_quality", None)
+        if not callable(quality_fn):
+            return True, "adapter_no_orderbook_quality", {}
+
+        try:
+            quality = quality_fn(
+                order_intent.symbol,
+                order_intent.side,
+                float(order_intent.qty),
+                limit=self.entry_orderbook_limit,
+                depth_slippage_bps=self.entry_orderbook_depth_slippage_bps,
+            )
+        except Exception as exc:
+            if self.entry_orderbook_guard_require_live:
+                return False, "orderbook_unavailable", {"error": str(exc)}
+            logger.warning("entry_orderbook_guard unavailable symbol=%s error=%s", order_intent.symbol, exc)
+            return True, "orderbook_unavailable_soft_pass", {"error": str(exc)}
+
+        raw = self._orderbook_quality_raw(quality)
+        if not bool(getattr(quality, "available", False)):
+            if self.entry_orderbook_guard_require_live:
+                return False, "orderbook_unavailable", raw
+            return True, "orderbook_unavailable_soft_pass", raw
+
+        max_slippage = self.max_entry_orderbook_slippage_bps
+        if max_slippage > 0.0 and float(quality.expected_slippage_bps) > max_slippage:
+            return False, "orderbook_slippage_too_high", raw
+
+        min_depth_ratio = self.min_entry_orderbook_depth_ratio
+        if min_depth_ratio > 0.0 and float(quality.depth_ratio) < min_depth_ratio:
+            return False, "orderbook_depth_too_thin", raw
+
+        return True, "ok", raw
+
+    @staticmethod
+    def _orderbook_quality_raw(quality: OrderBookQuality) -> dict[str, Any]:
+        return {
+            "symbol": str(quality.symbol),
+            "side": str(quality.side.value if hasattr(quality.side, "value") else quality.side),
+            "requested_qty": float(quality.requested_qty),
+            "requested_notional_usdt": float(quality.requested_notional_usdt),
+            "executable_qty": float(quality.executable_qty),
+            "executable_notional_usdt": float(quality.executable_notional_usdt),
+            "depth_ratio": float(quality.depth_ratio),
+            "best_bid": float(quality.best_bid),
+            "best_ask": float(quality.best_ask),
+            "spread_bps": float(quality.spread_bps),
+            "expected_avg_price": float(quality.expected_avg_price),
+            "expected_slippage_bps": float(quality.expected_slippage_bps),
+            "levels_used": int(quality.levels_used),
+            "available": bool(quality.available),
+        }
 
     def _set_stop_with_retry(
         self,
@@ -912,6 +980,24 @@ class ExecutionEngine:
                         status="validation_failed",
                     )
                     return ExecutionOutcome(accepted=False, status="REJECTED", reason=f"order_validation:{refreshed_reason}")
+
+            guard_ok, guard_reason, guard_raw = self._entry_orderbook_guard(order_intent)
+            if guard_raw:
+                payload["orderbook_quality"] = guard_raw
+            if not guard_ok:
+                self._persist_intent_status(
+                    intent_key=intent_key,
+                    symbol=norm_symbol,
+                    action=intent.action,
+                    payload=payload,
+                    status="orderbook_guard_failed",
+                )
+                return ExecutionOutcome(
+                    accepted=False,
+                    status="REJECTED",
+                    reason=guard_reason,
+                    raw={"orderbook_quality": guard_raw},
+                )
 
             pending_state = TradeState.PENDING_ENTRY_LONG if pos_side == PositionSide.LONG else TradeState.PENDING_ENTRY_SHORT
             self.state_machine.transition(norm_symbol, pending_state, "entry_order_submitted")

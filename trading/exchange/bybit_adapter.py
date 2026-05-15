@@ -12,9 +12,11 @@ from .bybit_client import BybitHttpClient
 from .bybit_ws import BybitWebSocketConfig, BybitWebSocketStream
 from .schemas import (
     AccountSnapshot,
+    ClosedPnlSnapshot,
     InstrumentRules,
     OpenOrderSnapshot,
     OrderIntent,
+    OrderBookQuality,
     OrderResult,
     OrderSide,
     PositionSide,
@@ -33,6 +35,24 @@ class ExchangeAdapter(Protocol):
     def get_open_orders(self, symbol: str | None = None) -> list[OpenOrderSnapshot]: ...
 
     def get_mark_price(self, symbol: str) -> float: ...
+
+    def get_recent_closed_pnl(
+        self,
+        symbol: str,
+        *,
+        limit: int = 20,
+        start_time_ms: int | None = None,
+    ) -> list[ClosedPnlSnapshot]: ...
+
+    def get_orderbook_quality(
+        self,
+        symbol: str,
+        side: OrderSide,
+        qty: float,
+        *,
+        limit: int = 50,
+        depth_slippage_bps: float = 35.0,
+    ) -> OrderBookQuality: ...
 
     def get_instrument_rules(self, symbol: str) -> InstrumentRules: ...
 
@@ -420,6 +440,179 @@ class BybitAdapter:
             if val > 0:
                 return val
         return 0.0
+
+    @classmethod
+    def _closed_pnl_id(cls, symbol: str, row: dict[str, Any]) -> str:
+        order_id = str(row.get("orderId") or row.get("orderID") or "").strip()
+        if order_id:
+            return f"{symbol}:{order_id}"
+        updated = str(row.get("updatedTime") or row.get("createdTime") or "").strip()
+        qty = str(row.get("qty") or row.get("closedSize") or "").strip()
+        pnl = str(row.get("closedPnl") or row.get("closedPNL") or "").strip()
+        entry = str(row.get("avgEntryPrice") or row.get("avgEntryPx") or "").strip()
+        exit_px = str(row.get("avgExitPrice") or row.get("avgExitPx") or "").strip()
+        return f"{symbol}:{updated}:{qty}:{pnl}:{entry}:{exit_px}"
+
+    @classmethod
+    def _extract_closed_pnl_snapshots(cls, symbol: str, payload: dict[str, Any] | None) -> list[ClosedPnlSnapshot]:
+        norm = cls.normalize_symbol(symbol)
+        result = payload.get("result", {}) if isinstance(payload, dict) else {}
+        rows = result.get("list", []) if isinstance(result, dict) else []
+        out: list[ClosedPnlSnapshot] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_symbol = cls.normalize_symbol(str(row.get("symbol") or norm))
+            if row_symbol != norm:
+                continue
+            raw_side = str(row.get("side") or row.get("positionSide") or "").upper().strip()
+            position_side = PositionSide.LONG if raw_side in ("BUY", "LONG") else PositionSide.SHORT
+            closed_ts_ms = cls._safe_float(row.get("updatedTime"), 0.0)
+            if closed_ts_ms <= 0.0:
+                closed_ts_ms = cls._safe_float(row.get("createdTime"), 0.0)
+            out.append(
+                ClosedPnlSnapshot(
+                    closure_id=cls._closed_pnl_id(norm, row),
+                    symbol=norm,
+                    position_side=position_side,
+                    qty=max(
+                        cls._safe_float(row.get("qty"), 0.0),
+                        cls._safe_float(row.get("closedSize"), 0.0),
+                        0.0,
+                    ),
+                    entry_price=cls._safe_float(row.get("avgEntryPrice"), 0.0),
+                    exit_price=cls._safe_float(row.get("avgExitPrice"), 0.0),
+                    closed_pnl=cls._safe_float(row.get("closedPnl"), 0.0),
+                    closed_ts=(closed_ts_ms / 1000.0) if closed_ts_ms > 10_000_000_000 else closed_ts_ms,
+                    raw=dict(row),
+                )
+            )
+        return sorted(out, key=lambda item: item.closed_ts, reverse=True)
+
+    def get_recent_closed_pnl(
+        self,
+        symbol: str,
+        *,
+        limit: int = 20,
+        start_time_ms: int | None = None,
+    ) -> list[ClosedPnlSnapshot]:
+        norm = self.normalize_symbol(symbol)
+        payload = self.client.get_closed_pnl(
+            norm,
+            limit=max(1, min(int(limit or 20), 100)),
+            start_time_ms=start_time_ms,
+        )
+        return self._extract_closed_pnl_snapshots(norm, payload)
+
+    @classmethod
+    def _parse_book_levels(cls, rows: Any) -> list[tuple[float, float]]:
+        levels: list[tuple[float, float]] = []
+        if not isinstance(rows, list):
+            return levels
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                continue
+            price = cls._safe_float(row[0], 0.0)
+            qty = cls._safe_float(row[1], 0.0)
+            if price > 0.0 and qty > 0.0:
+                levels.append((price, qty))
+        return levels
+
+    def get_orderbook_quality(
+        self,
+        symbol: str,
+        side: OrderSide,
+        qty: float,
+        *,
+        limit: int = 50,
+        depth_slippage_bps: float = 35.0,
+    ) -> OrderBookQuality:
+        norm = self.normalize_symbol(symbol)
+        requested_qty = max(0.0, float(qty or 0.0))
+        payload = self.client.get_orderbook(norm, limit=max(1, min(int(limit or 50), 200)))
+        result = payload.get("result", {}) if isinstance(payload, dict) else {}
+        bids = self._parse_book_levels(result.get("b") if isinstance(result, dict) else None)
+        asks = self._parse_book_levels(result.get("a") if isinstance(result, dict) else None)
+
+        best_bid = bids[0][0] if bids else 0.0
+        best_ask = asks[0][0] if asks else 0.0
+        mid = (best_bid + best_ask) / 2.0 if best_bid > 0.0 and best_ask > 0.0 else 0.0
+        spread_bps = ((best_ask - best_bid) / mid * 10_000.0) if mid > 0.0 and best_ask >= best_bid else 0.0
+
+        book_side = asks if side == OrderSide.BUY else bids
+        best_price = best_ask if side == OrderSide.BUY else best_bid
+        if requested_qty <= 0.0 or best_price <= 0.0 or not book_side:
+            return OrderBookQuality(
+                symbol=norm,
+                side=side,
+                requested_qty=requested_qty,
+                requested_notional_usdt=0.0,
+                executable_qty=0.0,
+                executable_notional_usdt=0.0,
+                depth_ratio=0.0,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                spread_bps=spread_bps,
+                expected_avg_price=0.0,
+                expected_slippage_bps=0.0,
+                levels_used=0,
+                available=False,
+            )
+
+        max_depth_slippage = max(0.0, float(depth_slippage_bps or 0.0))
+        total_qty = 0.0
+        total_notional = 0.0
+        executable_qty = 0.0
+        executable_notional = 0.0
+        levels_used = 0
+
+        for price, level_qty in book_side:
+            level_slippage_bps = (
+                ((price - best_price) / best_price) * 10_000.0
+                if side == OrderSide.BUY
+                else ((best_price - price) / best_price) * 10_000.0
+            )
+            if level_slippage_bps <= max_depth_slippage:
+                executable_qty += level_qty
+                executable_notional += level_qty * price
+
+            if total_qty < requested_qty:
+                consume_qty = min(level_qty, requested_qty - total_qty)
+                total_qty += consume_qty
+                total_notional += consume_qty * price
+                levels_used += 1
+
+            if total_qty >= requested_qty and level_slippage_bps > max_depth_slippage:
+                break
+
+        full_fill_available = total_qty + 1e-12 >= requested_qty
+        avg_price = (total_notional / total_qty) if total_qty > 0.0 else 0.0
+        expected_slippage_bps = 9999.0
+        if full_fill_available and avg_price > 0.0:
+            expected_slippage_bps = (
+                ((avg_price - best_price) / best_price) * 10_000.0
+                if side == OrderSide.BUY
+                else ((best_price - avg_price) / best_price) * 10_000.0
+            )
+            expected_slippage_bps = max(0.0, expected_slippage_bps)
+
+        requested_notional = requested_qty * best_price
+        return OrderBookQuality(
+            symbol=norm,
+            side=side,
+            requested_qty=requested_qty,
+            requested_notional_usdt=requested_notional,
+            executable_qty=executable_qty,
+            executable_notional_usdt=executable_notional,
+            depth_ratio=(executable_qty / requested_qty) if requested_qty > 0.0 else 0.0,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            spread_bps=spread_bps,
+            expected_avg_price=avg_price,
+            expected_slippage_bps=expected_slippage_bps,
+            levels_used=levels_used,
+            available=True,
+        )
 
     def get_instrument_rules(self, symbol: str, *, force_refresh: bool = False) -> InstrumentRules:
         norm = self.normalize_symbol(symbol)

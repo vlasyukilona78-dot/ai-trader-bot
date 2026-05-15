@@ -1,9 +1,9 @@
 {
   "version": "default",
-  "created_at": "2026-04-25T07:44:47.879244+00:00",
+  "created_at": "2026-05-10T02:26:40.927421+00:00",
   "model_type": "xgboost",
   "dataset_path": "data\\processed\\online_training_dataset_early.csv",
-  "rows": 1151,
+  "rows": 1651,
   "feature_names": [
     "rsi",
     "ema20",
@@ -35,5 +35,16 @@
     "mtf_trend_5m",
     "mtf_trend_15m"
   ],
-  "feature_schema_hash": "b69bd69e0d897aae970df2133ad00b12ad60a001d0cd44bc7578f160d12de0ca"
+  "feature_schema_hash": "b69bd69e0d897aae970df2133ad00b12ad60a001d0cd44bc7578f160d12de0ca",
+  "metrics": {
+    "train_rows": 1320,
+    "test_rows": 331,
+    "target_win_rate": 0.2628709872804361,
+    "test_auc": 0.5349067269643866,
+    "test_horizon_mae": 7.517788646444453,
+    "test_horizon_r2": -0.04029221603971256,
+    "walk_forward_auc_mean": 0.5389939782853006,
+    "walk_forward_folds": 5,
+    "calibrator_fitted": true
+  }
 }

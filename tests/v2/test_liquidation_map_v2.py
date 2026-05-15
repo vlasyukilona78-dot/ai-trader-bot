@@ -84,9 +84,9 @@ class LiquidationMapV2Tests(unittest.TestCase):
         self.assertEqual(_fmt_compact_notional(77000.0), "77K")
         self.assertEqual(_fmt_compact_notional(2_000_000.0), "2M")
         self.assertEqual(_fmt_compact_notional(1_250_000.0), "1.2M")
-        self.assertEqual(_fmt_liquidation_margin_label(margin_usdt=12_500.0, notional_usdt=77_000.0), "12K margin")
-        self.assertEqual(_fmt_liquidation_margin_label(notional_usdt=77_000.0), "77K margin")
-        self.assertEqual(_fmt_liquidation_margin_label(margin_usdt=77_000.0, estimated=True), "~77K margin")
+        self.assertEqual(_fmt_liquidation_margin_label(margin_usdt=12_500.0, notional_usdt=77_000.0), "12K")
+        self.assertEqual(_fmt_liquidation_margin_label(notional_usdt=77_000.0), "77K")
+        self.assertEqual(_fmt_liquidation_margin_label(margin_usdt=77_000.0, estimated=True), "~77K")
 
     def test_chart_estimates_missing_liquidation_margin_labels_from_volume(self):
         df = self._build_df()

@@ -22,6 +22,7 @@ class OnlineRetrainConfig:
     model_dir: str = "ai/models"
     retrain_interval_sec: int = 6 * 3600
     min_new_rows: int = 100
+    side: str | None = "SHORT"
 
 
 class OnlineRetrainer:
@@ -39,6 +40,21 @@ class OnlineRetrainer:
         except Exception:
             return 0
 
+    def _ensure_side_column(self) -> None:
+        side = str(self.config.side or "").strip().upper()
+        if not side:
+            return
+        if not os.path.exists(self.config.dataset_path):
+            return
+        try:
+            df = pd.read_csv(self.config.dataset_path)
+        except Exception:
+            return
+        if df.empty or "signal_side" in df.columns:
+            return
+        df["signal_side"] = side
+        df.to_csv(self.config.dataset_path, index=False)
+
     def maybe_retrain(self, model_type: str = "auto") -> bool:
         now = time.time()
         rows = self._row_count()
@@ -53,11 +69,13 @@ class OnlineRetrainer:
             return False
 
         try:
+            self._ensure_side_column()
             train_models(
                 dataset_path=self.config.dataset_path,
                 model_dir=self.config.model_dir,
                 model_type=model_type,
                 regime=None,
+                side=self.config.side,
             )
         except Exception:
             return False

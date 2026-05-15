@@ -7,6 +7,7 @@ import pandas as pd
 
 from alerts.chart_generator import build_signal_chart
 from app.main import _build_early_watch_candidate
+from app.main import _build_ultra_early_candidate
 from core.liquidation_map import build_liquidation_map
 from core.volume_profile import VolumeProfileLevels
 from trading.signals.signal_types import IntentAction, StrategyIntent
@@ -149,6 +150,44 @@ class LiquidationChartRuntimeTests(unittest.TestCase):
         )
         self.assertIsNotNone(candidate)
         self.assertIn("WATCH", str(candidate["phase"]))
+
+    def test_ultra_early_candidate_requires_level_hit_and_first_weakness(self):
+        df = self._build_df()
+        df.iloc[-2, df.columns.get_loc("rsi")] = 76.0
+        df.iloc[-1, df.columns.get_loc("rsi")] = 72.0
+        df.iloc[-2, df.columns.get_loc("hist")] = 0.030
+        df.iloc[-1, df.columns.get_loc("hist")] = 0.012
+        df.iloc[-1, df.columns.get_loc("volume_spike")] = 1.45
+        df.attrs["coinglass_liquidation_bands"] = [
+            {
+                "level": float(df.iloc[-1]["high"]) * 0.998,
+                "weight": 5.0,
+                "side": "above",
+                "source": "coinglass",
+                "start_ts": int(df.index[-14].timestamp()),
+                "end_ts": int(df.index[-1].timestamp()),
+                "notional_usdt": 724_000.0,
+            }
+        ]
+        intent = StrategyIntent(
+            symbol="SUIUSDT",
+            action=IntentAction.HOLD,
+            reason="ultra_watch_scan",
+            metadata=self._trace_meta(),
+        )
+
+        candidate = _build_ultra_early_candidate(
+            symbol="SUIUSDT",
+            timeframe="1",
+            mode="demo",
+            enriched=df,
+            intent=intent,
+        )
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate["phase"], "ULTRA")
+        self.assertLess(float(candidate["tp"]), float(candidate["entry"]))
+        self.assertGreater(float(candidate["sl"]), float(candidate["entry"]))
 
 
 if __name__ == "__main__":

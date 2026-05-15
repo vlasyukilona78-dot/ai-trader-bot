@@ -38,4 +38,17 @@ jobs:
 
       - name: Run unit tests
         run: |
-          python -m pytest -q --disable-warnings
+          mkdir -p reports
+          python -m pytest -q tests --disable-warnings --junitxml=reports/pytest.xml
+
+      - name: Run V2 safety suite
+        run: |
+          mkdir -p reports
+          python -m pytest -q tests/v2 --disable-warnings --junitxml=reports/pytest-v2.xml
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-reports
+          path: reports/*.xml

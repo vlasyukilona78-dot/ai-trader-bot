@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from core.feature_engineering import FeatureRow, build_feature_row, sanitize_feature_frame
+from core.feature_engineering import FeatureRow, assess_feature_frame_quality, build_feature_row, sanitize_feature_frame
 from core.indicators import compute_indicators
 from core.market_regime import detect_market_regime
 from core.volume_profile import compute_volume_profile
@@ -32,6 +32,14 @@ class FeaturePipeline:
             raise ValueError("insufficient_history")
 
         enriched = sanitize_feature_frame(compute_indicators(hist))
+        try:
+            enriched.attrs.update(getattr(hist, "attrs", {}) or {})
+        except Exception:
+            pass
+        quality = assess_feature_frame_quality(enriched)
+        if not bool(quality.get("usable", True)):
+            reason = str(quality.get("reason") or "blocked")
+            raise ValueError(f"feature_frame_quality:{reason}")
         vp = compute_volume_profile(enriched, window=self.profile_window, bins=self.profile_bins)
         regime = detect_market_regime(enriched)
 

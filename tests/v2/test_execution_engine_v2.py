@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 from tests.v2.fakes import FakeAdapter
 from trading.execution.engine import ExecutionEngine
-from trading.exchange.schemas import OpenOrderSnapshot, OrderResult, OrderSide, PositionSide, PositionSnapshot
+from trading.exchange.schemas import OpenOrderSnapshot, OrderBookQuality, OrderResult, OrderSide, PositionSide, PositionSnapshot
 from trading.market_data.reconciliation import ExchangeSnapshot
 from trading.risk.engine import RiskDecision
 from trading.signals.signal_types import IntentAction, StrategyIntent
@@ -450,6 +450,68 @@ class ExecutionEngineV2Tests(unittest.TestCase):
 
         self.assertTrue(out.accepted)
         self.assertEqual(out.status, "FILLED")
+
+    def test_entry_rejected_when_orderbook_slippage_is_too_high(self):
+        self.adapter.orderbook_quality = OrderBookQuality(
+            symbol="BTCUSDT",
+            side=OrderSide.SELL,
+            requested_qty=1.0,
+            requested_notional_usdt=100.0,
+            executable_qty=2.0,
+            executable_notional_usdt=200.0,
+            depth_ratio=2.0,
+            best_bid=100.0,
+            best_ask=100.1,
+            spread_bps=10.0,
+            expected_avg_price=99.0,
+            expected_slippage_bps=80.0,
+            levels_used=4,
+            available=True,
+        )
+        self.sm.transition("BTCUSDT", TradeState.FLAT, "init")
+        intent = StrategyIntent(symbol="BTCUSDT", action=IntentAction.SHORT_ENTRY, reason="x", stop_loss=101.0, take_profit=97.0)
+
+        out = self.exec.execute(
+            intent=intent,
+            risk=RiskDecision(approved=True, reason="ok", quantity=1.0),
+            snapshot=self._snapshot("BTCUSDT"),
+            mark_price=100.0,
+        )
+
+        self.assertFalse(out.accepted)
+        self.assertEqual(out.reason, "orderbook_slippage_too_high")
+        self.assertEqual(self.adapter.placed_orders, [])
+
+    def test_entry_rejected_when_orderbook_depth_is_too_thin(self):
+        self.adapter.orderbook_quality = OrderBookQuality(
+            symbol="BTCUSDT",
+            side=OrderSide.BUY,
+            requested_qty=1.0,
+            requested_notional_usdt=100.0,
+            executable_qty=0.4,
+            executable_notional_usdt=40.0,
+            depth_ratio=0.4,
+            best_bid=99.9,
+            best_ask=100.0,
+            spread_bps=10.0,
+            expected_avg_price=100.1,
+            expected_slippage_bps=5.0,
+            levels_used=2,
+            available=True,
+        )
+        self.sm.transition("BTCUSDT", TradeState.FLAT, "init")
+        intent = StrategyIntent(symbol="BTCUSDT", action=IntentAction.LONG_ENTRY, reason="x", stop_loss=99.0, take_profit=103.0)
+
+        out = self.exec.execute(
+            intent=intent,
+            risk=RiskDecision(approved=True, reason="ok", quantity=1.0),
+            snapshot=self._snapshot("BTCUSDT"),
+            mark_price=100.0,
+        )
+
+        self.assertFalse(out.accepted)
+        self.assertEqual(out.reason, "orderbook_depth_too_thin")
+        self.assertEqual(self.adapter.placed_orders, [])
 
 
 if __name__ == "__main__":

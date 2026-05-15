@@ -65,6 +65,36 @@ class BybitAdapterV2Tests(unittest.TestCase):
         self.assertEqual(BybitAdapter._parse_order_side("LONG").value, "BUY")
         self.assertEqual(BybitAdapter._parse_order_side("SHORT").value, "SELL")
 
+    def test_extract_closed_pnl_snapshots_normalizes_bybit_rows(self):
+        payload = {
+            "result": {
+                "list": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "orderId": "oid-1",
+                        "side": "Sell",
+                        "qty": "0.25",
+                        "avgEntryPrice": "102.5",
+                        "avgExitPrice": "98.0",
+                        "closedPnl": "1.125",
+                        "updatedTime": "1770000000123",
+                    },
+                    {"symbol": "ETHUSDT", "orderId": "oid-2"},
+                ]
+            }
+        }
+
+        rows = BybitAdapter._extract_closed_pnl_snapshots("BTCUSDT", payload)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].closure_id, "BTCUSDT:oid-1")
+        self.assertEqual(rows[0].position_side, PositionSide.SHORT)
+        self.assertAlmostEqual(rows[0].qty, 0.25)
+        self.assertAlmostEqual(rows[0].entry_price, 102.5)
+        self.assertAlmostEqual(rows[0].exit_price, 98.0)
+        self.assertAlmostEqual(rows[0].closed_pnl, 1.125)
+        self.assertAlmostEqual(rows[0].closed_ts, 1770000000.123)
+
     def test_invalid_instrument_rules_rejected(self):
         with self.assertRaises(InstrumentMetadataError):
             BybitAdapter._validate_rules(InstrumentRules(symbol="BTCUSDT", tick_size=0.0, qty_step=0.01, min_qty=0.01, min_notional=5.0))

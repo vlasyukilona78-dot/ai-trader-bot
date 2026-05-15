@@ -142,6 +142,7 @@ def _write_artifact_manifest(
     features: list[str],
     rows: int,
     metrics: dict[str, object] | None = None,
+    side_filter: str | None = None,
 ):
     model_metrics = dict(metrics or {})
     manifest = {
@@ -152,6 +153,7 @@ def _write_artifact_manifest(
         "rows": int(rows),
         "feature_names": list(features),
         "feature_schema_hash": compute_feature_schema_hash(list(features)),
+        "side_filter": str(side_filter or ""),
         "metrics": model_metrics,
     }
     path = Path(model_dir) / ("manifest.json" if version == "default" else f"manifest_{version}.json")
@@ -181,6 +183,7 @@ def train_models(
     model_dir: str = "ai/models",
     model_type: str = "auto",
     regime: str | None = None,
+    side: str | None = None,
 ):
     df = pd.read_csv(dataset_path)
     if "timestamp" in df.columns:
@@ -191,6 +194,14 @@ def train_models(
         if "market_regime" not in df.columns:
             raise ValueError("Dataset does not have market_regime column")
         df = df[df["market_regime"].astype(str).str.upper() == regime.upper()]
+
+    side_filter = str(side or "").strip().upper()
+    if side_filter:
+        if side_filter not in {"SHORT", "LONG"}:
+            raise ValueError("side must be SHORT or LONG")
+        if "signal_side" not in df.columns:
+            raise ValueError("Dataset does not have signal_side column")
+        df = df[df["signal_side"].astype(str).str.upper() == side_filter]
 
     df = df.reset_index(drop=True)
     if len(df) < 120:
@@ -297,6 +308,7 @@ def train_models(
         features=features,
         rows=len(df),
         metrics=metrics,
+        side_filter=side_filter or None,
     )
 
 
@@ -306,6 +318,7 @@ def parse_args():
     parser.add_argument("--model-dir", default="ai/models", help="Output directory for .pkl models")
     parser.add_argument("--model-type", default="auto", choices=["auto", "xgboost", "lightgbm", "sklearn"])
     parser.add_argument("--regime", default="", help="Optional market regime filter: TREND/RANGE/PUMP/PANIC")
+    parser.add_argument("--side", default="", choices=["", "SHORT", "LONG"], help="Optional signal_side filter")
     parser.add_argument(
         "--with-calibration",
         action="store_true",
@@ -327,6 +340,7 @@ if __name__ == "__main__":
             model_dir=args.model_dir,
             model_type=args.model_type,
             regime=args.regime if args.regime else None,
+            side=args.side if args.side else None,
         )
     except FileNotFoundError as exc:
         raise SystemExit(str(exc))

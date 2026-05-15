@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -14,7 +15,7 @@ class RuntimePersistenceV2Tests(unittest.TestCase):
             db_path = str(Path(tmpdir) / "runtime.db")
             store = RuntimeStore(db_path)
             try:
-                self.assertEqual(store.get_schema_version(), 2)
+                self.assertEqual(store.get_schema_version(), 3)
 
                 now = time.time()
                 store.put_idempotency_key("expired", expires_at=now - 1)
@@ -42,10 +43,21 @@ class RuntimePersistenceV2Tests(unittest.TestCase):
                 summary = store.maintenance()
                 self.assertGreaterEqual(summary.get("deleted_idempotency", 0), 1)
                 self.assertGreaterEqual(summary.get("deleted_inflight", 0), 1)
+                self.assertIn("deleted_exchange_closures", summary)
                 self.assertIn("live", store.load_live_idempotency_keys())
                 self.assertEqual(len(store.load_open_inflight_intents()), 1)
             finally:
                 store.close()
+
+            conn = sqlite3.connect(db_path)
+            try:
+                journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+                synchronous = int(conn.execute("PRAGMA synchronous").fetchone()[0])
+            finally:
+                conn.close()
+            self.assertEqual(journal_mode, "wal")
+            self.assertIn(synchronous, {1, 2})
+
     def test_load_transition_and_decision_journals(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = str(Path(tmpdir) / "runtime.db")
@@ -80,6 +92,48 @@ class RuntimePersistenceV2Tests(unittest.TestCase):
                 self.assertEqual(decisions[0].raw.get("k"), "v")
             finally:
                 store.close()
+
+    def test_exchange_closure_recording_is_deduplicated(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "runtime.db")
+            store = RuntimeStore(db_path)
+            try:
+                now = time.time()
+                first_inserted = store.record_exchange_closure_once(
+                    closure_id="BTCUSDT:closed-1",
+                    symbol="BTC/USDT",
+                    position_side="SHORT",
+                    qty=12.0,
+                    entry_price=101.0,
+                    exit_price=97.0,
+                    closed_pnl=4.5,
+                    closed_ts=now,
+                    raw={"orderId": "closed-1"},
+                    recorded_at=now,
+                )
+                second_inserted = store.record_exchange_closure_once(
+                    closure_id="BTCUSDT:closed-1",
+                    symbol="BTCUSDT",
+                    position_side="SHORT",
+                    qty=12.0,
+                    entry_price=101.0,
+                    exit_price=97.0,
+                    closed_pnl=4.5,
+                    closed_ts=now,
+                    raw={"orderId": "closed-1"},
+                    recorded_at=now + 1,
+                )
+
+                rows = store.load_exchange_closures("BTCUSDT")
+                self.assertTrue(first_inserted)
+                self.assertFalse(second_inserted)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0].symbol, "BTCUSDT")
+                self.assertAlmostEqual(rows[0].closed_pnl, 4.5)
+                self.assertEqual(rows[0].raw.get("orderId"), "closed-1")
+            finally:
+                store.close()
+
     def test_corrupted_db_recovery(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_file = Path(tmpdir) / "runtime.db"
@@ -87,7 +141,7 @@ class RuntimePersistenceV2Tests(unittest.TestCase):
 
             store = RuntimeStore(str(db_file))
             try:
-                self.assertEqual(store.get_schema_version(), 2)
+                self.assertEqual(store.get_schema_version(), 3)
             finally:
                 store.close()
 

@@ -193,6 +193,9 @@ class RiskEngine:
         rules: InstrumentRules,
     ) -> tuple[float, float]:
         base_bps = max(float(getattr(self.limits, "execution_cost_buffer_bps", 0.0) or 0.0), 0.0)
+        base_bps += max(float(getattr(self.limits, "entry_fee_bps", 0.0) or 0.0), 0.0)
+        base_bps += max(float(getattr(self.limits, "exit_fee_bps", 0.0) or 0.0), 0.0)
+        base_bps += max(float(getattr(self.limits, "slippage_buffer_bps", 0.0) or 0.0), 0.0)
         quality_penalty_bps = 0.0
 
         layer1 = self._extract_layer_details(intent, "layer1_pump_detection")
@@ -276,6 +279,52 @@ class RiskEngine:
         total_bps = min(base_bps + quality_penalty_bps, max(base_bps + 20.0, 35.0))
         return float(total_bps), float(quality_penalty_bps)
 
+    def _pre_trade_market_quality_guard(self, intent: StrategyIntent) -> tuple[bool, str]:
+        metadata = intent.metadata if isinstance(intent.metadata, Mapping) else {}
+        spread_bps = self._safe_float(metadata.get("spread_bps"), 0.0)
+        turnover24h = max(
+            self._safe_float(metadata.get("turnover24h_usdt"), 0.0),
+            self._safe_float(metadata.get("quote_turnover_24h"), 0.0),
+            self._safe_float(metadata.get("turnover24h"), 0.0),
+            self._safe_float(metadata.get("daily_turnover_usdt"), 0.0),
+        )
+
+        max_spread_bps = max(float(getattr(self.limits, "max_entry_spread_bps", 0.0) or 0.0), 0.0)
+        if max_spread_bps > 0.0 and spread_bps > max_spread_bps:
+            return False, "spread_too_wide"
+
+        min_turnover = max(float(getattr(self.limits, "min_entry_turnover_usdt", 0.0) or 0.0), 0.0)
+        if min_turnover > 0.0 and 0.0 < turnover24h < min_turnover:
+            return False, "turnover_too_low"
+
+        return True, "ok"
+
+    def _resolve_liq_price_hint(
+        self,
+        *,
+        intent: StrategyIntent,
+        side: PositionSide,
+        normalized_symbol: str,
+        effective_positions: list[PositionSnapshot],
+    ) -> float:
+        metadata = intent.metadata if isinstance(intent.metadata, Mapping) else {}
+        metadata_hint = self._safe_float(metadata.get("liq_price_hint"), 0.0)
+        if metadata_hint > 0.0:
+            return metadata_hint
+
+        # Use the exchange-reported liquidation price when this entry adds to
+        # an existing same-side position. Do not estimate fresh-position liq
+        # prices here: Bybit cross/isolated margin details are account-specific.
+        for position in effective_positions:
+            if position.side != side:
+                continue
+            if position.symbol.replace("/", "").upper() != normalized_symbol:
+                continue
+            liq_price = self._safe_float(position.liq_price, 0.0)
+            if liq_price > 0.0:
+                return liq_price
+        return 0.0
+
     def evaluate(
         self,
         *,
@@ -302,6 +351,10 @@ class RiskEngine:
 
         if mark_price <= 0:
             return RiskDecision(approved=False, reason="invalid_mark_price")
+
+        ok, reason = self._pre_trade_market_quality_guard(intent)
+        if not ok:
+            return RiskDecision(approved=False, reason=reason)
 
         if intent.action == IntentAction.LONG_ENTRY and intent.stop_loss is not None and intent.stop_loss >= mark_price:
             return RiskDecision(approved=False, reason="invalid_long_stop")
@@ -401,13 +454,13 @@ class RiskEngine:
         if projected_symbol / equity > self.limits.max_symbol_exposure_pct:
             return RiskDecision(approved=False, reason="projected_symbol_exposure")
 
-        liq_hint = intent.metadata.get("liq_price_hint") if isinstance(intent.metadata, dict) else None
-        try:
-            liq_price = float(liq_hint) if liq_hint is not None else 0.0
-        except (TypeError, ValueError):
-            liq_price = 0.0
-
         side = PositionSide.LONG if intent.action == IntentAction.LONG_ENTRY else PositionSide.SHORT
+        liq_price = self._resolve_liq_price_hint(
+            intent=intent,
+            side=side,
+            normalized_symbol=normalized_symbol,
+            effective_positions=effective_positions,
+        )
         if not liquidation_buffer_ok(
             side=side,
             entry_price=mark_price,

@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
 import os
 import runpy
@@ -39,6 +41,8 @@ from trading.alerts.telegram import TelegramAlerter
 from trading.execution.engine import ExecutionEngine, ExecutionOutcome
 from trading.exchange.bybit_adapter import BybitAdapter
 from trading.exchange.bybit_endpoints import resolve_public_http_base_url
+from trading.exchange.schemas import ClosedPnlSnapshot, PositionSide
+from trading.market_data.feed import MarketDataFeed
 from trading.metrics.counters import MetricsCounter
 from trading.metrics.logging import setup_logging
 from trading.risk.engine import RiskEngine
@@ -197,6 +201,25 @@ def _build_alerters(cfg: RuntimeConfig):
     return out
 
 
+def _build_ultra_early_alerters(cfg: RuntimeConfig):
+    token = str(
+        os.getenv("TELEGRAM_ULTRA_TOKEN")
+        or os.getenv("ULTRA_TELEGRAM_TOKEN")
+        or cfg.alerts.telegram_token
+        or ""
+    ).strip()
+    chat_id = str(
+        os.getenv("TELEGRAM_ULTRA_CHAT_ID")
+        or os.getenv("ULTRA_TELEGRAM_CHAT_ID")
+        or os.getenv("TELEGRAM_CHAT_ID_ULTRA")
+        or os.getenv("CHAT_ID_ULTRA")
+        or ""
+    ).strip()
+    if not token or not chat_id:
+        return []
+    return [TelegramAlerter(token=token, chat_id=chat_id)]
+
+
 _MOJIBAKE_ALERT_MARKERS = (
     "Р ",
     "Р ",
@@ -276,6 +299,7 @@ def _send_photo_alerts(
     reply_markup: dict | None = None,
 ):
     caption = _normalize_outbound_alert_text(caption)
+    fallback_on_photo_failure = _env_flag("ALERT_TEXT_FALLBACK_ON_PHOTO_FAILURE", False)
     attempted = 0
     sent = 0
     for alerter in alerters:
@@ -311,6 +335,8 @@ def _send_photo_alerts(
             delivered = False
         if delivered or not callable(send_text):
             continue
+        if callable(send_photo) and not fallback_on_photo_failure:
+            continue
         try:
             if send_text(caption, reply_markup=reply_markup):
                 sent += 1
@@ -329,6 +355,139 @@ def _log_alert_delivery(logger, *, event: str, attempted: int, sent: int, skip_r
     logger.info("%s attempted=%d sent=%d", event, attempted, sent, extra={"event": event})
     if skip_reason:
         logger.warning("%s reason=%s", f"{event}_skipped", skip_reason, extra={"event": f"{event}_skipped"})
+
+
+_SIGNAL_EVENT_METADATA_KEYS = {
+    "clean_pump_pct",
+    "confidence",
+    "entry_location_strength",
+    "funding_rate",
+    "long_short_ratio",
+    "open_interest_abs",
+    "phase",
+    "profile",
+    "quality_score",
+    "rsi",
+    "sentiment_index",
+    "setup_score",
+    "spread_bps",
+    "turnover24h_usdt",
+    "volume_spike",
+    "watch_score",
+    "weakness_strength",
+}
+
+
+def _json_safe_value(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        return {str(k): _json_safe_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_value(item) for item in value]
+    return str(value)
+
+
+def _compact_signal_metadata(*items: Mapping[str, object] | None) -> dict[str, object]:
+    compact: dict[str, object] = {}
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        for key in _SIGNAL_EVENT_METADATA_KEYS:
+            if key in item:
+                compact[key] = _json_safe_value(item.get(key))
+    return compact
+
+
+def _candidate_confidence(candidate: Mapping[str, object] | None) -> float:
+    if not isinstance(candidate, Mapping):
+        return 0.0
+    score = max(
+        _as_float(candidate.get("score"), 0.0),
+        _as_float(candidate.get("watch_score"), 0.0),
+        _as_float(candidate.get("setup_score"), 0.0),
+        _as_float(candidate.get("quality_score"), 0.0),
+    )
+    max_score = max(
+        _as_float(candidate.get("max_score"), 0.0),
+        _as_float(candidate.get("watch_max_score"), 0.0),
+        _as_float(candidate.get("setup_max_score"), 0.0),
+        10.0,
+    )
+    return max(0.0, min(score / max_score, 1.0))
+
+
+def _append_signal_event_log(record: Mapping[str, object], logger=APP_LOGGER) -> None:
+    if not _env_flag("SIGNAL_EVENT_LOG_ENABLED", True):
+        return
+    raw_path = str(os.getenv("SIGNAL_EVENT_LOG_PATH", "data/runtime/signal_events.jsonl")).strip()
+    if not raw_path:
+        return
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(_json_safe_value(record), ensure_ascii=False, sort_keys=True))
+            handle.write("\n")
+    except Exception as exc:
+        logger.debug("signal_event_log_failed path=%s err=%s", path, exc, extra={"event": "signal_event_log_failed"})
+
+
+def _record_signal_event(
+    *,
+    symbol: str,
+    phase: str,
+    side: str,
+    timeframe: str,
+    mode: str,
+    entry: float,
+    tp: float,
+    sl: float,
+    confidence: float,
+    reason: str,
+    metadata: Mapping[str, object] | None = None,
+    candidate: Mapping[str, object] | None = None,
+    delivery_attempted: int = 0,
+    delivery_sent: int = 0,
+    signal_signature: str = "",
+):
+    identity = "|".join(
+        [
+            str(symbol).upper(),
+            str(phase).upper(),
+            str(side).upper(),
+            f"{entry:.12g}",
+            f"{tp:.12g}",
+            f"{sl:.12g}",
+            str(signal_signature),
+        ]
+    )
+    signal_id = hashlib.sha1(identity.encode("utf-8", errors="ignore")).hexdigest()[:20]
+    _append_signal_event_log(
+        {
+            "ts": time.time(),
+            "signal_id": signal_id,
+            "symbol": str(symbol).replace("/", "").upper(),
+            "phase": str(phase).upper(),
+            "side": str(side).upper(),
+            "timeframe": str(timeframe),
+            "mode": str(mode),
+            "entry": float(entry),
+            "tp": float(tp),
+            "sl": float(sl),
+            "confidence": float(confidence),
+            "reason": str(reason),
+            "delivery_attempted": int(delivery_attempted),
+            "delivery_sent": int(delivery_sent),
+            "metadata": _compact_signal_metadata(metadata, candidate),
+        }
+    )
 
 
 
@@ -414,11 +573,6 @@ def _build_main_signal_signature(
     enriched,
     mark_price: float,
 ) -> str:
-    metadata = intent.metadata if isinstance(getattr(intent, "metadata", None), Mapping) else {}
-    legacy_signal_id = str(metadata.get("legacy_signal_id") or "").strip()
-    if legacy_signal_id:
-        return f"legacy|{legacy_signal_id}"
-
     bar_ts = ""
     if enriched is not None and not getattr(enriched, "empty", True):
         try:
@@ -539,11 +693,33 @@ def _build_alert_chart(
     liquidation_cluster_high: float | None = None,
     liquidation_cluster_low: float | None = None,
 ) -> bytes | None:
+    chart_frame = enriched
+    if _env_flag("ALERT_CHART_APPEND_LIVE_BUCKET", True):
+        try:
+            chart_frame = MarketDataFeed._overlay_live_price_to_ohlcv(
+                enriched,
+                mark_price=float(entry),
+                timeframe=timeframe,
+                append_new_bucket=True,
+            )
+            try:
+                chart_frame.attrs.update(getattr(enriched, "attrs", {}) or {})
+            except Exception:
+                pass
+        except Exception as exc:
+            chart_frame = enriched
+            APP_LOGGER.debug(
+                "chart_live_bucket_overlay_failed symbol=%s timeframe=%s err=%s",
+                symbol,
+                timeframe,
+                exc,
+                extra={"event": "chart_live_bucket_overlay_failed"},
+            )
     volume_profile = None
     liquidation_map = None
     effective_show_liquidation_map = bool(show_liquidation_map)
     try:
-        volume_profile = compute_volume_profile(enriched) if show_trade_levels else None
+        volume_profile = compute_volume_profile(chart_frame) if show_trade_levels else None
     except Exception as exc:
         APP_LOGGER.warning(
             "chart_volume_profile_failed symbol=%s timeframe=%s err=%s",
@@ -556,7 +732,7 @@ def _build_alert_chart(
     if effective_show_liquidation_map:
         try:
             liquidation_map = build_liquidation_map(
-                enriched,
+                chart_frame,
                 liquidation_cluster_high=liquidation_cluster_high,
                 liquidation_cluster_low=liquidation_cluster_low,
             )
@@ -573,7 +749,7 @@ def _build_alert_chart(
     try:
         return build_signal_chart(
             symbol=symbol,
-            df=enriched,
+            df=chart_frame,
             side=side,
             entry=entry,
             tp=tp,
@@ -596,7 +772,7 @@ def _build_alert_chart(
     try:
         return build_signal_chart(
             symbol=symbol,
-            df=enriched,
+            df=chart_frame,
             side=side,
             entry=entry,
             tp=tp,
@@ -687,7 +863,10 @@ def _prepare_symbol_analysis(
     pipeline: "FeaturePipeline",
     timeframe: str,
     candles_limit: int,
+    include_derivatives: bool | None = None,
+    include_liquidations: bool = False,
     overlay_live_price: bool = False,
+    append_live_bucket: bool | None = None,
 ) -> dict[str, object]:
     result: dict[str, object] = {
         "symbol": symbol,
@@ -695,12 +874,30 @@ def _prepare_symbol_analysis(
         "rec_state": rec_state,
     }
     try:
-        frame = feed.fetch_frame(
-            symbol=symbol,
-            timeframe=timeframe,
-            candles=candles_limit,
-            overlay_live_price=overlay_live_price,
-        )
+        strategy_append_live_bucket = False if overlay_live_price and append_live_bucket is None else append_live_bucket
+        frame_kwargs: dict[str, object] = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "candles": candles_limit,
+            "include_liquidations": include_liquidations,
+            "include_derivatives": include_derivatives,
+            "overlay_live_price": overlay_live_price,
+            "append_live_bucket": strategy_append_live_bucket,
+        }
+        try:
+            frame = feed.fetch_frame(**frame_kwargs)
+        except TypeError as exc:
+            if "unexpected keyword" not in str(exc):
+                raise
+            frame_kwargs.pop("append_live_bucket", None)
+            try:
+                frame = feed.fetch_frame(**frame_kwargs)
+            except TypeError as exc_without_append:
+                if "unexpected keyword" not in str(exc_without_append):
+                    raise
+                frame_kwargs.pop("include_derivatives", None)
+                frame_kwargs.pop("overlay_live_price", None)
+                frame = feed.fetch_frame(**frame_kwargs)
         if frame.ohlcv.empty:
             result["status"] = "empty_ohlcv"
             return result
@@ -718,7 +915,19 @@ def _prepare_symbol_analysis(
             "liquidation_cluster_high": frame.liquidation_cluster_high,
             "liquidation_cluster_low": frame.liquidation_cluster_low,
         }
-        features = _clone_pipeline(pipeline).build(symbol=symbol, ohlcv=frame.ohlcv, as_of=as_of, extras=extras)
+        try:
+            features = _clone_pipeline(pipeline).build(symbol=symbol, ohlcv=frame.ohlcv, as_of=as_of, extras=extras)
+        except ValueError as exc:
+            reason = str(exc)
+            if reason.startswith("feature_frame_quality:"):
+                result["status"] = "data_quality_blocked"
+                result["reason"] = reason.split(":", 1)[1] or "feature_frame_quality"
+                return result
+            raise
+        try:
+            features.enriched.attrs.update(getattr(frame.ohlcv, "attrs", {}) or {})
+        except Exception:
+            pass
         mark_price = frame.mark_price if frame.mark_price > 0 else float(features.enriched.iloc[-1]["close"])
 
         result.update(
@@ -767,10 +976,15 @@ _RUNTIME_MARKET_METADATA_KEYS = (
     "long_short_ratio",
     "long_short_ratio_source",
     "long_short_ratio_quality",
+    "long_short_ratio_degraded",
+    "open_interest",
+    "open_interest_abs",
+    "open_interest_source",
     "open_interest_ratio",
     "oi_signal",
     "oi_source",
     "oi_quality",
+    "oi_degraded",
 )
 
 
@@ -1285,6 +1499,8 @@ def _refresh_symbol_decision_live(
         pipeline=pipeline,
         timeframe=timeframe,
         candles_limit=candles_limit,
+        include_derivatives=True,
+        include_liquidations=True,
         overlay_live_price=True,
     )
     if str(prepared.get("status") or "") != "ok":
@@ -1399,7 +1615,9 @@ def _build_clean_context_chart_caption(symbol: str, *, stage_label: str, timefra
     clean_stage_upper = clean_stage_label.upper()
     raw_stage_upper = raw_stage_label.upper()
     if "HTF" in raw_stage_upper:
-        if "\u0420\u0410\u041d\u041d\u0418\u0419" in clean_stage_upper or "EARLY" in clean_stage_upper:
+        if "\u0423\u041b\u042c\u0422\u0420\u0410" in clean_stage_upper or "ULTRA" in clean_stage_upper:
+            clean_stage_label = "\u0423\u041b\u042c\u0422\u0420\u0410 \u0420\u0410\u041d\u041d\u0418\u0419 \u0428\u041e\u0420\u0422: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422"
+        elif "\u0420\u0410\u041d\u041d\u0418\u0419" in clean_stage_upper or "EARLY" in clean_stage_upper:
             clean_stage_label = "\u0420\u0410\u041d\u041d\u0418\u0419 \u0428\u041e\u0420\u0422: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422"
         elif "\u041b\u041e\u041d\u0413" in clean_stage_upper or "LONG" in clean_stage_upper:
             clean_stage_label = "\u041b\u041e\u041d\u0413 \u0421\u0418\u0413\u041d\u0410\u041b: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422"
@@ -1413,6 +1631,448 @@ def _build_clean_context_chart_caption(symbol: str, *, stage_label: str, timefra
     )
 
 
+def _fmt_alert_price(value: float) -> str:
+    value = max(_as_float(value, 0.0), 0.0)
+    if value >= 100:
+        return f"{value:.2f}"
+    if value >= 1:
+        return f"{value:.4f}"
+    if value >= 0.01:
+        return f"{value:.6f}"
+    return f"{value:.8f}".rstrip("0").rstrip(".")
+
+
+def _series_float(enriched: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
+    if enriched is None or getattr(enriched, "empty", True) or column not in enriched.columns:
+        return pd.Series(dtype=float)
+    return pd.to_numeric(enriched[column], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(default)
+
+
+def _last_frame_float(enriched: pd.DataFrame, column: str, default: float = 0.0) -> float:
+    series = _series_float(enriched, column, default)
+    if series.empty:
+        return default
+    return _as_float(series.iloc[-1], default)
+
+
+def _build_ultra_early_caption(
+    *,
+    symbol: str,
+    timeframe: str,
+    mode: str,
+    price: float,
+    fib50: float,
+    sl: float,
+    pump_pct: float,
+    rsi: float,
+    volume_spike: float,
+    quality_score: float,
+    level_label: str,
+    triggers: list[str],
+) -> str:
+    asset = str(symbol or "").replace("/", "").upper().replace("USDT", "")
+    downside_to_fib = max((price - fib50) / max(price, 1e-8), 0.0)
+    clean_triggers: list[str] = []
+    for trigger in triggers:
+        normalized = _normalize_human_text(trigger)
+        if normalized and normalized not in clean_triggers:
+            clean_triggers.append(normalized)
+    lines = [
+        "<b>\u0423\u041b\u042c\u0422\u0420\u0410 \u0420\u0410\u041d\u041d\u0418\u0419 \u0428\u041e\u0420\u0422: \u0423\u0414\u0410\u0420 \u0412 \u0423\u0420\u041e\u0412\u0415\u041d\u042c</b>",
+        f"<b>{asset}</b> | <code>{symbol}</code>",
+        f"\U0001f7e2 \u041b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0439 \u043f\u0430\u043c\u043f {pump_pct * 100.0:.2f}%",
+        f"\u23f1 \u0422\u0424: {timeframe}\u043c | \u0411\u0438\u0440\u0436\u0430: Bybit | \u0420\u0435\u0436\u0438\u043c: {mode}",
+        f"\U0001f4cd \u0426\u0435\u043d\u0430: {_fmt_alert_price(price)}",
+        f"\U0001f3af Fib 50%: {_fmt_alert_price(fib50)} | \u043f\u043e\u0442\u0435\u043d\u0446\u0438\u0430\u043b {downside_to_fib * 100.0:.2f}%",
+        f"\U0001f6d1 \u0418\u043d\u0432\u0430\u043b\u0438\u0434\u0430\u0446\u0438\u044f: {_fmt_alert_price(sl)}",
+        f"\U0001f4ca RSI: {rsi:.2f} | \u041e\u0431\u044a\u0451\u043c: {volume_spike:.2f}x | \u041a\u0430\u0447\u0435\u0441\u0442\u0432\u043e: {quality_score:.1f}/10",
+        "",
+        f"\U0001f4ca <b>\u041a\u043e\u043d\u0442\u0435\u043a\u0441\u0442 #{asset}</b>",
+        f"\u2022 \u0423\u0440\u043e\u0432\u0435\u043d\u044c: {level_label}",
+    ]
+    if clean_triggers:
+        lines.append(f"\u2022 \u0422\u0440\u0438\u0433\u0433\u0435\u0440\u044b: {', '.join(clean_triggers)}")
+    lines.append("\u2022 \u0421\u0442\u0430\u0442\u0443\u0441: \u0431\u0435\u0437 \u0430\u0432\u0442\u043e\u0432\u0445\u043e\u0434\u0430, \u0442\u043e\u043b\u044c\u043a\u043e ultra-watch")
+    return "\n".join(_normalize_human_text(line) for line in lines)
+
+
+def _build_ultra_early_candidate(*, symbol: str, timeframe: str, mode: str, enriched, intent) -> dict[str, object] | None:
+    if not _env_flag("ULTRA_EARLY_ENABLED", True):
+        return None
+    if enriched is None or getattr(enriched, "empty", True) or len(enriched) < 48:
+        return None
+
+    close = _last_frame_float(enriched, "close", 0.0)
+    prev_close = _as_float(_series_float(enriched, "close", close).iloc[-2], close) if len(enriched) >= 2 else close
+    open_px = _last_frame_float(enriched, "open", close)
+    high = _last_frame_float(enriched, "high", close)
+    low = _last_frame_float(enriched, "low", close)
+    atr = max(_last_frame_float(enriched, "atr", close * 0.01), close * 0.0012, 1e-8)
+    if close <= 0.0:
+        return None
+
+    highs = _series_float(enriched.tail(56), "high", close)
+    lows = _series_float(enriched.tail(56), "low", close)
+    closes = _series_float(enriched.tail(8), "close", close)
+    if highs.empty or lows.empty or closes.empty:
+        return None
+    recent_high = float(highs.max())
+    pump_low = float(lows.min())
+    if pump_low <= 0.0 or recent_high <= 0.0:
+        return None
+    pump_pct = max(recent_high / max(pump_low, 1e-8) - 1.0, 0.0)
+    min_pump = _early_config_float("ULTRA_EARLY_MIN_PUMP_PCT", 0.052)
+    if pump_pct < min_pump:
+        return None
+
+    peak_age = _latest_peak_age_bars(highs, reference_price=recent_high, atr=atr, relative_tolerance=0.0013)
+    max_peak_age = max(0, _as_int(os.getenv("ULTRA_EARLY_MAX_PEAK_AGE_BARS", "2"), 2))
+    if peak_age > max_peak_age:
+        return None
+
+    rsi = _last_frame_float(enriched, "rsi", 0.0)
+    prev_rsi = _as_float(_series_float(enriched, "rsi", rsi).iloc[-2], rsi) if "rsi" in enriched.columns and len(enriched) >= 2 else rsi
+    volume_spike = max(
+        _last_frame_float(enriched, "volume_spike", 0.0),
+        float(_series_float(enriched.tail(5), "volume_spike", 0.0).max() or 0.0),
+    )
+    if rsi <= 0.0:
+        close_tail = _series_float(enriched.tail(16), "close", close)
+        gains = close_tail.diff().clip(lower=0.0).rolling(8, min_periods=3).mean()
+        losses = (-close_tail.diff().clip(upper=0.0)).rolling(8, min_periods=3).mean()
+        rs = gains / losses.replace(0.0, np.nan)
+        rsi = _as_float((100 - (100 / (1 + rs))).dropna().iloc[-1] if not rs.dropna().empty else 0.0, 0.0)
+    if volume_spike <= 0.0:
+        volume = _series_float(enriched, "volume", 0.0)
+        if len(volume) >= 20:
+            baseline = float(volume.tail(24).head(19).mean() or 0.0)
+            volume_spike = float(volume.tail(5).max() / baseline) if baseline > 0.0 else 0.0
+
+    min_rsi = _early_config_float("ULTRA_EARLY_RSI_MIN", 68.0)
+    min_volume = _early_config_float("ULTRA_EARLY_VOLUME_SPIKE_MIN", 0.70)
+    if rsi < min_rsi or volume_spike < min_volume:
+        return None
+
+    candle_range = max(high - low, atr * 0.40, close * 0.0008, 1e-8)
+    upper_wick_ratio = max(high - max(open_px, close), 0.0) / candle_range
+    close_position = (close - low) / candle_range
+    hist = _last_frame_float(enriched, "hist", 0.0)
+    prev_hist = _as_float(_series_float(enriched, "hist", hist).iloc[-2], hist) if "hist" in enriched.columns and len(enriched) >= 2 else hist
+    last3_up = int((closes.diff().tail(3) > 0).sum())
+    rsi_rollover = rsi < prev_rsi
+    macd_rollover = hist < prev_hist
+    first_weakness_score = 0.0
+    if upper_wick_ratio >= 0.16:
+        first_weakness_score += 0.65
+    if close_position <= 0.72:
+        first_weakness_score += 0.45
+    if rsi_rollover:
+        first_weakness_score += 0.55
+    if macd_rollover:
+        first_weakness_score += 0.45
+    if close < prev_close:
+        first_weakness_score += 0.55
+
+    try:
+        volume_profile = compute_volume_profile(enriched)
+    except Exception:
+        volume_profile = None
+    try:
+        liquidation_map = build_liquidation_map(enriched)
+    except Exception:
+        liquidation_map = None
+
+    atr_pct = atr / max(close, 1e-8)
+    tolerance = max(atr_pct * 1.65, 0.0065 if close < 0.02 else 0.0040)
+    level_hits: list[tuple[str, float]] = []
+    if volume_profile is not None and volume_profile.vah > 0:
+        if abs(recent_high - volume_profile.vah) / max(close, 1e-8) <= tolerance or high >= volume_profile.vah >= low:
+            level_hits.append(("VAH", volume_profile.vah))
+    if liquidation_map is not None:
+        for band in liquidation_map.bands:
+            if str(band.side) != "above":
+                continue
+            level = _as_float(getattr(band, "level", 0.0), 0.0)
+            if level <= 0.0:
+                continue
+            touched = high >= level * (1.0 - tolerance) and close <= level * (1.0 + tolerance)
+            near = abs(recent_high - level) / max(close, 1e-8) <= tolerance
+            if touched or near or getattr(band, "closed_index", None) is not None:
+                amount = _as_float(getattr(band, "margin_usdt", 0.0), 0.0) or _as_float(getattr(band, "notional_usdt", 0.0), 0.0)
+                label = "верхняя ликвидация"
+                if amount > 0.0:
+                    if amount >= 1_000_000:
+                        label += f" {amount / 1_000_000:.1f}M"
+                    elif amount >= 1_000:
+                        label += f" {amount / 1_000:.0f}K"
+                level_hits.append((label, level))
+                break
+
+    if not level_hits:
+        return None
+
+    live_extension_without_rejection = bool(
+        last3_up >= 2
+        and close >= recent_high * 0.992
+        and close_position >= 0.74
+        and upper_wick_ratio < 0.12
+        and not rsi_rollover
+        and not macd_rollover
+    )
+    if live_extension_without_rejection:
+        return None
+    if first_weakness_score < _early_config_float("ULTRA_EARLY_WEAKNESS_SCORE_MIN", 1.05):
+        return None
+
+    fib50 = pump_low + (recent_high - pump_low) * 0.50
+    if fib50 >= close:
+        fib50 = close - max(atr * 2.0, close * 0.006)
+    potential_to_fib = max((close - fib50) / max(close, 1e-8), 0.0)
+    if potential_to_fib < _early_config_float("ULTRA_EARLY_MIN_FIB50_ROOM_PCT", 0.014):
+        return None
+
+    quality_score = 5.20
+    quality_score += min(1.35, (pump_pct - min_pump) * 18.0)
+    quality_score += min(1.20, first_weakness_score * 0.72)
+    quality_score += min(0.90, max(rsi - min_rsi, 0.0) / 18.0)
+    quality_score += min(0.75, max(volume_spike - min_volume, 0.0) * 0.25)
+    quality_score += 0.75 if any("ликвидация" in item[0] for item in level_hits) else 0.35
+    quality_score += min(0.70, potential_to_fib * 18.0)
+    if live_extension_without_rejection:
+        quality_score -= 1.1
+    quality_score = max(0.0, min(10.0, quality_score))
+    if quality_score < _early_config_float("ULTRA_EARLY_QUALITY_MIN", 7.60):
+        return None
+
+    level_label, level_value = level_hits[0]
+    sl = max(level_value, recent_high) + max(atr * 0.42, close * (0.0042 if close < 1.0 else 0.0024))
+    triggers: list[str] = [
+        "памп врезался в уровень",
+        "цена у вершины импульса",
+        "есть пространство до Fib 50%",
+    ]
+    if upper_wick_ratio >= 0.16:
+        triggers.append("появилась верхняя тень")
+    if rsi_rollover:
+        triggers.append("RSI начал сдавать")
+    if macd_rollover:
+        triggers.append("MACD начал терять силу")
+    if close < prev_close:
+        triggers.append("первая красная реакция")
+
+    return {
+        "phase": "ULTRA",
+        "caption": _build_ultra_early_caption(
+            symbol=symbol,
+            timeframe=timeframe,
+            mode=mode,
+            price=close,
+            fib50=fib50,
+            sl=sl,
+            pump_pct=pump_pct,
+            rsi=rsi,
+            volume_spike=volume_spike,
+            quality_score=quality_score,
+            level_label=level_label,
+            triggers=triggers,
+        ),
+        "entry": close,
+        "tp": fib50,
+        "sl": sl,
+        "quality_score": quality_score,
+    }
+
+
+def _maybe_emit_ultra_early_signal(
+    *,
+    symbol: str,
+    timeframe: str,
+    mode: str,
+    enriched,
+    intent,
+    mark_price: float,
+    extras: Mapping[str, object] | None,
+    feed: "MarketDataFeed",
+    pipeline: "FeaturePipeline",
+    candles_limit: int,
+    alerters,
+    state: dict[str, dict[str, object]],
+    stats: dict[str, int],
+    logger,
+) -> bool:
+    if not alerters or not _env_flag("ULTRA_EARLY_ENABLED", True):
+        return False
+
+    try:
+        candidate = _build_ultra_early_candidate(
+            symbol=symbol,
+            timeframe=timeframe,
+            mode=mode,
+            enriched=enriched,
+            intent=intent,
+        )
+    except Exception as exc:
+        logger.debug(
+            "ultra_early_candidate_error symbol=%s err=%s",
+            symbol,
+            exc,
+            extra={"event": "ultra_early_candidate_error"},
+        )
+        return False
+    if not isinstance(candidate, Mapping):
+        return False
+
+    if _env_flag("ULTRA_EARLY_LIVE_CONFIRMATION_ENABLED", True):
+        refreshed = _prepare_symbol_analysis(
+            symbol=symbol,
+            snapshot=None,
+            rec_state=None,
+            feed=feed,
+            pipeline=pipeline,
+            timeframe=timeframe,
+            candles_limit=candles_limit,
+            include_derivatives=True,
+            include_liquidations=True,
+            overlay_live_price=True,
+        )
+        if str(refreshed.get("status") or "") == "ok":
+            refreshed_features = refreshed["features"]
+            enriched = refreshed_features.enriched
+            mark_price = _as_float(refreshed.get("mark_price"), mark_price)
+            refreshed_extras = refreshed.get("extras")
+            if isinstance(refreshed_extras, Mapping):
+                extras = dict(extras or {}) | dict(refreshed_extras)
+            candidate = _build_ultra_early_candidate(
+                symbol=symbol,
+                timeframe=timeframe,
+                mode=mode,
+                enriched=enriched,
+                intent=intent,
+            )
+            if not isinstance(candidate, Mapping):
+                stats["ultra_live_rejected"] = int(stats.get("ultra_live_rejected", 0)) + 1
+                return False
+
+    now_ts = time.time()
+    current_state = state.get(symbol, {})
+    cooldown_sec = max(300, _as_int(os.getenv("ULTRA_EARLY_COOLDOWN_SEC", "3600"), 3600))
+    signature_cooldown_sec = max(
+        cooldown_sec,
+        _as_int(os.getenv("ULTRA_EARLY_SIGNATURE_COOLDOWN_SEC", "5400"), 5400),
+    )
+    cooldown_until_ts = _as_float(current_state.get("cooldown_until_ts"), 0.0)
+    signature_cooldown_until_ts = _as_float(current_state.get("signature_cooldown_until_ts"), 0.0)
+    last_signature = str(current_state.get("last_signature") or "")
+    signature = _build_early_candidate_signature(candidate, enriched)
+
+    if signature and signature == last_signature and now_ts < signature_cooldown_until_ts:
+        stats["ultra_suppressed"] = int(stats.get("ultra_suppressed", 0)) + 1
+        return False
+    if now_ts < cooldown_until_ts:
+        stats["ultra_suppressed"] = int(stats.get("ultra_suppressed", 0)) + 1
+        return False
+
+    entry = _as_float(candidate.get("entry"), mark_price)
+    tp = _as_float(candidate.get("tp"), mark_price * 0.985)
+    sl = _as_float(candidate.get("sl"), mark_price * 1.012)
+    reply_markup = build_symbol_copy_reply_markup(symbol)
+    chart_bytes = _build_alert_chart(
+        symbol=symbol,
+        timeframe=timeframe,
+        enriched=enriched,
+        side="SHORT",
+        entry=entry,
+        tp=tp,
+        sl=sl,
+        show_trade_levels=True,
+        show_liquidation_map=False,
+        timeframe_label=_format_chart_timeframe_label(timeframe),
+    )
+
+    attempted = 0
+    sent = 0
+    if chart_bytes:
+        a1, s1 = _send_photo_alerts(
+            alerters,
+            str(candidate.get("caption") or ""),
+            chart_bytes,
+            filename=f"{symbol.lower()}_ultra_1m.png",
+            reply_markup=reply_markup,
+        )
+        attempted += a1
+        sent += s1
+    else:
+        a1, s1 = _send_alerts(
+            alerters,
+            str(candidate.get("caption") or ""),
+            reply_markup=reply_markup,
+        )
+        attempted += a1
+        sent += s1
+
+    context_chart_bytes = _build_higher_timeframe_chart(
+        symbol=symbol,
+        side="SHORT",
+        entry=entry,
+        tp=tp,
+        sl=sl,
+        feed=feed,
+        pipeline=pipeline,
+        runtime_extras=dict(extras or {}),
+    )
+    if context_chart_bytes:
+        a2, s2 = _send_photo_alerts(
+            alerters,
+            _build_clean_context_chart_caption(
+                symbol,
+                stage_label="\u0423\u041b\u042c\u0422\u0420\u0410 \u0420\u0410\u041d\u041d\u0418\u0419 \u0428\u041e\u0420\u0422: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422",
+                timeframe_label=_format_chart_timeframe_label(os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "60")),
+            ),
+            context_chart_bytes,
+            filename=f"{symbol.lower()}_ultra_htf.png",
+            reply_markup=reply_markup,
+        )
+        attempted += a2
+        sent += s2
+
+    _log_alert_delivery(
+        logger,
+        event="ultra_early_signal_delivery",
+        attempted=attempted,
+        sent=sent,
+        skip_reason="no_alerters_configured" if attempted == 0 else "",
+    )
+    _record_signal_event(
+        symbol=symbol,
+        phase="ULTRA",
+        side="SHORT",
+        timeframe=timeframe,
+        mode=mode,
+        entry=entry,
+        tp=tp,
+        sl=sl,
+        confidence=min(_as_float(candidate.get("quality_score"), 0.0) / 10.0, 1.0),
+        reason="ultra_early_level_hit",
+        metadata=extras,
+        candidate=candidate,
+        delivery_attempted=attempted,
+        delivery_sent=sent,
+        signal_signature=signature,
+    )
+    if sent <= 0:
+        return False
+
+    stats["ultra_sent"] = int(stats.get("ultra_sent", 0)) + 1
+    state[symbol] = {
+        "last_signature": signature,
+        "last_emitted_ts": now_ts,
+        "cooldown_until_ts": now_ts + cooldown_sec,
+        "signature_cooldown_until_ts": now_ts + signature_cooldown_sec,
+        "quality_score": _as_float(candidate.get("quality_score"), 0.0),
+    }
+    return True
+
+
 def _build_higher_timeframe_chart(
     *,
     symbol: str,
@@ -1424,15 +2084,27 @@ def _build_higher_timeframe_chart(
     pipeline: "FeaturePipeline",
     runtime_extras: dict[str, object] | None = None,
 ) -> bytes | None:
-    context_timeframe = str(os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "240"))
-    context_candles = max(96, _as_int(os.getenv("BOT_ALERT_CONTEXT_CANDLES", "180"), 180))
+    context_timeframe = str(os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "60"))
+    context_candles = max(96, _as_int(os.getenv("BOT_ALERT_CONTEXT_CANDLES", "432"), 432))
     try:
-        context_frame = feed.fetch_frame(
-            symbol=symbol,
-            timeframe=context_timeframe,
-            candles=context_candles,
-            include_liquidations=True,
-        )
+        try:
+            context_frame = feed.fetch_frame(
+                symbol=symbol,
+                timeframe=context_timeframe,
+                candles=context_candles,
+                include_liquidations=True,
+                overlay_live_price=True,
+                append_live_bucket=False,
+            )
+        except TypeError as exc:
+            if "unexpected keyword" not in str(exc):
+                raise
+            context_frame = feed.fetch_frame(
+                symbol=symbol,
+                timeframe=context_timeframe,
+                candles=context_candles,
+                include_liquidations=True,
+            )
         if context_frame.ohlcv.empty:
             return None
         as_of = context_frame.ohlcv.index[-1]
@@ -1505,15 +2177,15 @@ def _build_early_watch_candidate_legacy(*, symbol: str, timeframe: str, mode: st
         layer2_score = _as_float(layer2.get("weakness_strength"), 0.0)
         layer2_triggers: list[str] = []
         if bool(_as_float(layer2.get("near_high_context"), 0.0)):
-            layer2_triggers.append("С†РµРЅР° РµС‰С‘ Сѓ Р»РѕРєР°Р»СЊРЅРѕРіРѕ С…Р°СЏ")
+            layer2_triggers.append("цена ещё у локального хая")
         if obv_divergence:
-            layer2_triggers.append("OBV СѓР¶Рµ РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚")
+            layer2_triggers.append("OBV уже не подтверждает рост")
         if cvd_divergence:
-            layer2_triggers.append("CVD СѓР¶Рµ РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚")
+            layer2_triggers.append("CVD уже не подтверждает рост")
         if liquidation_map.swept_above:
-            layer2_triggers.append("\\u0421\\u043d\\u044f\\u043b\\u0438 \\u0432\\u0435\\u0440\\u0445\\u043d\\u044e\\u044e \\u043b\\u0438\\u043a\\u0432\\u0438\\u0434\\u043d\\u043e\\u0441\\u0442\\u044c")
+            layer2_triggers.append("сняли верхнюю ликвидность")
         if liquidation_map.downside_magnet:
-            layer2_triggers.append("\\u043d\\u0438\\u0436\\u0435 \\u0435\\u0441\\u0442\\u044c \\u043b\\u0438\\u043a\\u0432\\u0438\\u0434\\u0430\\u0446\\u0438\\u043e\\u043d\\u043d\\u044b\\u0439 \\u043c\\u0430\\u0433\\u043d\\u0438\\u0442")
+            layer2_triggers.append("ниже есть ликвидационный магнит")
         if layer2_score < 0.67 and len(layer2_triggers) < 2:
             return None
         continuation_risk = max(0.0, 2.0 - layer2_score)
@@ -1532,7 +2204,7 @@ def _build_early_watch_candidate_legacy(*, symbol: str, timeframe: str, mode: st
                 watch_max_score=8.0,
                 continuation_risk=continuation_risk,
                 continuation_max_score=4.0,
-                triggers=layer2_triggers or ["РїР°РјРї СѓР¶Рµ РµСЃС‚СЊ", "СЃР»Р°Р±РѕСЃС‚СЊ СЂСЏРґРѕРј", "Р¶РґС‘Рј РІС…РѕРґ РїРѕ СЃС‚СЂР°С‚РµРіРёРё"],
+                triggers=layer2_triggers or ["памп уже есть", "слабость рядом", "ждём вход по стратегии"],
                 wait_for="подтверждение полноценного входа",
                 enriched=enriched,
             ),
@@ -1641,48 +2313,38 @@ def _build_early_watch_candidate_legacy(*, symbol: str, timeframe: str, mode: st
     obv_divergence = obv <= max(recent_obv_ref * 0.998, prev_obv)
     cvd_divergence = cvd <= max(recent_cvd_ref * 0.998, prev_cvd)
     if peak_still_fresh:
-        weighted_triggers.append(("РїРёРє РїР°РјРїР° СЃРѕРІСЃРµРј СЃРІРµР¶РёР№", 1.25))
-    if peak_still_fresh:
-        weighted_triggers.append(("\\u043f\\u0438\\u043a \\u043f\\u0430\\u043c\\u043f\\u0430 \\u0441\\u043e\\u0432\\u0441\\u0435\\u043c \\u0441\\u0432\\u0435\\u0436\\u0438\\u0439", 1.25))
+        weighted_triggers.append(("пик пампа совсем свежий", 1.25))
     if near_peak:
-        weighted_triggers.append(("С†РµРЅР° РµС‰С‘ Сѓ РІРµСЂС€РёРЅС‹ РїР°РјРїР°", 1.15))
+        weighted_triggers.append(("цена ещё у вершины пампа", 1.15))
     if first_reaction:
-        weighted_triggers.append(("РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·", 1.20))
-    if near_peak:
-        weighted_triggers.append(("С†РµРЅР° РµС‰С‘ Сѓ РІРµСЂС€РёРЅС‹ РїР°РјРїР°", 1.15))
-    if first_reaction:
-        weighted_triggers.append(("РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·", 1.20))
-    if near_peak:
-        weighted_triggers.append(("С†РµРЅР° РµС‰С‘ Сѓ РІРµСЂС€РёРЅС‹ РїР°РјРїР°", 1.15))
-    if first_reaction:
-        weighted_triggers.append(("РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·", 1.20))
+        weighted_triggers.append(("пошла первая реакция вниз", 1.20))
     if close >= max(bb_upper, kc_upper) * 0.998:
-        weighted_triggers.append(("С†РµРЅР° Сѓ РІРµСЂС…РЅРµР№ Р·РѕРЅС‹", 1.0))
+        weighted_triggers.append(("цена у верхней зоны", 1.0))
     if close >= signal_peak_reference * 0.995:
-        weighted_triggers.append(("С†РµРЅР° Сѓ Р»РѕРєР°Р»СЊРЅРѕРіРѕ С…Р°СЏ", 1.0))
+        weighted_triggers.append(("цена у локального хая", 1.0))
     if rsi >= 55.0:
-        weighted_triggers.append(("RSI РІС‹С€Рµ РЅРµР№С‚СЂР°Р»Рё", 0.5))
+        weighted_triggers.append(("RSI выше нейтрали", 0.5))
     if rsi < prev_rsi and rsi >= 52.0:
-        weighted_triggers.append(("RSI СЂР°Р·РІРѕСЂР°С‡РёРІР°РµС‚СЃСЏ РІРЅРёР·", 1.25))
+        weighted_triggers.append(("RSI разворачивается вниз", 1.25))
     if volume_spike >= volume_gate:
-        weighted_triggers.append(("РѕР±СЉС‘Рј РµС‰С‘ РїРѕРІС‹С€РµРЅ", 0.5))
+        weighted_triggers.append(("объём ещё повышен", 0.5))
     if recent_volume_spike > 0 and volume_spike < recent_volume_spike:
-        weighted_triggers.append(("РѕР±СЉС‘Рј Р·Р°С‚СѓС…Р°РµС‚", 1.25))
+        weighted_triggers.append(("объём затухает", 1.25))
     if upper_wick / candle_range >= 0.35:
-        weighted_triggers.append(("РµСЃС‚СЊ РІРµСЂС…РЅСЏСЏ С‚РµРЅСЊ", 1.0))
+        weighted_triggers.append(("есть верхняя тень", 1.0))
     if hist < prev_hist:
-        weighted_triggers.append(("MACD РѕСЃР»Р°Р±РµРІР°РµС‚", 1.25))
+        weighted_triggers.append(("MACD ослабевает", 1.25))
     if close <= recent_close_high * 0.9995:
-        weighted_triggers.append(("С†РµРЅР° РїРµСЂРµСЃС‚Р°Р»Р° СѓСЃРєРѕСЂСЏС‚СЊСЃСЏ", 0.75))
+        weighted_triggers.append(("цена перестала ускоряться", 0.75))
     if obv <= max(recent_obv_ref * 0.998, prev_obv):
-        weighted_triggers.append(("OBV РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚", 1.25))
+        weighted_triggers.append(("OBV не подтверждает рост", 1.25))
     if cvd <= max(recent_cvd_ref * 0.998, prev_cvd):
-        weighted_triggers.append(("CVD РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚", 1.25))
+        weighted_triggers.append(("CVD не подтверждает рост", 1.25))
 
     if liquidation_map.swept_above:
-        weighted_triggers.append(("\\u0421\\u043d\\u044f\\u043b\\u0438 \\u0432\\u0435\\u0440\\u0445\\u043d\\u044e\\u044e \\u043b\\u0438\\u043a\\u0432\\u0438\\u0434\\u043d\\u043e\\u0441\\u0442\\u044c", 1.35))
+        weighted_triggers.append(("сняли верхнюю ликвидность", 1.35))
     if liquidation_map.downside_magnet:
-        weighted_triggers.append(("\\u043d\\u0438\\u0436\\u0435 \\u0435\\u0441\\u0442\\u044c \\u043b\\u0438\\u043a\\u0432\\u0438\\u0434\\u0430\\u0446\\u0438\\u043e\\u043d\\u043d\\u044b\\u0439 \\u043c\\u0430\\u0433\\u043d\\u0438\\u0442", 1.15))
+        weighted_triggers.append(("ниже есть ликвидационный магнит", 1.15))
 
     obv_divergence = obv <= max(recent_obv_ref * 0.998, prev_obv)
     cvd_divergence = cvd <= max(recent_cvd_ref * 0.998, prev_cvd)
@@ -1695,14 +2357,14 @@ def _build_early_watch_candidate_legacy(*, symbol: str, timeframe: str, mode: st
         score += float(weight)
 
     weakness_markers = {
-        "RSI СЂР°Р·РІРѕСЂР°С‡РёРІР°РµС‚СЃСЏ РІРЅРёР·",
-        "РѕР±СЉС‘Рј Р·Р°С‚СѓС…Р°РµС‚",
-        "MACD РѕСЃР»Р°Р±РµРІР°РµС‚",
-        "OBV РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚",
-        "CVD РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚",
-        "С†РµРЅР° РїРµСЂРµСЃС‚Р°Р»Р° СѓСЃРєРѕСЂСЏС‚СЊСЃСЏ",
-        "\\u0421\\u043d\\u044f\\u043b\\u0438 \\u0432\\u0435\\u0440\\u0445\\u043d\\u044e\\u044e \\u043b\\u0438\\u043a\\u0432\\u0438\\u0434\\u043d\\u043e\\u0441\\u0442\\u044c",
-        "\\u043d\\u0438\\u0436\\u0435 \\u0435\\u0441\\u0442\\u044c \\u043b\\u0438\\u043a\\u0432\\u0438\\u0434\\u0430\\u0446\\u0438\\u043e\\u043d\\u043d\\u044b\\u0439 \\u043c\\u0430\\u0433\\u043d\\u0438\\u0442",
+        "RSI разворачивается вниз",
+        "объём затухает",
+        "MACD ослабевает",
+        "OBV не подтверждает рост",
+        "CVD не подтверждает рост",
+        "цена перестала ускоряться",
+        "сняли верхнюю ликвидность",
+        "ниже есть ликвидационный магнит",
     }
     if score < 4.5 or len(unique_triggers) < 4:
         return None
@@ -2665,21 +3327,21 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
             and not reacceleration_after_pullback
         ):
             regime_triggers = [
-                "РїР°РјРї СѓР¶Рµ РµСЃС‚СЊ",
-                "С†РµРЅР° РµС‰С‘ Сѓ РІРµСЂС€РёРЅС‹ РїР°РјРїР°",
+                "памп уже есть",
+                "цена ещё у вершины пампа",
             ]
             if first_reaction:
-                regime_triggers.append("РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·")
+                regime_triggers.append("пошла первая реакция вниз")
             if peak_followthrough_confirmed:
-                regime_triggers.append("РїРѕСЃР»Рµ РїРёРєР° РїРѕСЏРІРёР»СЃСЏ lower-high / lower-close")
+                regime_triggers.append("после пика появился lower-high / lower-close")
             if hist < prev_hist:
-                regime_triggers.append("MACD РѕСЃР»Р°Р±РµРІР°РµС‚")
+                regime_triggers.append("MACD ослабевает")
             if rsi < prev_rsi:
-                regime_triggers.append("RSI СЂР°Р·РІРѕСЂР°С‡РёРІР°РµС‚СЃСЏ РІРЅРёР·")
+                regime_triggers.append("RSI разворачивается вниз")
             if liquidation_map.downside_magnet:
-                regime_triggers.append("РЅРёР¶Рµ РµСЃС‚СЊ Р»РёРєРІРёРґР°С†РёРѕРЅРЅС‹Р№ РјР°РіРЅРёС‚")
+                regime_triggers.append("ниже есть ликвидационный магнит")
             if liquidation_map.swept_above:
-                regime_triggers.append("РІРµСЂС…РЅСЋСЋ Р»РёРєРІРёРґРЅРѕСЃС‚СЊ СѓР¶Рµ СЃРЅСЏР»Рё")
+                regime_triggers.append("верхнюю ликвидность уже сняли")
 
             return {
                 "phase": "WATCH",
@@ -2731,21 +3393,21 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
 
         moderate_triggers: list[str] = []
         if peak_still_fresh:
-            moderate_triggers.append("РїРёРє РїР°РјРїР° СЃРѕРІСЃРµРј СЃРІРµР¶РёР№")
+            moderate_triggers.append("пик пампа совсем свежий")
         if near_peak:
-            moderate_triggers.append("С†РµРЅР° РµС‰С‘ Сѓ РІРµСЂС€РёРЅС‹ РїР°РјРїР°")
+            moderate_triggers.append("цена ещё у вершины пампа")
         if first_reaction:
-            moderate_triggers.append("РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·")
+            moderate_triggers.append("пошла первая реакция вниз")
         if micro_reversal_near_peak:
-            moderate_triggers.append("Р»РѕРєР°Р»СЊРЅС‹Р№ РїРёРє СѓР¶Рµ РЅР°С‡Р°Р» СЂР°Р·РІРѕСЂР°С‡РёРІР°С‚СЊСЃСЏ")
+            moderate_triggers.append("локальный пик уже начал разворачиваться")
         if obv_divergence:
-            moderate_triggers.append("OBV СѓР¶Рµ РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚")
+            moderate_triggers.append("OBV уже не подтверждает рост")
         if cvd_divergence:
-            moderate_triggers.append("CVD СѓР¶Рµ РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚")
+            moderate_triggers.append("CVD уже не подтверждает рост")
         if liquidation_map.swept_above:
-            moderate_triggers.append("РІРµСЂС…РЅСЋСЋ Р»РёРєРІРёРґРЅРѕСЃС‚СЊ СѓР¶Рµ СЃРЅСЏР»Рё")
+            moderate_triggers.append("верхнюю ликвидность уже сняли")
         if liquidation_map.downside_magnet:
-            moderate_triggers.append("РЅРёР¶Рµ РµСЃС‚СЊ Р»РёРєРІРёРґР°С†РёРѕРЅРЅС‹Р№ РјР°РіРЅРёС‚")
+            moderate_triggers.append("ниже есть ликвидационный магнит")
 
         moderate_watch_score = 0.0
         if near_peak:
@@ -2881,7 +3543,7 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
                     quality_grade=_early_quality_grade(moderate_quality_score),
                     continuation_risk=moderate_continuation_risk,
                     continuation_max_score=4.0,
-                    triggers=moderate_triggers or ["РїР°РјРї СѓР¶Рµ РµСЃС‚СЊ", "РїРѕСЏРІРёР»Р°СЃСЊ РїРµСЂРІР°СЏ СЃР»Р°Р±РѕСЃС‚СЊ", "Р¶РґС‘Рј РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ"],
+                    triggers=moderate_triggers or ["памп уже есть", "появилась первая слабость", "ждём подтверждение"],
                     wait_for="подтверждение слабости и точки входа",
                     enriched=enriched,
                 ),
@@ -2895,21 +3557,21 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
 
         triggers: list[str] = []
         if peak_still_fresh:
-            triggers.append("РїРёРє РїР°РјРїР° СЃРѕРІСЃРµРј СЃРІРµР¶РёР№")
+            triggers.append("пик пампа совсем свежий")
         if near_peak:
-            triggers.append("С†РµРЅР° РµС‰С‘ Сѓ РІРµСЂС€РёРЅС‹ РїР°РјРїР°")
+            triggers.append("цена ещё у вершины пампа")
         if first_reaction:
-            triggers.append("РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·")
+            triggers.append("пошла первая реакция вниз")
         if bool(_as_float(layer2.get("near_high_context"), 0.0)):
-            triggers.append("С†РµРЅР° РІСЃС‘ РµС‰С‘ Сѓ Р»РѕРєР°Р»СЊРЅРѕРіРѕ С…Р°СЏ")
+            triggers.append("цена всё ещё у локального хая")
         if bool(_as_float(layer2.get("obv_bearish_divergence"), 0.0)):
-            triggers.append("OBV СѓР¶Рµ РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚")
+            triggers.append("OBV уже не подтверждает рост")
         if bool(_as_float(layer2.get("cvd_bearish_divergence"), 0.0)):
-            triggers.append("CVD СѓР¶Рµ РЅРµ РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ СЂРѕСЃС‚")
+            triggers.append("CVD уже не подтверждает рост")
         if liquidation_map.swept_above:
-            triggers.append("РІРµСЂС…РЅСЋСЋ Р»РёРєРІРёРґРЅРѕСЃС‚СЊ СѓР¶Рµ СЃРЅСЏР»Рё")
+            triggers.append("верхнюю ликвидность уже сняли")
         if liquidation_map.downside_magnet:
-            triggers.append("РЅРёР¶Рµ РµСЃС‚СЊ Р»РёРєРІРёРґР°С†РёРѕРЅРЅС‹Р№ РјР°РіРЅРёС‚")
+            triggers.append("ниже есть ликвидационный магнит")
         hard_weakness_count = 0
         if micro_reversal_near_peak:
             hard_weakness_count += 1
@@ -3105,7 +3767,7 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
                 quality_grade=_early_quality_grade(quality_score),
                 continuation_risk=continuation_risk,
                 continuation_max_score=4.0,
-                triggers=triggers or ["РїР°РјРї СѓР¶Рµ РµСЃС‚СЊ", "СЃР»Р°Р±РѕСЃС‚СЊ СЂСЏРґРѕРј", "Р¶РґС‘Рј РІС…РѕРґ РїРѕ СЃС‚СЂР°С‚РµРіРёРё"],
+                triggers=triggers or ["памп уже есть", "слабость рядом", "ждём вход по стратегии"],
                 wait_for="подтверждение полноценного входа",
                 enriched=enriched,
             ),
@@ -3119,19 +3781,19 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         location_reason = str(layer3.get("failed_reason") or "")
         setup_triggers: list[str] = []
         if peak_recent_enough:
-            setup_triggers.append("РїРёРє РїР°РјРїР° РµС‰С‘ СЃРІРµР¶РёР№")
+            setup_triggers.append("пик пампа ещё свежий")
         if near_peak:
-            setup_triggers.append("С†РµРЅР° РІСЃС‘ РµС‰С‘ СЂСЏРґРѕРј СЃ РІРµСЂС€РёРЅРѕР№")
+            setup_triggers.append("цена всё ещё рядом с вершиной")
         if first_reaction:
-            setup_triggers.append("РїРѕСЃР»Рµ РїРёРєР° РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·")
+            setup_triggers.append("после пика пошла первая реакция вниз")
         if peak_followthrough_confirmed:
-            setup_triggers.append("РїРѕСЏРІРёР»СЃСЏ lower-high / lower-close РїРѕСЃР»Рµ РїРёРєР°")
+            setup_triggers.append("появился lower-high / lower-close после пика")
         if liquidation_map.swept_above:
-            setup_triggers.append("РІРµСЂС…РЅСЋСЋ Р»РёРєРІРёРґРЅРѕСЃС‚СЊ СѓР¶Рµ СЃРЅСЏР»Рё")
+            setup_triggers.append("верхнюю ликвидность уже сняли")
         if liquidation_map.downside_magnet:
-            setup_triggers.append("РЅРёР¶Рµ РµСЃС‚СЊ Р»РёРєРІРёРґР°С†РёРѕРЅРЅС‹Р№ РјР°РіРЅРёС‚")
+            setup_triggers.append("ниже есть ликвидационный магнит")
         if location_reason:
-            setup_triggers.append("СЃРµС‚РєР° РїРѕС‡С‚Рё РіРѕС‚РѕРІР°, Р¶РґС‘Рј Р»СѓС‡С€СѓСЋ С‚РѕС‡РєСѓ РІС…РѕРґР°")
+            setup_triggers.append("сетка почти готова, ждём лучшую точку входа")
 
         setup_failure_score = 0.0
         if first_reaction:
@@ -3305,25 +3967,25 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
     prefire_triggers: list[tuple[str, float]] = []
     if strong_peak_prefire:
         if peak_recent_enough:
-            prefire_triggers.append(("РїРёРє РїР°РјРїР° СЃРѕРІСЃРµРј СЃРІРµР¶РёР№", 1.25))
+            prefire_triggers.append(("пик пампа совсем свежий", 1.25))
         if near_peak:
-            prefire_triggers.append(("С†РµРЅР° РµС‰Рµ Сѓ РІРµСЂС€РёРЅС‹ РїР°РјРїР°", 1.10))
+            prefire_triggers.append(("цена ещё у вершины пампа", 1.10))
         if clean_pump_pct >= early_pump_min:
-            prefire_triggers.append(("С‡РёСЃС‚С‹Р№ РїР°РјРї СѓР¶Рµ РІС‹С€Рµ СЂР°РЅРЅРµРіРѕ РјРёРЅРёРјСѓРјР°", 0.80))
+            prefire_triggers.append(("чистый памп уже выше раннего минимума", 0.80))
         if first_reaction:
-            prefire_triggers.append(("РїРѕС€Р»Р° РїРµСЂРІР°СЏ СЂРµР°РєС†РёСЏ РІРЅРёР·", 1.25))
+            prefire_triggers.append(("пошла первая реакция вниз", 1.25))
         if micro_reversal_near_peak:
-            prefire_triggers.append(("Сѓ РІРµСЂС€РёРЅС‹ РїРѕСЏРІРёР»Р°СЃСЊ РјРёРєСЂРѕСЂРµР°РєС†РёСЏ РІРЅРёР·", 1.15))
+            prefire_triggers.append(("у вершины появилась микрореакция вниз", 1.15))
         if upper_wick / candle_range >= 0.18:
-            prefire_triggers.append(("РµСЃС‚СЊ РІРµСЂС…РЅСЏСЏ С‚РµРЅСЊ", 0.95))
+            prefire_triggers.append(("есть верхняя тень", 0.95))
         if hist < prev_hist:
-            prefire_triggers.append(("MACD РѕСЃР»Р°Р±РµРІР°РµС‚", 1.10))
+            prefire_triggers.append(("MACD ослабевает", 1.10))
         if recent_volume_spike > 0 and volume_spike < recent_volume_spike:
-            prefire_triggers.append(("РѕР±СЉРµРј Р·Р°С‚СѓС…Р°РµС‚", 1.10))
+            prefire_triggers.append(("объём затухает", 1.10))
         if liquidation_map.swept_above:
-            prefire_triggers.append(("РІРµСЂС…РЅСЋСЋ Р»РёРєРІРёРґРЅРѕСЃС‚СЊ СѓР¶Рµ СЃРЅСЏР»Рё", 1.20))
+            prefire_triggers.append(("верхнюю ликвидность уже сняли", 1.20))
         if liquidation_map.downside_magnet:
-            prefire_triggers.append(("РЅРёР¶Рµ РµСЃС‚СЊ Р»РёРєРІРёРґР°С†РёРѕРЅРЅС‹Р№ РјР°РіРЅРёС‚", 1.00))
+            prefire_triggers.append(("ниже есть ликвидационный магнит", 1.00))
 
         prefire_unique_triggers: list[str] = []
         prefire_watch_score = 0.0
@@ -5143,13 +5805,213 @@ def _strategy_audit_log_payload(strategy) -> dict[str, object]:
         "strategy_audit": full_snapshot,
     }
 
+
+def _position_side_for_state(state: TradeState | str | None) -> PositionSide | None:
+    try:
+        value = state.value if isinstance(state, TradeState) else str(state or "")
+    except Exception:
+        value = ""
+    value = value.upper().strip()
+    if value in (TradeState.LONG.value, TradeState.PENDING_EXIT_LONG.value):
+        return PositionSide.LONG
+    if value in (TradeState.SHORT.value, TradeState.PENDING_EXIT_SHORT.value):
+        return PositionSide.SHORT
+    return None
+
+
+def _select_exchange_closure(
+    closures: list[ClosedPnlSnapshot],
+    *,
+    expected_side: PositionSide,
+    start_ts: float,
+) -> ClosedPnlSnapshot | None:
+    recent = [
+        row
+        for row in closures
+        if row.symbol and (float(row.closed_ts or 0.0) <= 0.0 or float(row.closed_ts or 0.0) >= float(start_ts))
+    ]
+    if not recent:
+        return None
+
+    recent = sorted(recent, key=lambda row: float(row.closed_ts or 0.0), reverse=True)
+    side_matched = [row for row in recent if row.position_side == expected_side]
+    return side_matched[0] if side_matched else recent[0]
+
+
+def _record_online_exit_from_exchange_close(
+    *,
+    symbol: str,
+    closure: ClosedPnlSnapshot,
+    trade_learner,
+    online_retrainer,
+    logger,
+) -> None:
+    if trade_learner is None:
+        return
+    try:
+        dataset_row = trade_learner.record_exit(
+            symbol=symbol,
+            exit_ts=float(closure.closed_ts or time.time()),
+            realized_pnl=float(closure.closed_pnl),
+            qty=float(closure.qty),
+        )
+    except Exception as exc:
+        if logger is not None:
+            logger.warning(
+                "exchange_closed_position_learning_failed symbol=%s closure_id=%s err=%s",
+                symbol,
+                closure.closure_id,
+                exc,
+                extra={"event": "exchange_closed_position_learning_failed"},
+            )
+        return
+
+    if dataset_row is None:
+        return
+    if logger is not None:
+        logger.info(
+            "online_dataset_appended_from_exchange_close symbol=%s target_win=%s future_return=%s target_horizon=%s",
+            symbol,
+            dataset_row.get("target_win"),
+            dataset_row.get("future_return"),
+            dataset_row.get("target_horizon"),
+            extra={"event": "online_dataset_appended"},
+        )
+    if online_retrainer is not None:
+        try:
+            if online_retrainer.maybe_retrain():
+                if logger is not None:
+                    logger.info(
+                        "online_retrain_completed dataset=%s",
+                        online_retrainer.config.dataset_path,
+                        extra={"event": "online_retrain_completed"},
+                    )
+        except Exception:
+            pass
+
+
+def _reconcile_exchange_closed_position(
+    *,
+    symbol: str,
+    previous_state: TradeState | str | None,
+    previous_updated_at: float,
+    snapshot,
+    adapter: BybitAdapter | None,
+    risk: RiskEngine | None,
+    runtime_store,
+    trade_learner,
+    online_retrainer,
+    counters: MetricsCounter | None = None,
+    logger=None,
+    mode: str = "dry_run",
+) -> bool:
+    expected_side = _position_side_for_state(previous_state)
+    if expected_side is None:
+        return False
+    if snapshot is None or list(getattr(snapshot, "positions", []) or []):
+        return False
+    if str(mode or "").lower() not in ("demo", "testnet", "live"):
+        return False
+
+    get_closed = getattr(adapter, "get_recent_closed_pnl", None)
+    if not callable(get_closed):
+        return False
+
+    now_ts = time.time()
+    lookback_sec = max(600, _as_int(os.getenv("EXCHANGE_CLOSED_PNL_LOOKBACK_SEC", "21600"), 21600))
+    limit = max(1, min(_as_int(os.getenv("EXCHANGE_CLOSED_PNL_LIMIT", "20"), 20), 100))
+    anchor_ts = _as_float(previous_updated_at, 0.0)
+    if anchor_ts <= 0.0 or anchor_ts > now_ts:
+        anchor_ts = now_ts
+    start_ts = max(0.0, anchor_ts - float(lookback_sec))
+    start_time_ms = int(start_ts * 1000.0)
+
+    try:
+        closures = get_closed(symbol, limit=limit, start_time_ms=start_time_ms)
+    except Exception as exc:
+        if logger is not None:
+            logger.warning(
+                "exchange_closed_pnl_unavailable symbol=%s err=%s",
+                symbol,
+                exc,
+                extra={"event": "exchange_closed_pnl_unavailable"},
+            )
+        return False
+
+    closure = _select_exchange_closure(
+        [row for row in (closures or []) if isinstance(row, ClosedPnlSnapshot)],
+        expected_side=expected_side,
+        start_ts=start_ts,
+    )
+    if closure is None:
+        return False
+
+    inserted = True
+    if runtime_store is not None:
+        try:
+            inserted = runtime_store.record_exchange_closure_once(
+                closure_id=closure.closure_id,
+                symbol=symbol,
+                position_side=expected_side.value,
+                qty=float(closure.qty),
+                entry_price=float(closure.entry_price),
+                exit_price=float(closure.exit_price),
+                closed_pnl=float(closure.closed_pnl),
+                closed_ts=float(closure.closed_ts),
+                source="bybit_closed_pnl",
+                raw=closure.raw,
+            )
+        except Exception as exc:
+            if logger is not None:
+                logger.warning(
+                    "exchange_closed_position_store_failed symbol=%s closure_id=%s err=%s",
+                    symbol,
+                    closure.closure_id,
+                    exc,
+                    extra={"event": "exchange_closed_position_store_failed"},
+                )
+            return False
+
+    if not inserted:
+        return False
+
+    if risk is not None:
+        risk.record_trade_result(float(closure.closed_pnl), stopped_out=float(closure.closed_pnl) < 0.0)
+    _record_online_exit_from_exchange_close(
+        symbol=symbol,
+        closure=closure,
+        trade_learner=trade_learner,
+        online_retrainer=online_retrainer,
+        logger=logger,
+    )
+    if counters is not None:
+        counters.inc("exchange_closed_reconciled")
+    if logger is not None:
+        logger.info(
+            "exchange_closed_position_reconciled symbol=%s side=%s bybit_side=%s pnl=%s qty=%s closure_id=%s",
+            symbol,
+            expected_side.value,
+            closure.position_side.value,
+            float(closure.closed_pnl),
+            float(closure.qty),
+            closure.closure_id,
+            extra={"event": "exchange_closed_position_reconciled"},
+        )
+    return True
+
+
 def _startup_reconcile(
     *,
     symbols: list[str],
+    adapter: BybitAdapter | None,
     sync: ExchangeSyncService,
     state_machine: StateMachine,
     execution: ExecutionEngine,
     signal_profile: str = "main",
+    mode: str = "dry_run",
+    risk: RiskEngine | None = None,
+    trade_learner=None,
+    online_retrainer=None,
     logger=None,
 ):
     normalized_symbols = [str(symbol).replace("/", "").upper().strip() for symbol in symbols if symbol]
@@ -5198,12 +6060,28 @@ def _startup_reconcile(
         if symbol not in active_symbols:
             continue
         snapshot = bulk_snapshots.get(symbol) or sync.snapshot(symbol)
+        previous_rec = state_machine.get(symbol)
+        previous_state = previous_rec.state
+        previous_updated_at = float(previous_rec.updated_at or 0.0)
         rec_state = state_machine.reconcile(symbol, snapshot.positions, snapshot.open_orders)
         execution.recover_from_restart(symbol, snapshot)
 
         # Recovery can change exchange state (cancel/close/attach stop), refresh from exchange truth.
         snapshot = sync.reconciler.snapshot(symbol)
         rec_state = state_machine.reconcile(symbol, snapshot.positions, snapshot.open_orders)
+        _reconcile_exchange_closed_position(
+            symbol=symbol,
+            previous_state=previous_state,
+            previous_updated_at=previous_updated_at,
+            snapshot=snapshot,
+            adapter=adapter,
+            risk=risk,
+            runtime_store=execution.persistence,
+            trade_learner=trade_learner,
+            online_retrainer=online_retrainer,
+            logger=logger,
+            mode=mode,
+        )
         issues = execution.detect_external_intervention(symbol, snapshot)
         if issues:
             summary[symbol] = f"{state_machine.get(symbol).state.value}|issues={','.join(issues)}"
@@ -5235,6 +6113,8 @@ def run_cycle(
     early_signal_state: dict[str, dict[str, object]],
     early_signal_stats: dict[str, int],
     mode: str,
+    ultra_alerters=None,
+    ultra_signal_state: dict[str, dict[str, object]] | None = None,
     trade_learner=None,
     online_retrainer=None,
     early_signal_learner=None,
@@ -5245,6 +6125,9 @@ def run_cycle(
     ws_recovery_reason = sync.maybe_recover_ws(adapter)
     log_hold_decisions = _env_flag("LOG_HOLD_DECISIONS", False)
     log_dataset_appends = _env_flag("LOG_ONLINE_DATASET_APPENDS", False)
+    ultra_alerters = list(ultra_alerters or [])
+    if ultra_signal_state is None:
+        ultra_signal_state = {}
     if ws_recovery_reason:
         logger.warning(
             "ws_reconnect_triggered reason=%s",
@@ -5335,6 +6218,9 @@ def run_cycle(
                 cycle_ts = time.time()
                 intervention = []
             else:
+                previous_rec = execution.state_machine.get(symbol)
+                previous_state = previous_rec.state
+                previous_updated_at = float(previous_rec.updated_at or 0.0)
                 rec_state = execution.state_machine.reconcile(symbol, snapshot.positions, snapshot.open_orders)
                 recovery_touched_exchange = execution.recover_from_restart(symbol, snapshot)
 
@@ -5342,6 +6228,22 @@ def run_cycle(
                     snapshot = sync.reconciler.snapshot(symbol)
                     rec_state = execution.state_machine.reconcile(symbol, snapshot.positions, snapshot.open_orders)
                 else:
+                    rec_state = execution.state_machine.get(symbol)
+
+                if _reconcile_exchange_closed_position(
+                    symbol=symbol,
+                    previous_state=previous_state,
+                    previous_updated_at=previous_updated_at,
+                    snapshot=snapshot,
+                    adapter=adapter,
+                    risk=risk,
+                    runtime_store=execution.persistence,
+                    trade_learner=trade_learner,
+                    online_retrainer=online_retrainer,
+                    counters=counters,
+                    logger=logger,
+                    mode=mode,
+                ):
                     rec_state = execution.state_machine.get(symbol)
 
                 cycle_ts = time.time()
@@ -5424,6 +6326,9 @@ def run_cycle(
             prepared_status = str(prepared.get("status") or "")
             if prepared_status == "empty_ohlcv":
                 counters.inc("empty_ohlcv")
+                continue
+            if prepared_status == "data_quality_blocked":
+                counters.inc("data_quality_blocked")
                 continue
             if prepared_status != "ok":
                 counters.inc("cycle_errors")
@@ -5547,6 +6452,9 @@ def run_cycle(
                 continue
 
             prepared_status = str(decision_prepared.get("status") or "")
+            if prepared_status == "data_quality_blocked":
+                counters.inc("data_quality_blocked")
+                continue
             if prepared_status != "ok":
                 counters.inc("cycle_errors")
                 logger.error(
@@ -5606,6 +6514,24 @@ def run_cycle(
                         except Exception:
                             early_candidate = None
             _record_parallel_strategy_intent(strategy, intent)
+
+            if ultra_alerters and (observation_only_profile or current_state == TradeState.FLAT):
+                _maybe_emit_ultra_early_signal(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    mode=mode,
+                    enriched=features.enriched,
+                    intent=intent,
+                    mark_price=mark_price,
+                    extras=extras,
+                    feed=feed,
+                    pipeline=pipeline,
+                    candles_limit=candles_limit,
+                    alerters=ultra_alerters,
+                    state=ultra_signal_state,
+                    stats=early_signal_stats,
+                    logger=logger,
+                )
 
             try:
                 rules = adapter.get_instrument_rules(symbol)
@@ -6002,7 +6928,7 @@ def run_cycle(
                                         symbol,
                                         stage_label="\u0420\u0410\u041d\u041d\u0418\u0419 \u0428\u041e\u0420\u0422: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422",
                                         timeframe_label=_format_chart_timeframe_label(
-                                            os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "240")
+                                            os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "60")
                                         ),
                                     ),
                                     context_chart_bytes,
@@ -6017,6 +6943,23 @@ def run_cycle(
                                 attempted=attempted,
                                 sent=sent,
                                 skip_reason="no_alerters_configured" if attempted == 0 else "",
+                            )
+                            _record_signal_event(
+                                symbol=symbol,
+                                phase=phase,
+                                side="SHORT",
+                                timeframe=timeframe,
+                                mode=mode,
+                                entry=_as_float(early_candidate.get("entry"), mark_price),
+                                tp=_as_float(early_candidate.get("tp"), mark_price * 0.99),
+                                sl=_as_float(early_candidate.get("sl"), mark_price * 1.01),
+                                confidence=_candidate_confidence(early_candidate),
+                                reason="early_signal_candidate",
+                                metadata=extras,
+                                candidate=early_candidate,
+                                delivery_attempted=attempted,
+                                delivery_sent=sent,
+                                signal_signature=early_signature,
                             )
                             early_signal_stats["watch_sent" if phase == "WATCH" else "setup_sent"] = int(
                                 early_signal_stats.get("watch_sent" if phase == "WATCH" else "setup_sent", 0)
@@ -6232,7 +7175,7 @@ def run_cycle(
                                     symbol,
                                     stage_label="\u0420\u0410\u041d\u041d\u0418\u0419 \u0428\u041e\u0420\u0422: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422",
                                     timeframe_label=_format_chart_timeframe_label(
-                                        os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "240")
+                                        os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "60")
                                     ),
                                 ),
                                 context_chart_bytes,
@@ -6247,6 +7190,23 @@ def run_cycle(
                             attempted=attempted,
                             sent=sent,
                             skip_reason="no_alerters_configured" if attempted == 0 else "",
+                        )
+                        _record_signal_event(
+                            symbol=symbol,
+                            phase=phase,
+                            side="SHORT",
+                            timeframe=timeframe,
+                            mode=mode,
+                            entry=_as_float(early_candidate.get("entry"), mark_price),
+                            tp=_as_float(early_candidate.get("tp"), mark_price * 0.99),
+                            sl=_as_float(early_candidate.get("sl"), mark_price * 1.01),
+                            confidence=_candidate_confidence(early_candidate),
+                            reason="early_signal_candidate",
+                            metadata=extras,
+                            candidate=early_candidate,
+                            delivery_attempted=attempted,
+                            delivery_sent=sent,
+                            signal_signature=early_signature,
                         )
                         early_signal_stats["watch_sent" if phase == "WATCH" else "setup_sent"] = int(
                             early_signal_stats.get("watch_sent" if phase == "WATCH" else "setup_sent", 0)
@@ -6401,7 +7361,7 @@ def run_cycle(
                                 else "\u041b\u041e\u041d\u0413 \u0421\u0418\u0413\u041d\u0410\u041b: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422"
                             ),
                             timeframe_label=_format_chart_timeframe_label(
-                                os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "240")
+                                os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "60")
                             ),
                         ),
                         context_chart_bytes,
@@ -6416,6 +7376,22 @@ def run_cycle(
                     attempted=attempted,
                     sent=sent,
                     skip_reason="no_alerters_configured" if attempted == 0 else "",
+                )
+                _record_signal_event(
+                    symbol=symbol,
+                    phase="ENTRY",
+                    side="SHORT" if intent.action == IntentAction.SHORT_ENTRY else "LONG",
+                    timeframe=timeframe,
+                    mode=mode,
+                    entry=mark_price,
+                    tp=float(intent.take_profit or mark_price),
+                    sl=float(intent.stop_loss or mark_price),
+                    confidence=float(intent.confidence),
+                    reason=intent.reason,
+                    metadata=intent.metadata if isinstance(intent.metadata, Mapping) else {},
+                    delivery_attempted=attempted,
+                    delivery_sent=sent,
+                    signal_signature=signal_signature,
                 )
                 _remember_cached_alert(
                     signal_alert_cache,
@@ -6505,12 +7481,25 @@ def main() -> int:
         stop_attach_grace_sec=cfg.stop_attach_grace_sec,
         stale_open_order_sec=cfg.stale_open_order_sec,
         max_exchange_retries=cfg.max_exchange_retries,
+        entry_orderbook_guard_enabled=os.getenv("EXEC_ORDERBOOK_GUARD_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"),
+        entry_orderbook_guard_require_live=os.getenv("EXEC_ORDERBOOK_GUARD_REQUIRE_LIVE", "0").strip().lower() in ("1", "true", "yes", "on"),
+        entry_orderbook_limit=int(os.getenv("EXEC_ORDERBOOK_LIMIT", "50")),
+        entry_orderbook_depth_slippage_bps=float(os.getenv("EXEC_ORDERBOOK_DEPTH_SLIPPAGE_BPS", "35")),
+        max_entry_orderbook_slippage_bps=float(os.getenv("EXEC_MAX_ORDERBOOK_SLIPPAGE_BPS", "45")),
+        min_entry_orderbook_depth_ratio=float(os.getenv("EXEC_MIN_ORDERBOOK_DEPTH_RATIO", "1.15")),
         persistence=runtime_store,
     )
     pipeline = FeaturePipeline()
     strategy = _build_strategy(args.strategy)
     counters = MetricsCounter()
     alerters = _build_alerters(cfg)
+    ultra_alerters = _build_ultra_early_alerters(cfg)
+    logger.info(
+        "ultra_early_channel enabled=%s chat_configured=%s",
+        bool(ultra_alerters),
+        bool(ultra_alerters),
+        extra={"event": "ultra_early_channel"},
+    )
     trade_learner = None
     online_retrainer = None
     early_signal_learner = None
@@ -6554,10 +7543,15 @@ def main() -> int:
 
     startup_state = _startup_reconcile(
         symbols=cfg.symbols,
+        adapter=adapter,
         sync=sync,
         state_machine=state_machine,
         execution=execution,
         signal_profile=signal_profile,
+        mode=cfg.mode,
+        risk=risk,
+        trade_learner=trade_learner,
+        online_retrainer=online_retrainer,
         logger=logger,
     )
     startup_state_summary = _summarize_startup_state(startup_state)
@@ -6662,13 +7656,16 @@ def main() -> int:
     decision_log_cache: dict[str, str] = {}
     signal_alert_cache: dict[str, str] = {}
     early_signal_state: dict[str, dict[str, object]] = {}
+    ultra_signal_state: dict[str, dict[str, object]] = {}
     early_signal_stats: dict[str, int] = {
         "watch_sent": 0,
         "setup_sent": 0,
+        "ultra_sent": 0,
         "watch_to_setup_promoted": 0,
         "entry_confirmed": 0,
         "invalidated": 0,
         "suppressed_by_cooldown": 0,
+        "ultra_suppressed": 0,
     }
     try:
         while True:
@@ -6692,6 +7689,8 @@ def main() -> int:
                 signal_alert_cache=signal_alert_cache,
                 early_signal_state=early_signal_state,
                 early_signal_stats=early_signal_stats,
+                ultra_alerters=ultra_alerters,
+                ultra_signal_state=ultra_signal_state,
                 mode=cfg.mode,
                 trade_learner=trade_learner,
                 online_retrainer=online_retrainer,

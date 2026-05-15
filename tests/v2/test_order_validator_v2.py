@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 
 from trading.execution.order_validator import OrderValidationError, validate_order_intent
@@ -55,6 +56,25 @@ class OrderValidatorV2Tests(unittest.TestCase):
     def test_accept_decimal_safe_qty_step_alignment(self):
         intent = OrderIntent(symbol="BTCUSDT", side=OrderSide.BUY, qty=0.05)
         validate_order_intent(intent, rules=self.rules, account=self.account, mark_price=100.0, open_orders=[])
+
+    def test_reject_non_finite_qty_and_mark_price(self):
+        with self.assertRaisesRegex(OrderValidationError, "non_finite_order_input"):
+            validate_order_intent(
+                OrderIntent(symbol="BTCUSDT", side=OrderSide.BUY, qty=math.nan),
+                rules=self.rules,
+                account=self.account,
+                mark_price=100.0,
+                open_orders=[],
+            )
+
+        with self.assertRaisesRegex(OrderValidationError, "non_finite_order_input"):
+            validate_order_intent(
+                OrderIntent(symbol="BTCUSDT", side=OrderSide.BUY, qty=0.05),
+                rules=self.rules,
+                account=self.account,
+                mark_price=math.inf,
+                open_orders=[],
+            )
 
 
 if __name__ == "__main__":

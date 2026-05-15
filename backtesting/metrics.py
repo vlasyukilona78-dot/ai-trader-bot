@@ -46,12 +46,38 @@ def build_equity_curve(trades: pd.DataFrame, initial_equity: float = 1000.0) -> 
         ordered = ordered.sort_values("exit_time", kind="stable")
     ordered["pnl"] = pd.to_numeric(ordered.get("pnl", 0.0), errors="coerce").fillna(0.0)
 
+    reconstructed = float(initial_equity) + ordered["pnl"].cumsum()
     if "equity_after" in ordered.columns:
-        equity = pd.to_numeric(ordered["equity_after"], errors="coerce").ffill().fillna(float(initial_equity))
+        recorded = pd.to_numeric(ordered["equity_after"], errors="coerce")
+        equity = recorded.where(recorded.notna(), reconstructed)
     else:
-        equity = float(initial_equity) + ordered["pnl"].cumsum()
-    equity.name = "equity"
-    return equity.astype("float64")
+        equity = reconstructed
+    equity = equity.ffill().fillna(float(initial_equity)).astype("float64")
+    curve = pd.concat(
+        [
+            pd.Series([float(initial_equity)], dtype="float64"),
+            equity.reset_index(drop=True),
+        ],
+        ignore_index=True,
+    )
+    curve.name = "equity"
+    return curve
+
+
+def _resolve_trade_returns(ordered: pd.DataFrame, initial_equity: float) -> pd.Series:
+    pnl = pd.to_numeric(ordered.get("pnl", 0.0), errors="coerce").fillna(0.0)
+    if "equity_before" in ordered.columns:
+        base = pd.to_numeric(ordered["equity_before"], errors="coerce")
+    else:
+        base = float(initial_equity) + pnl.cumsum().shift(1, fill_value=0.0)
+
+    computed = pnl / base.replace(0.0, np.nan)
+    computed = computed.replace([np.inf, -np.inf], np.nan)
+    if "ret" not in ordered.columns:
+        return computed.fillna(0.0).astype("float64")
+
+    provided = pd.to_numeric(ordered["ret"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    return computed.where(computed.notna(), provided).fillna(0.0).astype("float64")
 
 
 def sharpe_ratio(
@@ -66,7 +92,7 @@ def sharpe_ratio(
     if annualization <= 0.0:
         annualization = infer_trade_periods_per_year(timestamps)
     if annualization <= 0.0:
-        annualization = float(max(len(returns), 1))
+        annualization = 1.0
     std = float(returns.std(ddof=0))
     if std <= 0.0:
         return 0.0
@@ -98,16 +124,17 @@ def summarize_trades(trades: pd.DataFrame, initial_equity: float = 1000.0) -> di
 
     ordered = trades.copy()
     ordered["pnl"] = pd.to_numeric(ordered["pnl"], errors="coerce").fillna(0.0)
-    ordered["ret"] = pd.to_numeric(ordered.get("ret", 0.0), errors="coerce").fillna(0.0)
     exit_times = None
     if "exit_time" in ordered.columns:
         ordered["exit_time"] = pd.to_datetime(ordered["exit_time"], utc=True, errors="coerce")
         ordered = ordered.sort_values("exit_time", kind="stable")
         exit_times = ordered["exit_time"]
+    ordered["ret"] = _resolve_trade_returns(ordered, initial_equity=initial_equity)
 
     winrate = float((ordered["pnl"] > 0).mean())
     pf = profit_factor(ordered["pnl"])
-    sharpe = sharpe_ratio(ordered["ret"], timestamps=exit_times)
+    sharpe_periods_per_year = infer_trade_periods_per_year(exit_times)
+    sharpe = sharpe_ratio(ordered["ret"], periods_per_year=sharpe_periods_per_year)
 
     equity = build_equity_curve(ordered, initial_equity=initial_equity)
     mdd = max_drawdown(equity)
@@ -116,6 +143,8 @@ def summarize_trades(trades: pd.DataFrame, initial_equity: float = 1000.0) -> di
         "trades": int(len(ordered)),
         "winrate": winrate,
         "sharpe": sharpe,
+        "sharpe_periods_per_year": sharpe_periods_per_year,
+        "sharpe_annualized": bool(sharpe_periods_per_year > 0.0),
         "profit_factor": pf,
         "max_drawdown": mdd,
         "net_pnl": float(ordered["pnl"].sum()),

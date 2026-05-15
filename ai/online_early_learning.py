@@ -251,6 +251,7 @@ class EarlySignalOutcomeLearner:
         row = {
             "timestamp": pd.Timestamp(future_index[-1]).strftime("%Y-%m-%d %H:%M:%S"),
             "market_regime": sample.market_regime,
+            "signal_side": "SHORT",
             "target_win": int(target_win),
             "target_horizon": float(target_horizon),
             "future_return": float(favorable - adverse),

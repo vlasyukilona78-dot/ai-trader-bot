@@ -53,6 +53,24 @@ class FeaturePipelineV2Tests(unittest.TestCase):
         for name in REQUIRED_MODEL_FEATURES:
             self.assertTrue(np.isfinite(float(bundle.row.values[name])))
 
+    def test_feature_pipeline_preserves_liquidation_attrs_for_strategy_context(self):
+        df = self._build_df()
+        df.attrs["coinglass_liquidation_bands"] = [
+            {
+                "level": 123.0,
+                "weight": 3.0,
+                "side": "above",
+                "source": "coinglass",
+                "notional_usdt": 250_000.0,
+            }
+        ]
+        pipe = FeaturePipeline()
+
+        bundle = pipe.build(symbol="BTCUSDT", ohlcv=df, as_of=df.index[-1])
+
+        self.assertIn("coinglass_liquidation_bands", bundle.enriched.attrs)
+        self.assertEqual(bundle.enriched.attrs["coinglass_liquidation_bands"][0]["level"], 123.0)
+
     def test_compute_mtf_feature_snapshot_populates_one_hour_context(self):
         df = self._build_df(n=2200)
 
@@ -103,6 +121,30 @@ class FeaturePipelineV2Tests(unittest.TestCase):
         self.assertEqual(str(out["reason"]), "recent_zero_volume_cluster")
         self.assertGreaterEqual(float(out["recent_zero_volume_count"]), 3.0)
         self.assertGreater(float(out["recent_zero_volume_ratio"]), 0.10)
+
+    def test_assess_feature_frame_quality_allows_sparse_zero_volume_minutes(self):
+        df = self._build_df(n=120)
+        sparse_zero_indices = df.index[-48::5]
+        df.loc[sparse_zero_indices, "volume"] = 0.0
+
+        out = assess_feature_frame_quality(
+            df,
+            recent_window=96,
+            max_recent_zero_volume_ratio=0.10,
+            min_recent_zero_volume_count=3,
+        )
+
+        self.assertTrue(bool(out["usable"]))
+        self.assertEqual(str(out["reason"]), "")
+        self.assertGreater(float(out["recent_zero_volume_ratio"]), 0.10)
+
+    def test_feature_pipeline_rejects_recent_quality_gap_before_model_row(self):
+        df = self._build_df(n=220)
+        broken = df.drop(df.index[[190, 191, 205, 206]])
+        pipe = FeaturePipeline()
+
+        with self.assertRaisesRegex(ValueError, "feature_frame_quality:"):
+            pipe.build(symbol="BTCUSDT", ohlcv=broken, as_of=broken.index[-1])
 
 
 if __name__ == "__main__":

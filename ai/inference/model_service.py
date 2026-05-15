@@ -51,15 +51,16 @@ class ModelService:
         names = self.artifacts.feature_names or sorted(features.keys())
         if self.strict_schema and self.artifacts.feature_names:
             expected_names = [str(name) for name in self.artifacts.feature_names]
-            runtime_names = sorted(str(name) for name in features.keys() if str(name))
-            missing = [name for name in expected_names if name not in features]
+            runtime_names = [str(name) for name in features.keys() if str(name)]
+            runtime_name_set = set(runtime_names)
+            missing = [name for name in expected_names if name not in runtime_name_set]
             unexpected = [name for name in runtime_names if name not in expected_names]
             if missing:
                 return InferenceResult(probability=0.5, horizon=8.0, model_enabled=False, reason="feature_parity_missing")
             if unexpected:
                 return InferenceResult(probability=0.5, horizon=8.0, model_enabled=False, reason="feature_parity_extra")
             expected_hash = self.artifacts.feature_schema_hash or compute_feature_schema_hash(expected_names)
-            actual_hash = compute_feature_schema_hash(expected_names)
+            actual_hash = compute_feature_schema_hash(runtime_names)
             if expected_hash and expected_hash != actual_hash:
                 return InferenceResult(probability=0.5, horizon=8.0, model_enabled=False, reason="feature_schema_mismatch")
 

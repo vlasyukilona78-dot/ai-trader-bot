@@ -179,6 +179,7 @@ class TradeExecutionLearner:
                 tz="UTC",
             ).strftime("%Y-%m-%d %H:%M:%S"),
             "market_regime": trade.market_regime,
+            "signal_side": str(trade.side or "").upper(),
             "target_win": int(target_win),
             "target_horizon": float(target_horizon),
             "future_return": float(future_return),

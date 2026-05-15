@@ -10,7 +10,10 @@ class OrderValidationError(ValueError):
 
 
 def _to_decimal(value: float) -> Decimal:
-    return Decimal(str(value))
+    out = Decimal(str(value))
+    if not out.is_finite():
+        raise InvalidOperation
+    return out
 
 
 def _is_step_aligned(value: float, step: float, tol: float = 1e-9) -> bool:
@@ -36,27 +39,43 @@ def validate_order_intent(
     mark_price: float,
     open_orders: list[OpenOrderSnapshot],
 ):
-    if rules.tick_size <= 0 or rules.qty_step <= 0 or rules.min_qty <= 0 or rules.min_notional <= 0:
+    try:
+        qty_d = _to_decimal(intent.qty)
+        mark_price_d = _to_decimal(mark_price)
+        tick_size_d = _to_decimal(rules.tick_size)
+        qty_step_d = _to_decimal(rules.qty_step)
+        min_qty_d = _to_decimal(rules.min_qty)
+        min_notional_d = _to_decimal(rules.min_notional)
+        max_qty_d = _to_decimal(rules.max_qty) if rules.max_qty > 0 else Decimal("0")
+    except (InvalidOperation, ValueError):
+        raise OrderValidationError("non_finite_order_input")
+
+    if tick_size_d <= 0 or qty_step_d <= 0 or min_qty_d <= 0 or min_notional_d <= 0:
         raise OrderValidationError("invalid_instrument_metadata")
 
-    if intent.qty <= 0:
+    if qty_d <= 0:
         raise OrderValidationError("qty_must_be_positive")
-    if mark_price <= 0:
+    if mark_price_d <= 0:
         raise OrderValidationError("invalid_mark_price")
 
     if not _is_step_aligned(intent.qty, rules.qty_step):
         raise OrderValidationError("qty_step_mismatch")
 
-    if intent.qty < rules.min_qty:
+    if qty_d < min_qty_d:
         raise OrderValidationError("below_min_qty")
-    if rules.max_qty > 0 and intent.qty > rules.max_qty:
+    if max_qty_d > 0 and qty_d > max_qty_d:
         raise OrderValidationError("above_max_qty")
 
-    notional = intent.qty * mark_price
-    if notional < rules.min_notional:
+    notional = qty_d * mark_price_d
+    if notional < min_notional_d:
         raise OrderValidationError("below_min_notional")
 
-    if account.available_balance_usdt <= 0 and not intent.reduce_only:
+    try:
+        available_balance_d = _to_decimal(account.available_balance_usdt)
+    except (InvalidOperation, ValueError):
+        available_balance_d = Decimal("0")
+
+    if available_balance_d <= 0 and not intent.reduce_only:
         raise OrderValidationError("insufficient_available_balance")
 
     conflict = any(

@@ -571,6 +571,16 @@ class LayeredPumpStrategy(StrategyInterface):
                         (tail_close >= (tail3["vwap"].astype(float) * (1.0 + vwap_acceptance_pad))).sum()
                     )
         cfg = self._generator.config
+        micro_fail_exit = (
+            holding_minutes >= float(cfg.managed_exit_micro_fail_min_hold_minutes)
+            and best_reward_r <= float(cfg.managed_exit_micro_fail_max_best_r)
+            and adverse_r >= float(cfg.managed_exit_micro_fail_min_adverse_r)
+            and acceptance_entry_count >= 2
+            and (acceptance_ema20_count >= 2 or acceptance_vwap_count >= 2)
+            and (close_above_ema20 or close_above_vwap)
+            and bounce_strength >= 2
+            and (up_close_count >= 2 or rsi_turning_up or hist_turning_up)
+        )
         stagnation_exit = (
             holding_minutes >= float(cfg.managed_exit_stagnation_min_hold_minutes)
             and reward_r < float(cfg.managed_exit_stagnation_max_reward_r)
@@ -677,6 +687,9 @@ class LayeredPumpStrategy(StrategyInterface):
         if hard_reclaim_exit:
             exit_type = "reclaim_invalidation"
             reason = "managed_exit_reclaim_invalidation"
+        elif micro_fail_exit:
+            exit_type = "micro_fail_acceptance"
+            reason = "managed_exit_micro_fail_acceptance"
         elif acceptance_reclaim_exit:
             exit_type = "acceptance_reclaim"
             reason = "managed_exit_acceptance_reclaim"
@@ -748,6 +761,7 @@ class LayeredPumpStrategy(StrategyInterface):
                 "acceptance_ema20_count": float(acceptance_ema20_count),
                 "acceptance_vwap_count": float(acceptance_vwap_count),
                 "up_close_count": float(up_close_count),
+                "micro_fail_exit": 1.0 if micro_fail_exit else 0.0,
             },
         }
         return StrategyIntent(
@@ -828,7 +842,10 @@ class LayeredPumpStrategy(StrategyInterface):
         )
         trace_meta = self._trace_meta()
         trace = trace_meta.get("layer_trace", {}) if isinstance(trace_meta, dict) else {}
-        self._audit.record(trace, signal_side=getattr(signal, "side", None))
+        audit_signal_side = getattr(signal, "side", None)
+        if str(audit_signal_side or "").upper() == "LONG" and not self._allow_long_entries:
+            audit_signal_side = None
+        self._audit.record(trace, signal_side=audit_signal_side)
         managed_short_exit = self._managed_short_exit_intent(
             context=context,
             enriched=enriched,

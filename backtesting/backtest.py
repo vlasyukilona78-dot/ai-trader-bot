@@ -107,7 +107,8 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
     trades: list[dict] = []
     equity = float(cfg.initial_equity)
 
-    for i in range(80, len(enriched) - 2):
+    i = 80
+    while i < len(enriched) - 2:
         if equity <= 0.0:
             break
         hist = enriched.iloc[: i + 1]
@@ -124,11 +125,13 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
             volume_profile=vp,
             regime=regime,
             sentiment_index=sentiment,
+            sentiment_source="provided",
             funding_rate=funding,
             long_short_ratio=ratio,
         )
         signal = signal_gen.generate(context)
         if signal is None:
+            i += 1
             continue
 
         entry = signal.entry
@@ -144,6 +147,7 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
         # risk-based sizing
         risk_per_unit = abs(entry - signal.sl)
         if risk_per_unit <= 0:
+            i += 1
             continue
         equity_before = max(equity, 0.0)
         risk_usdt = equity_before * cfg.risk_per_trade
@@ -184,6 +188,7 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
             }
         )
         equity = equity_after
+        i = max(i + 1, exit_idx + 1)
 
     trades_df = pd.DataFrame(trades)
     stats = summarize_trades(trades_df, initial_equity=cfg.initial_equity)
@@ -217,6 +222,7 @@ class PaperTrader:
             volume_profile=vp,
             regime=regime,
             sentiment_index=sentiment_index,
+            sentiment_source="provided" if sentiment_index is not None else "unavailable",
             funding_rate=funding_rate,
             long_short_ratio=1.0,
         )

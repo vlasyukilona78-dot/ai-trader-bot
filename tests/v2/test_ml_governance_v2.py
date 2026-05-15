@@ -78,6 +78,10 @@ class MlGovernanceV2Tests(unittest.TestCase):
         self.assertTrue(ok.model_enabled)
         self.assertGreater(ok.probability, 0.0)
 
+        reordered = service.predict({"f2": 2.0, "f1": 1.0})
+        self.assertFalse(reordered.model_enabled)
+        self.assertEqual(reordered.reason, "feature_schema_mismatch")
+
     @unittest.skipIf(joblib is None, "joblib unavailable")
     def test_validate_artifact_bundle_requires_manifest_feature_schema_contract(self):
         features = ["f1", "f2"]
@@ -115,6 +119,7 @@ class MlGovernanceV2Tests(unittest.TestCase):
         for idx in range(160):
             row = {
                 "timestamp": (base_ts + timedelta(minutes=idx)).isoformat(),
+                "signal_side": "SHORT",
                 "target_win": int(idx % 2 == 0),
                 "target_horizon": float(4 + (idx % 12)),
             }
@@ -128,9 +133,10 @@ class MlGovernanceV2Tests(unittest.TestCase):
             model_dir = tmp / "models"
             pd.DataFrame(rows).to_csv(dataset, index=False)
 
-            train_models(str(dataset), model_dir=str(model_dir), model_type="sklearn")
+            train_models(str(dataset), model_dir=str(model_dir), model_type="sklearn", side="SHORT")
 
             manifest = json.loads((model_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest.get("side_filter"), "SHORT")
             metrics = manifest.get("metrics", {})
             self.assertEqual(metrics.get("train_rows"), 128)
             self.assertEqual(metrics.get("test_rows"), 32)

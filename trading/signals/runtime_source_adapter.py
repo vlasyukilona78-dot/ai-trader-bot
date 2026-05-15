@@ -262,8 +262,8 @@ def build_runtime_signal_inputs(
     open_interest_raw, open_interest_raw_source, open_interest_raw_quality, open_interest_raw_degraded = _resolve_numeric(
         frame=frame,
         payload=payload,
-        value_keys=["open_interest"],
-        frame_value_cols=["open_interest"],
+        value_keys=["open_interest", "open_interest_abs"],
+        frame_value_cols=["open_interest", "open_interest_abs"],
         source_keys=["open_interest_source", "oi_source"],
         frame_source_cols=["open_interest_source", "oi_source"],
         degraded_keys=["oi_degraded"],

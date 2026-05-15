@@ -7,9 +7,11 @@ from types import SimpleNamespace
 from trading.exchange.events import NormalizedExchangeEvent
 from trading.exchange.schemas import (
     AccountSnapshot,
+    ClosedPnlSnapshot,
     InstrumentRules,
     OpenOrderSnapshot,
     OrderIntent,
+    OrderBookQuality,
     OrderResult,
     OrderSide,
     PositionSide,
@@ -53,6 +55,10 @@ class FakeAdapter:
         self.force_refresh_calls: list[str] = []
         self.ensure_leverage_calls: list[dict] = []
         self.ws_events: list[NormalizedExchangeEvent] = []
+        self.orderbook_quality: OrderBookQuality | None = None
+        self.orderbook_quality_calls: list[dict] = []
+        self.closed_pnl_snapshots: list[ClosedPnlSnapshot] = []
+        self.closed_pnl_calls: list[dict] = []
 
     @staticmethod
     def normalize_symbol(symbol: str) -> str:
@@ -94,6 +100,24 @@ class FakeAdapter:
     def get_mark_price(self, symbol: str) -> float:
         return float(self.mark_price)
 
+    def get_recent_closed_pnl(
+        self,
+        symbol: str,
+        *,
+        limit: int = 20,
+        start_time_ms: int | None = None,
+    ) -> list[ClosedPnlSnapshot]:
+        norm = self.normalize_symbol(symbol)
+        self.closed_pnl_calls.append(
+            {
+                "symbol": norm,
+                "limit": int(limit),
+                "start_time_ms": start_time_ms,
+            }
+        )
+        rows = [row for row in self.closed_pnl_snapshots if self.normalize_symbol(row.symbol) == norm]
+        return list(rows[: max(1, int(limit))])
+
     def get_instrument_rules(self, symbol: str, *, force_refresh: bool = False) -> InstrumentRules:
         norm = self.normalize_symbol(symbol)
         if force_refresh:
@@ -121,6 +145,43 @@ class FakeAdapter:
     def ensure_position_leverage(self, symbol: str, leverage: float) -> bool:
         self.ensure_leverage_calls.append({"symbol": self.normalize_symbol(symbol), "leverage": float(leverage)})
         return True
+
+    def get_orderbook_quality(
+        self,
+        symbol: str,
+        side: OrderSide,
+        qty: float,
+        *,
+        limit: int = 50,
+        depth_slippage_bps: float = 35.0,
+    ) -> OrderBookQuality:
+        self.orderbook_quality_calls.append(
+            {
+                "symbol": self.normalize_symbol(symbol),
+                "side": side,
+                "qty": float(qty),
+                "limit": int(limit),
+                "depth_slippage_bps": float(depth_slippage_bps),
+            }
+        )
+        if self.orderbook_quality is not None:
+            return self.orderbook_quality
+        return OrderBookQuality(
+            symbol=self.normalize_symbol(symbol),
+            side=side,
+            requested_qty=float(qty),
+            requested_notional_usdt=float(qty) * float(self.mark_price),
+            executable_qty=float(qty) * 2.0,
+            executable_notional_usdt=float(qty) * float(self.mark_price) * 2.0,
+            depth_ratio=2.0,
+            best_bid=float(self.mark_price) * 0.999,
+            best_ask=float(self.mark_price) * 1.001,
+            spread_bps=20.0,
+            expected_avg_price=float(self.mark_price),
+            expected_slippage_bps=3.0,
+            levels_used=3,
+            available=True,
+        )
 
     def drain_ws_events(self) -> list[NormalizedExchangeEvent]:
         out = list(self.ws_events)

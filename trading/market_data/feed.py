@@ -88,8 +88,8 @@ class MarketDataFeed:
                 payload["spread_bps"] = ((ask_px - bid_px) / mid) * 10_000.0
         return payload
 
-    def _fetch_optional_derivative_payload(self, symbol: str) -> dict[str, object]:
-        if not self._env_truthy("MARKETDATA_FETCH_DERIVATIVE_CONTEXT", False):
+    def _fetch_optional_derivative_payload(self, symbol: str, *, force: bool = False) -> dict[str, object]:
+        if not force and not self._env_truthy("MARKETDATA_FETCH_DERIVATIVE_CONTEXT", False):
             return {}
 
         payload: dict[str, object] = {}
@@ -99,14 +99,36 @@ class MarketDataFeed:
             payload["long_short_ratio_source"] = "live:bybit:account-ratio"
             payload["long_short_ratio_degraded"] = False
 
-        open_interest = self._client.fetch_open_interest(symbol)
+        if hasattr(self._client, "fetch_open_interest_context"):
+            oi_context = self._client.fetch_open_interest_context(symbol)
+            open_interest = self._safe_float(dict(oi_context).get("open_interest")) if oi_context else None
+            open_interest_ratio = self._safe_float(dict(oi_context).get("open_interest_ratio")) if oi_context else None
+            oi_signal = self._safe_float(dict(oi_context).get("oi_signal")) if oi_context else None
+        else:
+            open_interest = self._client.fetch_open_interest(symbol)
+            open_interest_ratio = None
+            oi_signal = None
         if open_interest is not None:
+            payload["open_interest"] = open_interest
+            payload["open_interest_source"] = "live:bybit:open-interest"
             payload["open_interest_abs"] = open_interest
             payload["open_interest_abs_source"] = "live:bybit:open-interest"
+        if open_interest_ratio is not None:
+            payload["open_interest_ratio"] = open_interest_ratio
+            payload["oi_signal"] = oi_signal if oi_signal is not None else open_interest_ratio
+            payload["oi_source"] = "live:bybit:open-interest"
+            payload["oi_degraded"] = False
         return payload
 
     @classmethod
-    def _overlay_live_price_to_ohlcv(cls, ohlcv: pd.DataFrame, *, mark_price: float, timeframe: str) -> pd.DataFrame:
+    def _overlay_live_price_to_ohlcv(
+        cls,
+        ohlcv: pd.DataFrame,
+        *,
+        mark_price: float,
+        timeframe: str,
+        append_new_bucket: bool | None = None,
+    ) -> pd.DataFrame:
         if ohlcv.empty or mark_price <= 0:
             return ohlcv
 
@@ -136,13 +158,18 @@ class MarketDataFeed:
             updated.iloc[-1, updated.columns.get_loc("close")] = mark_price
             return updated
 
-        if not cls._env_truthy("MARKETDATA_LIVE_OVERLAY_APPEND_NEW_BUCKET", False):
+        should_append_new_bucket = (
+            cls._env_truthy("MARKETDATA_LIVE_OVERLAY_APPEND_NEW_BUCKET", False)
+            if append_new_bucket is None
+            else bool(append_new_bucket)
+        )
+        if not should_append_new_bucket:
             max_lag = pd.Timedelta(minutes=interval_minutes * 2)
             if current_bucket - last_ts <= max_lag:
                 updated.iloc[-1, updated.columns.get_loc("high")] = max(float(last_row.get("high", mark_price)), mark_price)
                 updated.iloc[-1, updated.columns.get_loc("low")] = min(float(last_row.get("low", mark_price)), mark_price)
                 updated.iloc[-1, updated.columns.get_loc("close")] = mark_price
-                return updated
+            return updated
 
         new_row = last_row.copy()
         new_row["open"] = last_close
@@ -160,12 +187,17 @@ class MarketDataFeed:
         candles: int,
         *,
         include_liquidations: bool = False,
+        include_derivatives: bool | None = None,
         overlay_live_price: bool = False,
+        append_live_bucket: bool | None = None,
     ) -> MarketFrame:
         ohlcv = self._client.fetch_ohlcv(symbol=symbol, interval=timeframe, limit=int(candles))
         ticker = self._client.fetch_ticker_meta(symbol=symbol)
         runtime_payload = self._runtime_payload_from_ticker(ticker)
-        runtime_payload.update(self._fetch_optional_derivative_payload(symbol))
+        force_derivatives = bool(include_derivatives)
+        if include_derivatives is None:
+            force_derivatives = False
+        runtime_payload.update(self._fetch_optional_derivative_payload(symbol, force=force_derivatives))
         mark_price = 0.0
         for key in ("markPrice", "lastPrice", "indexPrice"):
             try:
@@ -175,7 +207,12 @@ class MarketDataFeed:
             except (TypeError, ValueError):
                 continue
         if overlay_live_price:
-            ohlcv = self._overlay_live_price_to_ohlcv(ohlcv, mark_price=mark_price, timeframe=timeframe)
+            ohlcv = self._overlay_live_price_to_ohlcv(
+                ohlcv,
+                mark_price=mark_price,
+                timeframe=timeframe,
+                append_new_bucket=append_live_bucket,
+            )
         liq_high = None
         liq_low = None
         if include_liquidations:

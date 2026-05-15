@@ -45,6 +45,19 @@ class PositionSnapshot:
     stop_loss: float | None = None
 
 
+@dataclass(frozen=True)
+class ClosedPnlSnapshot:
+    closure_id: str
+    symbol: str
+    position_side: PositionSide
+    qty: float
+    entry_price: float
+    exit_price: float
+    closed_pnl: float
+    closed_ts: float
+    raw: dict[str, Any]
+
+
 @dataclass
 class OpenOrderSnapshot:
     symbol: str
@@ -88,6 +101,24 @@ class ProtectiveOrderResult:
     success: bool
     raw: dict[str, Any]
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class OrderBookQuality:
+    symbol: str
+    side: OrderSide
+    requested_qty: float
+    requested_notional_usdt: float
+    executable_qty: float
+    executable_notional_usdt: float
+    depth_ratio: float
+    best_bid: float
+    best_ask: float
+    spread_bps: float
+    expected_avg_price: float
+    expected_slippage_bps: float
+    levels_used: int
+    available: bool = True
 
 
 

@@ -81,6 +81,25 @@ class BybitHttpClient:
     def get_ticker_meta(self, symbol: str) -> dict[str, Any]:
         return self._client.get_ticker_meta(symbol)
 
+    def get_orderbook(self, symbol: str, limit: int = 50) -> dict[str, Any]:
+        return self._client.get_orderbook(symbol, limit=limit)
+
+    def get_closed_pnl(
+        self,
+        symbol: str,
+        *,
+        limit: int = 20,
+        start_time_ms: int | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "category": "linear",
+            "symbol": symbol,
+            "limit": max(1, min(int(limit or 20), 100)),
+        }
+        if start_time_ms is not None and int(start_time_ms) > 0:
+            params["startTime"] = int(start_time_ms)
+        return self._client._request("GET", "/v5/position/closed-pnl", params=params, private=True)
+
 
     def get_account_info(self) -> dict[str, Any]:
         return self._client.get_account_info()

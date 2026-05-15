@@ -2,7 +2,7 @@
 
 import unittest
 
-from trading.exchange.schemas import AccountSnapshot, InstrumentRules
+from trading.exchange.schemas import AccountSnapshot, InstrumentRules, PositionSide, PositionSnapshot
 from trading.risk.engine import RiskEngine
 from trading.risk.limits import RiskLimits
 from trading.signals.signal_types import IntentAction, StrategyIntent
@@ -26,7 +26,13 @@ class RiskEngineV2Tests(unittest.TestCase):
         self.rules = InstrumentRules(symbol="BTCUSDT", tick_size=0.1, qty_step=0.001, min_qty=0.001, min_notional=5.0)
 
     @staticmethod
-    def _roomy_limits(*, execution_cost_buffer_bps: float = 6.0) -> RiskLimits:
+    def _roomy_limits(
+        *,
+        execution_cost_buffer_bps: float = 6.0,
+        entry_fee_bps: float = 0.0,
+        exit_fee_bps: float = 0.0,
+        slippage_buffer_bps: float = 0.0,
+    ) -> RiskLimits:
         return RiskLimits(
             max_risk_per_trade_pct=0.01,
             max_daily_loss_pct=0.05,
@@ -36,6 +42,9 @@ class RiskEngineV2Tests(unittest.TestCase):
             max_total_notional_pct=10.0,
             min_liquidation_buffer_pct=0.01,
             execution_cost_buffer_bps=execution_cost_buffer_bps,
+            entry_fee_bps=entry_fee_bps,
+            exit_fee_bps=exit_fee_bps,
+            slippage_buffer_bps=slippage_buffer_bps,
             require_stop_loss=True,
             pyramiding_enabled=False,
         )
@@ -69,6 +78,46 @@ class RiskEngineV2Tests(unittest.TestCase):
             metadata={"liq_price_hint": 99.5},
         )
         decision = self.engine.evaluate(intent=intent, account=self.account, existing_positions=[], mark_price=100.0, rules=self.rules)
+        self.assertFalse(decision.approved)
+        self.assertEqual(decision.reason, "liquidation_too_close")
+
+    def test_uses_exchange_position_liq_price_when_metadata_hint_missing(self):
+        limits = RiskLimits(
+            max_risk_per_trade_pct=0.01,
+            max_daily_loss_pct=0.05,
+            max_leverage=10.0,
+            max_concurrent_positions=3,
+            max_symbol_exposure_pct=2.0,
+            max_total_notional_pct=10.0,
+            min_liquidation_buffer_pct=0.02,
+            require_stop_loss=True,
+            pyramiding_enabled=True,
+        )
+        engine = RiskEngine(limits)
+        existing_position = PositionSnapshot(
+            symbol="BTCUSDT",
+            side=PositionSide.SHORT,
+            qty=0.1,
+            entry_price=100.0,
+            liq_price=101.0,
+            leverage=5.0,
+            position_idx=2,
+        )
+        intent = StrategyIntent(
+            symbol="BTCUSDT",
+            action=IntentAction.SHORT_ENTRY,
+            reason="t",
+            stop_loss=102.0,
+        )
+
+        decision = engine.evaluate(
+            intent=intent,
+            account=AccountSnapshot(equity_usdt=10_000.0, available_balance_usdt=10_000.0),
+            existing_positions=[existing_position],
+            mark_price=100.0,
+            rules=self.rules,
+        )
+
         self.assertFalse(decision.approved)
         self.assertEqual(decision.reason, "liquidation_too_close")
 
@@ -190,6 +239,44 @@ class RiskEngineV2Tests(unittest.TestCase):
         self.assertGreater(weak.effective_stop_loss, baseline.effective_stop_loss)
         self.assertGreater(weak.effective_stop_loss, baseline_intent.stop_loss)
 
+    def test_fee_and_slippage_buffers_are_included_in_position_sizing(self):
+        account = AccountSnapshot(equity_usdt=10_000.0, available_balance_usdt=10_000.0)
+        rules = InstrumentRules(symbol="BTCUSDT", tick_size=0.001, qty_step=0.001, min_qty=0.001, min_notional=5.0)
+        intent = StrategyIntent(
+            symbol="BTCUSDT",
+            action=IntentAction.SHORT_ENTRY,
+            reason="t",
+            stop_loss=101.0,
+            confidence=0.90,
+        )
+        baseline = RiskEngine(self._roomy_limits(execution_cost_buffer_bps=0.0)).evaluate(
+            intent=intent,
+            account=account,
+            existing_positions=[],
+            mark_price=100.0,
+            rules=rules,
+        )
+        buffered = RiskEngine(
+            self._roomy_limits(
+                execution_cost_buffer_bps=0.0,
+                entry_fee_bps=5.5,
+                exit_fee_bps=5.5,
+                slippage_buffer_bps=8.0,
+            )
+        ).evaluate(
+            intent=intent,
+            account=account,
+            existing_positions=[],
+            mark_price=100.0,
+            rules=rules,
+        )
+
+        self.assertTrue(baseline.approved)
+        self.assertTrue(buffered.approved)
+        self.assertAlmostEqual(buffered.execution_cost_buffer_bps_used, 19.0)
+        self.assertGreater(buffered.effective_stop_loss, baseline.effective_stop_loss)
+        self.assertLess(buffered.quantity, baseline.quantity)
+
     def test_turnover_and_spread_penalties_raise_buffer_even_without_layer_trace(self):
         intent = StrategyIntent(
             symbol="BTCUSDT",
@@ -214,6 +301,41 @@ class RiskEngineV2Tests(unittest.TestCase):
         self.assertTrue(decision.approved)
         self.assertGreater(decision.execution_cost_buffer_bps_used, self.limits.execution_cost_buffer_bps)
         self.assertGreater(decision.quality_penalty_bps_used, 0.0)
+
+    def test_rejects_entries_when_spread_or_turnover_are_outside_guardrails(self):
+        spread_intent = StrategyIntent(
+            symbol="BTCUSDT",
+            action=IntentAction.SHORT_ENTRY,
+            reason="t",
+            stop_loss=101.0,
+            metadata={"spread_bps": 50.0, "turnover24h_usdt": 1_000_000.0},
+        )
+        spread_decision = self.engine.evaluate(
+            intent=spread_intent,
+            account=self.account,
+            existing_positions=[],
+            mark_price=100.0,
+            rules=self.rules,
+        )
+        self.assertFalse(spread_decision.approved)
+        self.assertEqual(spread_decision.reason, "spread_too_wide")
+
+        turnover_intent = StrategyIntent(
+            symbol="BTCUSDT",
+            action=IntentAction.SHORT_ENTRY,
+            reason="t",
+            stop_loss=101.0,
+            metadata={"spread_bps": 5.0, "turnover24h_usdt": 100_000.0},
+        )
+        turnover_decision = self.engine.evaluate(
+            intent=turnover_intent,
+            account=self.account,
+            existing_positions=[],
+            mark_price=100.0,
+            rules=self.rules,
+        )
+        self.assertFalse(turnover_decision.approved)
+        self.assertEqual(turnover_decision.reason, "turnover_too_low")
 
     def test_rounds_qty_down_with_decimal_safe_step_alignment(self):
         limits = self._roomy_limits(execution_cost_buffer_bps=0.0)

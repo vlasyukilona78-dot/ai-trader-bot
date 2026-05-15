@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -64,6 +64,22 @@ class PersistedDecisionRow:
     ts: float
     raw: dict
 
+
+@dataclass(frozen=True)
+class PersistedExchangeClosureRow:
+    closure_id: str
+    symbol: str
+    position_side: str
+    qty: float
+    entry_price: float
+    exit_price: float
+    closed_pnl: float
+    closed_ts: float
+    source: str
+    raw: dict
+    recorded_at: float
+
+
 class RuntimeStore:
     """SQLite-backed runtime persistence for restart-safe V2 execution."""
 
@@ -96,6 +112,13 @@ class RuntimeStore:
         value = str(row[0]).strip().lower()
         return value == "ok"
 
+    @staticmethod
+    def _configure_connection(conn: sqlite3.Connection) -> None:
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+
     def _open_connection_with_recovery(self, db_file: Path) -> sqlite3.Connection:
         try:
             conn = sqlite3.connect(str(db_file), check_same_thread=False)
@@ -103,6 +126,7 @@ class RuntimeStore:
             conn = None
 
         if conn is not None and self._connection_integrity_ok(conn):
+            self._configure_connection(conn)
             return conn
 
         if conn is not None:
@@ -117,7 +141,9 @@ class RuntimeStore:
             os.replace(str(db_file), str(corrupt_path))
         except OSError:
             pass
-        return sqlite3.connect(str(db_file), check_same_thread=False)
+        conn = sqlite3.connect(str(db_file), check_same_thread=False)
+        self._configure_connection(conn)
+        return conn
 
     def close(self):
         with self._lock:
@@ -192,6 +218,20 @@ class RuntimeStore:
                     ts REAL NOT NULL,
                     raw_json TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS exchange_closures (
+                    closure_id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    position_side TEXT NOT NULL,
+                    qty REAL NOT NULL,
+                    entry_price REAL NOT NULL,
+                    exit_price REAL NOT NULL,
+                    closed_pnl REAL NOT NULL,
+                    closed_ts REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    raw_json TEXT NOT NULL,
+                    recorded_at REAL NOT NULL
+                );
                 """
             )
             self._conn.commit()
@@ -235,6 +275,30 @@ class RuntimeStore:
             )
             self._write_schema_version_locked(2)
             version = 2
+
+        if version == 2:
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS exchange_closures (
+                    closure_id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    position_side TEXT NOT NULL,
+                    qty REAL NOT NULL,
+                    entry_price REAL NOT NULL,
+                    exit_price REAL NOT NULL,
+                    closed_pnl REAL NOT NULL,
+                    closed_ts REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    raw_json TEXT NOT NULL,
+                    recorded_at REAL NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_exchange_closures_symbol_ts ON exchange_closures(symbol, closed_ts)"
+            )
+            self._write_schema_version_locked(3)
+            version = 3
 
         if version < SCHEMA_VERSION:
             self._write_schema_version_locked(SCHEMA_VERSION)
@@ -574,6 +638,121 @@ class RuntimeStore:
             )
         return out
 
+    def record_exchange_closure_once(
+        self,
+        *,
+        closure_id: str,
+        symbol: str,
+        position_side: str,
+        qty: float,
+        entry_price: float,
+        exit_price: float,
+        closed_pnl: float,
+        closed_ts: float,
+        source: str = "bybit_closed_pnl",
+        raw: dict | None = None,
+        recorded_at: float | None = None,
+    ) -> bool:
+        clean_id = str(closure_id or "").strip()
+        if not clean_id:
+            raise ValueError("closure_id_required")
+
+        payload = raw if isinstance(raw, dict) else {}
+        raw_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        now = float(recorded_at if recorded_at is not None else self.now_ts())
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT OR IGNORE INTO exchange_closures(
+                    closure_id, symbol, position_side, qty, entry_price, exit_price,
+                    closed_pnl, closed_ts, source, raw_json, recorded_at
+                )
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    clean_id,
+                    str(symbol).replace("/", "").upper().strip(),
+                    str(position_side).upper().strip(),
+                    float(qty or 0.0),
+                    float(entry_price or 0.0),
+                    float(exit_price or 0.0),
+                    float(closed_pnl or 0.0),
+                    float(closed_ts or 0.0),
+                    str(source or "bybit_closed_pnl"),
+                    raw_json,
+                    now,
+                ),
+            )
+            inserted = int(cur.rowcount if cur.rowcount is not None else 0) > 0
+            self._conn.commit()
+        return inserted
+
+    def load_exchange_closures(self, symbol: str | None = None, *, limit: int = 500) -> list[PersistedExchangeClosureRow]:
+        safe_limit = max(1, int(limit))
+        clean_symbol = str(symbol or "").replace("/", "").upper().strip()
+        with self._lock:
+            if clean_symbol:
+                rows = self._conn.execute(
+                    """
+                    SELECT
+                        closure_id, symbol, position_side, qty, entry_price, exit_price,
+                        closed_pnl, closed_ts, source, raw_json, recorded_at
+                    FROM exchange_closures
+                    WHERE symbol=?
+                    ORDER BY closed_ts DESC, recorded_at DESC
+                    LIMIT ?
+                    """,
+                    (clean_symbol, safe_limit),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT
+                        closure_id, symbol, position_side, qty, entry_price, exit_price,
+                        closed_pnl, closed_ts, source, raw_json, recorded_at
+                    FROM exchange_closures
+                    ORDER BY closed_ts DESC, recorded_at DESC
+                    LIMIT ?
+                    """,
+                    (safe_limit,),
+                ).fetchall()
+
+        out: list[PersistedExchangeClosureRow] = []
+        for row in rows:
+            try:
+                raw = json.loads(str(row["raw_json"]))
+                if not isinstance(raw, dict):
+                    raw = {}
+            except Exception:
+                raw = {}
+            out.append(
+                PersistedExchangeClosureRow(
+                    closure_id=str(row["closure_id"]),
+                    symbol=str(row["symbol"]),
+                    position_side=str(row["position_side"]),
+                    qty=float(row["qty"]),
+                    entry_price=float(row["entry_price"]),
+                    exit_price=float(row["exit_price"]),
+                    closed_pnl=float(row["closed_pnl"]),
+                    closed_ts=float(row["closed_ts"]),
+                    source=str(row["source"]),
+                    raw=raw,
+                    recorded_at=float(row["recorded_at"]),
+                )
+            )
+        return out
+
+    def cleanup_exchange_closures(self, max_age_sec: int = 30 * 24 * 3600) -> int:
+        cutoff = self.now_ts() - max(24 * 3600, int(max_age_sec))
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM exchange_closures WHERE recorded_at < ?",
+                (cutoff,),
+            )
+            deleted = int(cur.rowcount if cur.rowcount is not None else 0)
+            self._conn.commit()
+        return max(0, deleted)
+
     def compact_journals(
         self,
         *,
@@ -635,9 +814,11 @@ class RuntimeStore:
         deleted_idem = self.cleanup_idempotency_keys()
         compacted = self.compact_journals()
         deleted_inflight = self.cleanup_closed_inflight()
+        deleted_exchange_closures = self.cleanup_exchange_closures()
         return {
             "deleted_idempotency": deleted_idem,
             "deleted_inflight": deleted_inflight,
+            "deleted_exchange_closures": deleted_exchange_closures,
             **compacted,
             "schema_version": self.get_schema_version(),
         }

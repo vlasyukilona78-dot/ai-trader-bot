@@ -222,28 +222,76 @@ class MarketDataClient:
         return None
 
     def fetch_open_interest(self, symbol: str) -> float | None:
+        context = self.fetch_open_interest_context(symbol, limit=1)
+        value = context.get("open_interest") if isinstance(context, dict) else None
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def fetch_open_interest_context(self, symbol: str, *, interval: str = "5min", limit: int = 12) -> dict[str, float]:
         category = self._category_for_symbol(symbol)
         payload = self._request_public(
             "/v5/market/open-interest",
             params={
                 "category": category,
                 "symbol": self.normalize_symbol(symbol),
-                "intervalTime": "5min",
-                "limit": 1,
+                "intervalTime": str(interval or "5min"),
+                "limit": max(1, min(int(limit), 200)),
             },
         )
         if not payload:
-            return None
+            return {}
         items = payload.get("result", {}).get("list", [])
         if not items:
-            return None
-        row = items[0]
-        for key in ("openInterest", "open_interest"):
-            try:
-                return float(row.get(key))
-            except (TypeError, ValueError):
+            return {}
+
+        values: list[tuple[int | None, float]] = []
+        for row in items:
+            if not isinstance(row, dict):
                 continue
-        return None
+            oi_value = None
+            for key in ("openInterest", "open_interest"):
+                try:
+                    oi_value = float(row.get(key))
+                    break
+                except (TypeError, ValueError):
+                    continue
+            if oi_value is None or oi_value <= 0:
+                continue
+            ts_value = None
+            try:
+                ts_raw = row.get("timestamp") or row.get("time")
+                ts_value = int(float(ts_raw)) if ts_raw not in (None, "") else None
+            except (TypeError, ValueError):
+                ts_value = None
+            values.append((ts_value, oi_value))
+
+        if not values:
+            return {}
+
+        if all(ts is not None for ts, _value in values):
+            values = sorted(values, key=lambda item: int(item[0] or 0))
+            latest = float(values[-1][1])
+            history = [float(value) for _ts, value in values[:-1]]
+        else:
+            # Bybit returns newest first when timestamp sorting is unavailable.
+            latest = float(values[0][1])
+            history = [float(value) for _ts, value in values[1:]]
+
+        out: dict[str, float] = {"open_interest": latest}
+        if history:
+            ordered = sorted(history)
+            mid = len(ordered) // 2
+            if len(ordered) % 2:
+                baseline = float(ordered[mid])
+            else:
+                baseline = (float(ordered[mid - 1]) + float(ordered[mid])) / 2.0
+            if baseline > 0:
+                ratio = latest / baseline
+                out["open_interest_ratio"] = float(ratio)
+                out["oi_signal"] = float(ratio)
+        return out
 
     def fetch_long_short_ratio(self, symbol: str) -> float | None:
         category = self._category_for_symbol(symbol)

@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 try:
     import numpy as np
@@ -12,11 +13,13 @@ try:
     from app.main import (
         _build_approved_early_candidate,
         _build_clean_context_chart_caption,
+        _build_main_signal_signature,
         _build_early_watch_candidate,
         _build_higher_timeframe_chart,
         _current_recent_peak_price,
         _enrich_intent_with_runtime_market_metadata,
         _format_chart_timeframe_label,
+        _prepare_symbol_analysis,
         _remember_cached_alert,
         _scan_live_price_overlay_enabled,
         _send_alerts,
@@ -165,6 +168,36 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertTrue(np.isfinite(float(out["rsi"].iloc[-1])))
         self.assertTrue(np.isfinite(float(out["hist"].iloc[-1])))
 
+    def test_prepare_symbol_analysis_treats_quality_guard_as_data_skip(self):
+        df = self._build_df()
+
+        class _FakeFeed:
+            def fetch_frame(self, **kwargs):
+                return SimpleNamespace(
+                    ohlcv=df,
+                    mark_price=float(df.iloc[-1]["close"]),
+                    liquidation_cluster_high=0.0,
+                    liquidation_cluster_low=0.0,
+                    runtime_payload={},
+                )
+
+        class _FakePipeline:
+            def build(self, **kwargs):
+                raise ValueError("feature_frame_quality:recent_zero_volume_cluster")
+
+        result = _prepare_symbol_analysis(
+            symbol="TESTUSDT",
+            snapshot=SimpleNamespace(),
+            rec_state=SimpleNamespace(),
+            feed=_FakeFeed(),
+            pipeline=_FakePipeline(),
+            timeframe="1",
+            candles_limit=120,
+        )
+
+        self.assertEqual(result.get("status"), "data_quality_blocked")
+        self.assertEqual(result.get("reason"), "recent_zero_volume_cluster")
+
     def test_format_chart_timeframe_label_formats_hours_cleanly(self):
         self.assertEqual(_format_chart_timeframe_label("1"), "1m")
         self.assertEqual(_format_chart_timeframe_label("240"), "4h")
@@ -195,7 +228,7 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(enriched.metadata.get("spread_bps"), 7.0)
         self.assertEqual(enriched.metadata.get("turnover24h_usdt"), 250000.0)
         self.assertEqual(enriched.metadata.get("funding_rate"), 0.0004)
-        self.assertNotIn("open_interest_abs", enriched.metadata)
+        self.assertEqual(enriched.metadata.get("open_interest_abs"), 999999.0)
         self.assertEqual(enriched.metadata.get("custom"), "keep")
 
     def test_build_higher_timeframe_chart_returns_png_bytes(self):
@@ -436,6 +469,48 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertIn("РАННИЙ ШОРТ: HTF КОНТЕКСТ", photo_alerter.caption)
         self.assertIn("HTF уровни + карта ликвидаций", photo_alerter.caption)
         self.assertNotIn("Р ", photo_alerter.caption)
+
+    def test_photo_alerts_do_not_fallback_to_text_when_photo_transport_fails_by_default(self):
+        class _FakeAlerter:
+            def __init__(self):
+                self.text = ""
+
+            def send(self, text, reply_markup=None):
+                self.text = text
+                return True
+
+            def send_photo(self, caption, image_bytes, filename="signal.png", reply_markup=None):
+                return False
+
+        previous_env = os.environ.pop("ALERT_TEXT_FALLBACK_ON_PHOTO_FAILURE", None)
+        try:
+            alerter = _FakeAlerter()
+            attempted, sent = _send_photo_alerts([alerter], "signal", b"png-bytes")
+
+            self.assertEqual((attempted, sent), (1, 0))
+            self.assertEqual(alerter.text, "")
+        finally:
+            if previous_env is not None:
+                os.environ["ALERT_TEXT_FALLBACK_ON_PHOTO_FAILURE"] = previous_env
+
+    def test_photo_alerts_can_opt_into_text_fallback_when_photo_transport_fails(self):
+        class _FakeAlerter:
+            def __init__(self):
+                self.text = ""
+
+            def send(self, text, reply_markup=None):
+                self.text = text
+                return True
+
+            def send_photo(self, caption, image_bytes, filename="signal.png", reply_markup=None):
+                return False
+
+        with patch.dict(os.environ, {"ALERT_TEXT_FALLBACK_ON_PHOTO_FAILURE": "1"}, clear=False):
+            alerter = _FakeAlerter()
+            attempted, sent = _send_photo_alerts([alerter], "signal", b"png-bytes")
+
+        self.assertEqual((attempted, sent), (1, 1))
+        self.assertEqual(alerter.text, "signal")
 
     def test_compute_price_view_bounds_ignores_isolated_recent_wick(self):
         df = self._build_df()
@@ -2991,6 +3066,34 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertAlmostEqual(float(updated.iloc[-1]["high"]), 104.25, places=8)
         self.assertAlmostEqual(float(updated.iloc[-1]["volume"]), 12.0, places=8)
 
+    def test_live_price_overlay_can_append_current_bucket_for_final_alert_refresh(self):
+        now_bucket = pd.Timestamp.now("UTC").floor("1min")
+        idx = pd.date_range(end=now_bucket - pd.Timedelta(minutes=1), periods=3, freq="min", tz="UTC")
+        ohlcv = pd.DataFrame(
+            {
+                "open": [100.0, 101.0, 102.0],
+                "high": [101.0, 102.0, 103.0],
+                "low": [99.0, 100.0, 101.0],
+                "close": [100.5, 101.5, 102.5],
+                "volume": [10.0, 11.0, 12.0],
+            },
+            index=idx,
+        )
+
+        updated = MarketDataFeed._overlay_live_price_to_ohlcv(
+            ohlcv,
+            mark_price=104.25,
+            timeframe="1",
+            append_new_bucket=True,
+        )
+
+        self.assertEqual(len(updated), len(ohlcv) + 1)
+        self.assertEqual(updated.index[-1], now_bucket)
+        self.assertAlmostEqual(float(updated.iloc[-1]["open"]), 102.5, places=8)
+        self.assertAlmostEqual(float(updated.iloc[-1]["close"]), 104.25, places=8)
+        self.assertAlmostEqual(float(updated.iloc[-1]["high"]), 104.25, places=8)
+        self.assertAlmostEqual(float(updated.iloc[-1]["volume"]), 0.0, places=8)
+
     def test_scan_live_price_overlay_defaults_on_for_one_minute_only(self):
         previous_env = os.environ.pop("MARKETDATA_SCAN_OVERLAY_LIVE_PRICE", None)
         try:
@@ -3047,6 +3150,39 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertGreater(float(cache["BTCUSDT"].get("next_allowed_ts", 0.0)), 1_800_000_120.0)
         self.assertEqual(float(cache["BTCUSDT"].get("main_short_entry_price", 0.0)), 108.4)
         self.assertEqual(float(cache["BTCUSDT"].get("main_short_peak_price", 0.0)), 109.2)
+
+    def test_main_signal_signature_ignores_timestamped_legacy_signal_id(self):
+        df = self._build_df()
+        intent_a = SimpleNamespace(
+            action=IntentAction.SHORT_ENTRY,
+            reason="layered_short_entry",
+            take_profit=102.0,
+            stop_loss=114.0,
+            metadata={"legacy_signal_id": "BTCUSDT-1800000000000"},
+        )
+        intent_b = SimpleNamespace(
+            action=IntentAction.SHORT_ENTRY,
+            reason="layered_short_entry",
+            take_profit=102.0,
+            stop_loss=114.0,
+            metadata={"legacy_signal_id": "BTCUSDT-1800000000123"},
+        )
+
+        sig_a = _build_main_signal_signature(
+            symbol="BTCUSDT",
+            intent=intent_a,
+            enriched=df,
+            mark_price=108.55,
+        )
+        sig_b = _build_main_signal_signature(
+            symbol="BTCUSDT",
+            intent=intent_b,
+            enriched=df,
+            mark_price=108.55,
+        )
+
+        self.assertEqual(sig_a, sig_b)
+        self.assertNotIn("legacy|", sig_a)
 
     def test_live_main_short_continuation_blocks_late_rebound_below_vah_without_trigger(self):
         df = self._build_df()
@@ -3731,7 +3867,10 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(layer5.get("passed"), 1.0)
         self.assertEqual(layer5.get("volume_profile_available"), 1.0)
         self.assertEqual(layer5.get("fallback_rr_used"), 0.0)
-        self.assertIn(layer5.get("tp_reference"), {"vp_balance", "vp_mid", "vp_val", "vp_extension"})
+        self.assertIn(
+            layer5.get("tp_reference"),
+            {"session_vwap", "fair_value", "rr_tp1", "vp_balance", "vp_mid", "vp_val", "vp_extension"},
+        )
         self.assertLess(float(layer5.get("tp", 999.0)), float(df["close"].iloc[-1]))
         self.assertEqual(layer5.get("stop_above_invalidation"), 1.0)
         self.assertEqual(layer5.get("tp_at_poc_or_better"), 1.0)
@@ -3747,8 +3886,8 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(layer5.get("passed"), 1.0)
         self.assertEqual(layer5.get("volume_profile_available"), 0.0)
         self.assertIn(layer5.get("fallback_rr_used"), {0.0, 1.0})
-        self.assertIn(layer5.get("tp_reference"), {"rr_projection", "recent_support", "deep_support"})
-        self.assertGreater(float(layer5.get("risk_reward_ratio", 0.0)), 0.02)
+        self.assertIn(layer5.get("tp_reference"), {"session_vwap", "fair_value", "rr_tp1", "rr_projection", "recent_support", "deep_support"})
+        self.assertGreater(float(layer5.get("risk_reward_ratio", 0.0)), 0.50)
 
     def test_layer5_tp_sl_passes_when_recent_support_salvages_shallow_vp(self):
         df = self._build_df()
@@ -3821,6 +3960,9 @@ class SignalGeneratorTests(unittest.TestCase):
         if intent.action != IntentAction.HOLD:
             self.fail(f"unexpected_intent={intent.action} metadata={intent.metadata}")
         self.assertEqual(intent.reason, "long_disabled_for_short_on_pump")
+        audit = strategy.audit_snapshot()
+        self.assertEqual(audit.get("long_signal_count"), 0)
+        self.assertEqual(audit.get("no_signal_count"), 1)
 
     def test_layer4_live_source_quality_with_canonical_inputs(self):
         df = self._build_df()
@@ -4120,6 +4262,7 @@ class SignalGeneratorTests(unittest.TestCase):
                 managed_exit_fast_fail_min_hold_minutes=30.0,
                 managed_exit_no_progress_min_hold_minutes=30.0,
                 managed_exit_no_downside_min_hold_minutes=30.0,
+                managed_exit_micro_fail_min_hold_minutes=30.0,
                 managed_exit_roundtrip_min_hold_minutes=30.0,
                 managed_exit_acceptance_min_hold_minutes=30.0,
                 managed_exit_time_decay_min_hold_minutes=30.0,
@@ -4414,6 +4557,75 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(intent.action, IntentAction.EXIT_SHORT)
         self.assertEqual(intent.metadata.get("exit_type"), "no_downside_reclaim")
 
+    def test_layered_strategy_managed_exit_short_on_micro_fail_acceptance(self):
+        n = 120
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.linspace(112.00, 112.08, n)
+        close[-6:] = [112.02, 112.05, 112.10, 112.16, 112.22, 112.28]
+        df = pd.DataFrame(
+            {
+                "open": close * 0.9998,
+                "high": close * 1.0010,
+                "low": close * 0.9999,
+                "close": close,
+                "volume": np.linspace(8.0, 11.0, n),
+            },
+            index=idx,
+        )
+        df["rsi"] = np.linspace(48.0, 56.0, n)
+        df.loc[df.index[-6]:, "rsi"] = [50.0, 50.9, 51.8, 53.0, 54.2, 55.4]
+        df["volume_spike"] = 1.00
+        df["bb_upper"] = close * 1.014
+        df["bb_lower"] = close * 0.986
+        df["kc_upper"] = close * 1.012
+        df["kc_lower"] = close * 0.988
+        df["obv"] = np.linspace(1090.0, 1080.0, n)
+        df["cvd"] = np.linspace(1050.0, 1042.0, n)
+        df["vwap"] = np.linspace(111.94, 112.00, n)
+        df["atr"] = 0.48
+        df["ema20"] = np.linspace(111.95, 112.02, n)
+        df["ema50"] = np.linspace(112.00, 112.03, n)
+        df["hist"] = np.linspace(-0.05, 0.03, n)
+        df["poc"] = 111.40
+        df["vah"] = 112.52
+        df["val"] = 110.95
+        df["adx"] = 14.0
+
+        exchange = ExchangeSnapshot(
+            symbol="BTC/USDT",
+            account=AccountSnapshot(equity_usdt=1000.0, available_balance_usdt=1000.0),
+            positions=[
+                PositionSnapshot(
+                    symbol="BTC/USDT",
+                    side=PositionSide.SHORT,
+                    qty=1.0,
+                    entry_price=112.0,
+                    liq_price=120.0,
+                    leverage=3.0,
+                    position_idx=2,
+                    stop_loss=114.0,
+                )
+            ],
+            open_orders=[],
+        )
+
+        strategy = LayeredPumpStrategy(SignalConfig())
+        intent = strategy.generate(
+            StrategyContext(
+                symbol="BTC/USDT",
+                market_ohlcv=df,
+                mark_price=float(df.iloc[-1]["close"]),
+                exchange=exchange,
+                synced_state=TradeState.SHORT,
+                synced_state_updated_at=float(pd.Timestamp.now(tz="UTC").timestamp() - (3.0 * 60.0)),
+            )
+        )
+
+        self.assertEqual(intent.action, IntentAction.EXIT_SHORT)
+        self.assertEqual(intent.metadata.get("exit_type"), "micro_fail_acceptance")
+        details = intent.metadata.get("managed_exit_details", {})
+        self.assertEqual(float(details.get("micro_fail_exit", 0.0)), 1.0)
+
     def test_layered_strategy_managed_exit_short_on_adverse_acceptance(self):
         n = 120
         idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
@@ -4551,7 +4763,7 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(intent.action, IntentAction.EXIT_SHORT)
         self.assertEqual(intent.metadata.get("exit_type"), "roundtrip_reclaim")
 
-    def test_signal_generator_prefers_structural_tp2_as_protective_take_profit(self):
+    def test_signal_generator_prefers_first_protective_take_profit_when_rollover_is_not_confirmed(self):
         df = self._build_df()
         signal_gen = SignalGenerator(SignalConfig())
         passed, layer5 = signal_gen._layer5_tp_sl_levels(
@@ -4562,7 +4774,8 @@ class SignalGeneratorTests(unittest.TestCase):
 
         self.assertTrue(passed)
         self.assertGreater(float(layer5.get("tp2", 0.0)), 0.0)
-        self.assertAlmostEqual(float(layer5.get("tp")), float(layer5.get("tp2")))
+        self.assertGreater(float(layer5.get("tp1", 0.0)), 0.0)
+        self.assertAlmostEqual(float(layer5.get("tp")), float(layer5.get("tp1")))
     def test_runtime_source_adapter_classifies_live_payload_values(self):
         df = self._build_df()
         payload = {

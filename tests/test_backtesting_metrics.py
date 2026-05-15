@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import unittest
 
+import math
+
 import pandas as pd
 
-from backtesting.metrics import build_equity_curve, infer_trade_periods_per_year, summarize_trades
+from backtesting.metrics import build_equity_curve, infer_trade_periods_per_year, sharpe_ratio, summarize_trades
 
 
 class BacktestingMetricsTests(unittest.TestCase):
@@ -16,7 +18,7 @@ class BacktestingMetricsTests(unittest.TestCase):
             ]
         )
         equity = build_equity_curve(trades, initial_equity=1000.0)
-        self.assertEqual(list(equity.astype(float)), [1015.0, 1010.0])
+        self.assertEqual(list(equity.astype(float)), [1000.0, 1015.0, 1010.0])
 
     def test_infer_trade_periods_per_year_uses_trade_spacing(self):
         exit_times = pd.Series(
@@ -53,6 +55,39 @@ class BacktestingMetricsTests(unittest.TestCase):
         self.assertEqual(summary["trades"], 2)
         self.assertAlmostEqual(summary["final_equity"], 1009.8)
         self.assertAlmostEqual(summary["net_pnl"], 9.8)
+        self.assertGreater(summary["sharpe_periods_per_year"], 700.0)
+        self.assertTrue(summary["sharpe_annualized"])
+
+    def test_summarize_trades_includes_initial_equity_in_drawdown(self):
+        trades = pd.DataFrame(
+            [
+                {"exit_time": "2026-01-01T00:10:00Z", "pnl": -100.0, "equity_after": 900.0},
+                {"exit_time": "2026-01-01T00:20:00Z", "pnl": 50.0, "equity_after": 950.0},
+            ]
+        )
+
+        summary = summarize_trades(trades, initial_equity=1000.0)
+
+        self.assertAlmostEqual(summary["max_drawdown"], -0.10)
+
+    def test_summarize_trades_recomputes_returns_from_equity_before(self):
+        trades = pd.DataFrame(
+            [
+                {"exit_time": "2026-01-01T00:10:00Z", "pnl": 20.0, "ret": 99.0, "equity_before": 1000.0},
+                {"exit_time": "2026-01-01T00:20:00Z", "pnl": -10.2, "ret": 99.0, "equity_before": 1020.0},
+            ]
+        )
+
+        summary = summarize_trades(trades, initial_equity=1000.0)
+
+        self.assertTrue(math.isfinite(summary["sharpe"]))
+
+    def test_sharpe_without_timestamps_is_not_artificially_annualized(self):
+        returns = pd.Series([0.02, -0.01, 0.01])
+        raw = sharpe_ratio(returns, periods_per_year=1.0)
+        inferred = sharpe_ratio(returns)
+
+        self.assertAlmostEqual(inferred, raw)
 
 
 if __name__ == "__main__":
