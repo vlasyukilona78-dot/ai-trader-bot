@@ -25,6 +25,7 @@ class RiskDecision:
     effective_stop_loss: float = 0.0
     execution_cost_buffer_bps_used: float = 0.0
     quality_penalty_bps_used: float = 0.0
+    confidence_size_multiplier_used: float = 1.0
 
 
 @dataclass
@@ -356,6 +357,11 @@ class RiskEngine:
         if not ok:
             return RiskDecision(approved=False, reason=reason)
 
+        confidence = self._safe_float(getattr(intent, "confidence", 0.0), 0.0)
+        min_confidence = max(float(getattr(self.limits, "min_entry_confidence", 0.0) or 0.0), 0.0)
+        if confidence > 0.0 and min_confidence > 0.0 and confidence < min_confidence:
+            return RiskDecision(approved=False, reason="confidence_below_min")
+
         if intent.action == IntentAction.LONG_ENTRY and intent.stop_loss is not None and intent.stop_loss >= mark_price:
             return RiskDecision(approved=False, reason="invalid_long_stop")
 
@@ -434,6 +440,12 @@ class RiskEngine:
         qty = min(raw_qty, qty_cap_by_notional)
         if rules.max_qty > 0:
             qty = min(qty, self._safe_max_qty(rules))
+        confidence_multiplier = 1.0
+        soft_confidence = max(float(getattr(self.limits, "soft_entry_confidence", 0.0) or 0.0), 0.0)
+        soft_multiplier = float(getattr(self.limits, "soft_entry_size_multiplier", 1.0) or 1.0)
+        if confidence > 0.0 and soft_confidence > 0.0 and confidence < soft_confidence:
+            confidence_multiplier = min(max(soft_multiplier, 0.0), 1.0)
+            qty *= confidence_multiplier
         qty = self._round_qty_down(qty, rules.qty_step)
         if qty < rules.min_qty:
             return RiskDecision(approved=False, reason="below_min_qty_after_limits")
@@ -479,6 +491,7 @@ class RiskEngine:
             effective_stop_loss=float(effective_stop_loss),
             execution_cost_buffer_bps_used=float(execution_cost_buffer_bps_used),
             quality_penalty_bps_used=float(quality_penalty_bps_used),
+            confidence_size_multiplier_used=float(confidence_multiplier),
         )
 
 

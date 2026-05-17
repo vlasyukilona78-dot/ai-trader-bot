@@ -11,6 +11,8 @@ from core.feature_engineering import assess_feature_frame_quality, sanitize_feat
 from core.volume_profile import compute_volume_profile
 from trading.exchange.schemas import PositionSide
 from trading.portfolio.positions import first_effective_position_for_symbol
+from trading.signals.entry_gate import EntryGate, EntryGateConfig
+from trading.signals.models import SignalCandidate
 from trading.signals.signal_types import IntentAction, StrategyIntent
 from trading.signals.strategy_audit import StrategyAuditCollector
 from trading.signals.strategy_interface import StrategyContext, StrategyInterface
@@ -21,9 +23,17 @@ class LayeredPumpStrategy(StrategyInterface):
     """Adapter around migrated layered strategy that returns intents only."""
 
     def __init__(self, config: SignalConfig | None = None, audit_collector: StrategyAuditCollector | None = None):
-        self._allow_long_entries = str(os.getenv("ENABLE_LONG_SIGNALS", "0")).strip().lower() in {"1", "true", "yes", "on"}
+        runtime_config = config or self.runtime_default_config()
+        self._allow_long_entries = bool(runtime_config.allow_long_entries)
+        self._generator = SignalGenerator(runtime_config)
+        self._audit = audit_collector or StrategyAuditCollector()
+        self._entry_gate = EntryGate(EntryGateConfig.from_env())
+
+    @staticmethod
+    def runtime_default_config() -> SignalConfig:
+        allow_long_entries = str(os.getenv("ENABLE_LONG_SIGNALS", "0")).strip().lower() in {"1", "true", "yes", "on"}
         env_volume_threshold = max(1.0, float(os.getenv("VOLUME_THRESHOLD", "2.0")))
-        runtime_config = config or SignalConfig(
+        return SignalConfig(
             regime_volatility_threshold_override=0.0006,
             regime_volatility_dynamic_floor_mult=0.60,
             regime_volatility_baseline_lookback=96,
@@ -46,10 +56,8 @@ class LayeredPumpStrategy(StrategyInterface):
             msb_lookback=14,
             msb_recent_bars=11,
             msb_break_buffer_pct=0.0002,
-            allow_long_entries=self._allow_long_entries,
+            allow_long_entries=allow_long_entries,
         )
-        self._generator = SignalGenerator(runtime_config)
-        self._audit = audit_collector or StrategyAuditCollector()
 
     def _trace_meta(self) -> dict:
         trace = self._generator.last_diagnostics if isinstance(self._generator.last_diagnostics, dict) else {}
@@ -687,9 +695,6 @@ class LayeredPumpStrategy(StrategyInterface):
         if hard_reclaim_exit:
             exit_type = "reclaim_invalidation"
             reason = "managed_exit_reclaim_invalidation"
-        elif micro_fail_exit:
-            exit_type = "micro_fail_acceptance"
-            reason = "managed_exit_micro_fail_acceptance"
         elif acceptance_reclaim_exit:
             exit_type = "acceptance_reclaim"
             reason = "managed_exit_acceptance_reclaim"
@@ -702,6 +707,9 @@ class LayeredPumpStrategy(StrategyInterface):
         elif adverse_acceptance_exit:
             exit_type = "adverse_acceptance"
             reason = "managed_exit_adverse_acceptance"
+        elif micro_fail_exit:
+            exit_type = "micro_fail_acceptance"
+            reason = "managed_exit_micro_fail_acceptance"
         elif target_bounce_exit:
             exit_type = "target_zone_bounce"
             reason = "managed_exit_target_zone_bounce"
@@ -893,7 +901,12 @@ class LayeredPumpStrategy(StrategyInterface):
                 metadata=trace_meta,
             )
 
-        entry_meta = {"legacy_signal_id": signal.signal_id, **trace_meta}
+        entry_meta = {
+            "legacy_signal_id": signal.signal_id,
+            "signal_side": str(signal.side).upper(),
+            "strategy_version": "layered_v2_entry_gate_1",
+            **trace_meta,
+        }
         if signal.partial_tps:
             entry_meta["partial_tps"] = [float(x) for x in signal.partial_tps]
         signal_details = signal.details if isinstance(signal.details, Mapping) else {}
@@ -902,6 +915,28 @@ class LayeredPumpStrategy(StrategyInterface):
             for key in ("tp1", "tp2", "tp3", "tp1_reference", "tp2_reference", "tp3_reference", "tp_reference"):
                 if key in layer5_details:
                     entry_meta[key] = layer5_details.get(key)
+
+        candidate = SignalCandidate.from_signal(
+            signal=signal,
+            context=context,
+            enriched=enriched,
+            trace_meta=trace_meta if isinstance(trace_meta, Mapping) else {},
+        )
+        gate_decision = self._entry_gate.evaluate(candidate)
+        entry_meta["entry_gate"] = gate_decision.to_dict()
+        entry_meta["admission_status"] = "approved" if gate_decision.approved else "rejected"
+        entry_meta["admission_reason"] = gate_decision.reason
+        entry_meta["confidence_raw"] = float(signal.confidence)
+        admitted_confidence = min(float(signal.confidence), float(gate_decision.score))
+
+        if not gate_decision.approved:
+            return StrategyIntent(
+                symbol=context.symbol,
+                action=IntentAction.HOLD,
+                reason=f"entry_gate_{gate_decision.reason}",
+                confidence=float(gate_decision.score),
+                metadata=entry_meta,
+            )
 
         if signal.side == "LONG" and not self._allow_long_entries:
             return StrategyIntent(
@@ -918,7 +953,7 @@ class LayeredPumpStrategy(StrategyInterface):
                 reason="layered_long_entry",
                 stop_loss=float(signal.sl),
                 take_profit=float(signal.tp),
-                confidence=float(signal.confidence),
+                confidence=float(admitted_confidence),
                 metadata=entry_meta,
             )
 
@@ -928,7 +963,7 @@ class LayeredPumpStrategy(StrategyInterface):
             reason="layered_short_entry",
             stop_loss=float(signal.sl),
             take_profit=float(signal.tp),
-            confidence=float(signal.confidence),
+            confidence=float(admitted_confidence),
             metadata=entry_meta,
         )
 

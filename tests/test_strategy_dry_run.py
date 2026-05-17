@@ -13,6 +13,7 @@ try:
     from app.main import (
         _build_approved_early_candidate,
         _build_clean_context_chart_caption,
+        _build_strategy,
         _build_main_signal_signature,
         _build_early_watch_candidate,
         _build_higher_timeframe_chart,
@@ -26,6 +27,7 @@ try:
         _send_photo_alerts,
         _should_block_live_main_short_continuation,
         _should_block_recent_main_short_reentry,
+        _signal_config_from_strategy_settings,
         _strategy_audit_log_payload,
     )
     from trading.alerts.signal_card import build_early_signal_caption
@@ -4763,7 +4765,7 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(intent.action, IntentAction.EXIT_SHORT)
         self.assertEqual(intent.metadata.get("exit_type"), "roundtrip_reclaim")
 
-    def test_signal_generator_prefers_first_protective_take_profit_when_rollover_is_not_confirmed(self):
+    def test_signal_generator_skips_too_shallow_first_take_profit_when_rollover_is_not_confirmed(self):
         df = self._build_df()
         signal_gen = SignalGenerator(SignalConfig())
         passed, layer5 = signal_gen._layer5_tp_sl_levels(
@@ -4775,7 +4777,8 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertTrue(passed)
         self.assertGreater(float(layer5.get("tp2", 0.0)), 0.0)
         self.assertGreater(float(layer5.get("tp1", 0.0)), 0.0)
-        self.assertAlmostEqual(float(layer5.get("tp")), float(layer5.get("tp1")))
+        self.assertLess(float(layer5.get("tp")), float(layer5.get("tp1")))
+        self.assertGreater(float(layer5.get("risk_reward_ratio", 0.0)), 0.75)
     def test_runtime_source_adapter_classifies_live_payload_values(self):
         df = self._build_df()
         payload = {
@@ -6841,6 +6844,60 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(strict_layer4.get("passed"), soft_layer4.get("passed"))
         self.assertEqual(strict_layer4.get("missing_conditions"), soft_layer4.get("missing_conditions"))
         self.assertEqual(strict_layer4.get("failed_reason"), soft_layer4.get("failed_reason"))
+
+    def test_v2_strategy_uses_settings_config_over_runtime_defaults(self):
+        settings = SimpleNamespace(
+            rsi_high=82.0,
+            volume_spike_threshold=2.7,
+            layer1_clean_pump_min_pct=0.061,
+            early_watch_clean_pump_min_pct=0.043,
+            entry_tolerance_pct=0.011,
+            risk_reward=2.1,
+            not_a_signal_field=123,
+        )
+
+        config = _signal_config_from_strategy_settings(settings)
+        strategy = _build_strategy("layered", signal_config=config)
+
+        self.assertEqual(strategy._generator.config.rsi_high, 82.0)
+        self.assertEqual(strategy._generator.config.volume_spike_threshold, 2.7)
+        self.assertEqual(strategy._generator.config.layer1_clean_pump_min_pct, 0.061)
+        self.assertEqual(strategy._generator.config.early_watch_clean_pump_min_pct, 0.043)
+        self.assertEqual(strategy._generator.config.entry_tolerance_pct, 0.011)
+        self.assertEqual(strategy._generator.config.risk_reward, 2.1)
+        self.assertTrue(strategy._generator.config.regime_soft_pass_enabled)
+
+    def test_signal_id_is_candle_based_and_stable_for_same_setup(self):
+        df = self._build_df()
+        for offset in range(1, 13):
+            df.iloc[-offset, df.columns.get_loc("rsi")] = 55.0
+            df.iloc[-offset, df.columns.get_loc("volume_spike")] = 1.1
+            df.iloc[-offset, df.columns.get_loc("bb_upper")] = 120.0
+            df.iloc[-offset, df.columns.get_loc("kc_upper")] = 120.0
+        df.iloc[-8, df.columns.get_loc("rsi")] = 85.0
+        df.iloc[-8, df.columns.get_loc("volume_spike")] = 8.0
+        df.iloc[-8, df.columns.get_loc("bb_upper")] = 120.0
+        df.iloc[-8, df.columns.get_loc("kc_upper")] = 120.0
+
+        ctx = SignalContext(
+            symbol="BTC/USDT",
+            df=df,
+            volume_profile=VolumeProfileLevels(poc=102.0, vah=109.0, val=98.0),
+            regime=MarketRegime.PUMP,
+            sentiment_index=78.0,
+            sentiment_source="provided",
+            funding_rate=0.001,
+            long_short_ratio=1.2,
+        )
+        gen = LayeredPumpStrategy()._generator
+
+        first = gen.generate(ctx)
+        second = gen.generate(ctx)
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual(first.signal_id, second.signal_id)
+        self.assertIn(str(int(df.index[-1].timestamp())), first.signal_id)
 
     def test_runtime_default_volatility_override_creates_targeted_softer_gate(self):
         df = self._build_df()

@@ -24,6 +24,8 @@ class BybitHttpClient:
         tpsl_mode: str | None = None,
         sl_trigger_by: str | None = None,
         tp_trigger_by: str | None = None,
+        sl_order_type: str | None = None,
+        tp_order_type: str | None = None,
     ):
         if _BybitClient is None:
             raise RuntimeError("bybit_client_dependency_missing")
@@ -38,6 +40,8 @@ class BybitHttpClient:
             tpsl_mode=tpsl_mode,
             sl_trigger_by=sl_trigger_by,
             tp_trigger_by=tp_trigger_by,
+            sl_order_type=sl_order_type,
+            tp_order_type=tp_order_type,
         )
 
     def close(self):

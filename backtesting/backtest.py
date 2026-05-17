@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from backtesting.metrics import build_equity_curve, summarize_trades
+from core.feature_engineering import assess_feature_frame_quality, sanitize_feature_frame
 from core.indicators import compute_indicators
 from core.market_regime import detect_market_regime
 from core.signal_generator import SignalConfig, SignalContext, SignalGenerator
@@ -103,7 +104,7 @@ def _simulate_trade_exit(df: pd.DataFrame, start_idx: int, side: str, tp: float,
 def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig | None = None) -> tuple[pd.DataFrame, dict]:
     signal_gen = SignalGenerator(signal_cfg or SignalConfig())
 
-    enriched = compute_indicators(df)
+    enriched = sanitize_feature_frame(compute_indicators(df))
     trades: list[dict] = []
     equity = float(cfg.initial_equity)
 
@@ -112,12 +113,25 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
         if equity <= 0.0:
             break
         hist = enriched.iloc[: i + 1]
+        quality = assess_feature_frame_quality(hist)
+        if not bool(quality.get("usable", True)):
+            i += 1
+            continue
         vp = compute_volume_profile(hist)
         regime = detect_market_regime(hist)
 
-        sentiment = float(hist.iloc[-1].get("sentiment_index", 50.0)) if "sentiment_index" in hist.columns else 50.0
-        funding = float(hist.iloc[-1].get("funding_rate", 0.0)) if "funding_rate" in hist.columns else 0.0
-        ratio = float(hist.iloc[-1].get("long_short_ratio", 1.0)) if "long_short_ratio" in hist.columns else 1.0
+        last_row = hist.iloc[-1]
+        sentiment = float(last_row.get("sentiment_index", 50.0)) if "sentiment_index" in hist.columns else 50.0
+        funding = float(last_row.get("funding_rate", 0.0)) if "funding_rate" in hist.columns else 0.0
+        ratio = float(last_row.get("long_short_ratio", 1.0)) if "long_short_ratio" in hist.columns else 1.0
+        open_interest = (
+            float(last_row.get("open_interest")) if "open_interest" in hist.columns and pd.notna(last_row.get("open_interest")) else None
+        )
+        open_interest_ratio = (
+            float(last_row.get("open_interest_ratio"))
+            if "open_interest_ratio" in hist.columns and pd.notna(last_row.get("open_interest_ratio"))
+            else None
+        )
 
         context = SignalContext(
             symbol="BACKTEST/USDT",
@@ -125,9 +139,14 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
             volume_profile=vp,
             regime=regime,
             sentiment_index=sentiment,
-            sentiment_source="provided",
+            sentiment_source="provided" if "sentiment_index" in hist.columns else "backtest_default",
             funding_rate=funding,
+            funding_source="provided" if "funding_rate" in hist.columns else "backtest_default",
             long_short_ratio=ratio,
+            long_short_ratio_source="provided" if "long_short_ratio" in hist.columns else "backtest_default",
+            open_interest=open_interest,
+            open_interest_ratio=open_interest_ratio,
+            open_interest_source="provided" if open_interest is not None or open_interest_ratio is not None else "backtest_unavailable",
         )
         signal = signal_gen.generate(context)
         if signal is None:
@@ -203,7 +222,15 @@ class PaperTrader:
         self.history = pd.DataFrame()
         self.open_positions: list[dict] = []
 
-    def on_new_bar(self, bar: dict, sentiment_index: float | None = 50.0, funding_rate: float | None = 0.0):
+    def on_new_bar(
+        self,
+        bar: dict,
+        sentiment_index: float | None = 50.0,
+        funding_rate: float | None = 0.0,
+        long_short_ratio: float | None = 1.0,
+        open_interest: float | None = None,
+        open_interest_ratio: float | None = None,
+    ):
         row = pd.DataFrame([bar])
         if "datetime" in row.columns:
             row["datetime"] = pd.to_datetime(row["datetime"], utc=True)
@@ -212,7 +239,10 @@ class PaperTrader:
         if len(self.history) < 80:
             return None
 
-        enriched = compute_indicators(self.history)
+        enriched = sanitize_feature_frame(compute_indicators(self.history))
+        quality = assess_feature_frame_quality(enriched)
+        if not bool(quality.get("usable", True)):
+            return None
         vp = compute_volume_profile(enriched)
         regime = detect_market_regime(enriched)
 
@@ -224,7 +254,12 @@ class PaperTrader:
             sentiment_index=sentiment_index,
             sentiment_source="provided" if sentiment_index is not None else "unavailable",
             funding_rate=funding_rate,
-            long_short_ratio=1.0,
+            funding_source="provided" if funding_rate is not None else "unavailable",
+            long_short_ratio=long_short_ratio,
+            long_short_ratio_source="provided" if long_short_ratio is not None else "unavailable",
+            open_interest=open_interest,
+            open_interest_ratio=open_interest_ratio,
+            open_interest_source="provided" if open_interest is not None or open_interest_ratio is not None else "unavailable",
         )
         return self.signal_gen.generate(ctx)
 

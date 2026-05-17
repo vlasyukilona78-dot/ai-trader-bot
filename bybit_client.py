@@ -32,6 +32,8 @@ class BybitClient:
         tpsl_mode: str | None = None,
         sl_trigger_by: str | None = None,
         tp_trigger_by: str | None = None,
+        sl_order_type: str | None = None,
+        tp_order_type: str | None = None,
     ):
         self.api_key = str(api_key or "").strip()
         self.api_secret = str(api_secret or "").strip()
@@ -44,6 +46,8 @@ class BybitClient:
         self.tpsl_mode = self._normalize_tpsl_mode(tpsl_mode)
         self.sl_trigger_by = self._normalize_trigger_by(sl_trigger_by, default="")
         self.tp_trigger_by = self._normalize_trigger_by(tp_trigger_by, default="")
+        self.sl_order_type = self._normalize_order_type(sl_order_type, default="")
+        self.tp_order_type = self._normalize_order_type(tp_order_type, default="")
         self.base_url = resolve_private_http_base_url(testnet=bool(sandbox), demo=bool(demo))
         self.public_base_url = resolve_public_http_base_url(testnet=bool(sandbox))
         self._private_auth_invalid = False
@@ -122,6 +126,11 @@ class BybitClient:
     def _normalize_tpsl_mode(value: str | None) -> str:
         candidate = str(value or "").strip().title()
         return candidate if candidate in {"Full", "Partial"} else ""
+
+    @staticmethod
+    def _normalize_order_type(value: str | None, *, default: str = "Market") -> str:
+        candidate = str(value or default).strip().title()
+        return candidate if candidate in {"Market", "Limit"} else default
 
     @staticmethod
     def _canonical_query(params: dict[str, Any] | None) -> str:
@@ -558,12 +567,15 @@ class BybitClient:
         sl_trigger_by = self.sl_trigger_by or self._normalize_trigger_by(os.getenv("BYBIT_SL_TRIGGER_BY", "MarkPrice"))
         tp_trigger_by = self.tp_trigger_by or self._normalize_trigger_by(os.getenv("BYBIT_TP_TRIGGER_BY", "MarkPrice"))
         explicit_tpsl_mode = self.tpsl_mode or self._normalize_tpsl_mode(os.getenv("BYBIT_TPSL_MODE", ""))
+        sl_order_type = self.sl_order_type or self._normalize_order_type(os.getenv("BYBIT_SL_ORDER_TYPE", "Market"))
+        tp_order_type = self.tp_order_type or self._normalize_order_type(os.getenv("BYBIT_TP_ORDER_TYPE", "Market"))
 
         body: dict[str, Any] = {
             "category": self.category,
             "symbol": normalized_symbol,
             "stopLoss": str(stop_loss),
             "slTriggerBy": sl_trigger_by,
+            "slOrderType": sl_order_type,
         }
 
         if qty is not None and qty > 0:
@@ -573,17 +585,30 @@ class BybitClient:
                 body["takeProfit"] = str(take_profit)
                 body["tpSize"] = str(qty)
                 body["tpTriggerBy"] = tp_trigger_by
+                body["tpOrderType"] = tp_order_type
         else:
             body["tpslMode"] = "Full"
             if take_profit is not None:
                 body["takeProfit"] = str(take_profit)
                 body["tpTriggerBy"] = tp_trigger_by
+                body["tpOrderType"] = tp_order_type
 
         if explicit_tpsl_mode:
             body["tpslMode"] = explicit_tpsl_mode
             if explicit_tpsl_mode == "Full":
                 body.pop("slSize", None)
                 body.pop("tpSize", None)
+
+        if body.get("tpslMode") == "Full":
+            # Bybit Full TP/SL mode only supports market protective orders.
+            body["slOrderType"] = "Market"
+            if "tpOrderType" in body:
+                body["tpOrderType"] = "Market"
+        else:
+            if body.get("slOrderType") == "Limit":
+                body["slLimitPrice"] = body["stopLoss"]
+            if body.get("tpOrderType") == "Limit" and "takeProfit" in body:
+                body["tpLimitPrice"] = body["takeProfit"]
 
         if position_idx is not None:
             body["positionIdx"] = int(position_idx)

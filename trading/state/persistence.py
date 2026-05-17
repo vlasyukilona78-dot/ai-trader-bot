@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -61,6 +61,20 @@ class PersistedDecisionRow:
     exec_reason: str
     order_id: str
     order_link_id: str
+    ts: float
+    raw: dict
+
+
+@dataclass(frozen=True)
+class PersistedSignalAdmissionRow:
+    id: int
+    signal_id: str
+    symbol: str
+    side: str
+    action: str
+    approved: bool
+    reason: str
+    score: float
     ts: float
     raw: dict
 
@@ -219,6 +233,19 @@ class RuntimeStore:
                     raw_json TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS signal_admissions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    signal_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    approved INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    ts REAL NOT NULL,
+                    raw_json TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS exchange_closures (
                     closure_id TEXT PRIMARY KEY,
                     symbol TEXT NOT NULL,
@@ -299,6 +326,32 @@ class RuntimeStore:
             )
             self._write_schema_version_locked(3)
             version = 3
+
+        if version == 3:
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS signal_admissions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    signal_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    approved INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    ts REAL NOT NULL,
+                    raw_json TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_signal_admissions_ts ON signal_admissions(ts)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_signal_admissions_symbol_ts ON signal_admissions(symbol, ts)"
+            )
+            self._write_schema_version_locked(4)
+            version = 4
 
         if version < SCHEMA_VERSION:
             self._write_schema_version_locked(SCHEMA_VERSION)
@@ -638,6 +691,80 @@ class RuntimeStore:
             )
         return out
 
+    def append_signal_admission(
+        self,
+        *,
+        signal_id: str,
+        symbol: str,
+        side: str,
+        action: str,
+        approved: bool,
+        reason: str,
+        score: float,
+        ts: float,
+        raw: dict | None,
+    ):
+        payload = raw if isinstance(raw, dict) else {}
+        raw_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO signal_admissions(
+                    signal_id, symbol, side, action, approved, reason, score, ts, raw_json
+                )
+                VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    str(signal_id),
+                    symbol.replace("/", "").upper(),
+                    str(side).upper(),
+                    str(action),
+                    1 if approved else 0,
+                    str(reason),
+                    float(score),
+                    float(ts),
+                    raw_json,
+                ),
+            )
+            self._conn.commit()
+
+    def load_signal_admissions(self, limit: int = 50000) -> list[PersistedSignalAdmissionRow]:
+        safe_limit = max(1, int(limit))
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, signal_id, symbol, side, action, approved, reason, score, ts, raw_json
+                FROM signal_admissions
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (safe_limit,),
+            ).fetchall()
+
+        out: list[PersistedSignalAdmissionRow] = []
+        for row in rows:
+            try:
+                raw = json.loads(str(row["raw_json"]))
+                if not isinstance(raw, dict):
+                    raw = {}
+            except Exception:
+                raw = {}
+            out.append(
+                PersistedSignalAdmissionRow(
+                    id=int(row["id"]),
+                    signal_id=str(row["signal_id"]),
+                    symbol=str(row["symbol"]),
+                    side=str(row["side"]),
+                    action=str(row["action"]),
+                    approved=bool(row["approved"]),
+                    reason=str(row["reason"]),
+                    score=float(row["score"]),
+                    ts=float(row["ts"]),
+                    raw=raw,
+                )
+            )
+        return out
+
     def record_exchange_closure_once(
         self,
         *,
@@ -766,6 +893,7 @@ class RuntimeStore:
 
         deleted_transitions = 0
         deleted_decisions = 0
+        deleted_admissions = 0
 
         with self._lock:
             transition_count = int(self._conn.execute("SELECT COUNT(*) FROM state_transitions").fetchone()[0])
@@ -788,11 +916,23 @@ class RuntimeStore:
                     cur = self._conn.execute("DELETE FROM order_decisions WHERE id < ?", (int(cutoff[0]),))
                     deleted_decisions = int(cur.rowcount if cur.rowcount is not None else 0)
 
+            if self._table_exists("signal_admissions"):
+                admission_count = int(self._conn.execute("SELECT COUNT(*) FROM signal_admissions").fetchone()[0])
+                if admission_count > max_decision_rows:
+                    cutoff = self._conn.execute(
+                        "SELECT id FROM signal_admissions ORDER BY id DESC LIMIT 1 OFFSET ?",
+                        (keep_recent - 1,),
+                    ).fetchone()
+                    if cutoff is not None:
+                        cur = self._conn.execute("DELETE FROM signal_admissions WHERE id < ?", (int(cutoff[0]),))
+                        deleted_admissions = int(cur.rowcount if cur.rowcount is not None else 0)
+
             self._conn.commit()
 
         return {
             "deleted_transitions": max(0, deleted_transitions),
             "deleted_decisions": max(0, deleted_decisions),
+            "deleted_signal_admissions": max(0, deleted_admissions),
         }
 
     def cleanup_closed_inflight(self, max_age_sec: int = 7 * 24 * 3600) -> int:

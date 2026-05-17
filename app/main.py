@@ -11,6 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 from collections.abc import Mapping
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -28,6 +29,7 @@ from app.bootstrap import ConfigError, RuntimeConfig, load_runtime_config
 from alerts.chart_generator import build_signal_chart
 from core.market_regime import detect_market_regime
 from core.liquidation_map import build_liquidation_map
+from core.signal_generator import SignalConfig
 from core.volume_profile import compute_volume_profile
 from trading.alerts.discord import DiscordAlerter
 from trading.alerts.signal_card_clean import (
@@ -185,10 +187,27 @@ def _extract_layer_details(meta: Mapping[str, object] | None, layer_name: str) -
     return details if isinstance(details, Mapping) else {}
 
 
-def _build_strategy(name: str):
+def _signal_config_from_strategy_settings(strategy_settings: object | None = None) -> SignalConfig:
+    config = LayeredPumpStrategy.runtime_default_config()
+    if strategy_settings is None:
+        return config
+
+    valid_fields = {item.name for item in fields(SignalConfig)}
+    overrides: dict[str, object] = {}
+    for key, value in vars(strategy_settings).items():
+        if key in valid_fields and value is not None:
+            overrides[key] = value
+
+    # Keep the long-only/short-only runtime switch explicit. YAML controls strategy parameters,
+    # while ENABLE_LONG_SIGNALS remains the operational safety switch.
+    overrides["allow_long_entries"] = config.allow_long_entries
+    return replace(config, **overrides)
+
+
+def _build_strategy(name: str, *, signal_config: SignalConfig | None = None):
     if name == "hold":
         return HoldStrategy()
-    return LayeredPumpStrategy()
+    return LayeredPumpStrategy(config=signal_config)
 
 
 
@@ -7490,7 +7509,17 @@ def main() -> int:
         persistence=runtime_store,
     )
     pipeline = FeaturePipeline()
-    strategy = _build_strategy(args.strategy)
+    signal_config = _signal_config_from_strategy_settings(getattr(app_settings, "strategy", None))
+    strategy = _build_strategy(args.strategy, signal_config=signal_config)
+    logger.info(
+        "strategy_config_loaded source=config/config.yaml rsi_high=%.4f volume_spike_threshold=%.4f clean_pump_min_pct=%.4f early_pump_min_pct=%.4f risk_reward=%.4f",
+        float(signal_config.rsi_high),
+        float(signal_config.volume_spike_threshold),
+        float(signal_config.layer1_clean_pump_min_pct),
+        float(signal_config.early_watch_clean_pump_min_pct),
+        float(signal_config.risk_reward),
+        extra={"event": "strategy_config_loaded"},
+    )
     counters = MetricsCounter()
     alerters = _build_alerters(cfg)
     ultra_alerters = _build_ultra_early_alerters(cfg)

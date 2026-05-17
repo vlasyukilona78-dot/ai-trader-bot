@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from backtesting.backtest import BacktestConfig, run_backtest
+from backtesting.backtest import BacktestConfig, PaperTrader, run_backtest
 
 
 class _AlwaysShortGenerator:
@@ -52,6 +52,30 @@ class BacktestTradeOverlapTests(unittest.TestCase):
         first_exit = pd.Timestamp(trades.iloc[0]["exit_time"])
         second_entry = pd.Timestamp(trades.iloc[1]["entry_time"])
         self.assertGreater(second_entry, first_exit)
+
+    def test_paper_trader_uses_quality_guard_before_signal_generation(self):
+        idx = pd.date_range("2026-01-01", periods=90, freq="min", tz="UTC")
+        close = [100.0] * 90
+        bars = [
+            {
+                "datetime": ts,
+                "open": close[i],
+                "high": close[i] + 0.2,
+                "low": close[i] - 0.2,
+                "close": close[i],
+                "volume": 0.0 if i >= 78 else 1000.0,
+                "symbol": "BADUSDT",
+            }
+            for i, ts in enumerate(idx)
+        ]
+
+        with patch("backtesting.backtest.SignalGenerator", _AlwaysShortGenerator):
+            trader = PaperTrader()
+            result = None
+            for bar in bars:
+                result = trader.on_new_bar(bar)
+
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

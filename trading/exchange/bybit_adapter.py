@@ -95,6 +95,8 @@ class BybitAdapterConfig:
     tpsl_mode: str = ""
     sl_trigger_by: str = "MarkPrice"
     tp_trigger_by: str = "MarkPrice"
+    sl_order_type: str = "Market"
+    tp_order_type: str = "Market"
 
 
 @dataclass
@@ -122,6 +124,8 @@ class BybitAdapter:
             tpsl_mode=config.tpsl_mode,
             sl_trigger_by=config.sl_trigger_by,
             tp_trigger_by=config.tp_trigger_by,
+            sl_order_type=config.sl_order_type,
+            tp_order_type=config.tp_order_type,
         )
         self._rules_cache: dict[str, _RulesCacheEntry] = {}
         self._applied_leverage_cache: dict[str, float] = {}

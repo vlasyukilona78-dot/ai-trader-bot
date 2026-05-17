@@ -215,6 +215,8 @@ class BootstrapConfigV2Tests(unittest.TestCase):
             "BYBIT_TPSL_MODE": "partial",
             "BYBIT_SL_TRIGGER_BY": "LastPrice",
             "BYBIT_TP_TRIGGER_BY": "IndexPrice",
+            "BYBIT_SL_ORDER_TYPE": "Limit",
+            "BYBIT_TP_ORDER_TYPE": "Market",
             "FEATURE_RUNTIME_ENABLED": "false",
             "WS_ENABLED": "false",
         }
@@ -223,6 +225,8 @@ class BootstrapConfigV2Tests(unittest.TestCase):
             self.assertEqual(cfg.adapter.tpsl_mode, "Partial")
             self.assertEqual(cfg.adapter.sl_trigger_by, "LastPrice")
             self.assertEqual(cfg.adapter.tp_trigger_by, "IndexPrice")
+            self.assertEqual(cfg.adapter.sl_order_type, "Limit")
+            self.assertEqual(cfg.adapter.tp_order_type, "Market")
 
     def test_demo_mode_uses_profile_specific_demo_credentials_for_early(self):
         env = {

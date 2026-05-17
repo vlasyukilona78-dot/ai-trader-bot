@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import logging
+import hashlib
 import threading
 import time
 from dataclasses import dataclass
@@ -246,12 +247,31 @@ class ExecutionEngine:
         return False
 
     @staticmethod
-    def _is_position_protected(position: PositionSnapshot | None, expected_stop: float) -> bool:
+    def _stable_client_order_id(prefix: str, *parts: Any, digest_len: int = 16) -> str:
+        payload = "|".join(str(part) for part in parts)
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[: max(8, int(digest_len))]
+        return f"{prefix}-{digest}"[:36]
+
+    @staticmethod
+    def _is_position_protected(
+        position: PositionSnapshot | None,
+        expected_stop: float,
+        *,
+        tolerance_bps: float = 5.0,
+        tick_size: float | None = None,
+    ) -> bool:
         if position is None:
             return False
         if position.stop_loss is None or position.stop_loss <= 0:
             return False
-        return abs(float(position.stop_loss) - float(expected_stop)) <= 1e-6 * max(1.0, abs(expected_stop))
+        expected = float(expected_stop)
+        if expected <= 0:
+            return False
+        bps_tolerance = abs(expected) * max(0.0, float(tolerance_bps)) / 10000.0
+        tick_tolerance = abs(float(tick_size or 0.0)) * 2.0
+        min_tolerance = 1e-8 * max(1.0, abs(expected))
+        tolerance = max(min_tolerance, bps_tolerance, tick_tolerance)
+        return abs(float(position.stop_loss) - expected) <= tolerance
 
     @staticmethod
     def _is_retryable(result: OrderResult) -> bool:
@@ -565,6 +585,7 @@ class ExecutionEngine:
             "effective_stop_loss": float(risk.effective_stop_loss),
             "execution_cost_buffer_bps_used": float(risk.execution_cost_buffer_bps_used),
             "quality_penalty_bps_used": float(risk.quality_penalty_bps_used),
+            "confidence_size_multiplier_used": float(risk.confidence_size_multiplier_used),
         }
         payload["execution_context"] = {
             "accepted": bool(outcome.accepted),
@@ -633,6 +654,45 @@ class ExecutionEngine:
             order_link_id=outcome.order_link_id,
             ts=time.time(),
             raw=self._build_persisted_decision_raw(intent=intent, risk=risk, outcome=outcome),
+        )
+        self._persist_signal_admission(intent=intent, risk=risk, outcome=outcome)
+
+    def _persist_signal_admission(
+        self,
+        *,
+        intent: StrategyIntent,
+        risk: RiskDecision,
+        outcome: ExecutionOutcome,
+    ) -> None:
+        if self.persistence is None or not isinstance(intent.metadata, dict):
+            return
+        gate = intent.metadata.get("entry_gate")
+        if not isinstance(gate, dict):
+            return
+        signal_id = str(intent.metadata.get("legacy_signal_id") or "")
+        if not signal_id:
+            signal_id = self._idempotency_key(intent)
+        raw = {
+            "entry_gate": self._json_safe(gate),
+            "admission_status": self._json_safe(intent.metadata.get("admission_status")),
+            "admission_reason": self._json_safe(intent.metadata.get("admission_reason")),
+            "intent_reason": str(intent.reason),
+            "intent_confidence": float(intent.confidence),
+            "risk_approved": bool(risk.approved),
+            "risk_reason": str(risk.reason),
+            "execution_status": str(outcome.status),
+            "execution_reason": str(outcome.reason),
+        }
+        self.persistence.append_signal_admission(
+            signal_id=signal_id,
+            symbol=intent.symbol.replace("/", "").upper(),
+            side=str(intent.metadata.get("signal_side") or intent.action.value),
+            action=intent.action.value,
+            approved=bool(gate.get("approved")),
+            reason=str(gate.get("reason") or intent.reason),
+            score=float(gate.get("score") or 0.0),
+            ts=time.time(),
+            raw=raw,
         )
 
     def _symbol_inflight_entries(self, symbol: str):
@@ -834,7 +894,7 @@ class ExecutionEngine:
                     qty=float(position.qty),
                     reduce_only=True,
                     position_idx=position.position_idx,
-                    client_order_id=f"v2-recover-{abs(hash((entry.intent_key, now_ts))) % 10**12}",
+                    client_order_id=self._stable_client_order_id("v2-recover", entry.intent_key, norm_symbol),
                     close_on_trigger=True,
                 )
             )
@@ -928,7 +988,7 @@ class ExecutionEngine:
             if qty <= 0:
                 return ExecutionOutcome(accepted=False, status="REJECTED", reason="rounded_qty_zero")
 
-            client_order_id = f"v2-{abs(hash((intent_key, qty))) % 10**12}"
+            client_order_id = self._stable_client_order_id("v2", intent_key, norm_symbol, qty)
             order_intent = OrderIntent(
                 symbol=norm_symbol,
                 side=order_side,
@@ -1184,7 +1244,7 @@ class ExecutionEngine:
                     qty=position.qty,
                     reduce_only=True,
                     position_idx=position.position_idx,
-                    client_order_id=f"v2-exit-{abs(hash((intent_key, position.qty))) % 10**12}",
+                    client_order_id=self._stable_client_order_id("v2-exit", intent_key, norm_symbol, position.qty),
                     close_on_trigger=True,
                 )
             )

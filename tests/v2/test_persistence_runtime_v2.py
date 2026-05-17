@@ -15,7 +15,7 @@ class RuntimePersistenceV2Tests(unittest.TestCase):
             db_path = str(Path(tmpdir) / "runtime.db")
             store = RuntimeStore(db_path)
             try:
-                self.assertEqual(store.get_schema_version(), 3)
+                self.assertEqual(store.get_schema_version(), 4)
 
                 now = time.time()
                 store.put_idempotency_key("expired", expires_at=now - 1)
@@ -93,6 +93,35 @@ class RuntimePersistenceV2Tests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_signal_admission_journal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "runtime.db")
+            store = RuntimeStore(db_path)
+            try:
+                now = time.time()
+                store.append_signal_admission(
+                    signal_id="sig-1",
+                    symbol="BTC/USDT",
+                    side="SHORT",
+                    action="HOLD",
+                    approved=False,
+                    reason="score_below_min",
+                    score=0.52,
+                    ts=now,
+                    raw={"entry_gate": {"approved": False}},
+                )
+
+                rows = store.load_signal_admissions(limit=100)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0].symbol, "BTCUSDT")
+                self.assertEqual(rows[0].side, "SHORT")
+                self.assertFalse(rows[0].approved)
+                self.assertEqual(rows[0].reason, "score_below_min")
+                self.assertAlmostEqual(rows[0].score, 0.52)
+                self.assertFalse(rows[0].raw["entry_gate"]["approved"])
+            finally:
+                store.close()
+
     def test_exchange_closure_recording_is_deduplicated(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = str(Path(tmpdir) / "runtime.db")
@@ -141,7 +170,7 @@ class RuntimePersistenceV2Tests(unittest.TestCase):
 
             store = RuntimeStore(str(db_file))
             try:
-                self.assertEqual(store.get_schema_version(), 3)
+                self.assertEqual(store.get_schema_version(), 4)
             finally:
                 store.close()
 

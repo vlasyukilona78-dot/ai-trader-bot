@@ -157,11 +157,142 @@ class SignalGenerator:
         self.last_diagnostics: dict[str, Any] = {}
 
     @staticmethod
+    def _stable_signal_id(context: SignalContext, side: str, entry: float, sl: float, tp: float) -> str:
+        index = getattr(context.df, "index", None)
+        bar_key: str
+        try:
+            last_index = index[-1]
+            if hasattr(last_index, "timestamp"):
+                bar_key = str(int(last_index.timestamp()))
+            else:
+                bar_key = str(last_index)
+        except Exception:
+            bar_key = str(len(context.df))
+        identity = "|".join(
+            [
+                str(context.symbol).replace("/", "").upper(),
+                str(side).upper(),
+                bar_key,
+                f"{float(entry):.12g}",
+                f"{float(sl):.12g}",
+                f"{float(tp):.12g}",
+            ]
+        )
+        return identity
+
+    @staticmethod
     def _safe(value: Any, default: float = 0.0) -> float:
         try:
-            return float(value)
+            result = float(value)
         except (TypeError, ValueError):
             return default
+        return result if np.isfinite(result) else default
+
+    @staticmethod
+    def _clamp(value: Any, low: float = 0.0, high: float = 1.0, default: float = 0.0) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            result = default
+        if not np.isfinite(result):
+            result = default
+        return float(max(low, min(high, result)))
+
+    def _score_signal_confidence(
+        self,
+        *,
+        context: SignalContext,
+        layer1: dict[str, Any],
+        layer2: dict[str, Any],
+        layer3: dict[str, Any],
+        layer4: dict[str, Any],
+        layer5: dict[str, Any],
+    ) -> tuple[float, dict[str, float]]:
+        volume_threshold = max(float(self.config.volume_spike_threshold), 1e-9)
+        clean_pump_min = max(float(self.config.layer1_clean_pump_min_pct), 1e-9)
+        volume_spike = self._safe(layer1.get("volume_spike"), volume_threshold)
+        clean_pump_pct = self._safe(layer1.get("clean_pump_pct"), clean_pump_min)
+        rsi_value = self._safe(layer1.get("rsi"), self.config.rsi_high)
+
+        volume_quality = self._clamp((volume_spike / volume_threshold) / 1.45)
+        pump_quality = self._clamp(clean_pump_pct / clean_pump_min)
+        rsi_quality = self._clamp((rsi_value - max(52.0, self.config.rsi_high * 0.78)) / 28.0)
+        layer1_quality = self._clamp(0.42 * pump_quality + 0.38 * volume_quality + 0.20 * rsi_quality)
+
+        weakness_strength = self._clamp(layer2.get("weakness_strength"), default=0.72)
+        hard_reclaim = self._clamp(layer2.get("failed_reclaim")) or self._clamp(layer2.get("retest_failed_breakout"))
+        rejection_score = max(
+            self._clamp(layer2.get("price_rejection_near_high")),
+            self._clamp(layer2.get("rejection_bar")),
+            self._clamp(layer2.get("lower_close_after_peak")),
+            self._clamp(layer2.get("lower_high_after_peak")),
+        )
+        rollover_score = 0.5 * self._clamp(layer2.get("rsi_rollover")) + 0.5 * self._clamp(layer2.get("hist_rollover"))
+        flow_score = 0.5 * self._clamp(layer2.get("obv_bearish_divergence")) + 0.5 * self._clamp(layer2.get("cvd_bearish_divergence"))
+        layer2_quality = self._clamp(
+            0.46 * weakness_strength
+            + 0.24 * rejection_score
+            + 0.14 * rollover_score
+            + 0.10 * flow_score
+            + 0.06 * min(1.0, float(hard_reclaim))
+        )
+
+        entry_location_strength = self._clamp(layer3.get("entry_location_strength"), default=0.72)
+        fresh_reaction = max(
+            self._clamp(layer3.get("fresh_reaction_from_high")),
+            self._clamp(layer3.get("fresh_reaction")),
+            self._clamp(layer3.get("fresh_reaction_or_reject")),
+        )
+        value_area = max(
+            self._clamp(layer3.get("value_area_entry_ok")),
+            self._clamp(layer3.get("below_vah_or_rejected_from_vah")),
+            self._clamp(layer3.get("resolved_below_vah_or_failed_reclaim")),
+        )
+        layer3_quality = self._clamp(0.58 * entry_location_strength + 0.24 * fresh_reaction + 0.18 * value_area)
+
+        tp_sl_strength = self._clamp(layer5.get("tp_sl_strength"), default=1.0)
+        rr_quality = self._clamp(self._safe(layer5.get("risk_reward_ratio"), self.config.risk_reward) / max(float(self.config.risk_reward), 1e-9))
+        fallback_rr_used = self._clamp(layer5.get("fallback_rr_used"))
+        layer5_quality = self._clamp(0.62 * tp_sl_strength + 0.38 * rr_quality - 0.18 * fallback_rr_used)
+
+        sentiment_distance = self._clamp(abs(self._safe(layer4.get("sentiment"), 50.0) - 50.0) / 50.0)
+        crowd_extreme = self._clamp(layer4.get("crowd_extreme"))
+        layer4_quality = self._clamp(0.58 * sentiment_distance + 0.42 * crowd_extreme)
+        if bool(self._clamp(layer4.get("degraded_mode"))):
+            layer4_quality = min(layer4_quality, 0.40)
+
+        regime_quality = 0.82 if context.regime in (MarketRegime.PUMP, MarketRegime.PANIC, MarketRegime.TREND) else 0.62
+        confidence = (
+            0.10
+            + 0.15 * layer1_quality
+            + 0.26 * layer2_quality
+            + 0.27 * layer3_quality
+            + 0.12 * layer5_quality
+            + 0.06 * layer4_quality
+            + 0.04 * regime_quality
+        )
+
+        caps = [0.99]
+        if bool(self._clamp(layer4.get("degraded_mode"))):
+            caps.append(float(self.config.degraded_signal_confidence_cap))
+        if fallback_rr_used:
+            caps.append(0.78)
+        if layer2_quality < 0.66:
+            caps.append(0.74)
+        if layer3_quality < 0.70:
+            caps.append(0.76)
+        if not hard_reclaim and rejection_score < 0.55:
+            caps.append(0.82)
+        confidence = self._clamp(confidence, 0.0, min(caps))
+        return confidence, {
+            "layer1_quality": float(layer1_quality),
+            "layer2_quality": float(layer2_quality),
+            "layer3_quality": float(layer3_quality),
+            "layer4_quality": float(layer4_quality),
+            "layer5_quality": float(layer5_quality),
+            "regime_quality": float(regime_quality),
+            "confidence_cap": float(min(caps)),
+        }
 
     @staticmethod
     def _source_tag(source: str | None, fallback: str = "unavailable") -> str:
@@ -792,6 +923,8 @@ class SignalGenerator:
 
         recent = df.tail(min(len(df), 14)).copy()
         if len(recent) < 4:
+            return default
+        if not {"open", "high", "low", "close"}.issubset(set(recent.columns)):
             return default
 
         last = recent.iloc[-1]
@@ -2181,9 +2314,19 @@ class SignalGenerator:
                 final_tp = tp1
                 final_tp_ref = str(tp1_ref or tp_ref)
         else:
-            if bool(self.config.protective_take_profit_prefer_first_target) and tp1 > 0 and tp1_rr >= protective_min_rr:
+            first_target_rr_floor = max(protective_min_rr, 1.02)
+            if bool(self.config.protective_take_profit_prefer_first_target) and tp1 > 0 and tp1_rr >= first_target_rr_floor:
                 final_tp = tp1
                 final_tp_ref = str(tp1_ref or tp_ref)
+            elif tp2 > 0 and tp2_rr >= first_target_rr_floor:
+                final_tp = tp2
+                final_tp_ref = str(tp2_ref or tp_ref)
+            elif tp3 > 0 and tp3_rr >= first_target_rr_floor and str(tp3_ref) != "rr_tp3":
+                final_tp = tp3
+                final_tp_ref = str(tp3_ref or tp_ref)
+            elif tp > 0 and base_tp_rr >= first_target_rr_floor:
+                final_tp = tp
+                final_tp_ref = str(tp_ref)
             elif tp2 > 0:
                 final_tp = tp2
                 final_tp_ref = str(tp2_ref or tp_ref)
@@ -2327,16 +2470,18 @@ class SignalGenerator:
         partial_tps = [float(x) for x in layer5.get("partial_tps", [])]
         self.last_diagnostics = trace
 
-        confidence = 0.45
-        confidence += 0.20 * min(float(layer1.get("volume_spike", 1.0)) / self.config.volume_spike_threshold, 2.0)
-        confidence += 0.10 * abs(float(layer4.get("sentiment", 50.0)) - 50.0) / 50.0
-        confidence += 0.10 * float(layer4.get("crowd_extreme", 0.0))
-        confidence += 0.20 if context.regime in (MarketRegime.PUMP, MarketRegime.PANIC, MarketRegime.TREND) else 0.05
-        if bool(float(layer4.get("degraded_mode", 0.0) or 0.0)):
-            confidence = min(confidence, float(self.config.degraded_signal_confidence_cap))
-        confidence = float(max(0.0, min(confidence, 0.99)))
+        confidence, confidence_breakdown = self._score_signal_confidence(
+            context=context,
+            layer1=layer1,
+            layer2=layer2,
+            layer3=layer3,
+            layer4=layer4,
+            layer5=layer5,
+        )
+        trace["confidence"] = confidence
+        trace["confidence_breakdown"] = confidence_breakdown
 
-        signal_id = f"{context.symbol.replace('/', '')}-{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+        signal_id = self._stable_signal_id(context, side, entry, sl, tp)
         return SignalResult(
             signal_id=signal_id,
             symbol=context.symbol,
@@ -2346,7 +2491,17 @@ class SignalGenerator:
             tp=tp,
             partial_tps=partial_tps,
             confidence=confidence,
-            details={"regime_filter": regime_filter, "layer1": layer1, "layer2": layer2, "layer3": layer3, "layer4": layer4, "layer5": layer5, "layer_trace": trace, "regime": context.regime.value},
+            details={
+                "regime_filter": regime_filter,
+                "layer1": layer1,
+                "layer2": layer2,
+                "layer3": layer3,
+                "layer4": layer4,
+                "layer5": layer5,
+                "confidence_breakdown": confidence_breakdown,
+                "layer_trace": trace,
+                "regime": context.regime.value,
+            },
         )
 
 

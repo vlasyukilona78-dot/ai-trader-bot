@@ -25,6 +25,9 @@ class RiskLimits:
     entry_fee_bps: float = 0.0
     exit_fee_bps: float = 0.0
     slippage_buffer_bps: float = 0.0
+    min_entry_confidence: float = 0.0
+    soft_entry_confidence: float = 0.0
+    soft_entry_size_multiplier: float = 1.0
     max_entry_spread_bps: float = 35.0
     min_entry_turnover_usdt: float = 200_000.0
     require_stop_loss: bool = True
@@ -47,6 +50,9 @@ def load_risk_limits_from_env() -> RiskLimits:
         entry_fee_bps=float(os.getenv("RISK_ENTRY_FEE_BPS", "5.5")),
         exit_fee_bps=float(os.getenv("RISK_EXIT_FEE_BPS", "5.5")),
         slippage_buffer_bps=float(os.getenv("RISK_SLIPPAGE_BUFFER_BPS", "6.0")),
+        min_entry_confidence=float(os.getenv("RISK_MIN_ENTRY_CONFIDENCE", "0.64")),
+        soft_entry_confidence=float(os.getenv("RISK_SOFT_ENTRY_CONFIDENCE", "0.76")),
+        soft_entry_size_multiplier=float(os.getenv("RISK_SOFT_ENTRY_SIZE_MULTIPLIER", "0.50")),
         max_entry_spread_bps=float(os.getenv("RISK_MAX_ENTRY_SPREAD_BPS", "35.0")),
         min_entry_turnover_usdt=float(os.getenv("RISK_MIN_ENTRY_TURNOVER_USDT", "200000")),
         require_stop_loss=os.getenv("RISK_REQUIRE_STOP_LOSS", "true").lower() in ("1", "true", "yes"),

@@ -140,6 +140,8 @@ class BybitPostSigningV2Tests(unittest.TestCase):
                     "BYBIT_SL_TRIGGER_BY": "LastPrice",
                     "BYBIT_TP_TRIGGER_BY": "IndexPrice",
                     "BYBIT_TPSL_MODE": "Partial",
+                    "BYBIT_SL_ORDER_TYPE": "Market",
+                    "BYBIT_TP_ORDER_TYPE": "Limit",
                 },
                 clear=False,
             ):
@@ -159,6 +161,9 @@ class BybitPostSigningV2Tests(unittest.TestCase):
             self.assertEqual(payload.get("tpslMode"), "Partial")
             self.assertEqual(payload.get("slTriggerBy"), "LastPrice")
             self.assertEqual(payload.get("tpTriggerBy"), "IndexPrice")
+            self.assertEqual(payload.get("slOrderType"), "Market")
+            self.assertEqual(payload.get("tpOrderType"), "Limit")
+            self.assertEqual(payload.get("tpLimitPrice"), "90.0")
             self.assertEqual(payload.get("slSize"), "0.5")
             self.assertEqual(payload.get("tpSize"), "0.5")
             self.assertEqual(payload.get("positionIdx"), 2)
@@ -175,6 +180,8 @@ class BybitPostSigningV2Tests(unittest.TestCase):
             tpsl_mode="Partial",
             sl_trigger_by="LastPrice",
             tp_trigger_by="IndexPrice",
+            sl_order_type="Limit",
+            tp_order_type="Market",
         )
         client._sess.request = MagicMock(return_value=_FakeResponse({"retCode": 0, "retMsg": "OK", "result": {}}))
         try:
@@ -184,6 +191,8 @@ class BybitPostSigningV2Tests(unittest.TestCase):
                     "BYBIT_SL_TRIGGER_BY": "MarkPrice",
                     "BYBIT_TP_TRIGGER_BY": "MarkPrice",
                     "BYBIT_TPSL_MODE": "Full",
+                    "BYBIT_SL_ORDER_TYPE": "Market",
+                    "BYBIT_TP_ORDER_TYPE": "Limit",
                 },
                 clear=False,
             ):
@@ -198,6 +207,36 @@ class BybitPostSigningV2Tests(unittest.TestCase):
             self.assertEqual(payload.get("tpslMode"), "Partial")
             self.assertEqual(payload.get("slTriggerBy"), "LastPrice")
             self.assertEqual(payload.get("tpTriggerBy"), "IndexPrice")
+            self.assertEqual(payload.get("slOrderType"), "Limit")
+            self.assertEqual(payload.get("tpOrderType"), "Market")
+            self.assertEqual(payload.get("slLimitPrice"), "95.0")
+        finally:
+            client.close()
+
+    def test_trading_stop_forces_market_order_types_in_full_mode(self):
+        client = self._make_client()
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "BYBIT_TPSL_MODE": "Full",
+                    "BYBIT_SL_ORDER_TYPE": "Limit",
+                    "BYBIT_TP_ORDER_TYPE": "Limit",
+                },
+                clear=False,
+            ):
+                _ = client.set_trading_stop(
+                    symbol="BTCUSDT",
+                    stop_loss=95.0,
+                    take_profit=90.0,
+                    position_idx=0,
+                )
+            payload = json.loads(client._sess.request.call_args.kwargs["data"])
+            self.assertEqual(payload.get("tpslMode"), "Full")
+            self.assertEqual(payload.get("slOrderType"), "Market")
+            self.assertEqual(payload.get("tpOrderType"), "Market")
+            self.assertNotIn("slLimitPrice", payload)
+            self.assertNotIn("tpLimitPrice", payload)
         finally:
             client.close()
 

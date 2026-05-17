@@ -138,6 +138,11 @@ def _normalize_tpsl_mode(value: str | None) -> str:
     return candidate if candidate in {"", "Full", "Partial"} else ""
 
 
+def _normalize_order_type(value: str | None, *, default: str = "Market") -> str:
+    candidate = str(value or default).strip().title()
+    return candidate if candidate in {"Market", "Limit"} else default
+
+
 def _resolve_signal_profile_env() -> str:
     raw = str(os.getenv("BOT_SIGNAL_PROFILE", "both")).strip().lower()
     if raw in {"main", "early"}:
@@ -716,6 +721,8 @@ def load_runtime_config() -> RuntimeConfig:
         tpsl_mode=_normalize_tpsl_mode(os.getenv("BYBIT_TPSL_MODE", "")),
         sl_trigger_by=_normalize_trigger_by(os.getenv("BYBIT_SL_TRIGGER_BY", "MarkPrice")),
         tp_trigger_by=_normalize_trigger_by(os.getenv("BYBIT_TP_TRIGGER_BY", "MarkPrice")),
+        sl_order_type=_normalize_order_type(os.getenv("BYBIT_SL_ORDER_TYPE", "Market")),
+        tp_order_type=_normalize_order_type(os.getenv("BYBIT_TP_ORDER_TYPE", "Market")),
     )
 
     cfg = RuntimeConfig(

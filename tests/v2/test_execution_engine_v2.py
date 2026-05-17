@@ -513,6 +513,30 @@ class ExecutionEngineV2Tests(unittest.TestCase):
         self.assertEqual(out.reason, "orderbook_depth_too_thin")
         self.assertEqual(self.adapter.placed_orders, [])
 
+    def test_client_order_id_is_stable_for_same_intent(self):
+        first = ExecutionEngine._stable_client_order_id("v2", "intent-key", "BTCUSDT", 1.0)
+        second = ExecutionEngine._stable_client_order_id("v2", "intent-key", "BTCUSDT", 1.0)
+        other = ExecutionEngine._stable_client_order_id("v2", "intent-key", "ETHUSDT", 1.0)
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, other)
+        self.assertLessEqual(len(first), 36)
+
+    def test_position_protected_allows_small_bps_drift(self):
+        position = PositionSnapshot(
+            symbol="BTCUSDT",
+            side=PositionSide.SHORT,
+            qty=1.0,
+            entry_price=100.0,
+            liq_price=0.0,
+            leverage=1.0,
+            position_idx=0,
+            stop_loss=101.0004,
+        )
+
+        self.assertTrue(ExecutionEngine._is_position_protected(position, 101.0, tolerance_bps=1.0))
+        self.assertFalse(ExecutionEngine._is_position_protected(position, 101.0, tolerance_bps=0.001))
+
 
 if __name__ == "__main__":
     unittest.main()

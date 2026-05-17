@@ -32,6 +32,9 @@ class RiskEngineV2Tests(unittest.TestCase):
         entry_fee_bps: float = 0.0,
         exit_fee_bps: float = 0.0,
         slippage_buffer_bps: float = 0.0,
+        min_entry_confidence: float = 0.0,
+        soft_entry_confidence: float = 0.0,
+        soft_entry_size_multiplier: float = 1.0,
     ) -> RiskLimits:
         return RiskLimits(
             max_risk_per_trade_pct=0.01,
@@ -45,6 +48,9 @@ class RiskEngineV2Tests(unittest.TestCase):
             entry_fee_bps=entry_fee_bps,
             exit_fee_bps=exit_fee_bps,
             slippage_buffer_bps=slippage_buffer_bps,
+            min_entry_confidence=min_entry_confidence,
+            soft_entry_confidence=soft_entry_confidence,
+            soft_entry_size_multiplier=soft_entry_size_multiplier,
             require_stop_loss=True,
             pyramiding_enabled=False,
         )
@@ -238,6 +244,49 @@ class RiskEngineV2Tests(unittest.TestCase):
         self.assertLess(weak.quantity, baseline.quantity)
         self.assertGreater(weak.effective_stop_loss, baseline.effective_stop_loss)
         self.assertGreater(weak.effective_stop_loss, baseline_intent.stop_loss)
+
+    def test_confidence_gate_rejects_weak_entries_and_scales_marginal_size(self):
+        account = AccountSnapshot(equity_usdt=10_000.0, available_balance_usdt=10_000.0)
+        rules = InstrumentRules(symbol="BTCUSDT", tick_size=0.1, qty_step=0.001, min_qty=0.001, min_notional=5.0)
+        limits = self._roomy_limits(
+            execution_cost_buffer_bps=0.0,
+            min_entry_confidence=0.64,
+            soft_entry_confidence=0.76,
+            soft_entry_size_multiplier=0.5,
+        )
+        engine = RiskEngine(limits)
+        strong_intent = StrategyIntent(
+            symbol="BTCUSDT",
+            action=IntentAction.SHORT_ENTRY,
+            reason="t",
+            stop_loss=101.0,
+            confidence=0.88,
+        )
+        marginal_intent = StrategyIntent(
+            symbol="BTCUSDT",
+            action=IntentAction.SHORT_ENTRY,
+            reason="t",
+            stop_loss=101.0,
+            confidence=0.70,
+        )
+        weak_intent = StrategyIntent(
+            symbol="BTCUSDT",
+            action=IntentAction.SHORT_ENTRY,
+            reason="t",
+            stop_loss=101.0,
+            confidence=0.58,
+        )
+
+        strong = engine.evaluate(intent=strong_intent, account=account, existing_positions=[], mark_price=100.0, rules=rules)
+        marginal = engine.evaluate(intent=marginal_intent, account=account, existing_positions=[], mark_price=100.0, rules=rules)
+        weak = engine.evaluate(intent=weak_intent, account=account, existing_positions=[], mark_price=100.0, rules=rules)
+
+        self.assertTrue(strong.approved)
+        self.assertTrue(marginal.approved)
+        self.assertFalse(weak.approved)
+        self.assertEqual(weak.reason, "confidence_below_min")
+        self.assertAlmostEqual(marginal.confidence_size_multiplier_used, 0.5)
+        self.assertLess(marginal.quantity, strong.quantity)
 
     def test_fee_and_slippage_buffers_are_included_in_position_sizing(self):
         account = AccountSnapshot(equity_usdt=10_000.0, available_balance_usdt=10_000.0)
