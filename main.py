@@ -22,6 +22,7 @@ PROJECT_VENV_PYTHON = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
 PROJECT_RUNTIME_CFG = PROJECT_ROOT / ".runtime_env" / "pyvenv.cfg"
 PROJECT_RUNTIME_LOG_DIR = PROJECT_ROOT / "logs" / "runtime"
 SUPERVISOR_STATE_PATH = PROJECT_RUNTIME_LOG_DIR / "active_supervisor.json"
+SUPERVISOR_LOCK_PATH = PROJECT_RUNTIME_LOG_DIR / "bot_supervisor.lock"
 
 
 def _emit_supervisor_log(message: str, log_stream: TextIO | None = None) -> None:
@@ -46,6 +47,60 @@ def _open_supervisor_run_log() -> tuple[Path, TextIO | None]:
         return path, path.open("a", encoding="utf-8", buffering=1)
     except Exception:
         return path, None
+
+
+def _acquire_supervisor_lock(log_stream: TextIO | None = None) -> TextIO | None:
+    PROJECT_RUNTIME_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    lock_file = SUPERVISOR_LOCK_PATH.open("a+", encoding="utf-8", buffering=1)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                _emit_supervisor_log(
+                    "[supervisor] active lock detected; stopping previous supervisor before restart",
+                    log_stream,
+                )
+                _stop_previous_supervisor_if_needed(log_stream=log_stream)
+                time.sleep(0.75)
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(
+            json.dumps(
+                {"pid": os.getpid(), "cwd": str(PROJECT_ROOT), "updated_at": int(time.time())},
+                ensure_ascii=False,
+            )
+        )
+        lock_file.flush()
+        return lock_file
+    except Exception:
+        try:
+            lock_file.close()
+        except Exception:
+            pass
+        raise
+
+
+def _release_supervisor_lock(lock_file: TextIO | None) -> None:
+    if lock_file is None:
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    except Exception:
+        pass
+    try:
+        lock_file.close()
+    except Exception:
+        pass
 
 
 def _select_base_python_from_runtime_cfg() -> str | None:
@@ -198,6 +253,7 @@ def _run_dual_profile_supervisor() -> int:
     except Exception:
         pass
     supervisor_log_path, supervisor_log_stream = _open_supervisor_run_log()
+    supervisor_lock_handle = _acquire_supervisor_lock(log_stream=supervisor_log_stream)
     _stop_previous_supervisor_if_needed(log_stream=supervisor_log_stream)
     _write_active_supervisor_state(pid=os.getpid(), log_path=str(supervisor_log_path))
     profiles = ("main", "early")
@@ -254,6 +310,7 @@ def _run_dual_profile_supervisor() -> int:
         for thread in threads:
             thread.join(timeout=1)
         _clear_active_supervisor_state(pid=os.getpid())
+        _release_supervisor_lock(supervisor_lock_handle)
         if supervisor_log_stream is not None:
             try:
                 supervisor_log_stream.close()

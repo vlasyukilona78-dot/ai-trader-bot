@@ -53,5 +53,22 @@ class FeaturePipeline:
         if row is None:
             raise ValueError("feature_row_none")
 
+        self._bind_row_snapshot_to_latest_frame(enriched, row)
         assert_finite_features(row.values)
         return FeatureBundle(symbol=symbol, as_of=as_of, enriched=enriched, row=row)
+
+    @staticmethod
+    def _bind_row_snapshot_to_latest_frame(enriched: pd.DataFrame, row: FeatureRow) -> None:
+        if enriched.empty:
+            return
+        latest_idx = enriched.index[-1]
+        for key, value in row.values.items():
+            if not key.startswith("mtf_"):
+                continue
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if key not in enriched.columns:
+                enriched[key] = 50.0 if key.startswith("mtf_rsi_") else 0.0
+            enriched.loc[latest_idx, key] = numeric_value

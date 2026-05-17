@@ -7,7 +7,7 @@ from dataclasses import replace
 
 from core.market_regime import detect_market_regime
 from core.signal_generator import SignalConfig, SignalContext, SignalGenerator
-from core.feature_engineering import assess_feature_frame_quality, sanitize_feature_frame
+from core.feature_engineering import assess_feature_frame_quality, compute_mtf_feature_snapshot, sanitize_feature_frame
 from core.volume_profile import compute_volume_profile
 from trading.exchange.schemas import PositionSide
 from trading.portfolio.positions import first_effective_position_for_symbol
@@ -16,6 +16,7 @@ from trading.signals.models import SignalCandidate
 from trading.signals.signal_types import IntentAction, StrategyIntent
 from trading.signals.strategy_audit import StrategyAuditCollector
 from trading.signals.strategy_interface import StrategyContext, StrategyInterface
+from trading.signals.versioning import STRATEGY_RUNTIME_VERSION, runtime_versions
 from trading.state.models import TradeState
 
 
@@ -102,6 +103,24 @@ class LayeredPumpStrategy(StrategyInterface):
             return default
 
     @staticmethod
+    def _attach_mtf_snapshot(enriched):
+        required = ("open", "high", "low", "close", "volume")
+        if getattr(enriched, "empty", True) or not set(required).issubset(set(getattr(enriched, "columns", []))):
+            return enriched
+        try:
+            snapshot = compute_mtf_feature_snapshot(enriched[list(required)])
+            latest_idx = enriched.index[-1]
+            for key, value in snapshot.items():
+                numeric_value = float(value)
+                if key not in enriched.columns:
+                    enriched[key] = 50.0 if key.startswith("mtf_rsi_") else 0.0
+                enriched.loc[latest_idx, key] = numeric_value
+            enriched.attrs["mtf_snapshot"] = dict(snapshot)
+        except Exception:
+            return enriched
+        return enriched
+
+    @staticmethod
     def _regime_condition_state(value: object) -> bool | None:
         if value is None:
             return None
@@ -165,8 +184,10 @@ class LayeredPumpStrategy(StrategyInterface):
             "htf_trend_direction_context": "",
             "mtf_trend_5m_used": None,
             "mtf_trend_15m_used": None,
+            "mtf_trend_1h_used": None,
             "mtf_rsi_5m_used": None,
             "mtf_rsi_15m_used": None,
+            "mtf_rsi_1h_used": None,
             "mtf_hard_filter_enabled": 0.0,
             "vwap_distance_metric_used": None,
             "vwap_stretch_threshold_used": None,
@@ -187,8 +208,10 @@ class LayeredPumpStrategy(StrategyInterface):
             "htf_trend_threshold_used",
             "mtf_trend_5m_used",
             "mtf_trend_15m_used",
+            "mtf_trend_1h_used",
             "mtf_rsi_5m_used",
             "mtf_rsi_15m_used",
+            "mtf_rsi_1h_used",
             "mtf_hard_filter_enabled",
             "vwap_distance_metric_used",
             "vwap_stretch_threshold_used",
@@ -797,6 +820,7 @@ class LayeredPumpStrategy(StrategyInterface):
 
             enriched = compute_indicators(df)
         enriched = sanitize_feature_frame(enriched)
+        enriched = self._attach_mtf_snapshot(enriched)
         frame_quality = assess_feature_frame_quality(enriched)
         if not bool(frame_quality.get("usable", True)):
             layer_trace = {"failed_layer": "data_quality_guard", "layers": {}}
@@ -904,7 +928,8 @@ class LayeredPumpStrategy(StrategyInterface):
         entry_meta = {
             "legacy_signal_id": signal.signal_id,
             "signal_side": str(signal.side).upper(),
-            "strategy_version": "layered_v2_entry_gate_1",
+            "strategy_version": STRATEGY_RUNTIME_VERSION,
+            "runtime_versions": runtime_versions(),
             **trace_meta,
         }
         if signal.partial_tps:

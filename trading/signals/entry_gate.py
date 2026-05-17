@@ -7,6 +7,7 @@ from typing import Any
 
 from trading.signals.models import SignalCandidate
 from trading.signals.scoring import boolish, clamp, layer_details, mapping_get, safe_float
+from trading.signals.versioning import ENTRY_GATE_VERSION
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -46,6 +47,14 @@ class EntryGateConfig:
     max_chase_distance_atr: float = 0.75
     hard_reject_chase_distance_atr: float = 1.35
     reentry_cooldown_bars: int = 6
+    mtf_guard_enabled: bool = True
+    require_mtf_context: bool = False
+    mtf_trend_1h_max_short: float = 0.0036
+    mtf_trend_15m_max_short: float = 0.0044
+    mtf_trend_5m_max_short: float = 0.0060
+    mtf_rsi_1h_max_short: float = 64.0
+    mtf_rsi_15m_max_short: float = 68.0
+    mtf_rsi_5m_max_short: float = 75.0
 
     @classmethod
     def from_env(cls) -> "EntryGateConfig":
@@ -64,6 +73,14 @@ class EntryGateConfig:
                 cls.hard_reject_chase_distance_atr,
             ),
             reentry_cooldown_bars=_env_int("ENTRY_GATE_REENTRY_COOLDOWN_BARS", cls.reentry_cooldown_bars),
+            mtf_guard_enabled=_env_bool("ENTRY_GATE_MTF_GUARD_ENABLED", cls.mtf_guard_enabled),
+            require_mtf_context=_env_bool("ENTRY_GATE_REQUIRE_MTF_CONTEXT", cls.require_mtf_context),
+            mtf_trend_1h_max_short=_env_float("ENTRY_GATE_MTF_TREND_1H_MAX_SHORT", cls.mtf_trend_1h_max_short),
+            mtf_trend_15m_max_short=_env_float("ENTRY_GATE_MTF_TREND_15M_MAX_SHORT", cls.mtf_trend_15m_max_short),
+            mtf_trend_5m_max_short=_env_float("ENTRY_GATE_MTF_TREND_5M_MAX_SHORT", cls.mtf_trend_5m_max_short),
+            mtf_rsi_1h_max_short=_env_float("ENTRY_GATE_MTF_RSI_1H_MAX_SHORT", cls.mtf_rsi_1h_max_short),
+            mtf_rsi_15m_max_short=_env_float("ENTRY_GATE_MTF_RSI_15M_MAX_SHORT", cls.mtf_rsi_15m_max_short),
+            mtf_rsi_5m_max_short=_env_float("ENTRY_GATE_MTF_RSI_5M_MAX_SHORT", cls.mtf_rsi_5m_max_short),
         )
 
 
@@ -75,7 +92,7 @@ class EntryGateDecision:
     penalties: dict[str, float] = field(default_factory=dict)
     flags: dict[str, bool] = field(default_factory=dict)
     diagnostics: dict[str, Any] = field(default_factory=dict)
-    version: str = "entry_gate_v1"
+    version: str = ENTRY_GATE_VERSION
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -130,6 +147,7 @@ class EntryGate:
         pump_bar_offset = safe_float(mapping_get(layer1, "pump_bar_offset"), 0.0)
         context_quality = self._context_quality(candidate.details)
         degraded_context = self._is_degraded_context(candidate.details)
+        mtf_context = self._mtf_context(candidate)
 
         invalid_geometry = entry <= 0 or stop <= entry or target >= entry or target <= 0
         if invalid_geometry:
@@ -142,6 +160,13 @@ class EntryGate:
                     "take_profit": target,
                     "risk_reward_ratio": rr,
                 },
+            )
+
+        if self.config.mtf_guard_enabled and self.config.require_mtf_context and mtf_context["missing"]:
+            return self._reject(
+                "mtf_context_missing",
+                candidate,
+                diagnostics=mtf_context,
             )
 
         if rr + 1e-9 < self.config.min_rr:
@@ -182,6 +207,13 @@ class EntryGate:
                 },
             )
 
+        if self.config.mtf_guard_enabled and mtf_context["hard_continuation"]:
+            return self._reject(
+                "mtf_continuation_block",
+                candidate,
+                diagnostics=mtf_context,
+            )
+
         penalties: dict[str, float] = {}
         flags: dict[str, bool] = {
             "degraded_context": degraded_context,
@@ -190,6 +222,7 @@ class EntryGate:
             "chasing_after_peak": atr > 0 and chase_atr > self.config.max_chase_distance_atr,
             "context_quality_low": context_quality < self.config.min_context_quality,
             "continuation_risk": self._continuation_risk(candidate, layer1),
+            "mtf_continuation_risk": bool(self.config.mtf_guard_enabled and mtf_context["caution_continuation"]),
         }
 
         if flags["degraded_context"]:
@@ -205,6 +238,8 @@ class EntryGate:
             penalties["context_quality_low"] = 0.08
         if flags["continuation_risk"]:
             penalties["continuation_risk"] = 0.06
+        if flags["mtf_continuation_risk"]:
+            penalties["mtf_continuation_risk"] = 0.08
 
         score = self._score(
             candidate=candidate,
@@ -236,6 +271,7 @@ class EntryGate:
                     layer2=layer2,
                     layer3=layer3,
                     layer5=layer5,
+                    mtf_context=mtf_context,
                 ),
             )
 
@@ -256,6 +292,7 @@ class EntryGate:
                 layer2=layer2,
                 layer3=layer3,
                 layer5=layer5,
+                mtf_context=mtf_context,
             ),
         )
 
@@ -385,6 +422,7 @@ class EntryGate:
         layer2: Mapping[str, Any],
         layer3: Mapping[str, Any],
         layer5: Mapping[str, Any],
+        mtf_context: Mapping[str, Any],
     ) -> dict[str, Any]:
         return {
             "symbol": candidate.symbol,
@@ -402,4 +440,45 @@ class EntryGate:
             "entry": float(candidate.entry),
             "stop_loss": float(candidate.stop_loss),
             "take_profit": float(candidate.take_profit),
+            "mtf_context": dict(mtf_context),
+        }
+
+    def _mtf_context(self, candidate: SignalCandidate) -> dict[str, Any]:
+        extras = candidate.market_extras if isinstance(candidate.market_extras, Mapping) else {}
+        trend_1h = safe_float(extras.get("mtf_trend_1h"), 0.0)
+        trend_15m = safe_float(extras.get("mtf_trend_15m"), 0.0)
+        trend_5m = safe_float(extras.get("mtf_trend_5m"), 0.0)
+        rsi_1h = safe_float(extras.get("mtf_rsi_1h"), 50.0)
+        rsi_15m = safe_float(extras.get("mtf_rsi_15m"), 50.0)
+        rsi_5m = safe_float(extras.get("mtf_rsi_5m"), 50.0)
+        observed_keys = {
+            "mtf_trend_1h",
+            "mtf_trend_15m",
+            "mtf_trend_5m",
+            "mtf_rsi_1h",
+            "mtf_rsi_15m",
+            "mtf_rsi_5m",
+        }
+        missing = not any(key in extras for key in observed_keys)
+        hard_1h = trend_1h >= self.config.mtf_trend_1h_max_short and rsi_1h >= self.config.mtf_rsi_1h_max_short
+        hard_15m = trend_15m >= self.config.mtf_trend_15m_max_short and rsi_15m >= self.config.mtf_rsi_15m_max_short
+        hard_5m = trend_5m >= self.config.mtf_trend_5m_max_short and rsi_5m >= self.config.mtf_rsi_5m_max_short
+        caution_1h = trend_1h >= self.config.mtf_trend_1h_max_short * 0.78 and rsi_1h >= self.config.mtf_rsi_1h_max_short - 2.0
+        caution_15m = trend_15m >= self.config.mtf_trend_15m_max_short * 0.82 and rsi_15m >= self.config.mtf_rsi_15m_max_short - 2.0
+        caution_5m = trend_5m >= self.config.mtf_trend_5m_max_short * 0.88 and rsi_5m >= self.config.mtf_rsi_5m_max_short - 2.0
+        return {
+            "missing": bool(missing),
+            "hard_continuation": bool(not missing and (hard_1h or hard_15m or hard_5m)),
+            "caution_continuation": bool(not missing and (caution_1h or caution_15m or caution_5m)),
+            "hard_1h": bool(hard_1h),
+            "hard_15m": bool(hard_15m),
+            "hard_5m": bool(hard_5m),
+            "mtf_trend_1h": float(trend_1h),
+            "mtf_trend_15m": float(trend_15m),
+            "mtf_trend_5m": float(trend_5m),
+            "mtf_rsi_1h": float(rsi_1h),
+            "mtf_rsi_15m": float(rsi_15m),
+            "mtf_rsi_5m": float(rsi_5m),
+            "mtf_guard_enabled": bool(self.config.mtf_guard_enabled),
+            "require_mtf_context": bool(self.config.require_mtf_context),
         }

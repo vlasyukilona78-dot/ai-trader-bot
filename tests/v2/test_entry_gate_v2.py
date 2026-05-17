@@ -4,6 +4,7 @@ import unittest
 
 from trading.signals.entry_gate import EntryGate, EntryGateConfig
 from trading.signals.models import SignalCandidate
+from trading.signals.replay_audit import summarize_signal_admissions
 
 
 class EntryGateV2Tests(unittest.TestCase):
@@ -63,6 +64,51 @@ class EntryGateV2Tests(unittest.TestCase):
         decision = gate.evaluate(self._candidate(entry=98.0, stop_loss=99.0, take_profit=96.0, recent_high=100.0))
         self.assertFalse(decision.approved)
         self.assertEqual(decision.reason, "entry_chasing_after_peak")
+
+    def test_rejects_strong_mtf_continuation(self):
+        gate = EntryGate(EntryGateConfig(min_score=0.70))
+        decision = gate.evaluate(
+            self._candidate(
+                market_extras={
+                    "mtf_trend_1h": 0.0040,
+                    "mtf_rsi_1h": 66.0,
+                    "mtf_trend_15m": 0.0010,
+                    "mtf_rsi_15m": 55.0,
+                    "mtf_trend_5m": 0.0010,
+                    "mtf_rsi_5m": 55.0,
+                }
+            )
+        )
+        self.assertFalse(decision.approved)
+        self.assertEqual(decision.reason, "mtf_continuation_block")
+        self.assertTrue(decision.diagnostics["hard_1h"])
+
+    def test_can_require_mtf_context(self):
+        gate = EntryGate(EntryGateConfig(require_mtf_context=True))
+        decision = gate.evaluate(self._candidate())
+        self.assertFalse(decision.approved)
+        self.assertEqual(decision.reason, "mtf_context_missing")
+
+    def test_replay_admission_summary(self):
+        class Row:
+            def __init__(self, approved: bool, reason: str, score: float, symbol: str):
+                self.approved = approved
+                self.reason = reason
+                self.score = score
+                self.symbol = symbol
+                self.ts = 1.0
+                self.raw = {"entry_gate": {"version": "test_gate"}}
+
+        summary = summarize_signal_admissions(
+            [
+                Row(True, "approved", 0.84, "BTCUSDT"),
+                Row(False, "mtf_continuation_block", 0.0, "BTCUSDT"),
+            ]
+        )
+        self.assertEqual(summary["total"], 2)
+        self.assertEqual(summary["approved"], 1)
+        self.assertEqual(summary["rejected_reason_counts"]["mtf_continuation_block"], 1)
+        self.assertEqual(summary["versions"]["test_gate"], 2)
 
 
 if __name__ == "__main__":

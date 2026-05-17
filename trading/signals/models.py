@@ -8,6 +8,22 @@ from typing import Any
 from trading.signals.scoring import safe_float
 
 
+_MARKET_EXTRA_KEYS: tuple[str, ...] = (
+    "mtf_rsi_5m",
+    "mtf_rsi_15m",
+    "mtf_rsi_1h",
+    "mtf_atr_norm_5m",
+    "mtf_atr_norm_15m",
+    "mtf_atr_norm_1h",
+    "mtf_trend_5m",
+    "mtf_trend_15m",
+    "mtf_trend_1h",
+    "volume_spike",
+    "vwap_dist",
+    "atr_norm",
+)
+
+
 @dataclass(frozen=True)
 class SignalCandidate:
     """Normalized candidate passed from signal generation into admission checks."""
@@ -57,6 +73,12 @@ class SignalCandidate:
         if mark_price <= 0:
             mark_price = safe_float(getattr(signal, "entry", 0.0), 0.0)
 
+        market_extras: dict[str, Any] = {}
+        if hasattr(latest, "get"):
+            for key in _MARKET_EXTRA_KEYS:
+                if key in latest:
+                    market_extras[key] = safe_float(latest.get(key), 0.0)
+
         return cls(
             signal_id=str(getattr(signal, "signal_id", "")),
             symbol=str(getattr(context, "symbol", getattr(signal, "symbol", ""))).replace("/", "").upper(),
@@ -77,5 +99,5 @@ class SignalCandidate:
             latest_close=safe_float(latest.get("close") if hasattr(latest, "get") else 0.0, 0.0),
             recent_high=recent_high,
             recent_low=recent_low,
-            market_extras={},
+            market_extras=market_extras,
         )
