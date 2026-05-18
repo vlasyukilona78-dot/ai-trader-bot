@@ -716,6 +716,7 @@ def load_runtime_config() -> RuntimeConfig:
         ws_close_timeout_sec=float(os.getenv("WS_CLOSE_TIMEOUT_SEC", "6.0")),
         ws_ping_interval_sec=float(os.getenv("WS_PING_INTERVAL_SEC", "60.0")),
         ws_ping_timeout_sec=float(os.getenv("WS_PING_TIMEOUT_SEC", "30.0")),
+        ws_transport_ping_enabled=_env_bool("WS_TRANSPORT_PING_ENABLED", False),
         ws_symbols=symbols,
         target_entry_leverage=float(os.getenv("BYBIT_TARGET_ENTRY_LEVERAGE", os.getenv("RISK_MAX_LEVERAGE", "3.0"))),
         tpsl_mode=_normalize_tpsl_mode(os.getenv("BYBIT_TPSL_MODE", "")),

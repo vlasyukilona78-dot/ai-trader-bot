@@ -579,6 +579,7 @@ class LayeredPumpStrategy(StrategyInterface):
         hist_turning_up = hist > prev_hist and hist > -0.02
         rebound_confirmed = bounce_strength >= 2 and (rsi_turning_up or hist_turning_up)
         reclaiming_entry = close >= entry_price * (1.0 - max(atr_pct * 0.18, 0.0007))
+        accepted_above_entry = close >= entry_price * (1.0 + max(atr_pct * 0.06, 0.00035))
         bullish_reclaim = close_above_ema20 and close_above_vwap and bounce_strength >= 3
         tail3 = enriched.tail(3)
         acceptance_entry_count = 0
@@ -655,6 +656,17 @@ class LayeredPumpStrategy(StrategyInterface):
             and close_above_ema20
             and close_above_vwap
             and (rebound_confirmed or bullish_reclaim or up_close_count >= 2)
+        )
+        entry_failure_continuation_exit = (
+            holding_minutes >= float(cfg.managed_exit_entry_failure_min_hold_minutes)
+            and best_reward_r <= float(cfg.managed_exit_entry_failure_max_best_r)
+            and adverse_r >= float(cfg.managed_exit_entry_failure_min_adverse_r)
+            and accepted_above_entry
+            and acceptance_entry_count >= 2
+            and (acceptance_ema20_count >= 2 or acceptance_vwap_count >= 2)
+            and (close_above_ema20 or close_above_vwap)
+            and bounce_strength >= int(float(cfg.managed_exit_entry_failure_min_bounce_strength))
+            and (up_close_count >= 2 or rsi_turning_up or hist_turning_up)
         )
         roundtrip_reclaim_exit = (
             holding_minutes >= float(cfg.managed_exit_roundtrip_min_hold_minutes)
@@ -733,6 +745,9 @@ class LayeredPumpStrategy(StrategyInterface):
         elif micro_fail_exit:
             exit_type = "micro_fail_acceptance"
             reason = "managed_exit_micro_fail_acceptance"
+        elif entry_failure_continuation_exit:
+            exit_type = "entry_failure_continuation"
+            reason = "managed_exit_entry_failure_continuation"
         elif target_bounce_exit:
             exit_type = "target_zone_bounce"
             reason = "managed_exit_target_zone_bounce"
@@ -787,12 +802,14 @@ class LayeredPumpStrategy(StrategyInterface):
                 "rsi_turning_up": 1.0 if rsi_turning_up else 0.0,
                 "hist_turning_up": 1.0 if hist_turning_up else 0.0,
                 "reclaiming_entry": 1.0 if reclaiming_entry else 0.0,
+                "accepted_above_entry": 1.0 if accepted_above_entry else 0.0,
                 "bounce_strength": float(bounce_strength),
                 "acceptance_entry_count": float(acceptance_entry_count),
                 "acceptance_ema20_count": float(acceptance_ema20_count),
                 "acceptance_vwap_count": float(acceptance_vwap_count),
                 "up_close_count": float(up_close_count),
                 "micro_fail_exit": 1.0 if micro_fail_exit else 0.0,
+                "entry_failure_continuation_exit": 1.0 if entry_failure_continuation_exit else 0.0,
             },
         }
         return StrategyIntent(

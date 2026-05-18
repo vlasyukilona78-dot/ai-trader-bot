@@ -25,6 +25,21 @@ class _FakeSession:
         return self._behavior
 
 
+class _SequenceSession:
+    def __init__(self, behaviors):
+        self._behaviors = list(behaviors)
+
+    def post(self, *args, **kwargs):
+        if not self._behaviors:
+            return _FakeResponse(200, "ok")
+        behavior = self._behaviors.pop(0)
+        if isinstance(behavior, Exception):
+            raise behavior
+        if callable(behavior):
+            return behavior(*args, **kwargs)
+        return behavior
+
+
 class TelegramClientV2Tests(unittest.TestCase):
     def test_prefers_proxy_then_direct_when_proxy_configured(self):
         env = {"TELEGRAM_PROXY_URL": "socks5://127.0.0.1:1080"}
@@ -65,6 +80,16 @@ class TelegramClientV2Tests(unittest.TestCase):
             ("direct", _FakeSession(_FakeResponse(200, "ok"))),
         ]
         self.assertTrue(client.send_photo("caption", b"png-bytes"))
+
+    def test_send_photo_document_fallback_suppresses_transient_photo_warning(self):
+        with patch.dict(os.environ, {"TELEGRAM_AUTO_LOCAL_PROXY": "0"}, clear=True):
+            client = TelegramClient(token="t", chat_id="c")
+        client._transports = [
+            ("direct", _SequenceSession([ConnectionError("reset_once"), _FakeResponse(200, "ok")])),
+        ]
+        with patch("alerts.telegram_client.logger.warning") as warning_mock:
+            self.assertTrue(client.send_photo("caption", b"png-bytes"))
+        warning_mock.assert_not_called()
 
     def test_skips_dead_local_proxy_and_uses_direct(self):
         with patch.dict(os.environ, {"TELEGRAM_PROXY_URL": "http://127.0.0.1:10801"}, clear=False), patch.object(

@@ -90,6 +90,7 @@ class BybitAdapterConfig:
     ws_close_timeout_sec: float = 6.0
     ws_ping_interval_sec: float = 30.0
     ws_ping_timeout_sec: float = 20.0
+    ws_transport_ping_enabled: bool = False
     ws_symbols: list[str] = field(default_factory=list)
     target_entry_leverage: float = 3.0
     tpsl_mode: str = ""
@@ -149,6 +150,7 @@ class BybitAdapter:
             close_timeout_sec=float(self.config.ws_close_timeout_sec),
             ping_interval_sec=float(self.config.ws_ping_interval_sec),
             ping_timeout_sec=float(self.config.ws_ping_timeout_sec),
+            transport_ping_enabled=bool(self.config.ws_transport_ping_enabled),
         )
         self._ws_stream = BybitWebSocketStream(ws_cfg)
         self._ws_stream.start()

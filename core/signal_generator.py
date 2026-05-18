@@ -101,6 +101,10 @@ class SignalConfig:
     managed_exit_micro_fail_min_hold_minutes: float = 2.0
     managed_exit_micro_fail_max_best_r: float = 0.12
     managed_exit_micro_fail_min_adverse_r: float = 0.025
+    managed_exit_entry_failure_min_hold_minutes: float = 2.0
+    managed_exit_entry_failure_max_best_r: float = 0.10
+    managed_exit_entry_failure_min_adverse_r: float = 0.045
+    managed_exit_entry_failure_min_bounce_strength: float = 3.0
     managed_exit_target_zone_min_reward_r: float = 0.32
     managed_exit_profit_reclaim_min_reward_r: float = 0.85
     managed_exit_reclaim_invalidation_min_reward_r: float = 0.15

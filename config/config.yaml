@@ -31,6 +31,10 @@ strategy:
   msb_break_buffer_pct: 0.0002
   regime_volatility_dynamic_floor_mult: 0.72
   regime_volatility_baseline_lookback: 96
+  managed_exit_entry_failure_min_hold_minutes: 2.0
+  managed_exit_entry_failure_max_best_r: 0.10
+  managed_exit_entry_failure_min_adverse_r: 0.045
+  managed_exit_entry_failure_min_bounce_strength: 3.0
   volume_profile_window: 120
   volume_profile_bins: 48
 

@@ -142,6 +142,7 @@ class TelegramClient:
         files: dict | None = None,
         timeout=None,
         attempts_per_transport: int = 1,
+        log_failure: bool = True,
     ) -> tuple[bool, str]:
         last_status = None
         last_text = ""
@@ -160,6 +161,8 @@ class TelegramClient:
                     last_transport = transport_name
                     last_exc = exc
                     continue
+        if not log_failure:
+            return False, last_transport
         if last_status is not None:
             logger.warning("telegram request HTTP %s via %s: %s", last_status, last_transport or "unknown", last_text)
         elif last_exc is not None:
@@ -235,6 +238,7 @@ class TelegramClient:
             files=files,
             timeout=(3, max(int(self.timeout), 15)) if self._has_proxy_transport else (6, max(int(self.timeout), 25)),
             attempts_per_transport=1,
+            log_failure=False,
         )
         if delivered:
             logger.info("telegram sendPhoto ok via %s", transport or "unknown")

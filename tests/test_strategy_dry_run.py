@@ -17,6 +17,7 @@ try:
         _build_main_signal_signature,
         _build_early_watch_candidate,
         _build_higher_timeframe_chart,
+        _alert_context_timeframe,
         _current_recent_peak_price,
         _enrich_intent_with_runtime_market_metadata,
         _format_chart_timeframe_label,
@@ -24,6 +25,7 @@ try:
         _remember_cached_alert,
         _scan_live_price_overlay_enabled,
         _send_alerts,
+        _send_chart_or_text_alerts,
         _send_photo_alerts,
         _should_block_live_main_short_continuation,
         _should_block_recent_main_short_reentry,
@@ -513,6 +515,45 @@ class SignalGeneratorTests(unittest.TestCase):
 
         self.assertEqual((attempted, sent), (1, 1))
         self.assertEqual(alerter.text, "signal")
+
+    def test_signal_alerts_suppress_text_when_chart_build_missing_by_default(self):
+        class _FakeAlerter:
+            def __init__(self):
+                self.text = ""
+
+            def send(self, text, reply_markup=None):
+                self.text = text
+                return True
+
+            def send_photo(self, caption, image_bytes, filename="signal.png", reply_markup=None):
+                raise AssertionError("photo send should not be called without image bytes")
+
+        previous_env = os.environ.pop("ALERT_REQUIRE_CHART_FOR_SIGNAL", None)
+        try:
+            alerter = _FakeAlerter()
+            attempted, sent = _send_chart_or_text_alerts(
+                [alerter],
+                "signal",
+                None,
+                filename="missing.png",
+                chart_context="test",
+            )
+
+            self.assertEqual((attempted, sent), (1, 0))
+            self.assertEqual(alerter.text, "")
+        finally:
+            if previous_env is not None:
+                os.environ["ALERT_REQUIRE_CHART_FOR_SIGNAL"] = previous_env
+
+    def test_context_chart_timeframe_defaults_to_forced_one_hour(self):
+        with patch.dict(os.environ, {"BOT_ALERT_CONTEXT_TIMEFRAME": "240"}, clear=False):
+            self.assertEqual(_alert_context_timeframe(), "60")
+        with patch.dict(
+            os.environ,
+            {"BOT_ALERT_CONTEXT_TIMEFRAME": "4h", "BOT_ALERT_CONTEXT_FORCE_1H": "0"},
+            clear=False,
+        ):
+            self.assertEqual(_alert_context_timeframe(), "240")
 
     def test_compute_price_view_bounds_ignores_isolated_recent_wick(self):
         df = self._build_df()
@@ -4698,6 +4739,82 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertGreaterEqual(float(details.get("adverse_r", 0.0)), 0.06)
         self.assertLessEqual(float(details.get("best_reward_r", 999.0)), 0.20)
 
+    def test_layered_strategy_managed_exit_short_on_entry_failure_continuation(self):
+        n = 120
+        idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
+        close = np.linspace(112.0, 112.02, n)
+        close[-8:] = [112.01, 112.03, 112.07, 112.14, 112.22, 112.30, 112.38, 112.46]
+        df = pd.DataFrame(
+            {
+                "open": close * 0.9997,
+                "high": close * 1.0010,
+                "low": close * 0.9995,
+                "close": close,
+                "volume": np.linspace(8.0, 13.0, n),
+            },
+            index=idx,
+        )
+        df["rsi"] = np.linspace(47.0, 59.0, n)
+        df.loc[df.index[-6]:, "rsi"] = [52.0, 53.5, 55.0, 56.5, 58.0, 59.5]
+        df["volume_spike"] = 1.10
+        df["bb_upper"] = close * 1.014
+        df["bb_lower"] = close * 0.986
+        df["kc_upper"] = close * 1.012
+        df["kc_lower"] = close * 0.988
+        df["obv"] = np.linspace(1090.0, 1075.0, n)
+        df["cvd"] = np.linspace(1050.0, 1032.0, n)
+        df["vwap"] = np.linspace(111.94, 112.05, n)
+        df["atr"] = 0.50
+        df["ema20"] = np.linspace(111.95, 112.08, n)
+        df["ema50"] = np.linspace(112.00, 112.04, n)
+        df["hist"] = np.linspace(-0.04, 0.04, n)
+        df["poc"] = 111.25
+        df["vah"] = 112.60
+        df["val"] = 110.90
+        df["adx"] = 15.0
+
+        exchange = ExchangeSnapshot(
+            symbol="BTC/USDT",
+            account=AccountSnapshot(equity_usdt=1000.0, available_balance_usdt=1000.0),
+            positions=[
+                PositionSnapshot(
+                    symbol="BTC/USDT",
+                    side=PositionSide.SHORT,
+                    qty=1.0,
+                    entry_price=112.0,
+                    liq_price=120.0,
+                    leverage=3.0,
+                    position_idx=2,
+                    stop_loss=114.0,
+                )
+            ],
+            open_orders=[],
+        )
+
+        strategy = LayeredPumpStrategy(
+            SignalConfig(
+                managed_exit_micro_fail_min_hold_minutes=30.0,
+                managed_exit_adverse_acceptance_min_hold_minutes=30.0,
+            )
+        )
+        intent = strategy.generate(
+            StrategyContext(
+                symbol="BTC/USDT",
+                market_ohlcv=df,
+                mark_price=float(df.iloc[-1]["close"]),
+                exchange=exchange,
+                synced_state=TradeState.SHORT,
+                synced_state_updated_at=float(pd.Timestamp.now(tz="UTC").timestamp() - (3.0 * 60.0)),
+            )
+        )
+
+        self.assertEqual(intent.action, IntentAction.EXIT_SHORT)
+        self.assertEqual(intent.metadata.get("exit_type"), "entry_failure_continuation")
+        details = intent.metadata.get("managed_exit_details", {})
+        self.assertEqual(float(details.get("entry_failure_continuation_exit", 0.0)), 1.0)
+        self.assertGreaterEqual(float(details.get("adverse_r", 0.0)), 0.045)
+        self.assertLessEqual(float(details.get("best_reward_r", 999.0)), 0.10)
+
     def test_layered_strategy_managed_exit_short_on_roundtrip_reclaim(self):
         n = 120
         idx = pd.date_range("2026-01-01", periods=n, freq="min", tz="UTC")
@@ -6853,6 +6970,8 @@ class SignalGeneratorTests(unittest.TestCase):
             early_watch_clean_pump_min_pct=0.043,
             entry_tolerance_pct=0.011,
             risk_reward=2.1,
+            managed_exit_entry_failure_min_hold_minutes=3.0,
+            managed_exit_entry_failure_min_adverse_r=0.055,
             not_a_signal_field=123,
         )
 
@@ -6865,6 +6984,8 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(strategy._generator.config.early_watch_clean_pump_min_pct, 0.043)
         self.assertEqual(strategy._generator.config.entry_tolerance_pct, 0.011)
         self.assertEqual(strategy._generator.config.risk_reward, 2.1)
+        self.assertEqual(strategy._generator.config.managed_exit_entry_failure_min_hold_minutes, 3.0)
+        self.assertEqual(strategy._generator.config.managed_exit_entry_failure_min_adverse_r, 0.055)
         self.assertTrue(strategy._generator.config.regime_soft_pass_enabled)
 
     def test_signal_id_is_candle_based_and_stable_for_same_setup(self):

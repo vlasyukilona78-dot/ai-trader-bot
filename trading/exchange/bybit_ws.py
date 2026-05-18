@@ -36,6 +36,7 @@ class BybitWebSocketConfig:
     close_timeout_sec: float = 6.0
     ping_interval_sec: float = 60.0
     ping_timeout_sec: float = 30.0
+    transport_ping_enabled: bool = False
 
 
 class BybitWebSocketStream:
@@ -192,6 +193,10 @@ class BybitWebSocketStream:
     def _private_subscribe_payload() -> dict:
         return {"op": "subscribe", "args": ["order", "position", "wallet"]}
 
+    @staticmethod
+    def _application_ping_payload() -> str:
+        return json.dumps({"op": "ping"}, separators=(",", ":"))
+
     def _public_loop(self):
         self._connection_loop(channel="public", url=self._public_endpoint(), is_private=False)
 
@@ -201,6 +206,13 @@ class BybitWebSocketStream:
     def _connection_loop(self, *, channel: str, url: str, is_private: bool):
         base_backoff = max(0.5, float(self.config.reconnect_delay_sec))
         backoff = base_backoff
+        ping_interval = max(5.0, float(self.config.ping_interval_sec))
+        transport_ping_interval = ping_interval if bool(self.config.transport_ping_enabled) else None
+        transport_ping_timeout = (
+            max(3.0, float(self.config.ping_timeout_sec))
+            if bool(self.config.transport_ping_enabled)
+            else None
+        )
         while self._running and not self._stop_evt.is_set():
             try:
                 self._push(ExchangeEventType.RECONNECTING, payload={"channel": channel})
@@ -208,11 +220,12 @@ class BybitWebSocketStream:
                     url,
                     open_timeout=max(2.0, float(self.config.open_timeout_sec)),
                     close_timeout=max(1.0, float(self.config.close_timeout_sec)),
-                    ping_interval=max(5.0, float(self.config.ping_interval_sec)),
-                    ping_timeout=max(3.0, float(self.config.ping_timeout_sec)),
+                    ping_interval=transport_ping_interval,
+                    ping_timeout=transport_ping_timeout,
                     proxy=None,
                 ) as ws:
                     backoff = base_backoff
+                    last_ping_ts = 0.0
                     self._push(ExchangeEventType.CONNECTED, payload={"channel": channel})
                     self._push_snapshot_required(f"{channel}_connected")
                     if is_private:
@@ -226,6 +239,10 @@ class BybitWebSocketStream:
                         try:
                             msg = ws.recv(timeout=1)
                         except TimeoutError:
+                            now = time.time()
+                            if (now - last_ping_ts) >= ping_interval:
+                                ws.send(self._application_ping_payload())
+                                last_ping_ts = now
                             self._push(ExchangeEventType.HEARTBEAT, payload={"channel": channel})
                             continue
 

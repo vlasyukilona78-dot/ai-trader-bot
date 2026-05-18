@@ -340,9 +340,9 @@ def _draw_entry_plan_levels(ax, x_values, *, entry: float, tp: float, sl: float,
     x_right = float(x_values[-1])
     axis_low, axis_high = ax.get_ylim()
     y_span = max(float(axis_high) - float(axis_low), 1e-8)
-    seg_end = min(x_right + x_span * 0.010, xmax - x_span * 0.050)
-    seg_start = max(float(x_values[0]), seg_end - x_span * 0.090)
-    min_length = x_span * 0.045
+    seg_end = min(x_right + x_span * 0.012, xmax - x_span * 0.046)
+    seg_start = max(float(x_values[0]), seg_end - x_span * 0.072)
+    min_length = x_span * 0.038
     if seg_end - seg_start < min_length:
         seg_start = max(float(x_values[0]), seg_end - min_length)
 
@@ -350,26 +350,38 @@ def _draw_entry_plan_levels(ax, x_values, *, entry: float, tp: float, sl: float,
         if value <= 0:
             continue
         label_y = float(value) + y_span * float(y_offset_mult)
+        line_width = 1.34 if label == "ENTRY" else 1.12
+        line_alpha = 0.94 if label == "ENTRY" else 0.84
         ax.hlines(
             value,
             seg_start,
             seg_end,
             color=color,
             linestyle="-",
-            linewidth=1.18 if label == "ENTRY" else 1.05,
-            alpha=0.90 if label == "ENTRY" else 0.82,
+            linewidth=line_width,
+            alpha=line_alpha,
             zorder=6.4,
         )
+        cap = max(y_span * 0.0035, abs(float(value)) * 0.00055)
+        ax.vlines(
+            seg_start,
+            value - cap,
+            value + cap,
+            color=color,
+            linewidth=max(0.72, line_width * 0.76),
+            alpha=line_alpha * 0.78,
+            zorder=6.35,
+        )
         ax.text(
-            min(seg_end + x_span * 0.008, xmax - x_span * 0.030),
+            min(seg_end + x_span * 0.007, xmax - x_span * 0.026),
             label_y,
             label,
             ha="left",
             va=va,
-            fontsize=7.1,
+            fontsize=7.4,
             color=color,
             fontweight="bold",
-            alpha=0.92,
+            alpha=0.95,
             zorder=7.0,
             path_effects=[path_effects.withStroke(linewidth=2.2, foreground="#20293a", alpha=0.92)],
         )
@@ -379,8 +391,8 @@ def _liquidation_label_x(ax, seg_start: float, seg_end: float) -> float:
     xmin, xmax = ax.get_xlim()
     span = max(xmax - xmin, 1e-8)
     width = max(seg_end - seg_start, 1e-8)
-    ideal = seg_start + width * 0.72
-    return min(ideal, xmax - span * 0.16)
+    ideal = seg_start + min(width * 0.14, span * 0.065)
+    return min(max(ideal, xmin + span * 0.020), xmax - span * 0.120)
 
 
 def _is_external_liquidation_source(item) -> bool:
@@ -1940,24 +1952,24 @@ def _draw_liquidation_heatmap(ax, x_values, liq_map: LiquidationMap | None, fram
             continue
 
         if band.side == "above":
-            line_color = "#c16b88" if (important and external) else "#9c6a83"
-            label_color = "#e5ebf6" if important else "#a9b1c2"
-            y_offset = price_span * (0.0068 + 0.0017 * (rank % 3))
+            line_color = "#c78296" if (important and external) else "#8f6680"
+            label_color = "#eef3fb" if important else "#a9b1c2"
+            y_offset = price_span * (0.0076 + 0.0019 * (rank % 3))
             va = "bottom"
         else:
-            line_color = "#48a978" if (important and external) else "#5f9876"
-            label_color = "#e5ebf6" if important else "#a9b1c2"
-            y_offset = -price_span * (0.0068 + 0.0017 * (rank % 3))
+            line_color = "#57a978" if (important and external) else "#668d74"
+            label_color = "#eef3fb" if important else "#a9b1c2"
+            y_offset = -price_span * (0.0076 + 0.0019 * (rank % 3))
             va = "top"
 
-        line_alpha = 0.86 if important else 0.42
+        line_alpha = 0.92 if important else 0.38
         if is_closed:
             line_alpha *= 0.66
             line_color = "#8a93a4"
 
-        line_width = 0.72 + 0.40 * min(max(float(band.intensity), 0.0), 1.0)
+        line_width = 0.76 + 0.44 * min(max(float(band.intensity), 0.0), 1.0)
         if important:
-            line_width += 0.22
+            line_width += 0.32
         ax.hlines(
             band.level,
             seg_start,
@@ -1967,6 +1979,17 @@ def _draw_liquidation_heatmap(ax, x_values, liq_map: LiquidationMap | None, fram
             linestyles=(0, (4.0, 2.4)) if is_closed else "-",
             alpha=line_alpha,
             zorder=4.8,
+        )
+        cap_height = max(price_span * 0.0040, abs(float(band.level)) * 0.0007)
+        cap_x = seg_end if not is_closed else min(seg_end, x_right)
+        ax.vlines(
+            cap_x,
+            float(band.level) - cap_height,
+            float(band.level) + cap_height,
+            color=line_color,
+            linewidth=max(0.72, line_width * 0.70),
+            alpha=max(0.32, line_alpha * 0.72),
+            zorder=4.9,
         )
 
         if margin_label:
@@ -1985,12 +2008,12 @@ def _draw_liquidation_heatmap(ax, x_values, liq_map: LiquidationMap | None, fram
                 margin_label,
                 ha="left",
                 va=va,
-                fontsize=8.4,
+                fontsize=9.2,
                 color=label_color,
                 fontweight="bold",
                 alpha=0.98 if important else 0.68,
                 zorder=5.2,
-                path_effects=[path_effects.withStroke(linewidth=2.4, foreground="#20293a", alpha=0.94)],
+                path_effects=[path_effects.withStroke(linewidth=2.8, foreground="#20293a", alpha=0.96)],
             )
 
 

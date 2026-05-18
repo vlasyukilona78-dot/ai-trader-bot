@@ -49,6 +49,10 @@ class StrategySettings:
     regime_volatility_baseline_lookback: int = 96
     volume_profile_window: int = 120
     volume_profile_bins: int = 48
+    managed_exit_entry_failure_min_hold_minutes: float = 2.0
+    managed_exit_entry_failure_max_best_r: float = 0.10
+    managed_exit_entry_failure_min_adverse_r: float = 0.045
+    managed_exit_entry_failure_min_bounce_strength: float = 3.0
 
 
 @dataclass

@@ -73,6 +73,7 @@ class BybitWebSocketStreamV2Tests(unittest.TestCase):
                 close_timeout_sec=6.0,
                 ping_interval_sec=35.0,
                 ping_timeout_sec=18.0,
+                transport_ping_enabled=True,
             )
         )
         captured: dict[str, object] = {}
@@ -110,6 +111,90 @@ class BybitWebSocketStreamV2Tests(unittest.TestCase):
         self.assertEqual(captured.get("close_timeout"), 6.0)
         self.assertEqual(captured.get("ping_interval"), 35.0)
         self.assertEqual(captured.get("ping_timeout"), 18.0)
+
+    def test_connection_loop_disables_transport_ping_by_default(self):
+        stream = BybitWebSocketStream(
+            BybitWebSocketConfig(
+                testnet=True,
+                symbols=["BTCUSDT"],
+                ping_interval_sec=15.0,
+                ping_timeout_sec=8.0,
+            )
+        )
+        captured: dict[str, object] = {}
+
+        class _DummyWS:
+            def send(self, _payload):
+                return None
+
+            def recv(self, timeout=1):
+                stream._running = False
+                stream._stop_evt.set()
+                raise RuntimeError("stop_loop")
+
+        class _DummyConnect:
+            def __enter__(self):
+                return _DummyWS()
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def _fake_connect(url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return _DummyConnect()
+
+        with patch("trading.exchange.bybit_ws.ws_connect", side_effect=_fake_connect), patch(
+            "trading.exchange.bybit_ws.time.sleep",
+            return_value=None,
+        ):
+            stream._running = True
+            stream._stop_evt.clear()
+            stream._connection_loop(channel="public", url=stream._public_endpoint(), is_private=False)
+
+        self.assertIsNone(captured.get("ping_interval"))
+        self.assertIsNone(captured.get("ping_timeout"))
+
+    def test_recv_timeout_sends_bybit_application_ping(self):
+        stream = BybitWebSocketStream(
+            BybitWebSocketConfig(testnet=True, symbols=["BTCUSDT"], ping_interval_sec=5.0)
+        )
+        sent: list[str] = []
+
+        class _DummyWS:
+            def __init__(self):
+                self.calls = 0
+
+            def send(self, payload):
+                sent.append(payload)
+
+            def recv(self, timeout=1):
+                self.calls += 1
+                if self.calls == 1:
+                    raise TimeoutError()
+                stream._running = False
+                stream._stop_evt.set()
+                raise RuntimeError("stop_loop")
+
+        class _DummyConnect:
+            def __init__(self):
+                self.ws = _DummyWS()
+
+            def __enter__(self):
+                return self.ws
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with patch("trading.exchange.bybit_ws.ws_connect", return_value=_DummyConnect()), patch(
+            "trading.exchange.bybit_ws.time.sleep",
+            return_value=None,
+        ):
+            stream._running = True
+            stream._stop_evt.clear()
+            stream._connection_loop(channel="public", url=stream._public_endpoint(), is_private=False)
+
+        self.assertIn('{"op":"ping"}', sent)
 
 
 if __name__ == "__main__":

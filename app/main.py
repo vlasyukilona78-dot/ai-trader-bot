@@ -370,6 +370,35 @@ def _send_photo_alerts(
     return attempted, sent
 
 
+def _send_chart_or_text_alerts(
+    alerters,
+    caption: str,
+    image_bytes: bytes | None,
+    *,
+    filename: str,
+    reply_markup: dict | None = None,
+    chart_context: str = "",
+):
+    if image_bytes:
+        return _send_photo_alerts(
+            alerters,
+            caption,
+            image_bytes,
+            filename=filename,
+            reply_markup=reply_markup,
+        )
+
+    if _env_flag("ALERT_REQUIRE_CHART_FOR_SIGNAL", True):
+        APP_LOGGER.warning(
+            "chart_missing_text_suppressed context=%s",
+            chart_context or filename,
+            extra={"event": "chart_missing_text_suppressed"},
+        )
+        return len(alerters or []), 0
+
+    return _send_alerts(alerters, caption, reply_markup=reply_markup)
+
+
 def _log_alert_delivery(logger, *, event: str, attempted: int, sent: int, skip_reason: str = ""):
     logger.info("%s attempted=%d sent=%d", event, attempted, sent, extra={"event": event})
     if skip_reason:
@@ -507,6 +536,70 @@ def _record_signal_event(
             "metadata": _compact_signal_metadata(metadata, candidate),
         }
     )
+
+
+def _reserve_cross_process_alert(
+    *,
+    kind: str,
+    symbol: str,
+    signature: str,
+    cooldown_sec: int,
+) -> bool:
+    if not _env_flag("ALERT_CROSS_PROCESS_DEDUPE_ENABLED", True):
+        return True
+
+    normalized_kind = str(kind or "alert").strip().lower() or "alert"
+    normalized_symbol = str(symbol or "").replace("/", "").upper()
+    normalized_signature = str(signature or "").strip()
+    if not normalized_symbol or not normalized_signature:
+        return True
+
+    raw_dir = str(os.getenv("ALERT_DEDUPE_LOCK_DIR", "data/runtime/alert_locks")).strip()
+    lock_dir = Path(raw_dir)
+    if not lock_dir.is_absolute():
+        lock_dir = PROJECT_ROOT / lock_dir
+
+    now_ts = time.time()
+    cooldown = max(60, int(cooldown_sec or 0))
+    digest = hashlib.sha1(
+        "|".join([normalized_kind, normalized_symbol, normalized_signature]).encode("utf-8", errors="ignore")
+    ).hexdigest()
+    lock_path = lock_dir / f"{digest}.lock"
+
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            age_sec = now_ts - float(lock_path.stat().st_mtime)
+        except FileNotFoundError:
+            age_sec = None
+        if age_sec is not None:
+            if age_sec < cooldown:
+                return False
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "kind": normalized_kind,
+                        "symbol": normalized_symbol,
+                        "signature": normalized_signature,
+                        "reserved_ts": now_ts,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+        return True
+    except FileExistsError:
+        return False
+    except Exception:
+        # Dedupe must never become a trading blocker if the filesystem is unavailable.
+        return True
 
 
 
@@ -647,6 +740,20 @@ def _build_early_candidate_signature(candidate: Mapping[str, object], enriched) 
             last_bar_ts,
         ]
     )
+
+
+def _build_early_candidate_bar_signature(candidate: Mapping[str, object], enriched) -> str:
+    phase = str(candidate.get("phase") or "").strip().upper()
+    last_bar_ts = ""
+    try:
+        if enriched is not None and len(enriched.index) > 0:
+            last_bar = pd.Timestamp(enriched.index[-1])
+            if last_bar.tzinfo is not None:
+                last_bar = last_bar.tz_convert("UTC").tz_localize(None)
+            last_bar_ts = last_bar.isoformat()
+    except Exception:
+        last_bar_ts = ""
+    return "|".join([phase, last_bar_ts])
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -823,6 +930,27 @@ def _format_chart_timeframe_label(timeframe: str) -> str:
         hours = minutes // 60
         return f"{hours}h"
     return f"{minutes}m"
+
+
+def _normalize_timeframe_minutes(timeframe: str | int | float | None, default: int = 1) -> int:
+    text = str(timeframe if timeframe is not None else "").strip().lower()
+    if not text:
+        return max(1, int(default))
+    try:
+        if text.endswith("h"):
+            return max(1, int(float(text[:-1]) * 60))
+        if text.endswith("m"):
+            return max(1, int(float(text[:-1])))
+        return max(1, int(float(text)))
+    except (TypeError, ValueError):
+        return max(1, int(default))
+
+
+def _alert_context_timeframe() -> str:
+    minutes = _normalize_timeframe_minutes(os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "60"), default=60)
+    if _env_flag("BOT_ALERT_CONTEXT_FORCE_1H", True):
+        minutes = 60
+    return str(minutes)
 
 
 def _timeframe_to_minutes(timeframe: str) -> int:
@@ -1775,6 +1903,12 @@ def _build_ultra_early_candidate(*, symbol: str, timeframe: str, mode: str, enri
     candle_range = max(high - low, atr * 0.40, close * 0.0008, 1e-8)
     upper_wick_ratio = max(high - max(open_px, close), 0.0) / candle_range
     close_position = (close - low) / candle_range
+    body_pct = (close - open_px) / max(close, 1e-8)
+    vwap_dist = _last_frame_float(enriched, "vwap_dist", 0.0)
+    bb_position = _last_frame_float(enriched, "bb_position", 0.5)
+    mtf_trend_5m = _last_frame_float(enriched, "mtf_trend_5m", 0.0)
+    mtf_rsi_5m = _last_frame_float(enriched, "mtf_rsi_5m", 50.0)
+    pullback_from_recent_high_pct = max((recent_high - close) / max(recent_high, 1e-8), 0.0)
     hist = _last_frame_float(enriched, "hist", 0.0)
     prev_hist = _as_float(_series_float(enriched, "hist", hist).iloc[-2], hist) if "hist" in enriched.columns and len(enriched) >= 2 else hist
     last3_up = int((closes.diff().tail(3) > 0).sum())
@@ -1830,17 +1964,49 @@ def _build_ultra_early_candidate(*, symbol: str, timeframe: str, mode: str, enri
     if not level_hits:
         return None
 
+    hard_rejection_evidence = bool(
+        (
+            close < open_px
+            and close < prev_close
+            and close_position <= _early_config_float("ULTRA_EARLY_REJECTION_CLOSE_POSITION_MAX", 0.52)
+        )
+        or (
+            upper_wick_ratio >= _early_config_float("ULTRA_EARLY_REJECTION_WICK_MIN", 0.24)
+            and close_position <= _early_config_float("ULTRA_EARLY_REJECTION_WICK_CLOSE_POSITION_MAX", 0.48)
+        )
+        or (
+            close < prev_close
+            and rsi_rollover
+            and macd_rollover
+            and pullback_from_recent_high_pct >= _early_config_float("ULTRA_EARLY_REJECTION_PULLBACK_MIN", 0.0022)
+        )
+    )
     live_extension_without_rejection = bool(
-        last3_up >= 2
-        and close >= recent_high * 0.992
-        and close_position >= 0.74
-        and upper_wick_ratio < 0.12
-        and not rsi_rollover
-        and not macd_rollover
+        (
+            last3_up >= 2
+            or (
+                mtf_trend_5m >= _early_config_float("ULTRA_EARLY_MTF5_CONTINUATION_RISK_MIN", 0.0085)
+                and mtf_rsi_5m >= _early_config_float("ULTRA_EARLY_MTF5_RSI_RISK_MIN", 68.0)
+            )
+            or (
+                vwap_dist >= _early_config_float("ULTRA_EARLY_VWAP_EXTENSION_RISK_MIN", 0.038)
+                and bb_position >= _early_config_float("ULTRA_EARLY_BB_POSITION_RISK_MIN", 0.84)
+            )
+        )
+        and close >= recent_high * _early_config_float("ULTRA_EARLY_CONTINUATION_NEAR_HIGH_MIN", 0.984)
+        and close_position >= _early_config_float("ULTRA_EARLY_CONTINUATION_CLOSE_POSITION_MIN", 0.46)
+        and body_pct >= _early_config_float("ULTRA_EARLY_CONTINUATION_BODY_MIN", -0.0015)
+        and not hard_rejection_evidence
     )
     if live_extension_without_rejection:
         return None
-    if first_weakness_score < _early_config_float("ULTRA_EARLY_WEAKNESS_SCORE_MIN", 1.05):
+    if (
+        (vwap_dist >= _early_config_float("ULTRA_EARLY_VWAP_EXTENSION_RISK_MIN", 0.038) or bb_position >= 0.84)
+        and not hard_rejection_evidence
+        and not (first_weakness_score >= 1.85 and close_position <= 0.48)
+    ):
+        return None
+    if first_weakness_score < _early_config_float("ULTRA_EARLY_WEAKNESS_SCORE_MIN", 1.40):
         return None
 
     fib50 = pump_low + (recent_high - pump_low) * 0.50
@@ -1857,10 +2023,18 @@ def _build_ultra_early_candidate(*, symbol: str, timeframe: str, mode: str, enri
     quality_score += min(0.75, max(volume_spike - min_volume, 0.0) * 0.25)
     quality_score += 0.75 if any("ликвидация" in item[0] for item in level_hits) else 0.35
     quality_score += min(0.70, potential_to_fib * 18.0)
+    if hard_rejection_evidence:
+        quality_score += 0.55
+    if body_pct > 0.0 and close_position >= 0.50:
+        quality_score -= 0.45
+    if vwap_dist >= 0.038 and bb_position >= 0.84:
+        quality_score -= 0.65
+    if mtf_trend_5m >= 0.0085 and mtf_rsi_5m >= 68.0:
+        quality_score -= 0.45
     if live_extension_without_rejection:
         quality_score -= 1.1
     quality_score = max(0.0, min(10.0, quality_score))
-    if quality_score < _early_config_float("ULTRA_EARLY_QUALITY_MIN", 7.60):
+    if quality_score < _early_config_float("ULTRA_EARLY_QUALITY_MIN", 7.85):
         return None
 
     level_label, level_value = level_hits[0]
@@ -1983,11 +2157,20 @@ def _maybe_emit_ultra_early_signal(
     signature_cooldown_until_ts = _as_float(current_state.get("signature_cooldown_until_ts"), 0.0)
     last_signature = str(current_state.get("last_signature") or "")
     signature = _build_early_candidate_signature(candidate, enriched)
+    bar_signature = _build_early_candidate_bar_signature(candidate, enriched)
 
     if signature and signature == last_signature and now_ts < signature_cooldown_until_ts:
         stats["ultra_suppressed"] = int(stats.get("ultra_suppressed", 0)) + 1
         return False
     if now_ts < cooldown_until_ts:
+        stats["ultra_suppressed"] = int(stats.get("ultra_suppressed", 0)) + 1
+        return False
+    if not _reserve_cross_process_alert(
+        kind="ultra_early",
+        symbol=symbol,
+        signature=bar_signature or signature,
+        cooldown_sec=signature_cooldown_sec,
+    ):
         stats["ultra_suppressed"] = int(stats.get("ultra_suppressed", 0)) + 1
         return False
 
@@ -2010,24 +2193,16 @@ def _maybe_emit_ultra_early_signal(
 
     attempted = 0
     sent = 0
-    if chart_bytes:
-        a1, s1 = _send_photo_alerts(
-            alerters,
-            str(candidate.get("caption") or ""),
-            chart_bytes,
-            filename=f"{symbol.lower()}_ultra_1m.png",
-            reply_markup=reply_markup,
-        )
-        attempted += a1
-        sent += s1
-    else:
-        a1, s1 = _send_alerts(
-            alerters,
-            str(candidate.get("caption") or ""),
-            reply_markup=reply_markup,
-        )
-        attempted += a1
-        sent += s1
+    a1, s1 = _send_chart_or_text_alerts(
+        alerters,
+        str(candidate.get("caption") or ""),
+        chart_bytes,
+        filename=f"{symbol.lower()}_ultra_1m.png",
+        reply_markup=reply_markup,
+        chart_context=f"ultra_early:{symbol}:1m",
+    )
+    attempted += a1
+    sent += s1
 
     context_chart_bytes = _build_higher_timeframe_chart(
         symbol=symbol,
@@ -2045,7 +2220,7 @@ def _maybe_emit_ultra_early_signal(
             _build_clean_context_chart_caption(
                 symbol,
                 stage_label="\u0423\u041b\u042c\u0422\u0420\u0410 \u0420\u0410\u041d\u041d\u0418\u0419 \u0428\u041e\u0420\u0422: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422",
-                timeframe_label=_format_chart_timeframe_label(os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "60")),
+                timeframe_label=_format_chart_timeframe_label(_alert_context_timeframe()),
             ),
             context_chart_bytes,
             filename=f"{symbol.lower()}_ultra_htf.png",
@@ -2103,7 +2278,7 @@ def _build_higher_timeframe_chart(
     pipeline: "FeaturePipeline",
     runtime_extras: dict[str, object] | None = None,
 ) -> bytes | None:
-    context_timeframe = str(os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "60"))
+    context_timeframe = _alert_context_timeframe()
     context_candles = max(96, _as_int(os.getenv("BOT_ALERT_CONTEXT_CANDLES", "432"), 432))
     try:
         try:
@@ -2246,6 +2421,8 @@ def _build_early_watch_candidate_legacy(*, symbol: str, timeframe: str, mode: st
     low = _as_float(row.get("low"), close)
     open_px = _as_float(row.get("open"), close)
     bb_upper = _as_float(row.get("bb_upper"), close)
+    bb_position = _as_float(row.get("bb_position"), 0.5)
+    vwap_dist = _as_float(row.get("vwap_dist"), 0.0)
     kc_upper = _as_float(row.get("kc_upper"), close)
     rsi = max(_as_float(layer1.get("rsi"), 0.0), _as_float(row.get("rsi"), 50.0))
     prev_rsi = _as_float(prev.get("rsi"), rsi)
@@ -2485,6 +2662,8 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
     low = _as_float(row.get("low"), close)
     open_px = _as_float(row.get("open"), close)
     bb_upper = _as_float(row.get("bb_upper"), close)
+    bb_position = _as_float(row.get("bb_position"), 0.5)
+    vwap_dist = _as_float(row.get("vwap_dist"), 0.0)
     kc_upper = _as_float(row.get("kc_upper"), close)
     rsi = max(_as_float(layer1.get("rsi"), 0.0), _as_float(row.get("rsi"), 50.0))
     prev_rsi = _as_float(prev.get("rsi"), rsi)
@@ -2542,6 +2721,7 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
     prev_high = _as_float(prev.get("high"), high)
     prev_low = _as_float(prev.get("low"), low)
     close_position_in_candle = max(0.0, min(1.0, (close - low) / candle_range))
+    candle_body_pct = (close - open_px) / max(close, 1e-8)
     obv = _as_float(row.get("obv"), 0.0)
     prev_obv = _as_float(prev.get("obv"), obv)
     recent_obv_series = enriched.tail(6).head(5)["obv"] if "obv" in enriched.columns else pd.Series([obv])
@@ -3127,6 +3307,32 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
             or real_rollover
         )
     )
+    overheated_continuation_without_reject = bool(
+        (
+            bb_position >= _early_config_float("EARLY_WATCH_BB_POSITION_RISK_MIN", 0.84)
+            or (
+                vwap_dist >= _early_config_float("EARLY_WATCH_VWAP_EXTENSION_RISK_MIN", 0.038)
+                and mtf_trend_5m >= _early_config_float("EARLY_WATCH_MTF5_EXTENSION_RISK_MIN", 0.0075)
+            )
+        )
+        and candle_body_pct >= _early_config_float("EARLY_WATCH_CONTINUATION_BODY_MIN", -0.0015)
+        and close_position_in_candle >= _early_config_float("EARLY_WATCH_CONTINUATION_CLOSE_POSITION_MIN", 0.48)
+        and close >= prev_close * (1.0 - (0.0010 if close < 0.02 else 0.0007))
+        and not (
+            liquidation_map.swept_above
+            or recent_upper_liq_reaction
+            or structure_trigger_confirmed
+            or peak_followthrough_confirmed
+            or micro_reversal_near_peak
+            or real_rollover
+            or (
+                close < open_px
+                and close < prev_close
+                and close_position_in_candle <= 0.55
+                and (rsi < prev_rsi or hist < prev_hist)
+            )
+        )
+    )
     shallow_reject_pullback_floor = max(
         minimum_reversal_pullback * 1.08,
         atr_pct * 0.84,
@@ -3145,6 +3351,8 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         and not recent_upper_liq_reaction
     )
     if fresh_live_continuation_without_reject:
+        return None
+    if overheated_continuation_without_reject:
         return None
     if shallow_reject_without_displacement:
         return None
@@ -6534,8 +6742,9 @@ def run_cycle(
                             early_candidate = None
             _record_parallel_strategy_intent(strategy, intent)
 
+            ultra_sent_now = False
             if ultra_alerters and (observation_only_profile or current_state == TradeState.FLAT):
-                _maybe_emit_ultra_early_signal(
+                ultra_sent_now = _maybe_emit_ultra_early_signal(
                     symbol=symbol,
                     timeframe=timeframe,
                     mode=mode,
@@ -6551,6 +6760,12 @@ def run_cycle(
                     stats=early_signal_stats,
                     logger=logger,
                 )
+                if (
+                    ultra_sent_now
+                    and signal_profile != "main"
+                    and _env_flag("EARLY_SUPPRESS_AFTER_ULTRA_SAME_CYCLE", True)
+                ):
+                    early_candidate = None
 
             try:
                 rules = adapter.get_instrument_rules(symbol)
@@ -6887,10 +7102,21 @@ def run_cycle(
                             if not isinstance(early_candidate, Mapping) or str(early_candidate.get("phase") or "") != phase:
                                 continue
                             early_signature = _build_early_candidate_signature(early_candidate, features.enriched)
+                            early_bar_signature = _build_early_candidate_bar_signature(early_candidate, features.enriched)
                             if (
                                 early_signature
                                 and early_signature == last_signature
                                 and cycle_ts < signature_cooldown_until_ts
+                            ):
+                                early_signal_stats["suppressed_by_cooldown"] = int(
+                                    early_signal_stats.get("suppressed_by_cooldown", 0)
+                                ) + 1
+                                continue
+                            if not _reserve_cross_process_alert(
+                                kind=f"early_{str(phase or '').lower()}",
+                                symbol=symbol,
+                                signature=early_bar_signature or early_signature,
+                                cooldown_sec=early_signature_cooldown_sec,
                             ):
                                 early_signal_stats["suppressed_by_cooldown"] = int(
                                     early_signal_stats.get("suppressed_by_cooldown", 0)
@@ -6911,24 +7137,16 @@ def run_cycle(
                             )
                             attempted = 0
                             sent = 0
-                            if chart_bytes:
-                                a1, s1 = _send_photo_alerts(
-                                    alerters,
-                                    str(early_candidate.get("caption") or ""),
-                                    chart_bytes,
-                                    filename=f"{symbol.lower()}_early_1m.png",
-                                    reply_markup=reply_markup,
-                                )
-                                attempted += a1
-                                sent += s1
-                            else:
-                                a1, s1 = _send_alerts(
-                                    alerters,
-                                    str(early_candidate.get("caption") or ""),
-                                    reply_markup=reply_markup,
-                                )
-                                attempted += a1
-                                sent += s1
+                            a1, s1 = _send_chart_or_text_alerts(
+                                alerters,
+                                str(early_candidate.get("caption") or ""),
+                                chart_bytes,
+                                filename=f"{symbol.lower()}_early_1m.png",
+                                reply_markup=reply_markup,
+                                chart_context=f"early_{str(phase or '').lower()}:{symbol}:1m",
+                            )
+                            attempted += a1
+                            sent += s1
 
                             context_chart_bytes = _build_higher_timeframe_chart(
                                 symbol=symbol,
@@ -6947,7 +7165,7 @@ def run_cycle(
                                         symbol,
                                         stage_label="\u0420\u0410\u041d\u041d\u0418\u0419 \u0428\u041e\u0420\u0422: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422",
                                         timeframe_label=_format_chart_timeframe_label(
-                                            os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "60")
+                                            _alert_context_timeframe()
                                         ),
                                     ),
                                     context_chart_bytes,
@@ -7134,10 +7352,21 @@ def run_cycle(
                         if str(early_candidate.get("phase") or "") != phase:
                             continue
                         early_signature = _build_early_candidate_signature(early_candidate, features.enriched)
+                        early_bar_signature = _build_early_candidate_bar_signature(early_candidate, features.enriched)
                         if (
                             early_signature
                             and early_signature == last_signature
                             and cycle_ts < signature_cooldown_until_ts
+                        ):
+                            early_signal_stats["suppressed_by_cooldown"] = int(
+                                early_signal_stats.get("suppressed_by_cooldown", 0)
+                            ) + 1
+                            continue
+                        if not _reserve_cross_process_alert(
+                            kind=f"early_{str(phase or '').lower()}",
+                            symbol=symbol,
+                            signature=early_bar_signature or early_signature,
+                            cooldown_sec=early_signature_cooldown_sec,
                         ):
                             early_signal_stats["suppressed_by_cooldown"] = int(
                                 early_signal_stats.get("suppressed_by_cooldown", 0)
@@ -7158,24 +7387,16 @@ def run_cycle(
                         )
                         attempted = 0
                         sent = 0
-                        if chart_bytes:
-                            a1, s1 = _send_photo_alerts(
-                                alerters,
-                                str(early_candidate.get("caption") or ""),
-                                chart_bytes,
-                                filename=f"{symbol.lower()}_early_1m.png",
-                                reply_markup=reply_markup,
-                            )
-                            attempted += a1
-                            sent += s1
-                        else:
-                            a1, s1 = _send_alerts(
-                                alerters,
-                                str(early_candidate.get("caption") or ""),
-                                reply_markup=reply_markup,
-                            )
-                            attempted += a1
-                            sent += s1
+                        a1, s1 = _send_chart_or_text_alerts(
+                            alerters,
+                            str(early_candidate.get("caption") or ""),
+                            chart_bytes,
+                            filename=f"{symbol.lower()}_early_1m.png",
+                            reply_markup=reply_markup,
+                            chart_context=f"early_{str(phase or '').lower()}:{symbol}:1m",
+                        )
+                        attempted += a1
+                        sent += s1
 
                         context_chart_bytes = _build_higher_timeframe_chart(
                             symbol=symbol,
@@ -7194,7 +7415,7 @@ def run_cycle(
                                     symbol,
                                     stage_label="\u0420\u0410\u041d\u041d\u0418\u0419 \u0428\u041e\u0420\u0422: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422",
                                     timeframe_label=_format_chart_timeframe_label(
-                                        os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "60")
+                                        _alert_context_timeframe()
                                     ),
                                 ),
                                 context_chart_bytes,
@@ -7316,6 +7537,13 @@ def run_cycle(
                     now_ts=signal_now_ts,
                 ):
                     continue
+                if not _reserve_cross_process_alert(
+                    kind=f"main_{str(intent.action.value).lower()}",
+                    symbol=symbol,
+                    signature=signal_signature,
+                    cooldown_sec=signal_alert_cooldown_sec,
+                ):
+                    continue
                 action_label = ("\u0428\u041e\u0420\u0422 \u0421\u0418\u0413\u041d\u0410\u041b" if intent.action == IntentAction.SHORT_ENTRY else "\u041b\u041e\u041d\u0413 \u0421\u0418\u0413\u041d\u0410\u041b")
                 caption = build_signal_caption(
                     symbol=symbol,
@@ -7344,20 +7572,16 @@ def run_cycle(
                 )
                 attempted = 0
                 sent = 0
-                if chart_bytes:
-                    a1, s1 = _send_photo_alerts(
-                        alerters,
-                        caption,
-                        chart_bytes,
-                        filename=f"{symbol.lower()}_signal_1m.png",
-                        reply_markup=reply_markup,
-                    )
-                    attempted += a1
-                    sent += s1
-                else:
-                    a1, s1 = _send_alerts(alerters, caption, reply_markup=reply_markup)
-                    attempted += a1
-                    sent += s1
+                a1, s1 = _send_chart_or_text_alerts(
+                    alerters,
+                    caption,
+                    chart_bytes,
+                    filename=f"{symbol.lower()}_signal_1m.png",
+                    reply_markup=reply_markup,
+                    chart_context=f"main_{str(intent.action.value).lower()}:{symbol}:1m",
+                )
+                attempted += a1
+                sent += s1
 
                 context_chart_bytes = _build_higher_timeframe_chart(
                     symbol=symbol,
@@ -7380,7 +7604,7 @@ def run_cycle(
                                 else "\u041b\u041e\u041d\u0413 \u0421\u0418\u0413\u041d\u0410\u041b: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422"
                             ),
                             timeframe_label=_format_chart_timeframe_label(
-                                os.getenv("BOT_ALERT_CONTEXT_TIMEFRAME", "60")
+                                _alert_context_timeframe()
                             ),
                         ),
                         context_chart_bytes,

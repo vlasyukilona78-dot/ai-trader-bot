@@ -121,6 +121,61 @@ def _extract_float(raw: dict[str, Any], *keys: str) -> float | None:
     return None
 
 
+def _load_signal_event_log(path: Path) -> list[SignalEvent]:
+    if not path.exists():
+        return []
+
+    events: list[SignalEvent] = []
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                raw = json.loads(text)
+            except Exception:
+                continue
+            if not isinstance(raw, dict):
+                continue
+
+            side = str(raw.get("side") or "").upper()
+            if side != "SHORT":
+                continue
+            if int(_safe_float(raw.get("delivery_sent"), 0.0)) <= 0:
+                continue
+
+            phase = str(raw.get("phase") or "").upper()
+            reason = str(raw.get("reason") or "")
+            profile = "early" if phase in {"WATCH", "SETUP", "ULTRA"} or "early" in reason else "main"
+            if phase == "ULTRA":
+                kind = "ultra_alert"
+            elif phase in {"WATCH", "SETUP"}:
+                kind = "early_alert"
+            else:
+                kind = "signal_alert"
+
+            events.append(
+                SignalEvent(
+                    profile=profile,
+                    kind=kind,
+                    symbol=str(raw.get("symbol") or "").upper(),
+                    action="SHORT_ENTRY",
+                    exec_status="ALERT_SENT",
+                    ts=_safe_float(raw.get("ts"), 0.0),
+                    delivery_ts=_safe_float(raw.get("ts"), 0.0),
+                    entry_price=_extract_float(raw, "entry", "entry_price", "price"),
+                    tp=_extract_float(raw, "tp", "take_profit", "take_profit_price"),
+                    sl=_extract_float(raw, "sl", "stop_loss", "stop_loss_price"),
+                    risk_reason="alert",
+                    exec_reason=reason,
+                    order_link_id=str(raw.get("signal_id") or ""),
+                    raw=raw,
+                )
+            )
+
+    return [event for event in events if event.symbol and event.ts > 0]
+
+
 def _parse_log_for_early_alerts(log_path: Path) -> list[SignalEvent]:
     line_re = re.compile(r"^\[(?P<profile>[^\]]+)\]\s+(?P<payload>\{.*\})$")
     pending: dict[str, list[SignalEvent]] = {}
@@ -186,6 +241,34 @@ def _parse_log_for_early_alerts(log_path: Path) -> list[SignalEvent]:
                 alerts.append(event)
 
     return alerts
+
+
+def _dedupe_recent_alerts(rows: list[SignalEvent], *, cooldown_sec: int = 900) -> list[SignalEvent]:
+    """Remove exact cross-process alert duplicates while preserving later unique re-tests."""
+    deduped: list[SignalEvent] = []
+    last_seen: dict[tuple[str, str, str, float, float, float], float] = {}
+
+    for row in sorted(rows, key=lambda item: float(item.ts)):
+        phase = str(row.raw.get("phase") or row.kind).upper() if isinstance(row.raw, dict) else row.kind.upper()
+        key = (
+            str(row.symbol).upper(),
+            str(row.profile).lower(),
+            phase,
+            round(float(row.entry_price or 0.0), 8),
+            round(float(row.tp or 0.0), 8),
+            round(float(row.sl or 0.0), 8),
+        )
+        last_ts = last_seen.get(key)
+        if last_ts is not None and float(row.ts) - last_ts <= float(cooldown_sec):
+            continue
+        last_seen[key] = float(row.ts)
+        deduped.append(row)
+
+    return deduped
+
+
+def _is_early_kind(kind: str) -> bool:
+    return str(kind or "").lower() in {"early_alert", "ultra_alert", "watch", "setup", "ultra"}
 
 
 def _extract_token(msg: str, key: str) -> str:
@@ -508,7 +591,7 @@ def _classify_short_signal_outcome(
     if bars_to_first_down_move is not None and bars_to_first_down_move >= 8 and down_60 < max(0.75, up_15):
         return "late_or_weak"
 
-    if kind == "early_alert" and first_reaction == "up" and up_15 >= max(1.0, down_15 * 1.1) and up_60 >= max(1.5, down_60 * 1.15):
+    if _is_early_kind(kind) and first_reaction == "up" and up_15 >= max(1.0, down_15 * 1.1) and up_60 >= max(1.5, down_60 * 1.15):
         return "too_early"
 
     if first_reaction == "up" and up_15 >= max(0.55, down_15 * 1.15) and up_60 >= max(0.75, down_60 * 1.10):
@@ -520,7 +603,7 @@ def _classify_short_signal_outcome(
     if down_60 < 0.35 and up_15 > 0.35:
         return "weak"
 
-    if kind == "early_alert" and first_reaction != "down" and down_60 < 0.5:
+    if _is_early_kind(kind) and first_reaction != "down" and down_60 < 0.5:
         return "too_early"
 
     return "worked"
@@ -689,6 +772,7 @@ def _analyze_signal(client: MarketDataClient, event: SignalEvent, *, timeframe: 
     return {
         "profile": event.profile,
         "kind": event.kind,
+        "phase": str(event.raw.get("phase") or "") if isinstance(event.raw, dict) else "",
         "symbol": event.symbol,
         "signal_ts": _iso_utc(event.ts),
         "delivery_ts": _iso_utc(event.delivery_ts),
@@ -722,17 +806,25 @@ def main() -> int:
     parser.add_argument("--main-db", default=str(RUNTIME_DIR / "v2_demo_runtime_main.db"))
     parser.add_argument("--early-db", default=str(RUNTIME_DIR / "v2_demo_runtime_early.db"))
     parser.add_argument("--log", default=str(_latest_live_log()))
+    parser.add_argument("--signal-events", default=str(RUNTIME_DIR / "signal_events.jsonl"))
     parser.add_argument("--main-limit", type=int, default=12)
     parser.add_argument("--early-limit", type=int, default=12)
+    parser.add_argument("--dedupe-window-sec", type=int, default=900)
     parser.add_argument("--timeframe", default="1")
     args = parser.parse_args()
 
     main_rows = _load_db_rows(Path(args.main_db))
     early_rows = _load_db_rows(Path(args.early_db))
     early_log_rows = _parse_log_for_early_alerts(Path(args.log))
+    signal_event_rows = _dedupe_recent_alerts(
+        _load_signal_event_log(Path(args.signal_events)),
+        cooldown_sec=int(args.dedupe_window_sec),
+    )
+    signal_event_main = [row for row in signal_event_rows if row.profile == "main"]
+    signal_event_early = [row for row in signal_event_rows if row.profile == "early"]
 
-    main_entries = _select_recent_main_entries(main_rows, int(args.main_limit))
-    early_entries = _enrich_early_alerts_with_db_execution(
+    main_entries = signal_event_main[-int(args.main_limit):] or _select_recent_main_entries(main_rows, int(args.main_limit))
+    early_entries = signal_event_early[-int(args.early_limit):] or _enrich_early_alerts_with_db_execution(
         early_log_rows[-int(args.early_limit):],
         early_rows,
     )
