@@ -1,7 +1,9 @@
 ﻿from __future__ import annotations
 
 import unittest
+import tempfile
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 from tests.v2.fakes import FakeAdapter
@@ -10,8 +12,10 @@ from trading.exchange.schemas import OpenOrderSnapshot, OrderBookQuality, OrderR
 from trading.market_data.reconciliation import ExchangeSnapshot
 from trading.risk.engine import RiskDecision
 from trading.signals.signal_types import IntentAction, StrategyIntent
+from trading.signals.versioning import STRATEGY_RUNTIME_VERSION
 from trading.state.machine import StateMachine
 from trading.state.models import TradeState
+from trading.state.persistence import RuntimeStore
 
 
 class ExecutionEngineV2Tests(unittest.TestCase):
@@ -521,6 +525,146 @@ class ExecutionEngineV2Tests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotEqual(first, other)
         self.assertLessEqual(len(first), 36)
+
+    def test_idempotency_key_includes_runtime_setup_signature(self):
+        base = StrategyIntent(
+            symbol="BTC/USDT",
+            action=IntentAction.SHORT_ENTRY,
+            reason="layered_short_entry",
+            stop_loss=101.0,
+            take_profit=97.0,
+            metadata={
+                "timeframe": "1m",
+                "strategy_version": "strategy-a",
+                "setup_signature": "pump-a",
+            },
+        )
+        same = StrategyIntent(
+            symbol="BTCUSDT",
+            action=IntentAction.SHORT_ENTRY,
+            reason="layered_short_entry",
+            stop_loss=101.0,
+            take_profit=97.0,
+            metadata={
+                "timeframe": "1m",
+                "strategy_version": "strategy-a",
+                "setup_signature": "pump-a",
+            },
+        )
+        other_timeframe = StrategyIntent(
+            symbol="BTCUSDT",
+            action=IntentAction.SHORT_ENTRY,
+            reason="layered_short_entry",
+            stop_loss=101.0,
+            take_profit=97.0,
+            metadata={
+                "timeframe": "5m",
+                "strategy_version": "strategy-a",
+                "setup_signature": "pump-a",
+            },
+        )
+        other_strategy = StrategyIntent(
+            symbol="BTCUSDT",
+            action=IntentAction.SHORT_ENTRY,
+            reason="layered_short_entry",
+            stop_loss=101.0,
+            take_profit=97.0,
+            metadata={
+                "timeframe": "1m",
+                "strategy_version": "strategy-b",
+                "setup_signature": "pump-a",
+            },
+        )
+        other_setup = StrategyIntent(
+            symbol="BTCUSDT",
+            action=IntentAction.SHORT_ENTRY,
+            reason="layered_short_entry",
+            stop_loss=101.0,
+            take_profit=97.0,
+            metadata={
+                "timeframe": "1m",
+                "strategy_version": "strategy-a",
+                "setup_signature": "pump-b",
+            },
+        )
+
+        base_key = ExecutionEngine._idempotency_key(base)
+
+        self.assertEqual(base_key, ExecutionEngine._idempotency_key(same))
+        self.assertNotEqual(base_key, ExecutionEngine._idempotency_key(other_timeframe))
+        self.assertNotEqual(base_key, ExecutionEngine._idempotency_key(other_strategy))
+        self.assertNotEqual(base_key, ExecutionEngine._idempotency_key(other_setup))
+        self.assertIn("tf=1m", base_key)
+        self.assertIn("sv=strategy-a", base_key)
+
+    def test_entry_admission_is_persisted_with_execution_result(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = RuntimeStore(str(Path(tmpdir) / "runtime.db"))
+            try:
+                adapter = FakeAdapter()
+                sm = StateMachine()
+                engine = ExecutionEngine(
+                    adapter=adapter,
+                    state_machine=sm,
+                    hedge_mode=False,
+                    stop_loss_required=True,
+                    require_reconciliation=True,
+                    persistence=store,
+                )
+                sm.transition("BTCUSDT", TradeState.FLAT, "init")
+                intent = StrategyIntent(
+                    symbol="BTCUSDT",
+                    action=IntentAction.SHORT_ENTRY,
+                    reason="layered_short_entry",
+                    stop_loss=101.0,
+                    take_profit=97.0,
+                    confidence=0.81,
+                    metadata={
+                        "legacy_signal_id": "sig-admit-1",
+                        "signal_side": "SHORT",
+                        "timeframe": "1m",
+                        "strategy_version": STRATEGY_RUNTIME_VERSION,
+                        "setup_signature": "btc-pump-rejection",
+                        "entry_gate": {
+                            "approved": True,
+                            "reason": "approved",
+                            "score": 0.81,
+                        },
+                        "admission_status": "approved",
+                        "admission_reason": "approved",
+                    },
+                )
+
+                outcome = engine.execute(
+                    intent=intent,
+                    risk=RiskDecision(approved=True, reason="approved", quantity=1.0),
+                    snapshot=ExchangeSnapshot(
+                        symbol="BTCUSDT",
+                        account=adapter.get_account(),
+                        positions=adapter.get_positions("BTCUSDT"),
+                        open_orders=adapter.get_open_orders("BTCUSDT"),
+                    ),
+                    mark_price=100.0,
+                )
+
+                admissions = store.load_signal_admissions(limit=100)
+                decisions = store.load_order_decisions(limit=100)
+                idempotency_keys = store.load_live_idempotency_keys()
+
+                self.assertTrue(outcome.accepted)
+                self.assertEqual(outcome.status, "FILLED")
+                self.assertEqual(len(admissions), 1)
+                self.assertEqual(admissions[0].signal_id, "sig-admit-1")
+                self.assertEqual(admissions[0].symbol, "BTCUSDT")
+                self.assertEqual(admissions[0].action, "SHORT_ENTRY")
+                self.assertTrue(admissions[0].approved)
+                self.assertEqual(admissions[0].raw["admission_status"], "approved")
+                self.assertEqual(admissions[0].raw["execution_status"], "FILLED")
+                self.assertEqual(len(decisions), 1)
+                self.assertEqual(decisions[0].raw["intent_context"]["metadata"]["admission_status"], "approved")
+                self.assertTrue(any("tf=1m" in key and f"sv={STRATEGY_RUNTIME_VERSION}" in key for key in idempotency_keys))
+            finally:
+                store.close()
 
     def test_position_protected_allows_small_bps_drift(self):
         position = PositionSnapshot(

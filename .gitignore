@@ -9,10 +9,12 @@ __pycache__/
 # Virtual envs
 venv/
 .venv/
+.runtime_env/
 
 # IDE
 .idea/
 .vscode/
+.run/
 
 # Secrets and env
 .env
@@ -27,16 +29,17 @@ logs/
 backups/
 charts/
 data/
+data/runtime/*.db
+data/runtime/*.sqlite
+data/runtime/*.sqlite3
 *.csv
 *.xlsx
 *.xls
 *.pkl
 *.joblib
 *.parquet
+tmp_*
 
 # OS
 .DS_Store
 Thumbs.db
-.runtime_env/
-
-.env

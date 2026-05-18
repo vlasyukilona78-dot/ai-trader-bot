@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import json
 import logging
 import hashlib
 import threading
@@ -14,6 +15,7 @@ from trading.market_data.reconciliation import ExchangeSnapshot
 from trading.portfolio.positions import first_effective_position_for_symbol
 from trading.risk.engine import RiskDecision
 from trading.signals.signal_types import IntentAction, StrategyIntent
+from trading.signals.versioning import STRATEGY_RUNTIME_VERSION
 from trading.state.machine import StateMachine
 from trading.state.models import TradeState
 from trading.state.persistence import RuntimeStore
@@ -84,11 +86,88 @@ class ExecutionEngine:
             self._idempotency.restore(self.persistence.load_live_idempotency_keys())
 
     @staticmethod
-    def _idempotency_key(intent: StrategyIntent) -> str:
-        sl = f"{float(intent.stop_loss):.8f}" if intent.stop_loss else "0"
-        tp = f"{float(intent.take_profit):.8f}" if intent.take_profit else "0"
-        sid = str(intent.metadata.get("legacy_signal_id", "")) if isinstance(intent.metadata, dict) else ""
-        return f"{intent.symbol}|{intent.action.value}|{sl}|{tp}|{sid}"
+    def _format_key_price(value: float | None) -> str:
+        try:
+            numeric = float(value or 0.0)
+        except (TypeError, ValueError):
+            numeric = 0.0
+        return f"{numeric:.8f}" if numeric else "0"
+
+    @staticmethod
+    def _first_metadata_value(metadata: dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            value = metadata.get(key)
+            if value not in (None, ""):
+                return value
+        return ""
+
+    @classmethod
+    def _strategy_version_for_idempotency(cls, metadata: dict[str, Any]) -> str:
+        explicit = cls._first_metadata_value(metadata, "strategy_version", "strategy_runtime_version", "strategy_runtime")
+        if explicit:
+            return str(explicit)
+        runtime_versions = metadata.get("runtime_versions")
+        if isinstance(runtime_versions, dict):
+            runtime_version = runtime_versions.get("strategy_runtime")
+            if runtime_version not in (None, ""):
+                return str(runtime_version)
+        return STRATEGY_RUNTIME_VERSION
+
+    @classmethod
+    def _setup_signature_for_idempotency(cls, intent: StrategyIntent, metadata: dict[str, Any]) -> str:
+        explicit = cls._first_metadata_value(
+            metadata,
+            "setup_signature",
+            "signal_signature",
+            "candidate_signature",
+            "legacy_signal_id",
+            "signal_id",
+        )
+        if explicit:
+            payload = str(explicit)
+        else:
+            gate = metadata.get("entry_gate") if isinstance(metadata.get("entry_gate"), dict) else {}
+            payload_obj = {
+                "symbol": str(intent.symbol).replace("/", "").upper(),
+                "action": intent.action.value,
+                "reason": str(intent.reason),
+                "side": str(metadata.get("signal_side") or intent.action.value),
+                "entry": cls._first_metadata_value(metadata, "entry_price", "entry", "entry_px", "mark_price", "price"),
+                "admission_reason": str(metadata.get("admission_reason") or gate.get("reason") or ""),
+                "gate_score": gate.get("score"),
+                "confidence": round(float(intent.confidence or 0.0), 6),
+            }
+            payload = json.dumps(
+                cls._json_safe(payload_obj),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    @classmethod
+    def _idempotency_key(cls, intent: StrategyIntent) -> str:
+        metadata = intent.metadata if isinstance(intent.metadata, dict) else {}
+        sl = cls._format_key_price(intent.stop_loss)
+        tp = cls._format_key_price(intent.take_profit)
+        timeframe = str(
+            cls._first_metadata_value(
+                metadata,
+                "timeframe",
+                "tf",
+                "signal_timeframe",
+                "entry_timeframe",
+                "observation_timeframe",
+            )
+            or "na"
+        )
+        strategy_version = cls._strategy_version_for_idempotency(metadata)
+        setup_signature = cls._setup_signature_for_idempotency(intent, metadata)
+        symbol = str(intent.symbol).replace("/", "").upper()
+        return (
+            f"{symbol}|{intent.action.value}|tf={timeframe}|sv={strategy_version}|"
+            f"sl={sl}|tp={tp}|setup={setup_signature}"
+        )
 
     @staticmethod
     def _norm_symbol(symbol: str) -> str:

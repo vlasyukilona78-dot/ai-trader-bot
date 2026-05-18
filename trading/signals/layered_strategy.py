@@ -964,6 +964,12 @@ class LayeredPumpStrategy(StrategyInterface):
             enriched=enriched,
             trace_meta=trace_meta if isinstance(trace_meta, Mapping) else {},
         )
+        entry_meta["timeframe"] = candidate.timeframe
+        entry_meta["setup_signature"] = (
+            f"{candidate.signal_id}|{candidate.symbol}|{candidate.side}|{candidate.timeframe}|"
+            f"{candidate.entry:.12g}|{candidate.stop_loss:.12g}|{candidate.take_profit:.12g}|"
+            f"{STRATEGY_RUNTIME_VERSION}"
+        )
         gate_decision = self._entry_gate.evaluate(candidate)
         entry_meta["entry_gate"] = gate_decision.to_dict()
         entry_meta["admission_status"] = "approved" if gate_decision.approved else "rejected"
