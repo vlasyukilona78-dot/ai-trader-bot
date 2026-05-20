@@ -55,6 +55,26 @@ class EntryGateConfig:
     mtf_rsi_1h_max_short: float = 64.0
     mtf_rsi_15m_max_short: float = 68.0
     mtf_rsi_5m_max_short: float = 75.0
+    live_continuation_guard_enabled: bool = True
+    live_continuation_close_position_min: float = 0.58
+    live_continuation_mtf5_trend_min: float = 0.0070
+    live_continuation_mtf5_rsi_min: float = 70.0
+    live_continuation_mtf15_trend_min: float = 0.0042
+    live_continuation_mtf15_rsi_min: float = 66.0
+    live_continuation_volume_min: float = 0.62
+    live_continuation_bb_position_min: float = 0.76
+    live_pullback_volume_max: float = 0.86
+    live_pullback_mtf5_trend_min: float = 0.0065
+    live_pullback_vwap_dist_min: float = 0.0020
+    microstructure_guard_enabled: bool = True
+    max_microstructure_spread_bps: float = 35.0
+    soft_microstructure_spread_bps: float = 18.0
+    max_microstructure_slippage_bps: float = 45.0
+    soft_microstructure_slippage_bps: float = 28.0
+    min_microstructure_depth_ratio: float = 0.65
+    soft_microstructure_depth_ratio: float = 1.05
+    max_microstructure_bid_imbalance_short: float = 0.68
+    min_aggressor_exhaustion: float = 0.18
 
     @classmethod
     def from_env(cls) -> "EntryGateConfig":
@@ -81,6 +101,83 @@ class EntryGateConfig:
             mtf_rsi_1h_max_short=_env_float("ENTRY_GATE_MTF_RSI_1H_MAX_SHORT", cls.mtf_rsi_1h_max_short),
             mtf_rsi_15m_max_short=_env_float("ENTRY_GATE_MTF_RSI_15M_MAX_SHORT", cls.mtf_rsi_15m_max_short),
             mtf_rsi_5m_max_short=_env_float("ENTRY_GATE_MTF_RSI_5M_MAX_SHORT", cls.mtf_rsi_5m_max_short),
+            live_continuation_guard_enabled=_env_bool(
+                "ENTRY_GATE_LIVE_CONTINUATION_GUARD_ENABLED",
+                cls.live_continuation_guard_enabled,
+            ),
+            live_continuation_close_position_min=_env_float(
+                "ENTRY_GATE_LIVE_CONTINUATION_CLOSE_POSITION_MIN",
+                cls.live_continuation_close_position_min,
+            ),
+            live_continuation_mtf5_trend_min=_env_float(
+                "ENTRY_GATE_LIVE_CONTINUATION_MTF5_TREND_MIN",
+                cls.live_continuation_mtf5_trend_min,
+            ),
+            live_continuation_mtf5_rsi_min=_env_float(
+                "ENTRY_GATE_LIVE_CONTINUATION_MTF5_RSI_MIN",
+                cls.live_continuation_mtf5_rsi_min,
+            ),
+            live_continuation_mtf15_trend_min=_env_float(
+                "ENTRY_GATE_LIVE_CONTINUATION_MTF15_TREND_MIN",
+                cls.live_continuation_mtf15_trend_min,
+            ),
+            live_continuation_mtf15_rsi_min=_env_float(
+                "ENTRY_GATE_LIVE_CONTINUATION_MTF15_RSI_MIN",
+                cls.live_continuation_mtf15_rsi_min,
+            ),
+            live_continuation_volume_min=_env_float(
+                "ENTRY_GATE_LIVE_CONTINUATION_VOLUME_MIN",
+                cls.live_continuation_volume_min,
+            ),
+            live_continuation_bb_position_min=_env_float(
+                "ENTRY_GATE_LIVE_CONTINUATION_BB_POSITION_MIN",
+                cls.live_continuation_bb_position_min,
+            ),
+            live_pullback_volume_max=_env_float("ENTRY_GATE_LIVE_PULLBACK_VOLUME_MAX", cls.live_pullback_volume_max),
+            live_pullback_mtf5_trend_min=_env_float(
+                "ENTRY_GATE_LIVE_PULLBACK_MTF5_TREND_MIN",
+                cls.live_pullback_mtf5_trend_min,
+            ),
+            live_pullback_vwap_dist_min=_env_float(
+                "ENTRY_GATE_LIVE_PULLBACK_VWAP_DIST_MIN",
+                cls.live_pullback_vwap_dist_min,
+            ),
+            microstructure_guard_enabled=_env_bool(
+                "ENTRY_GATE_MICROSTRUCTURE_GUARD_ENABLED",
+                cls.microstructure_guard_enabled,
+            ),
+            max_microstructure_spread_bps=_env_float(
+                "ENTRY_GATE_MICROSTRUCTURE_MAX_SPREAD_BPS",
+                cls.max_microstructure_spread_bps,
+            ),
+            soft_microstructure_spread_bps=_env_float(
+                "ENTRY_GATE_MICROSTRUCTURE_SOFT_SPREAD_BPS",
+                cls.soft_microstructure_spread_bps,
+            ),
+            max_microstructure_slippage_bps=_env_float(
+                "ENTRY_GATE_MICROSTRUCTURE_MAX_SLIPPAGE_BPS",
+                cls.max_microstructure_slippage_bps,
+            ),
+            soft_microstructure_slippage_bps=_env_float(
+                "ENTRY_GATE_MICROSTRUCTURE_SOFT_SLIPPAGE_BPS",
+                cls.soft_microstructure_slippage_bps,
+            ),
+            min_microstructure_depth_ratio=_env_float(
+                "ENTRY_GATE_MICROSTRUCTURE_MIN_DEPTH_RATIO",
+                cls.min_microstructure_depth_ratio,
+            ),
+            soft_microstructure_depth_ratio=_env_float(
+                "ENTRY_GATE_MICROSTRUCTURE_SOFT_DEPTH_RATIO",
+                cls.soft_microstructure_depth_ratio,
+            ),
+            max_microstructure_bid_imbalance_short=_env_float(
+                "ENTRY_GATE_MICROSTRUCTURE_MAX_BID_IMBALANCE_SHORT",
+                cls.max_microstructure_bid_imbalance_short,
+            ),
+            min_aggressor_exhaustion=_env_float(
+                "ENTRY_GATE_MICROSTRUCTURE_MIN_AGGRESSOR_EXHAUSTION",
+                cls.min_aggressor_exhaustion,
+            ),
         )
 
 
@@ -214,6 +311,22 @@ class EntryGate:
                 diagnostics=mtf_context,
             )
 
+        live_block = self._short_live_continuation_block(candidate, layer1, layer2, layer3)
+        if live_block["blocked"]:
+            return self._reject(
+                str(live_block["reason"]),
+                candidate,
+                diagnostics=live_block,
+            )
+
+        microstructure_context = self._microstructure_context(candidate)
+        if microstructure_context["hard_risk"]:
+            return self._reject(
+                "microstructure_execution_risk",
+                candidate,
+                diagnostics=microstructure_context,
+            )
+
         penalties: dict[str, float] = {}
         flags: dict[str, bool] = {
             "degraded_context": degraded_context,
@@ -223,6 +336,7 @@ class EntryGate:
             "context_quality_low": context_quality < self.config.min_context_quality,
             "continuation_risk": self._continuation_risk(candidate, layer1),
             "mtf_continuation_risk": bool(self.config.mtf_guard_enabled and mtf_context["caution_continuation"]),
+            "microstructure_soft_risk": bool(microstructure_context["soft_risk"]),
         }
 
         if flags["degraded_context"]:
@@ -240,6 +354,8 @@ class EntryGate:
             penalties["continuation_risk"] = 0.06
         if flags["mtf_continuation_risk"]:
             penalties["mtf_continuation_risk"] = 0.08
+        if flags["microstructure_soft_risk"]:
+            penalties["microstructure_soft_risk"] = safe_float(microstructure_context.get("penalty"), 0.0)
 
         score = self._score(
             candidate=candidate,
@@ -272,6 +388,7 @@ class EntryGate:
                     layer3=layer3,
                     layer5=layer5,
                     mtf_context=mtf_context,
+                    microstructure_context=microstructure_context,
                 ),
             )
 
@@ -293,6 +410,7 @@ class EntryGate:
                 layer3=layer3,
                 layer5=layer5,
                 mtf_context=mtf_context,
+                microstructure_context=microstructure_context,
             ),
         )
 
@@ -399,6 +517,169 @@ class EntryGate:
             return 0.0
         return max(0.0, (recent_high - entry) / atr)
 
+    def _short_live_continuation_block(
+        self,
+        candidate: SignalCandidate,
+        layer1: Mapping[str, Any],
+        layer2: Mapping[str, Any],
+        layer3: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if not self.config.live_continuation_guard_enabled:
+            return {"blocked": False, "reason": ""}
+
+        extras = candidate.market_extras if isinstance(candidate.market_extras, Mapping) else {}
+        close = safe_float(candidate.latest_close, safe_float(candidate.entry))
+        open_ = safe_float(candidate.latest_open, close)
+        high = safe_float(candidate.latest_high, close)
+        low = safe_float(candidate.latest_low, close)
+        atr = max(safe_float(candidate.latest_atr), close * 0.0008, 1e-8)
+        candle_range = max(high - low, atr * 0.35, close * 0.0006, 1e-8)
+        close_position = clamp((close - low) / candle_range, default=0.5)
+        upper_wick_ratio = clamp(max(high - max(open_, close), 0.0) / candle_range)
+        body_pct = (close - open_) / max(close, 1e-8)
+        atr_pct = atr / max(close, 1e-8)
+        recent_high = max(safe_float(candidate.recent_high), high, close)
+        near_recent_high_pct = max((recent_high - close) / max(recent_high, 1e-8), 0.0)
+        price_near_peak = near_recent_high_pct <= max(0.0075, min(0.015, atr_pct * 1.15))
+
+        rsi = max(
+            safe_float(mapping_get(layer1, "rsi"), 0.0),
+            safe_float(extras.get("rsi"), 0.0),
+        )
+        volume_spike = safe_float(extras.get("volume_spike"), safe_float(mapping_get(layer1, "volume_spike"), 1.0))
+        if volume_spike <= 0.0:
+            volume_spike = safe_float(mapping_get(layer1, "volume_spike"), 1.0)
+        vwap_dist = safe_float(extras.get("vwap_dist"), 0.0)
+        bb_position = safe_float(extras.get("bb_position"), 0.5)
+        adx = safe_float(extras.get("adx"), 0.0)
+        ema20 = safe_float(extras.get("ema20"), 0.0)
+        mtf_trend_5m = safe_float(extras.get("mtf_trend_5m"), 0.0)
+        mtf_rsi_5m = safe_float(extras.get("mtf_rsi_5m"), 50.0)
+        mtf_trend_15m = safe_float(extras.get("mtf_trend_15m"), 0.0)
+        mtf_rsi_15m = safe_float(extras.get("mtf_rsi_15m"), 50.0)
+
+        reaction_markers = sum(
+            int(boolish(value))
+            for value in (
+                mapping_get(layer2, "price_rejection_near_high"),
+                mapping_get(layer2, "lower_close_after_peak"),
+                mapping_get(layer2, "lower_high_after_peak"),
+                mapping_get(layer3, "fresh_reaction_from_high"),
+            )
+        )
+        failed_breakout = any(
+            boolish(value)
+            for value in (
+                mapping_get(layer2, "failed_reclaim"),
+                mapping_get(layer2, "retest_failed_breakout"),
+                mapping_get(layer3, "failed_reclaim"),
+                mapping_get(layer3, "retest_failed_breakout"),
+            )
+        )
+        downside_displacement = any(
+            boolish(value)
+            for value in (
+                mapping_get(layer3, "downside_displacement_confirmed"),
+                mapping_get(layer3, "structural_reversal_ready"),
+                mapping_get(layer3, "peak_followthrough_confirmed"),
+            )
+        )
+        candle_rejection = bool(
+            close < open_
+            and close_position <= 0.48
+            and upper_wick_ratio >= 0.18
+            and near_recent_high_pct <= max(0.012, atr_pct * 1.50)
+        )
+        hard_failure_evidence = bool(
+            failed_breakout
+            or downside_displacement
+            or reaction_markers >= 2
+            or candle_rejection
+        )
+
+        above_fast_value = bool(ema20 > 0.0 and close >= ema20 * (1.0 + max(atr_pct * 0.18, 0.0006)))
+        strong_mtf_drive = bool(
+            (
+                mtf_trend_5m >= self.config.live_continuation_mtf5_trend_min
+                and mtf_rsi_5m >= self.config.live_continuation_mtf5_rsi_min
+            )
+            or (
+                mtf_trend_15m >= self.config.live_continuation_mtf15_trend_min
+                and mtf_rsi_15m >= self.config.live_continuation_mtf15_rsi_min
+            )
+            or (
+                bb_position >= self.config.live_continuation_bb_position_min
+                and vwap_dist >= max(self.config.live_pullback_vwap_dist_min, atr_pct * 0.35)
+            )
+        )
+        soft_mtf_drive = bool(
+            mtf_trend_5m >= self.config.live_pullback_mtf5_trend_min
+            and (
+                mtf_rsi_5m >= 62.0
+                or mtf_trend_15m >= self.config.live_continuation_mtf15_trend_min * 0.82
+                or vwap_dist >= self.config.live_pullback_vwap_dist_min
+                or adx >= 26.0
+            )
+        )
+        live_drive = bool(strong_mtf_drive or soft_mtf_drive or (above_fast_value and adx >= 28.0))
+
+        diagnostics = {
+            "blocked": False,
+            "reason": "",
+            "close_position": float(close_position),
+            "upper_wick_ratio": float(upper_wick_ratio),
+            "body_pct": float(body_pct),
+            "near_recent_high_pct": float(near_recent_high_pct),
+            "price_near_peak": bool(price_near_peak),
+            "volume_spike": float(volume_spike),
+            "vwap_dist": float(vwap_dist),
+            "bb_position": float(bb_position),
+            "adx": float(adx),
+            "mtf_trend_5m": float(mtf_trend_5m),
+            "mtf_rsi_5m": float(mtf_rsi_5m),
+            "mtf_trend_15m": float(mtf_trend_15m),
+            "mtf_rsi_15m": float(mtf_rsi_15m),
+            "reaction_markers": int(reaction_markers),
+            "failed_breakout": bool(failed_breakout),
+            "downside_displacement": bool(downside_displacement),
+            "hard_failure_evidence": bool(hard_failure_evidence),
+            "strong_mtf_drive": bool(strong_mtf_drive),
+            "soft_mtf_drive": bool(soft_mtf_drive),
+            "above_fast_value": bool(above_fast_value),
+        }
+
+        if (
+            live_drive
+            and price_near_peak
+            and close_position >= self.config.live_continuation_close_position_min
+            and body_pct >= -0.0015
+            and upper_wick_ratio <= 0.26
+            and volume_spike >= self.config.live_continuation_volume_min
+            and not hard_failure_evidence
+        ):
+            return {**diagnostics, "blocked": True, "reason": "live_continuation_without_rejection"}
+
+        if (
+            soft_mtf_drive
+            and vwap_dist >= self.config.live_pullback_vwap_dist_min
+            and volume_spike <= self.config.live_pullback_volume_max
+            and close_position <= 0.54
+            and near_recent_high_pct <= max(0.020, atr_pct * 2.40)
+            and not hard_failure_evidence
+        ):
+            return {**diagnostics, "blocked": True, "reason": "low_volume_pullback_without_displacement"}
+
+        if (
+            live_drive
+            and rsi <= 58.0
+            and volume_spike <= 0.96
+            and close >= open_ * 0.994
+            and not hard_failure_evidence
+        ):
+            return {**diagnostics, "blocked": True, "reason": "weak_top_without_real_failure"}
+
+        return diagnostics
+
     @staticmethod
     def _continuation_risk(candidate: SignalCandidate, layer1: Mapping[str, Any]) -> bool:
         close = safe_float(candidate.latest_close)
@@ -407,7 +688,157 @@ class EntryGate:
         candle_range = max(0.0, high - safe_float(candidate.latest_low))
         near_high = candle_range > 0 and (high - close) / candle_range <= 0.22
         rsi = safe_float(mapping_get(layer1, "rsi"), 0.0)
-        return close > open_ and near_high and rsi >= 78.0
+        extras = candidate.market_extras if isinstance(candidate.market_extras, Mapping) else {}
+        mtf_trend_5m = safe_float(extras.get("mtf_trend_5m"), 0.0)
+        mtf_rsi_5m = safe_float(extras.get("mtf_rsi_5m"), 50.0)
+        bb_position = safe_float(extras.get("bb_position"), 0.5)
+        vwap_dist = safe_float(extras.get("vwap_dist"), 0.0)
+        live_drive = (
+            mtf_trend_5m >= 0.0065
+            and mtf_rsi_5m >= 68.0
+        ) or (bb_position >= 0.78 and vwap_dist >= 0.002)
+        return close > open_ and near_high and (rsi >= 78.0 or live_drive)
+
+    def _microstructure_context(self, candidate: SignalCandidate) -> dict[str, Any]:
+        if not self.config.microstructure_guard_enabled:
+            return {
+                "enabled": False,
+                "missing": True,
+                "hard_risk": False,
+                "soft_risk": False,
+                "penalty": 0.0,
+                "hard_reasons": [],
+                "soft_reasons": [],
+            }
+
+        extras = candidate.market_extras if isinstance(candidate.market_extras, Mapping) else {}
+
+        def first_float(*keys: str) -> tuple[float | None, str]:
+            for key in keys:
+                if key not in extras:
+                    continue
+                raw = extras.get(key)
+                if raw is None:
+                    continue
+                return safe_float(raw, 0.0), key
+            return None, ""
+
+        spread_bps, spread_key = first_float("spread_bps")
+        slippage_bps, slippage_key = first_float("expected_slippage_bps", "orderbook_expected_slippage_bps")
+        depth_ratio, depth_key = first_float("depth_ratio", "orderbook_depth_ratio")
+        bid_ask_imbalance, imbalance_key = first_float("bid_ask_imbalance")
+        aggressor_exhaustion, aggressor_key = first_float("aggressor_exhaustion")
+
+        source_keys = [key for key in (spread_key, slippage_key, depth_key, imbalance_key, aggressor_key) if key]
+        hard_reasons: list[str] = []
+        soft_reasons: list[str] = []
+        penalty_parts: dict[str, float] = {}
+
+        def soft_ratio(value: float, soft: float, hard: float) -> float:
+            width = max(abs(hard - soft), 1e-9)
+            return clamp((value - soft) / width)
+
+        if spread_bps is not None:
+            if self.config.max_microstructure_spread_bps > 0.0 and spread_bps > self.config.max_microstructure_spread_bps:
+                hard_reasons.append("spread_too_wide")
+            elif self.config.soft_microstructure_spread_bps > 0.0 and spread_bps > self.config.soft_microstructure_spread_bps:
+                soft_reasons.append("spread_wide")
+                penalty_parts["spread_wide"] = min(
+                    0.055,
+                    0.020
+                    + 0.035
+                    * soft_ratio(
+                        spread_bps,
+                        self.config.soft_microstructure_spread_bps,
+                        max(self.config.max_microstructure_spread_bps, self.config.soft_microstructure_spread_bps),
+                    ),
+                )
+
+        if slippage_bps is not None:
+            if (
+                self.config.max_microstructure_slippage_bps > 0.0
+                and slippage_bps > self.config.max_microstructure_slippage_bps
+            ):
+                hard_reasons.append("slippage_too_high")
+            elif (
+                self.config.soft_microstructure_slippage_bps > 0.0
+                and slippage_bps > self.config.soft_microstructure_slippage_bps
+            ):
+                soft_reasons.append("slippage_elevated")
+                penalty_parts["slippage_elevated"] = min(
+                    0.065,
+                    0.025
+                    + 0.040
+                    * soft_ratio(
+                        slippage_bps,
+                        self.config.soft_microstructure_slippage_bps,
+                        max(
+                            self.config.max_microstructure_slippage_bps,
+                            self.config.soft_microstructure_slippage_bps,
+                        ),
+                    ),
+                )
+
+        if depth_ratio is not None:
+            if self.config.min_microstructure_depth_ratio > 0.0 and depth_ratio < self.config.min_microstructure_depth_ratio:
+                hard_reasons.append("depth_too_thin")
+            elif self.config.soft_microstructure_depth_ratio > 0.0 and depth_ratio < self.config.soft_microstructure_depth_ratio:
+                soft_reasons.append("depth_thin")
+                width = max(
+                    self.config.soft_microstructure_depth_ratio - self.config.min_microstructure_depth_ratio,
+                    1e-9,
+                )
+                penalty_parts["depth_thin"] = min(
+                    0.060,
+                    0.020 + 0.040 * clamp((self.config.soft_microstructure_depth_ratio - depth_ratio) / width),
+                )
+
+        if bid_ask_imbalance is not None and self.config.max_microstructure_bid_imbalance_short > 0.0:
+            hard_imbalance = min(0.92, self.config.max_microstructure_bid_imbalance_short + 0.18)
+            if bid_ask_imbalance > hard_imbalance:
+                hard_reasons.append("bid_imbalance_against_short")
+            elif bid_ask_imbalance > self.config.max_microstructure_bid_imbalance_short:
+                soft_reasons.append("bid_imbalance_against_short")
+                penalty_parts["bid_imbalance_against_short"] = min(
+                    0.045,
+                    0.020
+                    + 0.025
+                    * clamp((bid_ask_imbalance - self.config.max_microstructure_bid_imbalance_short) / 0.18),
+                )
+
+        if aggressor_exhaustion is not None and 0.0 <= aggressor_exhaustion <= 1.0:
+            if aggressor_exhaustion < self.config.min_aggressor_exhaustion:
+                soft_reasons.append("aggressor_not_exhausted")
+                penalty_parts["aggressor_not_exhausted"] = min(
+                    0.035,
+                    0.015
+                    + 0.020
+                    * clamp(
+                        (self.config.min_aggressor_exhaustion - aggressor_exhaustion)
+                        / max(self.config.min_aggressor_exhaustion, 1e-9)
+                    ),
+                )
+
+        penalty = min(0.14, sum(max(0.0, float(value)) for value in penalty_parts.values()))
+        return {
+            "enabled": True,
+            "missing": not bool(source_keys),
+            "source_keys": source_keys,
+            "hard_risk": bool(hard_reasons),
+            "soft_risk": bool(soft_reasons) and not bool(hard_reasons),
+            "penalty": float(0.0 if hard_reasons else penalty),
+            "penalty_parts": penalty_parts,
+            "hard_reasons": hard_reasons,
+            "soft_reasons": soft_reasons,
+            "spread_bps": spread_bps,
+            "expected_slippage_bps": slippage_bps,
+            "depth_ratio": depth_ratio,
+            "bid_ask_imbalance": bid_ask_imbalance,
+            "aggressor_exhaustion": aggressor_exhaustion,
+            "max_spread_bps": float(self.config.max_microstructure_spread_bps),
+            "max_slippage_bps": float(self.config.max_microstructure_slippage_bps),
+            "min_depth_ratio": float(self.config.min_microstructure_depth_ratio),
+        }
 
     @staticmethod
     def _diagnostics(
@@ -423,6 +854,7 @@ class EntryGate:
         layer3: Mapping[str, Any],
         layer5: Mapping[str, Any],
         mtf_context: Mapping[str, Any],
+        microstructure_context: Mapping[str, Any],
     ) -> dict[str, Any]:
         return {
             "symbol": candidate.symbol,
@@ -441,6 +873,7 @@ class EntryGate:
             "stop_loss": float(candidate.stop_loss),
             "take_profit": float(candidate.take_profit),
             "mtf_context": dict(mtf_context),
+            "microstructure_context": dict(microstructure_context),
         }
 
     def _mtf_context(self, candidate: SignalCandidate) -> dict[str, Any]:

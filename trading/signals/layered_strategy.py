@@ -4,10 +4,12 @@ import os
 import time
 from collections.abc import Mapping
 from dataclasses import replace
+from types import SimpleNamespace
 
 from core.market_regime import detect_market_regime
 from core.signal_generator import SignalConfig, SignalContext, SignalGenerator
 from core.feature_engineering import assess_feature_frame_quality, compute_mtf_feature_snapshot, sanitize_feature_frame
+from core.liquidation_map import build_liquidation_map
 from core.volume_profile import compute_volume_profile
 from trading.exchange.schemas import PositionSide
 from trading.portfolio.positions import first_effective_position_for_symbol
@@ -16,6 +18,7 @@ from trading.signals.models import SignalCandidate
 from trading.signals.signal_types import IntentAction, StrategyIntent
 from trading.signals.strategy_audit import StrategyAuditCollector
 from trading.signals.strategy_interface import StrategyContext, StrategyInterface
+from trading.signals.ultra_short_entry import UltraShortEntryDetector
 from trading.signals.versioning import STRATEGY_RUNTIME_VERSION, runtime_versions
 from trading.state.models import TradeState
 
@@ -29,6 +32,13 @@ class LayeredPumpStrategy(StrategyInterface):
         self._generator = SignalGenerator(runtime_config)
         self._audit = audit_collector or StrategyAuditCollector()
         self._entry_gate = EntryGate(EntryGateConfig.from_env())
+        self._ultra_short_detector = UltraShortEntryDetector()
+        self._ultra_short_enabled = str(os.getenv("ULTRA_SHORT_ENTRY_ENABLED", "1")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     @staticmethod
     def runtime_default_config() -> SignalConfig:
@@ -101,6 +111,44 @@ class LayeredPumpStrategy(StrategyInterface):
             return float(value)
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _ultra_gate_details(ultra_diagnostics: Mapping[str, object]) -> dict[str, object]:
+        scores = ultra_diagnostics if isinstance(ultra_diagnostics, Mapping) else {}
+        features = scores.get("features", {}) if isinstance(scores.get("features"), Mapping) else {}
+        failed_acceptance = LayeredPumpStrategy._safe_float(scores.get("failed_acceptance_score"), 0.0)
+        exhaustion = LayeredPumpStrategy._safe_float(scores.get("exhaustion_score"), 0.0)
+        reversal = LayeredPumpStrategy._safe_float(scores.get("reversal_level_score"), 0.0)
+        rr = LayeredPumpStrategy._safe_float((scores.get("trade_plan") or {}).get("rr") if isinstance(scores.get("trade_plan"), Mapping) else 0.0, 0.0)
+        return {
+            "layer1": {
+                "rsi": LayeredPumpStrategy._safe_float(features.get("rsi"), 0.0) if isinstance(features, Mapping) else 0.0,
+                "volume_spike": LayeredPumpStrategy._safe_float(features.get("volume_spike"), 1.0) if isinstance(features, Mapping) else 1.0,
+                "pump_bar_offset": 0,
+            },
+            "layer2": {
+                "weakness_strength": max(exhaustion, failed_acceptance),
+                "confirmation_strength": max(exhaustion, failed_acceptance),
+                "price_rejection_near_high": failed_acceptance,
+                "lower_close_after_peak": failed_acceptance,
+                "lower_high_after_peak": failed_acceptance,
+                "failed_reclaim": 1.0 if failed_acceptance >= 0.35 else 0.0,
+                "retest_failed_breakout": 1.0 if failed_acceptance >= 0.50 else 0.0,
+            },
+            "layer3": {
+                "entry_location_strength": reversal,
+                "fresh_reaction_strength": failed_acceptance,
+                "fresh_reaction_from_high": failed_acceptance,
+                "reclaim_failure_strength": failed_acceptance,
+                "failed_reclaim": 1.0 if failed_acceptance >= 0.35 else 0.0,
+                "downside_displacement_confirmed": 1.0 if failed_acceptance >= 0.50 else 0.0,
+            },
+            "layer4": {"source_flags": {"vwap_quality": "live", "ultra_quality": "live"}},
+            "layer5": {
+                "tp_sl_strength": max(0.72, min(1.0, rr / 2.0 if rr > 0 else 0.72)),
+                "fallback_rr_used": 0.0,
+            },
+        }
 
     @staticmethod
     def _attach_mtf_snapshot(enriched):
@@ -901,6 +949,58 @@ class LayeredPumpStrategy(StrategyInterface):
             volume_profile=vp,
             trace_meta=trace_meta if isinstance(trace_meta, dict) else {},
         )
+
+        if self._ultra_short_enabled and context.synced_state == TradeState.FLAT:
+            ultra_context = replace(context, market_ohlcv=enriched)
+            try:
+                ultra_liquidation_map = build_liquidation_map(enriched)
+            except Exception:
+                ultra_liquidation_map = enriched.attrs.get("liquidation_map")
+            ultra_decision = self._ultra_short_detector.evaluate(
+                ultra_context,
+                trace_meta=trace_meta if isinstance(trace_meta, Mapping) else {},
+                liquidation_map=ultra_liquidation_map,
+                volume_profile=vp,
+            )
+            if ultra_decision.approved:
+                ultra_intent = ultra_decision.to_intent()
+                ultra_signal = SimpleNamespace(
+                    signal_id=ultra_decision.setup_signature,
+                    side="SHORT",
+                    entry=float(ultra_decision.entry),
+                    sl=float(ultra_decision.stop_loss),
+                    tp=float(ultra_decision.take_profit),
+                    confidence=float(ultra_decision.score),
+                    created_at=time.time(),
+                    details=self._ultra_gate_details(ultra_decision.diagnostics),
+                )
+                ultra_candidate = SignalCandidate.from_signal(
+                    signal=ultra_signal,
+                    context=ultra_context,
+                    enriched=enriched,
+                    trace_meta=trace_meta if isinstance(trace_meta, Mapping) else {},
+                )
+                ultra_gate_decision = self._entry_gate.evaluate(ultra_candidate)
+                ultra_meta = {
+                    **ultra_intent.metadata,
+                    "layer_trace": trace,
+                    "layer_failed": "",
+                    "entry_gate": ultra_gate_decision.to_dict(),
+                    "admission_status": "approved" if ultra_gate_decision.approved else "rejected",
+                    "admission_reason": ultra_gate_decision.reason,
+                    "confidence_raw": float(ultra_decision.score),
+                }
+                if not ultra_gate_decision.approved:
+                    return StrategyIntent(
+                        symbol=context.symbol,
+                        action=IntentAction.HOLD,
+                        reason=f"entry_gate_{ultra_gate_decision.reason}",
+                        confidence=float(ultra_gate_decision.score),
+                        metadata=ultra_meta,
+                    )
+                ultra_intent.metadata = ultra_meta
+                ultra_intent.confidence = min(float(ultra_decision.score), float(ultra_gate_decision.score))
+                return ultra_intent
 
         if signal is None:
             if managed_short_exit is not None:

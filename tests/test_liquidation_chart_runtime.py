@@ -185,7 +185,7 @@ class LiquidationChartRuntimeTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(candidate)
-        self.assertEqual(candidate["phase"], "ULTRA")
+        self.assertIn(candidate["phase"], {"ULTRA_RADAR", "ULTRA_CONFIRM", "ULTRA"})
         self.assertLess(float(candidate["tp"]), float(candidate["entry"]))
         self.assertGreater(float(candidate["sl"]), float(candidate["entry"]))
 

@@ -38,6 +38,11 @@ class StrategyContext:
     news_veto: bool | None = None
     news_source: str | None = None
     news_degraded: bool | None = None
+    spread_bps: float | None = None
+    expected_slippage_bps: float | None = None
+    depth_ratio: float | None = None
+    bid_ask_imbalance: float | None = None
+    aggressor_exhaustion: float | None = None
 
 
 class StrategyInterface(Protocol):

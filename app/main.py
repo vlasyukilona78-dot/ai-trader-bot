@@ -53,6 +53,8 @@ from trading.signals.layered_strategy import LayeredPumpStrategy
 from trading.signals.runtime_source_adapter import build_runtime_signal_inputs
 from trading.signals.signal_types import IntentAction, StrategyIntent
 from trading.signals.strategy_interface import StrategyContext
+from trading.signals.ultra_v2 import UltraV2Config, evaluate_ultra_v2
+from trading.signals.versioning import ULTRA_V2_VERSION
 from trading.state.machine import StateMachine
 from trading.state.models import StateRecord, TradeState
 from trading.state.persistence import RuntimeStore
@@ -419,6 +421,12 @@ _SIGNAL_EVENT_METADATA_KEYS = {
     "sentiment_index",
     "setup_score",
     "spread_bps",
+    "expected_slippage_bps",
+    "orderbook_expected_slippage_bps",
+    "depth_ratio",
+    "orderbook_depth_ratio",
+    "bid_ask_imbalance",
+    "aggressor_exhaustion",
     "turnover24h_usdt",
     "volume_spike",
     "watch_score",
@@ -665,6 +673,84 @@ def _remember_symbol_rate_limited_alert(
     payload = dict(cached) if isinstance(cached, Mapping) else {}
     payload["symbol_next_allowed_ts"] = now_ts + max(60, cooldown_sec)
     cache[symbol] = payload
+
+
+def _candidate_repeat_quality(candidate: Mapping[str, object]) -> float:
+    return max(
+        _as_float(candidate.get("quality_score"), 0.0),
+        _as_float(candidate.get("watch_score"), 0.0),
+        _as_float(candidate.get("confidence"), 0.0) * 10.0,
+    )
+
+
+def _should_block_recent_candidate_realert(
+    cache: Mapping[str, object] | None,
+    *,
+    symbol: str,
+    candidate: Mapping[str, object],
+    now_ts: float,
+    cooldown_sec: int,
+    min_reprice_pct: float,
+    min_quality_improvement: float,
+    allow_phase_upgrade: bool,
+) -> bool:
+    if cooldown_sec <= 0:
+        return False
+    cached = cache.get(symbol) if isinstance(cache, Mapping) else None
+    if not isinstance(cached, Mapping):
+        return False
+
+    last_ts = _as_float(cached.get("last_symbol_signal_ts"), 0.0)
+    if last_ts <= 0 or now_ts >= last_ts + max(60, cooldown_sec):
+        return False
+
+    phase = str(candidate.get("phase") or "").strip().upper()
+    last_phase = str(cached.get("last_symbol_signal_phase") or "").strip().upper()
+    if allow_phase_upgrade and _phase_rank(phase) > _phase_rank(last_phase):
+        return False
+
+    entry = _as_float(candidate.get("entry"), 0.0)
+    last_entry = _as_float(cached.get("last_symbol_signal_entry"), 0.0)
+    quality = _candidate_repeat_quality(candidate)
+    last_quality = _as_float(cached.get("last_symbol_signal_quality"), 0.0)
+    if entry > 0 and last_entry > 0:
+        reprice_pct = (entry - last_entry) / max(last_entry, 1e-8)
+        if reprice_pct >= max(0.0, min_reprice_pct) and quality >= last_quality + max(0.0, min_quality_improvement):
+            return False
+
+    return True
+
+
+def _remember_recent_candidate_realert(
+    cache: dict[str, object],
+    *,
+    symbol: str,
+    candidate: Mapping[str, object],
+    now_ts: float,
+) -> None:
+    cached = cache.get(symbol)
+    payload = dict(cached) if isinstance(cached, Mapping) else {}
+    payload.update(
+        {
+            "last_symbol_signal_ts": now_ts,
+            "last_symbol_signal_phase": str(candidate.get("phase") or "").strip().upper(),
+            "last_symbol_signal_entry": _as_float(candidate.get("entry"), 0.0),
+            "last_symbol_signal_quality": _candidate_repeat_quality(candidate),
+        }
+    )
+    cache[symbol] = payload
+
+
+def _update_cached_signal_state(
+    cache: dict[str, object],
+    *,
+    symbol: str,
+    payload: Mapping[str, object],
+) -> None:
+    cached = cache.get(symbol)
+    merged = dict(cached) if isinstance(cached, Mapping) else {}
+    merged.update(dict(payload))
+    cache[symbol] = merged
 
 
 def _format_alert_price_bucket(value: float) -> str:
@@ -960,6 +1046,10 @@ def _timeframe_to_minutes(timeframe: str) -> int:
         return 1
 
 
+def _timeframe_seconds(timeframe: str | int | float | None) -> int:
+    return max(60, _normalize_timeframe_minutes(timeframe, default=1) * 60)
+
+
 def _needs_pre_alert_refresh(
     *,
     prepared_ts: float,
@@ -1115,6 +1205,12 @@ _RUNTIME_MARKET_METADATA_KEYS = (
     "turnover24h_usdt",
     "volume24h",
     "spread_bps",
+    "expected_slippage_bps",
+    "orderbook_expected_slippage_bps",
+    "depth_ratio",
+    "orderbook_depth_ratio",
+    "bid_ask_imbalance",
+    "aggressor_exhaustion",
     "bid1Price",
     "ask1Price",
     "funding_rate",
@@ -1217,6 +1313,12 @@ def _prepare_symbol_decision(
                 news_veto=runtime_inputs.get("news_veto"),
                 news_source=runtime_inputs.get("news_source"),
                 news_degraded=runtime_inputs.get("news_degraded"),
+                spread_bps=runtime_inputs.get("spread_bps"),
+                expected_slippage_bps=runtime_inputs.get("expected_slippage_bps")
+                or runtime_inputs.get("orderbook_expected_slippage_bps"),
+                depth_ratio=runtime_inputs.get("depth_ratio") or runtime_inputs.get("orderbook_depth_ratio"),
+                bid_ask_imbalance=runtime_inputs.get("bid_ask_imbalance"),
+                aggressor_exhaustion=runtime_inputs.get("aggressor_exhaustion"),
             )
         )
         intent = _enrich_intent_with_runtime_market_metadata(intent, runtime_inputs)
@@ -1816,16 +1918,44 @@ def _build_ultra_early_caption(
     quality_score: float,
     level_label: str,
     triggers: list[str],
+    ultra_phase: str = "ULTRA",
+    scenario: str = "",
 ) -> str:
     asset = str(symbol or "").replace("/", "").upper().replace("USDT", "")
     downside_to_fib = max((price - fib50) / max(price, 1e-8), 0.0)
     clean_triggers: list[str] = []
+    trigger_labels = {
+        "sweep_and_fail": "снятие ликвидности не удержали",
+        "upper_wick": "верхняя тень",
+        "volume_decay": "объём затухает",
+        "rsi_rollover": "RSI разворачивается",
+        "macd_rollover": "MACD теряет импульс",
+        "failed_reclaim": "failed reclaim",
+        "retest_failed_breakout": "ретест пробоя не удержали",
+        "downside_liq_magnet": "ниже есть ликвидационный магнит",
+    }
     for trigger in triggers:
-        normalized = _normalize_human_text(trigger)
+        normalized = _normalize_human_text(trigger_labels.get(str(trigger), trigger))
         if normalized and normalized not in clean_triggers:
             clean_triggers.append(normalized)
+    scenario_labels = {
+        "sweep_and_fail": "sweep-and-fail",
+        "blow_off_wick": "blow-off wick",
+        "climax_then_fade": "climax-then-fade",
+        "failed_continuation_after_pullback": "failed continuation",
+    }
+    phase_upper = str(ultra_phase or "ULTRA").upper()
+    if phase_upper == "ULTRA_CONFIRM":
+        title = "<b>УЛЬТРА РАННИЙ ШОРТ: CONFIRM</b>"
+        status = "мини-подтверждение получено, ждём early/main continuation"
+    elif phase_upper == "ULTRA_RADAR":
+        title = "<b>УЛЬТРА РАДАР: КУЛЬМИНАЦИЯ ПАМПА</b>"
+        status = "радар без автовхода, нужен confirm в ближайшие 1-3 бара"
+    else:
+        title = "<b>УЛЬТРА РАННИЙ ШОРТ: УДАР В УРОВЕНЬ</b>"
+        status = "без автовхода, только ultra-watch"
     lines = [
-        "<b>\u0423\u041b\u042c\u0422\u0420\u0410 \u0420\u0410\u041d\u041d\u0418\u0419 \u0428\u041e\u0420\u0422: \u0423\u0414\u0410\u0420 \u0412 \u0423\u0420\u041e\u0412\u0415\u041d\u042c</b>",
+        title,
         f"<b>{asset}</b> | <code>{symbol}</code>",
         f"\U0001f7e2 \u041b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0439 \u043f\u0430\u043c\u043f {pump_pct * 100.0:.2f}%",
         f"\u23f1 \u0422\u0424: {timeframe}\u043c | \u0411\u0438\u0440\u0436\u0430: Bybit | \u0420\u0435\u0436\u0438\u043c: {mode}",
@@ -1837,10 +1967,26 @@ def _build_ultra_early_caption(
         f"\U0001f4ca <b>\u041a\u043e\u043d\u0442\u0435\u043a\u0441\u0442 #{asset}</b>",
         f"\u2022 \u0423\u0440\u043e\u0432\u0435\u043d\u044c: {level_label}",
     ]
+    if scenario:
+        lines.append(f"\u2022 Сценарий: {scenario_labels.get(str(scenario), str(scenario))}")
     if clean_triggers:
         lines.append(f"\u2022 \u0422\u0440\u0438\u0433\u0433\u0435\u0440\u044b: {', '.join(clean_triggers)}")
-    lines.append("\u2022 \u0421\u0442\u0430\u0442\u0443\u0441: \u0431\u0435\u0437 \u0430\u0432\u0442\u043e\u0432\u0445\u043e\u0434\u0430, \u0442\u043e\u043b\u044c\u043a\u043e ultra-watch")
+    lines.append(f"\u2022 \u0421\u0442\u0430\u0442\u0443\u0441: {status}")
     return "\n".join(_normalize_human_text(line) for line in lines)
+
+
+def _ultra_v2_config_from_env() -> UltraV2Config:
+    return UltraV2Config(
+        min_pump_pct=_early_config_float("ULTRA_V2_MIN_PUMP_PCT", 0.028),
+        min_rsi=_early_config_float("ULTRA_V2_MIN_RSI", 54.0),
+        min_volume_spike=_early_config_float("ULTRA_V2_MIN_VOLUME_SPIKE", 1.20),
+        max_peak_age_bars=max(1, _as_int(os.getenv("ULTRA_V2_MAX_PEAK_AGE_BARS", "5"), 5)),
+        min_pump_range_position=_early_config_float("ULTRA_V2_MIN_PUMP_RANGE_POSITION", 0.65),
+        continuation_reject_score=_early_config_float("ULTRA_V2_CONTINUATION_REJECT_SCORE", 1.85),
+        radar_score=_early_config_float("ULTRA_V2_RADAR_SCORE", 0.68),
+        confirm_score=_early_config_float("ULTRA_V2_CONFIRM_SCORE", 0.78),
+        direct_confirm_score=_early_config_float("ULTRA_V2_DIRECT_CONFIRM_SCORE", 0.84),
+    )
 
 
 def _build_ultra_early_candidate(*, symbol: str, timeframe: str, mode: str, enriched, intent) -> dict[str, object] | None:
@@ -1848,6 +1994,46 @@ def _build_ultra_early_candidate(*, symbol: str, timeframe: str, mode: str, enri
         return None
     if enriched is None or getattr(enriched, "empty", True) or len(enriched) < 48:
         return None
+
+    if _env_flag("ULTRA_V2_ENABLED", True):
+        meta = intent.metadata if isinstance(getattr(intent, "metadata", None), Mapping) else {}
+        ultra_v2 = evaluate_ultra_v2(enriched, metadata=meta, config=_ultra_v2_config_from_env())
+        if not ultra_v2.accepted:
+            return None
+        close_v2 = _last_frame_float(enriched, "close", 0.0)
+        rsi_v2 = _last_frame_float(enriched, "rsi", 0.0)
+        volume_v2 = _last_frame_float(enriched, "volume_spike", 1.0)
+        features_v2 = ultra_v2.features if isinstance(ultra_v2.features, Mapping) else {}
+        pump_pct_v2 = _as_float(features_v2.get("pump_pct"), 0.0)
+        quality_score_v2 = min(max(float(ultra_v2.score) * 10.0, 0.0), 10.0)
+        return {
+            "phase": ultra_v2.phase,
+            "caption": _build_ultra_early_caption(
+                symbol=symbol,
+                timeframe=timeframe,
+                mode=mode,
+                price=close_v2,
+                fib50=ultra_v2.fib50,
+                sl=ultra_v2.sl,
+                pump_pct=pump_pct_v2,
+                rsi=rsi_v2,
+                volume_spike=volume_v2,
+                quality_score=quality_score_v2,
+                level_label=ultra_v2.level_label,
+                triggers=list(ultra_v2.triggers),
+                ultra_phase=ultra_v2.phase,
+                scenario=ultra_v2.scenario,
+            ),
+            "entry": close_v2,
+            "tp": ultra_v2.fib50,
+            "sl": ultra_v2.sl,
+            "quality_score": quality_score_v2,
+            "ultra_score": ultra_v2.score,
+            "ultra_phase": ultra_v2.phase,
+            "ultra_scenario": ultra_v2.scenario,
+            "ultra_version": ULTRA_V2_VERSION,
+            "ultra_features": dict(features_v2),
+        }
 
     close = _last_frame_float(enriched, "close", 0.0)
     prev_close = _as_float(_series_float(enriched, "close", close).iloc[-2], close) if len(enriched) >= 2 else close
@@ -2000,6 +2186,27 @@ def _build_ultra_early_candidate(*, symbol: str, timeframe: str, mode: str, enri
     )
     if live_extension_without_rejection:
         return None
+    soft_ultra_without_break = bool(
+        not hard_rejection_evidence
+        and (
+            first_weakness_score < _early_config_float("ULTRA_EARLY_SOFT_WEAKNESS_SCORE_MIN", 2.05)
+            or close_position > _early_config_float("ULTRA_EARLY_SOFT_CLOSE_POSITION_MAX", 0.48)
+            or (
+                volume_spike < max(
+                    min_volume * _early_config_float("ULTRA_EARLY_SOFT_VOLUME_MULT_MIN", 1.20),
+                    _early_config_float("ULTRA_EARLY_SOFT_VOLUME_MIN", 0.90),
+                )
+                and not any("ликвидация" in item[0] for item in level_hits)
+            )
+            or (
+                mtf_trend_5m >= _early_config_float("ULTRA_EARLY_SOFT_MTF5_TREND_RISK_MIN", 0.0070)
+                and mtf_rsi_5m >= _early_config_float("ULTRA_EARLY_SOFT_MTF5_RSI_RISK_MIN", 64.0)
+                and not (upper_wick_ratio >= 0.22 and close < prev_close)
+            )
+        )
+    )
+    if soft_ultra_without_break:
+        return None
     if (
         (vwap_dist >= _early_config_float("ULTRA_EARLY_VWAP_EXTENSION_RISK_MIN", 0.038) or bb_position >= 0.84)
         and not hard_rejection_evidence
@@ -2149,6 +2356,10 @@ def _maybe_emit_ultra_early_signal(
     now_ts = time.time()
     current_state = state.get(symbol, {})
     cooldown_sec = max(300, _as_int(os.getenv("ULTRA_EARLY_COOLDOWN_SEC", "3600"), 3600))
+    symbol_cooldown_sec = max(
+        300,
+        _as_int(os.getenv("ULTRA_EARLY_SYMBOL_COOLDOWN_SEC", "1800"), 1800),
+    )
     signature_cooldown_sec = max(
         cooldown_sec,
         _as_int(os.getenv("ULTRA_EARLY_SIGNATURE_COOLDOWN_SEC", "5400"), 5400),
@@ -2158,11 +2369,67 @@ def _maybe_emit_ultra_early_signal(
     last_signature = str(current_state.get("last_signature") or "")
     signature = _build_early_candidate_signature(candidate, enriched)
     bar_signature = _build_early_candidate_bar_signature(candidate, enriched)
+    ultra_phase = str(candidate.get("phase") or "ULTRA").strip().upper() or "ULTRA"
+
+    if ultra_phase == "ULTRA_RADAR":
+        _update_cached_signal_state(
+            state,
+            symbol=symbol,
+            payload={
+                "pending_radar_ts": now_ts,
+                "pending_radar_signature": signature,
+                "pending_radar_scenario": str(candidate.get("ultra_scenario") or ""),
+                "pending_radar_score": _as_float(candidate.get("quality_score"), 0.0),
+            },
+        )
+        if not _env_flag("ULTRA_V2_SEND_RADAR_ALERTS", True):
+            stats["ultra_suppressed"] = int(stats.get("ultra_suppressed", 0)) + 1
+            return False
+    elif ultra_phase == "ULTRA_CONFIRM":
+        radar_ttl_bars = max(1, _as_int(os.getenv("ULTRA_V2_CONFIRM_RADAR_TTL_BARS", "4"), 4))
+        timeframe_seconds = _timeframe_seconds(timeframe)
+        radar_ttl_sec = max(60, radar_ttl_bars * max(timeframe_seconds, 60))
+        pending_radar_ts = _as_float(current_state.get("pending_radar_ts"), 0.0)
+        has_recent_radar = pending_radar_ts > 0 and now_ts <= pending_radar_ts + radar_ttl_sec
+        direct_quality_min = _early_config_float("ULTRA_V2_DIRECT_CONFIRM_QUALITY_MIN", 8.4)
+        if not has_recent_radar and _as_float(candidate.get("quality_score"), 0.0) < direct_quality_min:
+            _update_cached_signal_state(
+                state,
+                symbol=symbol,
+                payload={
+                    "pending_radar_ts": now_ts,
+                    "pending_radar_signature": signature,
+                    "pending_radar_scenario": str(candidate.get("ultra_scenario") or ""),
+                    "pending_radar_score": _as_float(candidate.get("quality_score"), 0.0),
+                },
+            )
+            stats["ultra_suppressed"] = int(stats.get("ultra_suppressed", 0)) + 1
+            return False
 
     if signature and signature == last_signature and now_ts < signature_cooldown_until_ts:
         stats["ultra_suppressed"] = int(stats.get("ultra_suppressed", 0)) + 1
         return False
     if now_ts < cooldown_until_ts:
+        stats["ultra_suppressed"] = int(stats.get("ultra_suppressed", 0)) + 1
+        return False
+    if _should_block_recent_candidate_realert(
+        state,
+        symbol=symbol,
+        candidate=candidate,
+        now_ts=now_ts,
+        cooldown_sec=symbol_cooldown_sec,
+        min_reprice_pct=_early_config_float("ULTRA_EARLY_REPEAT_MIN_REPRICE_PCT", 0.014),
+        min_quality_improvement=_early_config_float("ULTRA_EARLY_REPEAT_MIN_QUALITY_IMPROVEMENT", 0.45),
+        allow_phase_upgrade=False,
+    ):
+        stats["ultra_suppressed"] = int(stats.get("ultra_suppressed", 0)) + 1
+        return False
+    if not _reserve_cross_process_alert(
+        kind="ultra_early_symbol",
+        symbol=symbol,
+        signature="symbol",
+        cooldown_sec=symbol_cooldown_sec,
+    ):
         stats["ultra_suppressed"] = int(stats.get("ultra_suppressed", 0)) + 1
         return False
     if not _reserve_cross_process_alert(
@@ -2197,7 +2464,7 @@ def _maybe_emit_ultra_early_signal(
         alerters,
         str(candidate.get("caption") or ""),
         chart_bytes,
-        filename=f"{symbol.lower()}_ultra_1m.png",
+        filename=f"{symbol.lower()}_{ultra_phase.lower()}_1m.png",
         reply_markup=reply_markup,
         chart_context=f"ultra_early:{symbol}:1m",
     )
@@ -2219,11 +2486,15 @@ def _maybe_emit_ultra_early_signal(
             alerters,
             _build_clean_context_chart_caption(
                 symbol,
-                stage_label="\u0423\u041b\u042c\u0422\u0420\u0410 \u0420\u0410\u041d\u041d\u0418\u0419 \u0428\u041e\u0420\u0422: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422",
+                stage_label=(
+                    "\u0423\u041b\u042c\u0422\u0420\u0410 \u0420\u0410\u0414\u0410\u0420: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422"
+                    if ultra_phase == "ULTRA_RADAR"
+                    else "\u0423\u041b\u042c\u0422\u0420\u0410 \u0420\u0410\u041d\u041d\u0418\u0419 \u0428\u041e\u0420\u0422: HTF \u041a\u041e\u041d\u0422\u0415\u041a\u0421\u0422"
+                ),
                 timeframe_label=_format_chart_timeframe_label(_alert_context_timeframe()),
             ),
             context_chart_bytes,
-            filename=f"{symbol.lower()}_ultra_htf.png",
+            filename=f"{symbol.lower()}_{ultra_phase.lower()}_htf.png",
             reply_markup=reply_markup,
         )
         attempted += a2
@@ -2238,7 +2509,7 @@ def _maybe_emit_ultra_early_signal(
     )
     _record_signal_event(
         symbol=symbol,
-        phase="ULTRA",
+        phase=ultra_phase,
         side="SHORT",
         timeframe=timeframe,
         mode=mode,
@@ -2246,7 +2517,7 @@ def _maybe_emit_ultra_early_signal(
         tp=tp,
         sl=sl,
         confidence=min(_as_float(candidate.get("quality_score"), 0.0) / 10.0, 1.0),
-        reason="ultra_early_level_hit",
+        reason=str(candidate.get("ultra_scenario") or "ultra_early_level_hit"),
         metadata=extras,
         candidate=candidate,
         delivery_attempted=attempted,
@@ -2257,13 +2528,24 @@ def _maybe_emit_ultra_early_signal(
         return False
 
     stats["ultra_sent"] = int(stats.get("ultra_sent", 0)) + 1
-    state[symbol] = {
-        "last_signature": signature,
-        "last_emitted_ts": now_ts,
-        "cooldown_until_ts": now_ts + cooldown_sec,
-        "signature_cooldown_until_ts": now_ts + signature_cooldown_sec,
-        "quality_score": _as_float(candidate.get("quality_score"), 0.0),
-    }
+    _update_cached_signal_state(
+        state,
+        symbol=symbol,
+        payload={
+            "last_signature": signature,
+            "last_emitted_ts": now_ts,
+            "cooldown_until_ts": now_ts + cooldown_sec,
+            "signature_cooldown_until_ts": now_ts + signature_cooldown_sec,
+            "quality_score": _as_float(candidate.get("quality_score"), 0.0),
+            "last_ultra_phase": ultra_phase,
+        },
+    )
+    _remember_recent_candidate_realert(
+        state,
+        symbol=symbol,
+        candidate=candidate,
+        now_ts=now_ts,
+    )
     return True
 
 
@@ -4674,6 +4956,38 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
         active_weakness_score += 0.65
     if continuation_after_pause:
         active_weakness_score = max(0.0, active_weakness_score - 1.25)
+    live_drive_without_confirmed_failure = bool(
+        (
+            trend_follow_through
+            or reacceleration_after_pullback
+            or (
+                mtf_trend_5m >= _early_config_float("EARLY_WATCH_LIVE_DRIVE_MTF5_TREND_MIN", 0.0070)
+                and mtf_rsi_5m >= _early_config_float("EARLY_WATCH_LIVE_DRIVE_MTF5_RSI_MIN", 64.0)
+            )
+            or (
+                mtf_trend_15m >= _early_config_float("EARLY_WATCH_LIVE_DRIVE_MTF15_TREND_MIN", 0.0040)
+                and mtf_rsi_15m >= _early_config_float("EARLY_WATCH_LIVE_DRIVE_MTF15_RSI_MIN", 64.0)
+            )
+        )
+        and close_position_in_candle >= _early_config_float("EARLY_WATCH_LIVE_DRIVE_CLOSE_POSITION_MIN", 0.50)
+        and candle_body_pct >= _early_config_float("EARLY_WATCH_LIVE_DRIVE_BODY_MIN", -0.0015)
+        and active_weakness_score < _early_config_float("EARLY_WATCH_LIVE_DRIVE_WEAKNESS_MIN", 2.85)
+        and not volume_fade_confirmed
+        and not (
+            liquidation_map.swept_above
+            or recent_upper_liq_reaction
+            or peak_followthrough_confirmed
+            or structure_trigger_confirmed
+            or micro_reversal_near_peak
+            or real_rollover
+            or layer2_failed_reclaim
+            or layer3_failed_reclaim
+            or layer2_retest_failed_breakout
+            or layer3_retest_failed_breakout
+        )
+    )
+    if live_drive_without_confirmed_failure:
+        return None
     weak_anchor_without_level = bool(
         recent_upper_anchor_touch
         and not (
@@ -7013,6 +7327,10 @@ def run_cycle(
                 early_cooldown_sec,
                 _as_int(os.getenv("EARLY_SIGNAL_SIGNATURE_COOLDOWN_SEC", "2700"), 2700),
             )
+            early_symbol_cooldown_sec = max(
+                300,
+                _as_int(os.getenv("EARLY_SIGNAL_SYMBOL_COOLDOWN_SEC", "1800"), 1800),
+            )
             cycle_ts = time.time()
             emitted_early_phase = ""
 
@@ -7107,6 +7425,36 @@ def run_cycle(
                                 early_signature
                                 and early_signature == last_signature
                                 and cycle_ts < signature_cooldown_until_ts
+                            ):
+                                early_signal_stats["suppressed_by_cooldown"] = int(
+                                    early_signal_stats.get("suppressed_by_cooldown", 0)
+                                ) + 1
+                                continue
+                            if _should_block_recent_candidate_realert(
+                                early_signal_state,
+                                symbol=symbol,
+                                candidate=early_candidate,
+                                now_ts=cycle_ts,
+                                cooldown_sec=early_symbol_cooldown_sec,
+                                min_reprice_pct=_early_config_float(
+                                    "EARLY_SIGNAL_REPEAT_MIN_REPRICE_PCT",
+                                    0.012,
+                                ),
+                                min_quality_improvement=_early_config_float(
+                                    "EARLY_SIGNAL_REPEAT_MIN_QUALITY_IMPROVEMENT",
+                                    0.35,
+                                ),
+                                allow_phase_upgrade=True,
+                            ):
+                                early_signal_stats["suppressed_by_cooldown"] = int(
+                                    early_signal_stats.get("suppressed_by_cooldown", 0)
+                                ) + 1
+                                continue
+                            if not _reserve_cross_process_alert(
+                                kind=f"early_{str(phase or '').lower()}_symbol",
+                                symbol=symbol,
+                                signature="symbol",
+                                cooldown_sec=early_symbol_cooldown_sec,
                             ):
                                 early_signal_stats["suppressed_by_cooldown"] = int(
                                     early_signal_stats.get("suppressed_by_cooldown", 0)
@@ -7223,32 +7571,46 @@ def run_cycle(
                                     success_move_pct=min(max(downside_target * 0.55, 0.004), 0.03),
                                     failure_move_pct=min(max(upside_risk * 0.60, 0.0035), 0.025),
                                 )
-                            early_signal_state[symbol] = {
-                                "active_phase": phase,
-                                "last_emitted_phase": phase,
-                                "cooldown_until_ts": cycle_ts + early_cooldown_sec,
-                                "last_emitted_ts": cycle_ts,
-                                "inactive_cycles": 0,
-                                "last_signature": early_signature,
-                                "signature_cooldown_until_ts": cycle_ts + early_signature_cooldown_sec,
-                            }
+                            _update_cached_signal_state(
+                                early_signal_state,
+                                symbol=symbol,
+                                payload={
+                                    "active_phase": phase,
+                                    "last_emitted_phase": phase,
+                                    "cooldown_until_ts": cycle_ts + early_cooldown_sec,
+                                    "last_emitted_ts": cycle_ts,
+                                    "inactive_cycles": 0,
+                                    "last_signature": early_signature,
+                                    "signature_cooldown_until_ts": cycle_ts + early_signature_cooldown_sec,
+                                },
+                            )
+                            _remember_recent_candidate_realert(
+                                early_signal_state,
+                                symbol=symbol,
+                                candidate=early_candidate,
+                                now_ts=cycle_ts,
+                            )
                             emitted_early_phase = phase
 
             if intent.action in (IntentAction.LONG_ENTRY, IntentAction.SHORT_ENTRY):
                 if active_phase or emitted_early_phase:
                     early_signal_stats["entry_confirmed"] = int(early_signal_stats.get("entry_confirmed", 0)) + 1
-                early_signal_state[symbol] = {
-                    "active_phase": "",
-                    "last_emitted_phase": emitted_early_phase or last_emitted_phase or active_phase,
-                    "cooldown_until_ts": max(cooldown_until_ts, cycle_ts + early_cooldown_sec),
-                    "last_emitted_ts": cycle_ts,
-                    "inactive_cycles": 0,
-                    "last_signature": last_signature,
-                    "signature_cooldown_until_ts": max(
-                        signature_cooldown_until_ts,
-                        cycle_ts + early_signature_cooldown_sec,
-                    ),
-                }
+                _update_cached_signal_state(
+                    early_signal_state,
+                    symbol=symbol,
+                    payload={
+                        "active_phase": "",
+                        "last_emitted_phase": emitted_early_phase or last_emitted_phase or active_phase,
+                        "cooldown_until_ts": max(cooldown_until_ts, cycle_ts + early_cooldown_sec),
+                        "last_emitted_ts": cycle_ts,
+                        "inactive_cycles": 0,
+                        "last_signature": last_signature,
+                        "signature_cooldown_until_ts": max(
+                            signature_cooldown_until_ts,
+                            cycle_ts + early_signature_cooldown_sec,
+                        ),
+                    },
+                )
             elif early_candidate is None:
                 if active_phase:
                     invalidation_grace_sec = _as_int(
@@ -7260,15 +7622,19 @@ def run_cycle(
                         3,
                     )
                     inactive_cycles += 1
-                    early_signal_state[symbol] = {
-                        "active_phase": active_phase,
-                        "last_emitted_phase": last_emitted_phase,
-                        "cooldown_until_ts": cooldown_until_ts,
-                        "last_emitted_ts": last_emitted_ts,
-                        "inactive_cycles": inactive_cycles,
-                        "last_signature": last_signature,
-                        "signature_cooldown_until_ts": signature_cooldown_until_ts,
-                    }
+                    _update_cached_signal_state(
+                        early_signal_state,
+                        symbol=symbol,
+                        payload={
+                            "active_phase": active_phase,
+                            "last_emitted_phase": last_emitted_phase,
+                            "cooldown_until_ts": cooldown_until_ts,
+                            "last_emitted_ts": last_emitted_ts,
+                            "inactive_cycles": inactive_cycles,
+                            "last_signature": last_signature,
+                            "signature_cooldown_until_ts": signature_cooldown_until_ts,
+                        },
+                    )
                     if cycle_ts - last_emitted_ts < invalidation_grace_sec:
                         continue
                     if inactive_cycles < invalidation_miss_limit:
@@ -7292,18 +7658,22 @@ def run_cycle(
                         skip_reason="no_alerters_configured" if attempted == 0 else "",
                     )
                     early_signal_stats["invalidated"] = int(early_signal_stats.get("invalidated", 0)) + 1
-                    early_signal_state[symbol] = {
-                        "active_phase": "",
-                        "last_emitted_phase": last_emitted_phase or active_phase,
-                        "cooldown_until_ts": cycle_ts + early_cooldown_sec,
-                        "last_emitted_ts": cycle_ts,
-                        "inactive_cycles": 0,
-                        "last_signature": last_signature,
-                        "signature_cooldown_until_ts": max(
-                            signature_cooldown_until_ts,
-                            cycle_ts + early_signature_cooldown_sec,
-                        ),
-                    }
+                    _update_cached_signal_state(
+                        early_signal_state,
+                        symbol=symbol,
+                        payload={
+                            "active_phase": "",
+                            "last_emitted_phase": last_emitted_phase or active_phase,
+                            "cooldown_until_ts": cycle_ts + early_cooldown_sec,
+                            "last_emitted_ts": cycle_ts,
+                            "inactive_cycles": 0,
+                            "last_signature": last_signature,
+                            "signature_cooldown_until_ts": max(
+                                signature_cooldown_until_ts,
+                                cycle_ts + early_signature_cooldown_sec,
+                            ),
+                        },
+                    )
             else:
                 phase = str(early_candidate.get("phase") or "")
                 if phase:
@@ -7357,6 +7727,36 @@ def run_cycle(
                             early_signature
                             and early_signature == last_signature
                             and cycle_ts < signature_cooldown_until_ts
+                        ):
+                            early_signal_stats["suppressed_by_cooldown"] = int(
+                                early_signal_stats.get("suppressed_by_cooldown", 0)
+                            ) + 1
+                            continue
+                        if _should_block_recent_candidate_realert(
+                            early_signal_state,
+                            symbol=symbol,
+                            candidate=early_candidate,
+                            now_ts=cycle_ts,
+                            cooldown_sec=early_symbol_cooldown_sec,
+                            min_reprice_pct=_early_config_float(
+                                "EARLY_SIGNAL_REPEAT_MIN_REPRICE_PCT",
+                                0.012,
+                            ),
+                            min_quality_improvement=_early_config_float(
+                                "EARLY_SIGNAL_REPEAT_MIN_QUALITY_IMPROVEMENT",
+                                0.35,
+                            ),
+                            allow_phase_upgrade=True,
+                        ):
+                            early_signal_stats["suppressed_by_cooldown"] = int(
+                                early_signal_stats.get("suppressed_by_cooldown", 0)
+                            ) + 1
+                            continue
+                        if not _reserve_cross_process_alert(
+                            kind=f"early_{str(phase or '').lower()}_symbol",
+                            symbol=symbol,
+                            signature="symbol",
+                            cooldown_sec=early_symbol_cooldown_sec,
                         ):
                             early_signal_stats["suppressed_by_cooldown"] = int(
                                 early_signal_stats.get("suppressed_by_cooldown", 0)
@@ -7473,15 +7873,25 @@ def run_cycle(
                                 success_move_pct=min(max(downside_target * 0.55, 0.004), 0.03),
                                 failure_move_pct=min(max(upside_risk * 0.60, 0.0035), 0.025),
                             )
-                        early_signal_state[symbol] = {
-                            "active_phase": phase,
-                            "last_emitted_phase": phase,
-                            "cooldown_until_ts": cycle_ts + early_cooldown_sec,
-                            "last_emitted_ts": cycle_ts,
-                            "inactive_cycles": 0,
-                            "last_signature": early_signature,
-                            "signature_cooldown_until_ts": cycle_ts + early_signature_cooldown_sec,
-                        }
+                        _update_cached_signal_state(
+                            early_signal_state,
+                            symbol=symbol,
+                            payload={
+                                "active_phase": phase,
+                                "last_emitted_phase": phase,
+                                "cooldown_until_ts": cycle_ts + early_cooldown_sec,
+                                "last_emitted_ts": cycle_ts,
+                                "inactive_cycles": 0,
+                                "last_signature": early_signature,
+                                "signature_cooldown_until_ts": cycle_ts + early_signature_cooldown_sec,
+                            },
+                        )
+                        _remember_recent_candidate_realert(
+                            early_signal_state,
+                            symbol=symbol,
+                            candidate=early_candidate,
+                            now_ts=cycle_ts,
+                        )
 
             if intent.action in (IntentAction.LONG_ENTRY, IntentAction.SHORT_ENTRY) and outcome.accepted:
                 refreshed_decision = _refresh_symbol_decision_live(
@@ -7535,6 +7945,13 @@ def run_cycle(
                     signal_alert_cache,
                     symbol=symbol,
                     now_ts=signal_now_ts,
+                ):
+                    continue
+                if not _reserve_cross_process_alert(
+                    kind=f"main_{str(intent.action.value).lower()}_symbol",
+                    symbol=symbol,
+                    signature="symbol",
+                    cooldown_sec=signal_symbol_cooldown_sec,
                 ):
                     continue
                 if not _reserve_cross_process_alert(

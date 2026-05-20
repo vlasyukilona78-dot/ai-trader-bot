@@ -23,10 +23,12 @@ try:
         _format_chart_timeframe_label,
         _prepare_symbol_analysis,
         _remember_cached_alert,
+        _remember_recent_candidate_realert,
         _scan_live_price_overlay_enabled,
         _send_alerts,
         _send_chart_or_text_alerts,
         _send_photo_alerts,
+        _should_block_recent_candidate_realert,
         _should_block_live_main_short_continuation,
         _should_block_recent_main_short_reentry,
         _signal_config_from_strategy_settings,
@@ -3193,6 +3195,61 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertGreater(float(cache["BTCUSDT"].get("next_allowed_ts", 0.0)), 1_800_000_120.0)
         self.assertEqual(float(cache["BTCUSDT"].get("main_short_entry_price", 0.0)), 108.4)
         self.assertEqual(float(cache["BTCUSDT"].get("main_short_peak_price", 0.0)), 109.2)
+
+    def test_recent_candidate_realert_guard_blocks_same_phase_duplicate(self):
+        cache = {}
+        first = {"phase": "WATCH", "entry": 1.0000, "watch_score": 8.0}
+        duplicate = {"phase": "WATCH", "entry": 1.0040, "watch_score": 8.1}
+        now_ts = 1_800_000_000.0
+
+        _remember_recent_candidate_realert(cache, symbol="BTCUSDT", candidate=first, now_ts=now_ts)
+
+        blocked = _should_block_recent_candidate_realert(
+            cache,
+            symbol="BTCUSDT",
+            candidate=duplicate,
+            now_ts=now_ts + 90,
+            cooldown_sec=900,
+            min_reprice_pct=0.012,
+            min_quality_improvement=0.35,
+            allow_phase_upgrade=True,
+        )
+
+        self.assertTrue(blocked)
+
+    def test_recent_candidate_realert_guard_allows_phase_upgrade_or_new_level(self):
+        cache = {}
+        first = {"phase": "WATCH", "entry": 1.0000, "watch_score": 8.0}
+        setup_upgrade = {"phase": "SETUP", "entry": 1.0030, "watch_score": 8.1}
+        higher_quality_level = {"phase": "WATCH", "entry": 1.0160, "watch_score": 8.5}
+        now_ts = 1_800_000_000.0
+
+        _remember_recent_candidate_realert(cache, symbol="BTCUSDT", candidate=first, now_ts=now_ts)
+
+        self.assertFalse(
+            _should_block_recent_candidate_realert(
+                cache,
+                symbol="BTCUSDT",
+                candidate=setup_upgrade,
+                now_ts=now_ts + 90,
+                cooldown_sec=900,
+                min_reprice_pct=0.012,
+                min_quality_improvement=0.35,
+                allow_phase_upgrade=True,
+            )
+        )
+        self.assertFalse(
+            _should_block_recent_candidate_realert(
+                cache,
+                symbol="BTCUSDT",
+                candidate=higher_quality_level,
+                now_ts=now_ts + 120,
+                cooldown_sec=900,
+                min_reprice_pct=0.012,
+                min_quality_improvement=0.35,
+                allow_phase_upgrade=False,
+            )
+        )
 
     def test_main_signal_signature_ignores_timestamped_legacy_signal_id(self):
         df = self._build_df()

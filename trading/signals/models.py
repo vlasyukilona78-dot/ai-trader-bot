@@ -21,6 +21,20 @@ _MARKET_EXTRA_KEYS: tuple[str, ...] = (
     "volume_spike",
     "vwap_dist",
     "atr_norm",
+    "rsi",
+    "adx",
+    "bb_position",
+    "bb_upper",
+    "kc_upper",
+    "ema20",
+    "ema50",
+    "spread_bps",
+    "expected_slippage_bps",
+    "orderbook_expected_slippage_bps",
+    "depth_ratio",
+    "orderbook_depth_ratio",
+    "bid_ask_imbalance",
+    "aggressor_exhaustion",
 )
 
 
@@ -78,6 +92,12 @@ class SignalCandidate:
             for key in _MARKET_EXTRA_KEYS:
                 if key in latest:
                     market_extras[key] = safe_float(latest.get(key), 0.0)
+        for key in _MARKET_EXTRA_KEYS:
+            if key in market_extras:
+                continue
+            value = getattr(context, key, None)
+            if value is not None:
+                market_extras[key] = safe_float(value, 0.0)
 
         return cls(
             signal_id=str(getattr(signal, "signal_id", "")),

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 
+import pandas as pd
+
 from trading.signals.entry_gate import EntryGate, EntryGateConfig
 from trading.signals.models import SignalCandidate
 from trading.signals.replay_audit import summarize_signal_admissions
@@ -82,6 +84,152 @@ class EntryGateV2Tests(unittest.TestCase):
         self.assertFalse(decision.approved)
         self.assertEqual(decision.reason, "mtf_continuation_block")
         self.assertTrue(decision.diagnostics["hard_1h"])
+
+    def test_rejects_live_continuation_without_rejection(self):
+        gate = EntryGate(EntryGateConfig(min_score=0.70))
+        decision = gate.evaluate(
+            self._candidate(
+                latest_open=99.8,
+                latest_high=100.8,
+                latest_low=99.4,
+                latest_close=100.55,
+                recent_high=100.8,
+                details={
+                    "layer1": {"rsi": 73.0, "pump_bar_offset": 1, "volume_spike": 1.05},
+                    "layer2": {"weakness_strength": 0.82},
+                    "layer3": {"entry_location_strength": 0.82},
+                    "layer4": {"source_flags": {"vwap_quality": "live"}},
+                    "layer5": {"tp_sl_strength": 0.88},
+                },
+                market_extras={
+                    "mtf_trend_5m": 0.0082,
+                    "mtf_rsi_5m": 70.5,
+                    "volume_spike": 1.05,
+                    "vwap_dist": 0.005,
+                    "bb_position": 0.82,
+                    "ema20": 99.2,
+                    "adx": 31.0,
+                },
+            )
+        )
+        self.assertFalse(decision.approved)
+        self.assertEqual(decision.reason, "live_continuation_without_rejection")
+
+    def test_rejects_low_volume_pullback_in_live_drive(self):
+        gate = EntryGate(EntryGateConfig(min_score=0.70))
+        decision = gate.evaluate(
+            self._candidate(
+                latest_open=100.45,
+                latest_high=100.6,
+                latest_low=99.3,
+                latest_close=100.0,
+                recent_high=100.8,
+                details={
+                    "layer1": {"rsi": 57.0, "pump_bar_offset": 1, "volume_spike": 0.55},
+                    "layer2": {"weakness_strength": 0.78},
+                    "layer3": {"entry_location_strength": 0.80},
+                    "layer4": {"source_flags": {"vwap_quality": "live"}},
+                    "layer5": {"tp_sl_strength": 0.84},
+                },
+                market_extras={
+                    "mtf_trend_5m": 0.0090,
+                    "mtf_rsi_5m": 64.0,
+                    "volume_spike": 0.55,
+                    "vwap_dist": 0.004,
+                    "adx": 28.0,
+                },
+            )
+        )
+        self.assertFalse(decision.approved)
+        self.assertEqual(decision.reason, "low_volume_pullback_without_displacement")
+
+    def test_allows_live_drive_after_real_failure(self):
+        gate = EntryGate(EntryGateConfig(min_score=0.70))
+        decision = gate.evaluate(
+            self._candidate(
+                latest_open=100.45,
+                latest_high=101.0,
+                latest_low=99.2,
+                latest_close=100.0,
+                recent_high=101.0,
+                market_extras={
+                    "mtf_trend_5m": 0.0090,
+                    "mtf_rsi_5m": 64.0,
+                    "volume_spike": 0.55,
+                    "vwap_dist": 0.004,
+                    "adx": 28.0,
+                },
+            )
+        )
+        self.assertTrue(decision.approved)
+        self.assertEqual(decision.reason, "approved")
+
+    def test_rejects_bad_microstructure_execution_risk(self):
+        gate = EntryGate(EntryGateConfig(min_score=0.70))
+        decision = gate.evaluate(
+            self._candidate(
+                market_extras={
+                    "spread_bps": 42.0,
+                    "expected_slippage_bps": 8.0,
+                    "depth_ratio": 1.4,
+                },
+            )
+        )
+        self.assertFalse(decision.approved)
+        self.assertEqual(decision.reason, "microstructure_execution_risk")
+        self.assertIn("spread_too_wide", decision.diagnostics["hard_reasons"])
+
+    def test_penalizes_soft_microstructure_without_hard_reject(self):
+        gate = EntryGate(EntryGateConfig(min_score=0.60))
+        decision = gate.evaluate(
+            self._candidate(
+                market_extras={
+                    "spread_bps": 23.0,
+                    "expected_slippage_bps": 31.0,
+                    "depth_ratio": 0.92,
+                    "bid_ask_imbalance": 0.72,
+                    "aggressor_exhaustion": 0.12,
+                },
+            )
+        )
+        self.assertTrue(decision.approved)
+        self.assertTrue(decision.flags["microstructure_soft_risk"])
+        self.assertGreater(decision.penalties["microstructure_soft_risk"], 0.0)
+        self.assertIn("microstructure_context", decision.diagnostics)
+
+    def test_signal_candidate_collects_microstructure_from_context(self):
+        class Signal:
+            signal_id = "sig-context"
+            side = "SHORT"
+            entry = 100.0
+            sl = 101.0
+            tp = 98.0
+            confidence = 0.9
+            created_at = 1.0
+            details = {}
+
+        class Context:
+            symbol = "BTCUSDT"
+            timeframe = "1m"
+            mark_price = 100.0
+            spread_bps = 12.0
+            expected_slippage_bps = 4.0
+            depth_ratio = 1.8
+            bid_ask_imbalance = 0.44
+            aggressor_exhaustion = 0.72
+
+        candidate = SignalCandidate.from_signal(
+            signal=Signal(),
+            context=Context(),
+            enriched=pd.DataFrame(
+                [{"open": 99.8, "high": 100.5, "low": 99.5, "close": 100.0, "atr": 1.0}]
+            ),
+        )
+        self.assertEqual(candidate.market_extras["spread_bps"], 12.0)
+        self.assertEqual(candidate.market_extras["expected_slippage_bps"], 4.0)
+        self.assertEqual(candidate.market_extras["depth_ratio"], 1.8)
+        self.assertEqual(candidate.market_extras["bid_ask_imbalance"], 0.44)
+        self.assertEqual(candidate.market_extras["aggressor_exhaustion"], 0.72)
 
     def test_can_require_mtf_context(self):
         gate = EntryGate(EntryGateConfig(require_mtf_context=True))
