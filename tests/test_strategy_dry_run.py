@@ -17,6 +17,7 @@ try:
         _build_main_signal_signature,
         _build_early_watch_candidate,
         _build_higher_timeframe_chart,
+        _build_ultra_entry_candidate,
         _alert_context_timeframe,
         _current_recent_peak_price,
         _enrich_intent_with_runtime_market_metadata,
@@ -3283,6 +3284,67 @@ class SignalGeneratorTests(unittest.TestCase):
 
         self.assertEqual(sig_a, sig_b)
         self.assertNotIn("legacy|", sig_a)
+
+    def test_ultra_entry_candidate_accepts_only_precision_a_plus(self):
+        df = self._build_df()
+        intent = SimpleNamespace(
+            action=IntentAction.SHORT_ENTRY,
+            reason="ultra_short_entry",
+            take_profit=102.0,
+            stop_loss=114.0,
+            confidence=0.88,
+            metadata={
+                "signal_profile": "ultra",
+                "ultra_grade": "A+",
+                "ultra_score": 0.88,
+                "continuation_risk": 1.04,
+                "rr": 1.90,
+                "entry_price": 108.55,
+                "ultra_scenario": "sweep_failure_short",
+                "setup_signature": "ultra-setup",
+            },
+        )
+
+        candidate = _build_ultra_entry_candidate(
+            symbol="BTCUSDT",
+            timeframe="1m",
+            mode="demo",
+            enriched=df,
+            intent=intent,
+        )
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate["phase"], "ULTRA_ENTRY")
+        self.assertEqual(candidate["ultra_grade"], "A+")
+        self.assertEqual(candidate["ultra_scenario"], "sweep_failure_short")
+
+    def test_ultra_entry_candidate_rejects_a_grade_for_ultra_channel(self):
+        df = self._build_df()
+        intent = SimpleNamespace(
+            action=IntentAction.SHORT_ENTRY,
+            reason="ultra_short_entry",
+            take_profit=102.0,
+            stop_loss=114.0,
+            confidence=0.84,
+            metadata={
+                "signal_profile": "ultra",
+                "ultra_grade": "A",
+                "ultra_score": 0.84,
+                "continuation_risk": 1.05,
+                "rr": 1.90,
+                "entry_price": 108.55,
+            },
+        )
+
+        candidate = _build_ultra_entry_candidate(
+            symbol="BTCUSDT",
+            timeframe="1m",
+            mode="demo",
+            enriched=df,
+            intent=intent,
+        )
+
+        self.assertIsNone(candidate)
 
     def test_live_main_short_continuation_blocks_late_rebound_below_vah_without_trigger(self):
         df = self._build_df()

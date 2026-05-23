@@ -2283,6 +2283,78 @@ def _build_ultra_early_candidate(*, symbol: str, timeframe: str, mode: str, enri
     }
 
 
+def _build_ultra_entry_candidate(*, symbol: str, timeframe: str, mode: str, enriched, intent) -> dict[str, object] | None:
+    if getattr(intent, "action", None) != IntentAction.SHORT_ENTRY:
+        return None
+    if str(getattr(intent, "reason", "") or "") != "ultra_short_entry":
+        return None
+    metadata = getattr(intent, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return None
+    if str(metadata.get("signal_profile") or "").strip().lower() != "ultra":
+        return None
+
+    grade = str(metadata.get("ultra_grade") or "").strip().upper()
+    min_grade = str(os.getenv("ULTRA_ENTRY_MIN_GRADE", "A+") or "A+").strip().upper()
+    if min_grade == "A+" and grade != "A+":
+        return None
+    if min_grade == "A" and grade not in {"A", "A+"}:
+        return None
+
+    score = _as_float(metadata.get("ultra_score"), _as_float(getattr(intent, "confidence", 0.0), 0.0))
+    min_score = _early_config_float("ULTRA_ENTRY_MIN_SCORE", 0.86)
+    if score < min_score:
+        return None
+
+    continuation_risk = _as_float(metadata.get("continuation_risk"), 99.0)
+    max_continuation_risk = _early_config_float("ULTRA_ENTRY_MAX_CONTINUATION_RISK", 1.15)
+    if continuation_risk > max_continuation_risk:
+        return None
+
+    rr = _as_float(metadata.get("rr"), 0.0)
+    min_rr = _early_config_float("ULTRA_ENTRY_MIN_RR", 1.80)
+    if rr < min_rr:
+        return None
+
+    close = _last_frame_float(enriched, "close", 0.0)
+    entry = _as_float(metadata.get("entry_price"), close)
+    tp = _as_float(getattr(intent, "take_profit", None), 0.0)
+    sl = _as_float(getattr(intent, "stop_loss", None), 0.0)
+    if entry <= 0.0 or tp <= 0.0 or sl <= 0.0:
+        return None
+
+    quality_score = min(max(score * 10.0, 0.0), 10.0)
+    caption = build_signal_caption(
+        symbol=symbol,
+        timeframe=timeframe,
+        mode=mode,
+        action_label="ULTRA SHORT ENTRY",
+        entry=entry,
+        tp=tp,
+        sl=sl,
+        confidence=score,
+        reason=str(getattr(intent, "reason", "") or "ultra_short_entry"),
+        trace_meta=metadata,
+        enriched=enriched,
+    )
+    diagnostics = metadata.get("ultra_diagnostics")
+    return {
+        "phase": "ULTRA_ENTRY",
+        "caption": caption,
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "quality_score": quality_score,
+        "ultra_score": score,
+        "ultra_phase": "ULTRA_ENTRY",
+        "ultra_scenario": str(metadata.get("ultra_scenario") or ""),
+        "ultra_grade": grade,
+        "ultra_version": str(metadata.get("strategy_version") or ""),
+        "ultra_features": dict(diagnostics) if isinstance(diagnostics, Mapping) else {},
+        "setup_signature": str(metadata.get("setup_signature") or ""),
+    }
+
+
 def _maybe_emit_ultra_early_signal(
     *,
     symbol: str,
@@ -2304,13 +2376,21 @@ def _maybe_emit_ultra_early_signal(
         return False
 
     try:
-        candidate = _build_ultra_early_candidate(
+        candidate = _build_ultra_entry_candidate(
             symbol=symbol,
             timeframe=timeframe,
             mode=mode,
             enriched=enriched,
             intent=intent,
         )
+        if not isinstance(candidate, Mapping) and _env_flag("ULTRA_RADAR_CHANNEL_ENABLED", False):
+            candidate = _build_ultra_early_candidate(
+                symbol=symbol,
+                timeframe=timeframe,
+                mode=mode,
+                enriched=enriched,
+                intent=intent,
+            )
     except Exception as exc:
         logger.debug(
             "ultra_early_candidate_error symbol=%s err=%s",
@@ -2339,16 +2419,25 @@ def _maybe_emit_ultra_early_signal(
             refreshed_features = refreshed["features"]
             enriched = refreshed_features.enriched
             mark_price = _as_float(refreshed.get("mark_price"), mark_price)
+            intent = refreshed.get("intent", intent)
             refreshed_extras = refreshed.get("extras")
             if isinstance(refreshed_extras, Mapping):
                 extras = dict(extras or {}) | dict(refreshed_extras)
-            candidate = _build_ultra_early_candidate(
+            candidate = _build_ultra_entry_candidate(
                 symbol=symbol,
                 timeframe=timeframe,
                 mode=mode,
                 enriched=enriched,
                 intent=intent,
             )
+            if not isinstance(candidate, Mapping) and _env_flag("ULTRA_RADAR_CHANNEL_ENABLED", False):
+                candidate = _build_ultra_early_candidate(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    mode=mode,
+                    enriched=enriched,
+                    intent=intent,
+                )
             if not isinstance(candidate, Mapping):
                 stats["ultra_live_rejected"] = int(stats.get("ultra_live_rejected", 0)) + 1
                 return False
