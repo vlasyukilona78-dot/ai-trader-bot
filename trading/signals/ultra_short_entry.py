@@ -122,7 +122,7 @@ class UltraShortFeatures:
     cvd_delta: float
     swept_above: bool
     downside_magnet: bool
-    upside_risk: bool
+    upside_risk: float
     failed_reclaim: bool
     retest_failed_breakout: bool
     acceptance_above_high: bool
@@ -412,7 +412,7 @@ class UltraShortEntryDetector:
 
         swept_above = _safe_bool(_mapping_get(liquidation_map, "swept_above", latest.get("swept_above", False)))
         downside_magnet = _safe_bool(_mapping_get(liquidation_map, "downside_magnet", latest.get("downside_magnet", False)))
-        upside_risk = _safe_bool(_mapping_get(liquidation_map, "upside_risk", latest.get("upside_risk", False)))
+        upside_risk = max(0.0, _safe_float(_mapping_get(liquidation_map, "upside_risk", latest.get("upside_risk", 0.0)), 0.0))
 
         return UltraShortFeatures(
             symbol=str(context.symbol).replace("/", "").upper(),
@@ -537,7 +537,7 @@ class UltraShortEntryDetector:
         return _clamp(score)
 
     def _downside_target_score(self, features: UltraShortFeatures) -> float:
-        targets = self._target_candidates(features)
+        targets = self._target_candidates(features, include_synthetic=False)
         best_move = max([move for _, _, move in targets], default=0.0)
         score = 0.0
         if best_move >= self.config.tp_min_move_pct:
@@ -571,8 +571,8 @@ class UltraShortEntryDetector:
             risk += 0.18
         if features.mtf_trend_15m > 0.0025 and features.mtf_rsi_15m >= 60.0:
             risk += 0.18
-        if features.upside_risk:
-            risk += 0.22
+        if features.upside_risk > 0.0:
+            risk += min(0.65, features.upside_risk * 0.25)
         if features.swept_above:
             risk -= 0.12
         if features.failed_reclaim or features.retest_failed_breakout:
@@ -688,7 +688,7 @@ class UltraShortEntryDetector:
         best_source = ""
         best_rr = 0.0
         best_move = 0.0
-        for source, target, move_pct in self._target_candidates(features):
+        for source, target, move_pct in self._target_candidates(features, include_synthetic=False):
             reward = entry - target
             rr = reward / risk if risk > 0 else 0.0
             if rr >= self.config.min_rr and (best_target <= 0.0 or target > best_target):
@@ -713,7 +713,7 @@ class UltraShortEntryDetector:
                 "target_move_pct": best_move,
                 "targets": [
                     {"source": source, "target": target, "move_pct": move_pct}
-                    for source, target, move_pct in self._target_candidates(features)
+                    for source, target, move_pct in self._target_candidates(features, include_synthetic=True)
                 ],
             }
         )
@@ -763,16 +763,22 @@ class UltraShortEntryDetector:
     ) -> UltraShortDecision:
         return self._reject(symbol=features.symbol, timeframe=features.timeframe, reason=reason, diagnostics=diagnostics)
 
-    def _target_candidates(self, features: UltraShortFeatures) -> list[tuple[str, float, float]]:
+    def _target_candidates(self, features: UltraShortFeatures, *, include_synthetic: bool) -> list[tuple[str, float, float]]:
         targets: list[tuple[str, float, float]] = []
-        for source, value in (
+        raw_targets: list[tuple[str, float]] = [
             ("vwap", features.vwap),
             ("poc", features.poc),
             ("val", features.val),
-            ("fixed_3pct", features.close * (1.0 - self.config.tp_min_move_pct)),
-            ("fixed_5pct", features.close * 0.95),
-            ("fixed_7pct", features.close * (1.0 - self.config.tp_max_move_pct)),
-        ):
+        ]
+        if include_synthetic:
+            raw_targets.extend(
+                [
+                    ("fixed_3pct", features.close * (1.0 - self.config.tp_min_move_pct)),
+                    ("fixed_5pct", features.close * 0.95),
+                    ("fixed_7pct", features.close * (1.0 - self.config.tp_max_move_pct)),
+                ]
+            )
+        for source, value in raw_targets:
             if value <= 0.0 or value >= features.close:
                 continue
             move_pct = (features.close - value) / features.close
