@@ -20,6 +20,7 @@ class RuntimeFlags:
     reconciliation_required: bool = True
     feature_runtime_enabled: bool = True
     ml_inference_enabled: bool = False
+    sentiment_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,10 @@ class RuntimeConfig:
     max_exchange_retries: int
     maintenance_interval_sec: int
     live_startup_max_notional_usdt: float
+    sentiment_api_url: str
+    sentiment_refresh_sec: int
+    sentiment_timeout_sec: int
+    sentiment_max_age_sec: int
 
 
 
@@ -107,6 +112,7 @@ def load_runtime_config() -> RuntimeConfig:
         reconciliation_required=_env_bool("RECONCILIATION_REQUIRED", True),
         feature_runtime_enabled=_env_bool("FEATURE_RUNTIME_ENABLED", True),
         ml_inference_enabled=_env_bool("ML_INFERENCE_ENABLED", False),
+        sentiment_enabled=_env_bool("SENTIMENT_ENABLED", True),
     )
 
     alerts = AlertConfig(
@@ -173,6 +179,10 @@ def load_runtime_config() -> RuntimeConfig:
         max_exchange_retries=int(os.getenv("EXEC_MAX_EXCHANGE_RETRIES", "2")),
         maintenance_interval_sec=int(os.getenv("RUNTIME_MAINTENANCE_INTERVAL_SEC", "300")),
         live_startup_max_notional_usdt=float(os.getenv("LIVE_STARTUP_MAX_NOTIONAL_USDT", "0")),
+        sentiment_api_url=str(os.getenv("SENTIMENT_API_URL", "https://api.alternative.me/fng/")),
+        sentiment_refresh_sec=int(os.getenv("SENTIMENT_REFRESH_SEC", "60")),
+        sentiment_timeout_sec=int(os.getenv("SENTIMENT_TIMEOUT_SEC", "5")),
+        sentiment_max_age_sec=int(os.getenv("SENTIMENT_MAX_AGE_SEC", "300")),
     )
     validate_runtime_config(cfg)
     return cfg
@@ -238,6 +248,14 @@ def validate_runtime_config(cfg: RuntimeConfig):
 
     if cfg.maintenance_interval_sec < 30:
         raise ConfigError("RUNTIME_MAINTENANCE_INTERVAL_SEC must be >= 30")
+
+    if cfg.flags.sentiment_enabled:
+        if cfg.sentiment_refresh_sec < 1:
+            raise ConfigError("SENTIMENT_REFRESH_SEC must be >= 1")
+        if cfg.sentiment_timeout_sec < 1:
+            raise ConfigError("SENTIMENT_TIMEOUT_SEC must be >= 1")
+        if cfg.sentiment_max_age_sec < cfg.sentiment_refresh_sec:
+            raise ConfigError("SENTIMENT_MAX_AGE_SEC must be >= SENTIMENT_REFRESH_SEC")
 
     if cfg.flags.feature_runtime_enabled:
         _require_modules(["numpy", "pandas"], context="feature_runtime")

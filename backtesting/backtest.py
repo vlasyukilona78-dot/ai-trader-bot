@@ -121,6 +121,7 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
             volume_profile=vp,
             regime=regime,
             sentiment_index=sentiment,
+            sentiment_source="backtest",
             funding_rate=funding,
             long_short_ratio=ratio,
         )
@@ -206,6 +207,7 @@ class PaperTrader:
             volume_profile=vp,
             regime=regime,
             sentiment_index=sentiment_index,
+            sentiment_source="paper",
             funding_rate=funding_rate,
             long_short_ratio=1.0,
         )
@@ -221,7 +223,40 @@ def parse_args():
     parser.add_argument("--max-hold", type=int, default=120)
     parser.add_argument("--fee-bps", type=float, default=5.0)
     parser.add_argument("--slippage-bps", type=float, default=2.0)
+    parser.add_argument("--rsi-low", type=float, default=None, help="Override SignalConfig.rsi_low")
+    parser.add_argument("--rsi-high", type=float, default=None, help="Override SignalConfig.rsi_high")
+    parser.add_argument(
+        "--volume-spike-threshold", type=float, default=None, help="Override SignalConfig.volume_spike_threshold"
+    )
+    parser.add_argument(
+        "--entry-tolerance-pct", type=float, default=None, help="Override SignalConfig.entry_tolerance_pct"
+    )
+    parser.add_argument(
+        "--confirmation-enabled", dest="confirmation_enabled", action="store_true", default=None,
+        help="Override SignalConfig.confirmation_enabled=True",
+    )
+    parser.add_argument(
+        "--no-confirmation-enabled", dest="confirmation_enabled", action="store_false", default=None,
+        help="Override SignalConfig.confirmation_enabled=False",
+    )
+    parser.add_argument(
+        "--confirmation-max-wait-bars", type=int, default=None,
+        help="Override SignalConfig.confirmation_max_wait_bars",
+    )
     return parser.parse_args()
+
+
+def _signal_config_overrides(args) -> SignalConfig | None:
+    field_map = {
+        "rsi_low": args.rsi_low,
+        "rsi_high": args.rsi_high,
+        "volume_spike_threshold": args.volume_spike_threshold,
+        "entry_tolerance_pct": args.entry_tolerance_pct,
+        "confirmation_enabled": args.confirmation_enabled,
+        "confirmation_max_wait_bars": args.confirmation_max_wait_bars,
+    }
+    overrides = {k: v for k, v in field_map.items() if v is not None}
+    return SignalConfig(**overrides) if overrides else None
 
 
 if __name__ == "__main__":
@@ -236,6 +271,7 @@ if __name__ == "__main__":
             fee_bps_per_side=float(args.fee_bps),
             slippage_bps_per_side=float(args.slippage_bps),
         ),
+        signal_cfg=_signal_config_overrides(args),
     )
 
     out_path = Path(args.out)

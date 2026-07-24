@@ -9,6 +9,7 @@ from trading.alerts.discord import DiscordAlerter
 from trading.alerts.telegram import TelegramAlerter
 from trading.execution.engine import ExecutionEngine
 from trading.exchange.bybit_adapter import BybitAdapter
+from trading.market_data.sentiment import SentimentFeed, SentimentFeedConfig
 from trading.metrics.counters import MetricsCounter
 from trading.metrics.logging import setup_logging
 from trading.risk.engine import RiskEngine
@@ -95,8 +96,14 @@ def run_cycle(
     candles_limit: int,
     alerters,
     state_alert_cache: dict[str, str],
+    sentiment_feed: SentimentFeed | None = None,
 ):
     sync.pull_adapter_events(adapter)
+
+    if sentiment_feed is not None:
+        sentiment_value, sentiment_source = sentiment_feed.get_sentiment()
+    else:
+        sentiment_value, sentiment_source = 50.0, "fallback_neutral_50"
 
     for symbol in symbols:
         try:
@@ -154,8 +161,8 @@ def run_cycle(
 
             as_of = frame.ohlcv.index[-1]
             extras = {
-                "sentiment_index": 50.0,
-                "sentiment_source": "fallback_neutral_50",
+                "sentiment_index": sentiment_value,
+                "sentiment_source": sentiment_source,
                 "funding_rate": None,
                 "long_short_ratio": None,
             }
@@ -297,6 +304,18 @@ def main() -> int:
     strategy = _build_strategy(args.strategy)
     counters = MetricsCounter()
     alerters = _build_alerters(cfg)
+    sentiment_feed = (
+        SentimentFeed(
+            SentimentFeedConfig(
+                url=cfg.sentiment_api_url,
+                refresh_sec=cfg.sentiment_refresh_sec,
+                timeout_sec=cfg.sentiment_timeout_sec,
+                max_age_sec=cfg.sentiment_max_age_sec,
+            )
+        )
+        if cfg.flags.sentiment_enabled
+        else None
+    )
 
     startup_state = _startup_reconcile(
         symbols=cfg.symbols,
@@ -345,6 +364,7 @@ def main() -> int:
                 candles_limit=cfg.candles_limit,
                 alerters=alerters,
                 state_alert_cache=state_alert_cache,
+                sentiment_feed=sentiment_feed,
             )
 
             now = time.time()
@@ -374,6 +394,8 @@ def main() -> int:
         feed.close()
         adapter.close()
         runtime_store.close()
+        if sentiment_feed is not None:
+            sentiment_feed.close()
 
     return 0
 

@@ -13,21 +13,24 @@ from .volume_profile import VolumeProfileLevels
 
 @dataclass
 class SignalConfig:
-    rsi_high: float = 68.0
-    rsi_low: float = 32.0
-    volume_spike_threshold: float = 1.6
+    rsi_high: float = 75.0
+    rsi_low: float = 25.0
+    volume_spike_threshold: float = 2.5
     weakness_lookback: int = 4
     sentiment_bullish_threshold: float = 68.0
     sentiment_bearish_threshold: float = 32.0
     risk_reward: float = 1.6
     atr_sl_mult: float = 1.0
-    entry_tolerance_pct: float = 0.004
+    entry_tolerance_pct: float = 0.0015
     vwap_tolerance_pct: float = 0.0025
     funding_tolerance: float = 0.0003
     long_short_ratio_tolerance: float = 0.10
     msb_lookback: int = 20
     msb_recent_bars: int = 6
     msb_break_buffer_pct: float = 0.0005
+    confirmation_enabled: bool = True
+    confirmation_max_wait_bars: int = 3
+    confirmation_invalidate_pct: float = 0.0015
 
 
 @dataclass
@@ -58,10 +61,22 @@ class SignalResult:
     details: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class PendingCandidate:
+    symbol: str
+    side: str
+    armed_bar_ts: Any
+    armed_close: float
+    last_seen_bar_ts: Any
+    bars_waited: int = 0
+    layer_snapshot: dict = field(default_factory=dict)
+
+
 class SignalGenerator:
     def __init__(self, config: SignalConfig | None = None):
         self.config = config or SignalConfig()
         self.last_diagnostics: dict[str, Any] = {}
+        self._pending: dict[str, PendingCandidate] = {}
 
     @staticmethod
     def _safe(value: Any, default: float = 0.0) -> float:
@@ -107,8 +122,8 @@ class SignalGenerator:
         if band_down:
             panic_points += 1
 
-        pump = band_up and pump_points >= 2
-        panic = band_down and panic_points >= 2
+        pump = band_up and pump_points >= 3
+        panic = band_down and panic_points >= 3
 
         metrics.update(
             {
@@ -356,39 +371,26 @@ class SignalGenerator:
                 sl = entry - min_step
         return float(tp), float(sl)
 
-    def generate(self, context: SignalContext) -> SignalResult | None:
-        df = context.df
-        trace: dict[str, Any] = {
-            "strategy_model": "layered_table_5_softened",
-            "failed_layer": None,
-            "layers": {},
-        }
-
-        if df.empty or len(df) < 40:
-            trace["failed_layer"] = "layer0_input"
-            trace["layers"]["layer0_input"] = {"passed": False, "details": {"insufficient_history": 1.0}}
-            self.last_diagnostics = trace
-            return None
-
+    def _evaluate_gates(
+        self, df: pd.DataFrame, context: SignalContext, trace: dict[str, Any]
+    ) -> tuple[str, dict, dict, dict, dict] | None:
+        """Run layers 1-4. Returns (side, layer1, layer2, layer3, layer4) on full pass, else None."""
         side, layer1 = self._layer1_pump_detection(df)
         trace["layers"]["layer1_pump_detection"] = {"passed": side is not None, "side": side or "", "details": layer1}
         if side is None:
             trace["failed_layer"] = "layer1_pump_detection"
-            self.last_diagnostics = trace
             return None
 
         layer2_ok, layer2 = self._layer2_weakness_confirmation(df, side)
         trace["layers"]["layer2_weakness_confirmation"] = {"passed": layer2_ok, "details": layer2}
         if not layer2_ok:
             trace["failed_layer"] = "layer2_weakness_confirmation"
-            self.last_diagnostics = trace
             return None
 
         layer3_ok, layer3 = self._layer3_entry_location(df, side, context.volume_profile)
         trace["layers"]["layer3_entry_location"] = {"passed": layer3_ok, "details": layer3}
         if not layer3_ok:
             trace["failed_layer"] = "layer3_entry_location"
-            self.last_diagnostics = trace
             return None
 
         layer4_ok, layer4 = self._layer4_fake_filter(
@@ -402,10 +404,23 @@ class SignalGenerator:
         trace["layers"]["layer4_fake_filter"] = {"passed": layer4_ok, "details": layer4}
         if not layer4_ok:
             trace["failed_layer"] = "layer4_fake_filter"
-            self.last_diagnostics = trace
             return None
 
-        entry = float(df.iloc[-1]["close"])
+        return side, layer1, layer2, layer3, layer4
+
+    def _finalize_signal(
+        self,
+        df: pd.DataFrame,
+        context: SignalContext,
+        side: str,
+        layer1: dict,
+        layer2: dict,
+        layer3: dict,
+        layer4: dict,
+        trace: dict[str, Any],
+        entry: float | None = None,
+    ) -> SignalResult:
+        entry = float(entry if entry is not None else df.iloc[-1]["close"])
         tp, sl, partial_tps = self._layer5_tp_sl_levels(df, side, context.volume_profile)
         tp, sl = self._normalize_levels(entry=entry, tp=tp, sl=sl, side=side)
 
@@ -448,3 +463,135 @@ class SignalGenerator:
                 "regime": context.regime.value,
             },
         )
+
+    def generate(self, context: SignalContext) -> SignalResult | None:
+        df = context.df
+        trace: dict[str, Any] = {
+            "strategy_model": "layered_table_5_softened",
+            "failed_layer": None,
+            "layers": {},
+        }
+
+        if df.empty or len(df) < 40:
+            trace["failed_layer"] = "layer0_input"
+            trace["layers"]["layer0_input"] = {"passed": False, "details": {"insufficient_history": 1.0}}
+            self.last_diagnostics = trace
+            return None
+
+        if not self.config.confirmation_enabled:
+            gates = self._evaluate_gates(df, context, trace)
+            if gates is None:
+                self.last_diagnostics = trace
+                return None
+            side, layer1, layer2, layer3, layer4 = gates
+            return self._finalize_signal(df, context, side, layer1, layer2, layer3, layer4, trace)
+
+        return self._generate_with_confirmation(df, context, trace)
+
+    def _generate_with_confirmation(
+        self, df: pd.DataFrame, context: SignalContext, trace: dict[str, Any]
+    ) -> SignalResult | None:
+        bar_ts = df.index[-1]
+        pending = self._pending.get(context.symbol)
+
+        if pending is not None:
+            if bar_ts == pending.last_seen_bar_ts:
+                trace["failed_layer"] = "layer_confirmation_pending"
+                trace["layers"]["layer_confirmation"] = {
+                    "passed": False,
+                    "details": {"status": "same_bar", "bars_waited": float(pending.bars_waited)},
+                }
+                self.last_diagnostics = trace
+                return None
+
+            close_now = float(df.iloc[-1]["close"])
+            pending.last_seen_bar_ts = bar_ts
+
+            if pending.side == "LONG":
+                confirmed = close_now > pending.armed_close
+                invalidated = close_now <= pending.armed_close * (1.0 - self.config.confirmation_invalidate_pct)
+            else:
+                confirmed = close_now < pending.armed_close
+                invalidated = close_now >= pending.armed_close * (1.0 + self.config.confirmation_invalidate_pct)
+
+            if invalidated:
+                del self._pending[context.symbol]
+                trace["failed_layer"] = "layer_confirmation_invalidated"
+                trace["layers"]["layer_confirmation"] = {
+                    "passed": False,
+                    "details": {
+                        "status": "invalidated",
+                        "armed_close": float(pending.armed_close),
+                        "close_now": close_now,
+                        "bars_waited": float(pending.bars_waited),
+                    },
+                }
+                self.last_diagnostics = trace
+                return None
+
+            if confirmed:
+                del self._pending[context.symbol]
+                side = pending.side
+                layer1 = pending.layer_snapshot["layer1"]
+                layer2 = pending.layer_snapshot["layer2"]
+                layer3 = pending.layer_snapshot["layer3"]
+                layer4 = pending.layer_snapshot["layer4"]
+                trace["layers"]["layer1_pump_detection"] = {"passed": True, "side": side, "details": layer1}
+                trace["layers"]["layer2_weakness_confirmation"] = {"passed": True, "details": layer2}
+                trace["layers"]["layer3_entry_location"] = {"passed": True, "details": layer3}
+                trace["layers"]["layer4_fake_filter"] = {"passed": True, "details": layer4}
+                trace["layers"]["layer_confirmation"] = {
+                    "passed": True,
+                    "details": {
+                        "status": "confirmed",
+                        "armed_bar_ts": str(pending.armed_bar_ts),
+                        "armed_close": float(pending.armed_close),
+                        "confirmed_bar_ts": str(bar_ts),
+                        "confirmed_close": close_now,
+                        "bars_waited": float(pending.bars_waited),
+                    },
+                }
+                return self._finalize_signal(df, context, side, layer1, layer2, layer3, layer4, trace, entry=close_now)
+
+            pending.bars_waited += 1
+            if pending.bars_waited >= self.config.confirmation_max_wait_bars:
+                del self._pending[context.symbol]
+                trace["failed_layer"] = "layer_confirmation_expired"
+                trace["layers"]["layer_confirmation"] = {
+                    "passed": False,
+                    "details": {"status": "expired", "bars_waited": float(pending.bars_waited)},
+                }
+                self.last_diagnostics = trace
+                return None
+
+            trace["failed_layer"] = "layer_confirmation_pending"
+            trace["layers"]["layer_confirmation"] = {
+                "passed": False,
+                "details": {"status": "waiting", "bars_waited": float(pending.bars_waited)},
+            }
+            self.last_diagnostics = trace
+            return None
+
+        gates = self._evaluate_gates(df, context, trace)
+        if gates is None:
+            self.last_diagnostics = trace
+            return None
+
+        side, layer1, layer2, layer3, layer4 = gates
+        armed_close = float(df.iloc[-1]["close"])
+        self._pending[context.symbol] = PendingCandidate(
+            symbol=context.symbol,
+            side=side,
+            armed_bar_ts=bar_ts,
+            armed_close=armed_close,
+            last_seen_bar_ts=bar_ts,
+            bars_waited=0,
+            layer_snapshot={"layer1": layer1, "layer2": layer2, "layer3": layer3, "layer4": layer4},
+        )
+        trace["failed_layer"] = "layer_confirmation_pending"
+        trace["layers"]["layer_confirmation"] = {
+            "passed": False,
+            "details": {"status": "armed", "armed_close": armed_close, "bars_waited": 0.0},
+        }
+        self.last_diagnostics = trace
+        return None

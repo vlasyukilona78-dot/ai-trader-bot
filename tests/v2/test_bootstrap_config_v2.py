@@ -88,6 +88,61 @@ class BootstrapConfigV2Tests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 load_runtime_config()
 
+    def test_sentiment_defaults_enabled(self):
+        env = {
+            "BOT_RUNTIME_MODE": "paper",
+            "WS_ENABLED": "false",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_runtime_config()
+            self.assertTrue(cfg.flags.sentiment_enabled)
+            self.assertEqual(cfg.sentiment_api_url, "https://api.alternative.me/fng/")
+            self.assertEqual(cfg.sentiment_refresh_sec, 60)
+            self.assertEqual(cfg.sentiment_timeout_sec, 5)
+            self.assertEqual(cfg.sentiment_max_age_sec, 300)
+
+    def test_sentiment_can_be_disabled(self):
+        env = {
+            "BOT_RUNTIME_MODE": "paper",
+            "SENTIMENT_ENABLED": "false",
+            "WS_ENABLED": "false",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_runtime_config()
+            self.assertFalse(cfg.flags.sentiment_enabled)
+
+    def test_sentiment_refresh_sec_must_be_positive(self):
+        env = {
+            "BOT_RUNTIME_MODE": "paper",
+            "SENTIMENT_REFRESH_SEC": "0",
+            "WS_ENABLED": "false",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(ConfigError):
+                load_runtime_config()
+
+    def test_sentiment_max_age_must_not_be_below_refresh(self):
+        env = {
+            "BOT_RUNTIME_MODE": "paper",
+            "SENTIMENT_REFRESH_SEC": "120",
+            "SENTIMENT_MAX_AGE_SEC": "60",
+            "WS_ENABLED": "false",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(ConfigError):
+                load_runtime_config()
+
+    def test_sentiment_bounds_ignored_when_disabled(self):
+        env = {
+            "BOT_RUNTIME_MODE": "paper",
+            "SENTIMENT_ENABLED": "false",
+            "SENTIMENT_REFRESH_SEC": "0",
+            "WS_ENABLED": "false",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_runtime_config()
+            self.assertFalse(cfg.flags.sentiment_enabled)
+
 
 if __name__ == "__main__":
     unittest.main()
