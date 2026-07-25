@@ -5,14 +5,24 @@ from core.signal_generator import SignalConfig, SignalContext, SignalGenerator
 from core.volume_profile import compute_volume_profile
 from trading.signals.signal_types import IntentAction, StrategyIntent
 from trading.signals.strategy_interface import StrategyContext, StrategyInterface
+from trading.signals.volatility_context import VolatilityContext, VolatilityContextConfig
 from trading.state.models import TradeState
 
 
 class LayeredPumpStrategy(StrategyInterface):
     """Adapter around migrated layered strategy that returns intents only."""
 
-    def __init__(self, config: SignalConfig | None = None):
+    def __init__(
+        self,
+        config: SignalConfig | None = None,
+        volatility_context: VolatilityContext | None = None,
+    ):
         self._generator = SignalGenerator(config or SignalConfig())
+        # Every scanned symbol contributes its volatility, so the gate compares a
+        # candidate against the rest of the board rather than a fixed number.
+        self._volatility = volatility_context or VolatilityContext(
+            VolatilityContextConfig(fallback_floor=self._generator.config.min_atr_pct)
+        )
 
     def _trace_meta(self) -> dict:
         trace = self._generator.last_diagnostics if isinstance(self._generator.last_diagnostics, dict) else {}
@@ -40,6 +50,13 @@ class LayeredPumpStrategy(StrategyInterface):
 
         regime = detect_market_regime(enriched)
         vp = compute_volume_profile(enriched)
+
+        last = enriched.iloc[-1]
+        close = float(last.get("close") or 0.0)
+        atr = float(last.get("atr") or 0.0)
+        if close > 0 and atr > 0:
+            self._volatility.observe(context.symbol, atr / close)
+
         signal = self._generator.generate(
             SignalContext(
                 symbol=context.symbol,
@@ -50,6 +67,7 @@ class LayeredPumpStrategy(StrategyInterface):
                 sentiment_source=context.sentiment_source,
                 funding_rate=context.funding_rate,
                 long_short_ratio=context.long_short_ratio,
+                atr_floor=self._volatility.floor(),
             )
         )
         trace_meta = self._trace_meta()

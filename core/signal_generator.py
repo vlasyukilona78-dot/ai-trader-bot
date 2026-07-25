@@ -77,6 +77,10 @@ class SignalContext:
     sentiment_source: str | None
     funding_rate: float | None
     long_short_ratio: float | None
+    # Cross-sectional volatility cutoff for this scan. When supplied it replaces
+    # SignalConfig.min_atr_pct, so the gate tracks the current market regime
+    # instead of a number fitted to one period.
+    atr_floor: float | None = None
 
 
 @dataclass
@@ -280,7 +284,7 @@ class SignalGenerator:
             return "LONG", metrics
         return None, metrics
 
-    def _layer1b_quality_gate(self, df: pd.DataFrame) -> tuple[bool, dict[str, float]]:
+    def _layer1b_quality_gate(self, df: pd.DataFrame, atr_floor: float | None = None) -> tuple[bool, dict[str, float]]:
         """Reject pumps that historically fail to resolve: calm or illiquid ones.
 
         Low-volatility pumps drift instead of dumping (86% resolve vs 99% for the
@@ -301,12 +305,14 @@ class SignalGenerator:
             .sum()
         )
 
-        atr_ok = atr_pct >= cfg.min_atr_pct if cfg.min_atr_pct > 0 else True
+        effective_floor = cfg.min_atr_pct if atr_floor is None else atr_floor
+        atr_ok = atr_pct >= effective_floor if effective_floor > 0 else True
         liq_ok = usd_volume >= cfg.min_hourly_usd_volume if cfg.min_hourly_usd_volume > 0 else True
 
         return bool(atr_ok and liq_ok), {
             "atr_pct": float(atr_pct),
-            "min_atr_pct": float(cfg.min_atr_pct),
+            "min_atr_pct": float(effective_floor),
+            "atr_floor_adaptive": 1.0 if atr_floor is not None else 0.0,
             "atr_ok": 1.0 if atr_ok else 0.0,
             "usd_volume_recent": usd_volume,
             "min_hourly_usd_volume": float(cfg.min_hourly_usd_volume),
@@ -633,7 +639,7 @@ class SignalGenerator:
             return None
 
         if self.config.pump_window_enabled:
-            quality_ok, quality = self._layer1b_quality_gate(df)
+            quality_ok, quality = self._layer1b_quality_gate(df, atr_floor=context.atr_floor)
             trace["layers"]["layer1b_quality_gate"] = {"passed": quality_ok, "details": quality}
             if not quality_ok:
                 trace["failed_layer"] = "layer1b_quality_gate"
