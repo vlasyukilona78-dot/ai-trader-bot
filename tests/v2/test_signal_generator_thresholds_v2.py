@@ -83,12 +83,12 @@ class Layer3EntryToleranceV2Tests(unittest.TestCase):
         vp = VolumeProfileLevels(poc=100.0, vah=100.0, val=90.0)
         df = self._df(prev_close=99.7, close=99.8)
 
-        new_gen = SignalGenerator(SignalConfig(entry_tolerance_pct=0.0015))
+        new_gen = SignalGenerator(SignalConfig(entry_tolerance_pct=0.0015, pump_window_enabled=False))
         with patch.object(new_gen, "_layer3_msb_confirmation", return_value=(True, {})):
             ok_new, _ = new_gen._layer3_entry_location(df, "SHORT", vp)
         self.assertFalse(ok_new)
 
-        old_gen = SignalGenerator(SignalConfig(entry_tolerance_pct=0.004))
+        old_gen = SignalGenerator(SignalConfig(entry_tolerance_pct=0.004, pump_window_enabled=False))
         with patch.object(old_gen, "_layer3_msb_confirmation", return_value=(True, {})):
             ok_old, _ = old_gen._layer3_entry_location(df, "SHORT", vp)
         self.assertTrue(ok_old)

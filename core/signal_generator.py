@@ -31,6 +31,33 @@ class SignalConfig:
     confirmation_enabled: bool = True
     confirmation_max_wait_bars: int = 3
     confirmation_invalidate_pct: float = 0.0015
+    # Layer 1 window mode: treat a pump as a recent *event* to fade, not as a
+    # single-bar confluence. Set False to restore the legacy same-bar detector.
+    pump_window_enabled: bool = True
+    # 45 bars measured best on live MEXC alt data: a 3% run-up inside 20 minutes is
+    # rare enough to starve the strategy, while widening to 60 bars with a 2% move
+    # floods it with low-quality setups that lose money net of fees.
+    pump_window_bars: int = 45
+    pump_min_move_pct: float = 0.03
+    pump_min_bars_since_peak: int = 1
+    pump_max_retrace_pct: float = 0.5
+    # Window mode entry/stop: anchor on the pump's own peak, not on VAH. The peak is
+    # both the tightest stop and the cleanest invalidation (a new high = thesis wrong),
+    # which is what makes an entry viable at 50-100x.
+    pump_entry_max_dist_from_peak_pct: float = 0.015
+    pump_stop_buffer_pct: float = 0.003
+    # Caps loss per trade, not liquidation distance: on cross margin with a small
+    # position relative to equity, liquidation sits far beyond any sane stop, so this
+    # is a risk-budget knob rather than a survival one.
+    max_stop_distance_pct: float = 0.03
+    # Payoff ratio drives expected value - reject setups whose target is too near.
+    min_risk_reward: float = 1.5
+    # Leverage used only to express stop/target as a percentage of committed margin
+    # in the signal payload; it does not affect detection.
+    report_leverage: float = 100.0
+    # The strategy thesis is short-only (low-cap alts trend down); the long/panic
+    # side is opt-in rather than on by default.
+    enable_long_side: bool = False
 
 
 @dataclass
@@ -70,6 +97,10 @@ class PendingCandidate:
     last_seen_bar_ts: Any
     bars_waited: int = 0
     layer_snapshot: dict = field(default_factory=dict)
+    # Price level that kills the setup while waiting. In window mode this is the
+    # structural extreme (a new high means the fade thesis is wrong); a fixed small
+    # percentage would just track noise on a low-cap alt.
+    invalidate_level: float | None = None
 
 
 class SignalGenerator:
@@ -139,6 +170,102 @@ class SignalGenerator:
                 "panic_detected": 1.0 if panic else 0.0,
             }
         )
+
+        if pump:
+            return "SHORT", metrics
+        if panic:
+            return "LONG", metrics
+        return None, metrics
+
+    def _layer1_pump_window(self, df: pd.DataFrame) -> tuple[str | None, dict[str, float | str]]:
+        """Layer 1 (window mode): a pump is an *event to fade*, not a same-bar state.
+
+        The legacy detector required RSI extreme + volume spike + band breakout all on
+        the current bar, which contradicts layer 2 (it demands the move already be
+        weakening) - a bar cannot be at peak pump intensity and exhausted at once.
+        Here layer 1 instead asks: did a pump fire somewhere in the recent window, was
+        it large enough to be worth fading, has price turned off that peak, and are we
+        still early enough in the fade to have room.
+        """
+        cfg = self.config
+        window_bars = max(5, int(cfg.pump_window_bars))
+        if len(df) < window_bars + 2:
+            return None, {"insufficient_history": 1.0, "pump_window_bars": float(window_bars)}
+
+        work = df.tail(window_bars)
+
+        def _col(name: str, default: float) -> pd.Series:
+            if name not in work.columns:
+                return pd.Series(default, index=work.index, dtype=float)
+            return pd.to_numeric(work[name], errors="coerce").fillna(default)
+
+        close_s = _col("close", 0.0)
+        high_s = _col("high", 0.0)
+        low_s = _col("low", 0.0)
+        rsi_s = _col("rsi", 50.0)
+        vol_s = _col("volume_spike", 1.0)
+
+        band_up = (close_s > _col("bb_upper", float("inf"))) | (close_s > _col("kc_upper", float("inf")))
+        band_down = (close_s < _col("bb_lower", float("-inf"))) | (close_s < _col("kc_lower", float("-inf")))
+        vol_hot = vol_s >= cfg.volume_spike_threshold
+
+        pump_events = (band_up & ((rsi_s >= cfg.rsi_high) | vol_hot)).fillna(False)
+        panic_events = (band_down & ((rsi_s <= cfg.rsi_low) | vol_hot)).fillna(False)
+
+        close_now = float(close_s.iloc[-1])
+        win_high = float(high_s.max())
+        win_low = float(low_s.min())
+        span = max(win_high - win_low, 1e-12)
+
+        bars_since_peak = int(len(high_s) - 1 - int(high_s.to_numpy().argmax()))
+        bars_since_trough = int(len(low_s) - 1 - int(low_s.to_numpy().argmin()))
+
+        run_up_pct = (win_high - win_low) / max(win_low, 1e-12)
+        drop_pct = (win_high - win_low) / max(win_high, 1e-12)
+        retrace_from_high = (win_high - close_now) / span
+        bounce_from_low = (close_now - win_low) / span
+
+        metrics: dict[str, float | str] = {
+            "mode": "window",
+            "pump_window_bars": float(window_bars),
+            "close": close_now,
+            "window_high": win_high,
+            "window_low": win_low,
+            "run_up_pct": float(run_up_pct),
+            "drop_pct": float(drop_pct),
+            "bars_since_peak": float(bars_since_peak),
+            "bars_since_trough": float(bars_since_trough),
+            "retrace_from_high": float(retrace_from_high),
+            "bounce_from_low": float(bounce_from_low),
+            "pump_event_bars": float(pump_events.sum()),
+            "panic_event_bars": float(panic_events.sum()),
+            "rsi": float(rsi_s.iloc[-1]),
+            "volume_spike": float(vol_s.iloc[-1]),
+            "rsi_threshold": float(cfg.rsi_high),
+            "volume_spike_threshold": float(cfg.volume_spike_threshold),
+            "pump_min_move_pct": float(cfg.pump_min_move_pct),
+        }
+
+        pump = bool(
+            pump_events.any()
+            and run_up_pct >= cfg.pump_min_move_pct
+            and bars_since_peak >= cfg.pump_min_bars_since_peak
+            and close_now < win_high
+            and retrace_from_high <= cfg.pump_max_retrace_pct
+        )
+
+        panic = bool(
+            cfg.enable_long_side
+            and panic_events.any()
+            and drop_pct >= cfg.pump_min_move_pct
+            and bars_since_trough >= cfg.pump_min_bars_since_peak
+            and close_now > win_low
+            and bounce_from_low <= cfg.pump_max_retrace_pct
+        )
+
+        metrics["pump_detected"] = 1.0 if pump else 0.0
+        metrics["panic_detected"] = 1.0 if panic else 0.0
+        metrics["long_side_enabled"] = 1.0 if cfg.enable_long_side else 0.0
 
         if pump:
             return "SHORT", metrics
@@ -231,8 +358,57 @@ class SignalGenerator:
         }
         return ok, details
 
+    def _window_extremes(self, df: pd.DataFrame) -> tuple[float, float]:
+        work = df.tail(max(5, int(self.config.pump_window_bars)))
+        high = pd.to_numeric(work["high"], errors="coerce").max()
+        low = pd.to_numeric(work["low"], errors="coerce").min()
+        return float(high), float(low)
+
+    def _layer3_entry_near_peak(self, df: pd.DataFrame, side: str, vp: VolumeProfileLevels | None) -> tuple[bool, dict[str, float]]:
+        """Layer 3 (window mode): entry must sit close to the pump's own extreme.
+
+        The legacy check waits for price to travel all the way back to VAH, but a pump
+        overshoots VAH by far - by the time price returns there the dump is mostly done
+        and no tight stop exists. Anchoring on the window extreme keeps the entry at the
+        turn, where the stop is small enough to survive high leverage.
+        """
+        if len(df) < 2:
+            return False, {"insufficient_history": 1.0}
+
+        close = self._safe(df.iloc[-1].get("close"))
+        win_high, win_low = self._window_extremes(df)
+        max_dist = max(0.0, self.config.pump_entry_max_dist_from_peak_pct)
+
+        if side == "SHORT":
+            reference = win_high
+            dist = (win_high - close) / max(win_high, 1e-12)
+        else:
+            reference = win_low
+            dist = (close - win_low) / max(win_low, 1e-12)
+
+        entry_ok = 0.0 <= dist <= max_dist
+        msb_ok, msb = self._layer3_msb_confirmation(df=df, side=side)
+
+        details = {
+            "mode_window": 1.0,
+            "close": close,
+            "reference_extreme": float(reference),
+            "dist_from_extreme_pct": float(dist),
+            "max_dist_from_extreme_pct": float(max_dist),
+            "entry_ok": 1.0 if entry_ok else 0.0,
+            "poc": float(vp.poc) if vp else 0.0,
+            "vah": float(vp.vah) if vp else 0.0,
+            "val": float(vp.val) if vp else 0.0,
+            "vp_levels_available": 1.0 if vp else 0.0,
+        }
+        details.update(msb)
+        return bool(entry_ok and msb_ok), details
+
     def _layer3_entry_location(self, df: pd.DataFrame, side: str, vp: VolumeProfileLevels | None) -> tuple[bool, dict[str, float]]:
         """Layer 3: Entry location via Volume Profile levels + MSB."""
+        if self.config.pump_window_enabled:
+            return self._layer3_entry_near_peak(df, side, vp)
+
         if vp is None or len(df) < 2:
             return False, {"vp_missing": 1.0}
 
@@ -326,8 +502,37 @@ class SignalGenerator:
             "sentiment_source": source,
         }
 
+    def _layer5_structural_levels(self, df: pd.DataFrame, side: str, vp: VolumeProfileLevels | None) -> tuple[float, float, list[float]]:
+        """Layer 5 (window mode): stop just beyond the pump extreme, not an ATR multiple.
+
+        The thesis is invalidated by a new extreme, so that is where the stop belongs.
+        It is also usually far tighter than an ATR stop, which is what makes the setup
+        survivable at high leverage; setups whose structural stop is too wide are
+        rejected upstream rather than traded with an arbitrarily tightened stop.
+        """
+        close = self._safe(df.iloc[-1].get("close"))
+        atr = self._safe(df.iloc[-1].get("atr"), close * 0.01) or close * 0.01
+        win_high, win_low = self._window_extremes(df)
+        buf = max(0.0, self.config.pump_stop_buffer_pct)
+
+        if side == "SHORT":
+            sl = win_high * (1.0 + buf)
+            risk = max(sl - close, 1e-12)
+            tp = vp.poc if (vp and vp.poc < close) else close - risk * self.config.risk_reward
+            partial = [close - risk, (close + float(tp)) / 2.0]
+        else:
+            sl = win_low * (1.0 - buf)
+            risk = max(close - sl, 1e-12)
+            tp = vp.poc if (vp and vp.poc > close) else close + risk * self.config.risk_reward
+            partial = [close + risk, (close + float(tp)) / 2.0]
+
+        return float(tp), float(sl), [float(x) for x in partial]
+
     def _layer5_tp_sl_levels(self, df: pd.DataFrame, side: str, vp: VolumeProfileLevels | None) -> tuple[float, float, list[float]]:
         """Layer 5: TP/SL levels via ATR + Volume Profile (with RR fallback)."""
+        if self.config.pump_window_enabled:
+            return self._layer5_structural_levels(df, side, vp)
+
         last = df.iloc[-1]
         close = self._safe(last.get("close"))
         atr = self._safe(last.get("atr"), close * 0.01)
@@ -375,7 +580,13 @@ class SignalGenerator:
         self, df: pd.DataFrame, context: SignalContext, trace: dict[str, Any]
     ) -> tuple[str, dict, dict, dict, dict] | None:
         """Run layers 1-4. Returns (side, layer1, layer2, layer3, layer4) on full pass, else None."""
-        side, layer1 = self._layer1_pump_detection(df)
+        if self.config.pump_window_enabled:
+            side, layer1 = self._layer1_pump_window(df)
+        else:
+            side, layer1 = self._layer1_pump_detection(df)
+            if side == "LONG" and not self.config.enable_long_side:
+                side = None
+                layer1["long_side_disabled"] = 1.0
         trace["layers"]["layer1_pump_detection"] = {"passed": side is not None, "side": side or "", "details": layer1}
         if side is None:
             trace["failed_layer"] = "layer1_pump_detection"
@@ -419,10 +630,44 @@ class SignalGenerator:
         layer4: dict,
         trace: dict[str, Any],
         entry: float | None = None,
-    ) -> SignalResult:
+    ) -> SignalResult | None:
         entry = float(entry if entry is not None else df.iloc[-1]["close"])
         tp, sl, partial_tps = self._layer5_tp_sl_levels(df, side, context.volume_profile)
         tp, sl = self._normalize_levels(entry=entry, tp=tp, sl=sl, side=side)
+
+        stop_distance_pct = abs(sl - entry) / max(entry, 1e-12)
+        max_stop = max(0.0, self.config.max_stop_distance_pct)
+        if max_stop > 0 and stop_distance_pct > max_stop:
+            trace["failed_layer"] = "layer5_stop_too_wide"
+            trace["layers"]["layer5_tp_sl"] = {
+                "passed": False,
+                "details": {
+                    "entry": float(entry),
+                    "sl": float(sl),
+                    "stop_distance_pct": float(stop_distance_pct),
+                    "max_stop_distance_pct": float(max_stop),
+                },
+            }
+            self.last_diagnostics = trace
+            return None
+
+        risk = abs(sl - entry)
+        reward = abs(tp - entry)
+        realized_rr = reward / max(risk, 1e-12)
+        if self.config.min_risk_reward > 0 and realized_rr < self.config.min_risk_reward:
+            trace["failed_layer"] = "layer5_risk_reward_too_low"
+            trace["layers"]["layer5_tp_sl"] = {
+                "passed": False,
+                "details": {
+                    "entry": float(entry),
+                    "tp": float(tp),
+                    "sl": float(sl),
+                    "realized_risk_reward": float(realized_rr),
+                    "min_risk_reward": float(self.config.min_risk_reward),
+                },
+            }
+            self.last_diagnostics = trace
+            return None
 
         layer5 = {
             "entry": float(entry),
@@ -432,6 +677,13 @@ class SignalGenerator:
             "atr_sl_mult": float(self.config.atr_sl_mult),
             "risk_reward": float(self.config.risk_reward),
             "vp_available": 1.0 if context.volume_profile is not None else 0.0,
+            "stop_distance_pct": float(stop_distance_pct),
+            "realized_risk_reward": float(realized_rr),
+            # Same levels expressed against committed margin, which is how the trade
+            # is actually sized: a 2% move at 100x is 200% of the margin put up.
+            "report_leverage": float(self.config.report_leverage),
+            "stop_pct_of_margin": float(stop_distance_pct * self.config.report_leverage * 100.0),
+            "target_pct_of_margin": float(reward / max(entry, 1e-12) * self.config.report_leverage * 100.0),
         }
         trace["layers"]["layer5_tp_sl"] = {"passed": True, "details": layer5}
         self.last_diagnostics = trace
@@ -509,10 +761,20 @@ class SignalGenerator:
 
             if pending.side == "LONG":
                 confirmed = close_now > pending.armed_close
-                invalidated = close_now <= pending.armed_close * (1.0 - self.config.confirmation_invalidate_pct)
+                floor = (
+                    pending.invalidate_level
+                    if pending.invalidate_level is not None
+                    else pending.armed_close * (1.0 - self.config.confirmation_invalidate_pct)
+                )
+                invalidated = close_now <= floor
             else:
                 confirmed = close_now < pending.armed_close
-                invalidated = close_now >= pending.armed_close * (1.0 + self.config.confirmation_invalidate_pct)
+                ceiling = (
+                    pending.invalidate_level
+                    if pending.invalidate_level is not None
+                    else pending.armed_close * (1.0 + self.config.confirmation_invalidate_pct)
+                )
+                invalidated = close_now >= ceiling
 
             if invalidated:
                 del self._pending[context.symbol]
@@ -579,6 +841,13 @@ class SignalGenerator:
 
         side, layer1, layer2, layer3, layer4 = gates
         armed_close = float(df.iloc[-1]["close"])
+
+        invalidate_level: float | None = None
+        if self.config.pump_window_enabled:
+            win_high, win_low = self._window_extremes(df)
+            buf = max(0.0, self.config.pump_stop_buffer_pct)
+            invalidate_level = win_high * (1.0 + buf) if side == "SHORT" else win_low * (1.0 - buf)
+
         self._pending[context.symbol] = PendingCandidate(
             symbol=context.symbol,
             side=side,
@@ -587,11 +856,17 @@ class SignalGenerator:
             last_seen_bar_ts=bar_ts,
             bars_waited=0,
             layer_snapshot={"layer1": layer1, "layer2": layer2, "layer3": layer3, "layer4": layer4},
+            invalidate_level=invalidate_level,
         )
         trace["failed_layer"] = "layer_confirmation_pending"
         trace["layers"]["layer_confirmation"] = {
             "passed": False,
-            "details": {"status": "armed", "armed_close": armed_close, "bars_waited": 0.0},
+            "details": {
+                "status": "armed",
+                "armed_close": armed_close,
+                "invalidate_level": float(invalidate_level) if invalidate_level is not None else 0.0,
+                "bars_waited": 0.0,
+            },
         }
         self.last_diagnostics = trace
         return None

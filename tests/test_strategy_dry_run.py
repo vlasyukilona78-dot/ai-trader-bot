@@ -58,7 +58,9 @@ class SignalGeneratorTests(unittest.TestCase):
     def test_generate_short_signal_on_pump(self):
         df = self._build_df()
 
-        signal_gen = SignalGenerator(SignalConfig(confirmation_enabled=False))
+        signal_gen = SignalGenerator(
+            SignalConfig(confirmation_enabled=False, pump_window_enabled=False, enable_long_side=True)
+        )
         ctx = SignalContext(
             symbol="BTC/USDT",
             df=df,
@@ -86,7 +88,9 @@ class SignalGeneratorTests(unittest.TestCase):
     def test_sentiment_fallback_degraded_mode_is_explicit(self):
         df = self._build_df()
 
-        signal_gen = SignalGenerator(SignalConfig(confirmation_enabled=False))
+        signal_gen = SignalGenerator(
+            SignalConfig(confirmation_enabled=False, pump_window_enabled=False, enable_long_side=True)
+        )
         ctx = SignalContext(
             symbol="BTC/USDT",
             df=df,
