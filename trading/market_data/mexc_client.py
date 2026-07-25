@@ -53,6 +53,7 @@ class MexcContractClient:
         self._session.headers.update({"User-Agent": "crypto-ai-bot/2.0", "Accept": "application/json"})
         self._tickers_cache: list[dict[str, Any]] = []
         self._tickers_cache_ts: float = 0.0
+        self._details_cache: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
     def close(self):
@@ -117,6 +118,27 @@ class MexcContractClient:
             self._tickers_cache = items
             self._tickers_cache_ts = now
             return list(items)
+
+    def fetch_contract_details(self, force: bool = False) -> dict[str, dict[str, Any]]:
+        """Contract specs for every symbol, keyed by MEXC symbol, cached for the session.
+
+        One call covers the whole board, so the minimum tradeable size can be
+        checked without a per-symbol request.
+        """
+        with self._lock:
+            if self._details_cache and not force:
+                return dict(self._details_cache)
+
+        payload = self._request_public("/api/v1/contract/detail")
+        items = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            with self._lock:
+                return dict(self._details_cache)
+
+        out = {str(i.get("symbol")): i for i in items if isinstance(i, dict) and i.get("symbol")}
+        with self._lock:
+            self._details_cache = out
+            return dict(out)
 
     @staticmethod
     def _translate_ticker(item: dict[str, Any]) -> dict[str, Any]:

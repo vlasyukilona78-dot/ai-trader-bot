@@ -30,6 +30,9 @@ class UniverseConfig:
     max_symbols: int = 0  # 0 = no cap
     min_change_24h: float | None = None  # e.g. 0.15 to only scan things already up 15%
     excluded_symbols: tuple[str, ...] = DEFAULT_EXCLUDED_SYMBOLS
+    # Roughly one in eight contracts has a minimum lot larger than a small
+    # position, so signalling them would force oversizing. 0 disables the check.
+    max_min_notional_usdt: float = 0.0
 
 
 @dataclass
@@ -41,6 +44,8 @@ class UniverseEntry:
     funding_rate: float | None = None
     open_interest: float | None = None
     last_price: float | None = None
+    min_notional_usdt: float | None = None
+    max_leverage: float | None = None
 
 
 @dataclass
@@ -96,6 +101,13 @@ class SymbolUniverse:
         excluded = {s.upper() for s in cfg.excluded_symbols}
         entries: list[UniverseEntry] = []
 
+        details: dict[str, dict] = {}
+        if cfg.max_min_notional_usdt > 0:
+            try:
+                details = self.client.fetch_contract_details()
+            except Exception:
+                details = {}  # missing specs must not empty the scan list
+
         for item in tickers:
             if not isinstance(item, dict):
                 continue
@@ -111,6 +123,18 @@ class SymbolUniverse:
             if cfg.min_change_24h is not None and change < cfg.min_change_24h:
                 continue
 
+            last_price = _as_float(item.get("lastPrice"))
+            min_notional = None
+            max_lev = None
+            spec = details.get(mexc_symbol)
+            if spec and last_price:
+                size = _as_float(spec.get("contractSize")) or 1.0
+                min_vol = _as_float(spec.get("minVol")) or 1.0
+                min_notional = size * min_vol * last_price
+                max_lev = _as_float(spec.get("maxLeverage"))
+                if cfg.max_min_notional_usdt > 0 and min_notional > cfg.max_min_notional_usdt:
+                    continue
+
             entries.append(
                 UniverseEntry(
                     symbol=mexc_symbol.replace("_", ""),
@@ -119,7 +143,9 @@ class SymbolUniverse:
                     change_24h=change,
                     funding_rate=_as_float(item.get("fundingRate")),
                     open_interest=_as_float(item.get("holdVol")),
-                    last_price=_as_float(item.get("lastPrice")),
+                    last_price=last_price,
+                    min_notional_usdt=min_notional,
+                    max_leverage=max_lev,
                 )
             )
 
