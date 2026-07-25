@@ -86,6 +86,11 @@ class SignalConfig:
     # (95.2% resolved with no overhead zone versus 84.6% with three), so it is
     # available as a filter but off by default.
     require_confluence: int = 0
+    # From Codex's EntryGate: cap how far price has run from its mean before
+    # entering, measured in ATR so it compares across coins. Validated on the
+    # MEXC dataset - 1.35 lifts expectancy +0.0627 -> +0.0674 and 0.75 reaches
+    # +0.0721, but each step roughly halves signal flow, so it is opt-in.
+    max_chase_atr: float = 0.0
     # The strategy thesis is short-only (low-cap alts trend down); the long/panic
     # side is opt-in rather than on by default.
     enable_long_side: bool = False
@@ -358,6 +363,17 @@ class SignalGenerator:
                 htf_ok = rsi_htf >= cfg.min_rsi_4h
             details["rsi_htf_ok"] = 1.0 if htf_ok else 0.0
 
+        chase_ok = True
+        if cfg.max_chase_atr > 0:
+            from core.pump_features import extension
+
+            ext = extension(df).get("ext_ema20_atr", float("nan"))
+            details["chase_atr"] = float(ext) if ext == ext else 0.0
+            details["max_chase_atr"] = float(cfg.max_chase_atr)
+            if ext == ext:
+                chase_ok = abs(ext) <= cfg.max_chase_atr
+            details["chase_ok"] = 1.0 if chase_ok else 0.0
+
         level_ok = True
         if cfg.require_level_overhead:
             close = self._safe(df.iloc[-1].get("close"))
@@ -367,7 +383,7 @@ class SignalGenerator:
             details["level_dist"] = float(dist) if dist == dist else 0.0
             details["level_ok"] = 1.0 if level_ok else 0.0
 
-        return bool(rs_ok and htf_ok and level_ok), details
+        return bool(rs_ok and htf_ok and chase_ok and level_ok), details
 
     def _layer1b_quality_gate(self, df: pd.DataFrame, atr_floor: float | None = None) -> tuple[bool, dict[str, float]]:
         """Reject pumps that historically fail to resolve: calm or illiquid ones.
