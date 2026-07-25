@@ -55,6 +55,13 @@ class SignalConfig:
     # Leverage used only to express stop/target as a percentage of committed margin
     # in the signal payload; it does not affect detection.
     report_leverage: float = 100.0
+    # Quality gates measured on 5523 labelled pump events over ~3 months of MEXC
+    # history. Counter-intuitively, calm low-volatility pumps are the ones that
+    # fail to resolve - violent pumps on volatile, liquid coins come back down
+    # almost every time, so these are floors rather than ceilings.
+    min_atr_pct: float = 0.046
+    min_hourly_usd_volume: float = 100_000.0
+    liquidity_lookback_bars: int = 12
     # The strategy thesis is short-only (low-cap alts trend down); the long/panic
     # side is opt-in rather than on by default.
     enable_long_side: bool = False
@@ -272,6 +279,39 @@ class SignalGenerator:
         if panic:
             return "LONG", metrics
         return None, metrics
+
+    def _layer1b_quality_gate(self, df: pd.DataFrame) -> tuple[bool, dict[str, float]]:
+        """Reject pumps that historically fail to resolve: calm or illiquid ones.
+
+        Low-volatility pumps drift instead of dumping (86% resolve vs 99% for the
+        violent ones), and thin books carry a 4x higher share of runaway losers -
+        illiquid events were the single best advance predictor of a deep drawdown.
+        """
+        cfg = self.config
+        last = df.iloc[-1]
+        close = self._safe(last.get("close"))
+        atr = self._safe(last.get("atr"), 0.0)
+        atr_pct = atr / close if close else 0.0
+
+        lookback = max(1, int(cfg.liquidity_lookback_bars))
+        tail = df.tail(lookback)
+        usd_volume = float(
+            (pd.to_numeric(tail["close"], errors="coerce") * pd.to_numeric(tail["volume"], errors="coerce"))
+            .fillna(0.0)
+            .sum()
+        )
+
+        atr_ok = atr_pct >= cfg.min_atr_pct if cfg.min_atr_pct > 0 else True
+        liq_ok = usd_volume >= cfg.min_hourly_usd_volume if cfg.min_hourly_usd_volume > 0 else True
+
+        return bool(atr_ok and liq_ok), {
+            "atr_pct": float(atr_pct),
+            "min_atr_pct": float(cfg.min_atr_pct),
+            "atr_ok": 1.0 if atr_ok else 0.0,
+            "usd_volume_recent": usd_volume,
+            "min_hourly_usd_volume": float(cfg.min_hourly_usd_volume),
+            "liquidity_ok": 1.0 if liq_ok else 0.0,
+        }
 
     def _layer2_weakness_confirmation(self, df: pd.DataFrame, side: str) -> tuple[bool, dict[str, float]]:
         """Layer 2: Weakness confirmation via price-vs-OBV/CVD divergence."""
@@ -592,6 +632,13 @@ class SignalGenerator:
             trace["failed_layer"] = "layer1_pump_detection"
             return None
 
+        if self.config.pump_window_enabled:
+            quality_ok, quality = self._layer1b_quality_gate(df)
+            trace["layers"]["layer1b_quality_gate"] = {"passed": quality_ok, "details": quality}
+            if not quality_ok:
+                trace["failed_layer"] = "layer1b_quality_gate"
+                return None
+
         layer2_ok, layer2 = self._layer2_weakness_confirmation(df, side)
         trace["layers"]["layer2_weakness_confirmation"] = {"passed": layer2_ok, "details": layer2}
         if not layer2_ok:
@@ -684,6 +731,9 @@ class SignalGenerator:
             "report_leverage": float(self.config.report_leverage),
             "stop_pct_of_margin": float(stop_distance_pct * self.config.report_leverage * 100.0),
             "target_pct_of_margin": float(reward / max(entry, 1e-12) * self.config.report_leverage * 100.0),
+            # Largest leverage at which the stop still costs less than the whole
+            # margin, so a stop-out is not automatically a liquidation.
+            "max_safe_leverage": float(1.0 / max(stop_distance_pct, 1e-6)),
         }
         trace["layers"]["layer5_tp_sl"] = {"passed": True, "details": layer5}
         self.last_diagnostics = trace

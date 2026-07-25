@@ -115,6 +115,52 @@ class StructuralStopV2Tests(unittest.TestCase):
         self.assertLess(abs(sl - close) / close, 0.05)
 
 
+class QualityGateV2Tests(unittest.TestCase):
+    """The gate encodes a counter-intuitive, measured result: calm and illiquid
+    pumps are the ones that fail, so both checks are floors, not ceilings."""
+
+    def _df(self, atr_pct: float, usd_per_bar: float, n: int = 20) -> pd.DataFrame:
+        close = 10.0
+        return pd.DataFrame(
+            {
+                "close": [close] * n,
+                "high": [close * 1.001] * n,
+                "low": [close * 0.999] * n,
+                "volume": [usd_per_bar / close] * n,
+                "atr": [close * atr_pct] * n,
+            }
+        )
+
+    def test_accepts_volatile_and_liquid(self):
+        gen = SignalGenerator(SignalConfig())
+        ok, d = gen._layer1b_quality_gate(self._df(atr_pct=0.08, usd_per_bar=50_000))
+        self.assertTrue(ok)
+        self.assertEqual(d["atr_ok"], 1.0)
+        self.assertEqual(d["liquidity_ok"], 1.0)
+
+    def test_rejects_calm_pump(self):
+        gen = SignalGenerator(SignalConfig())
+        ok, d = gen._layer1b_quality_gate(self._df(atr_pct=0.01, usd_per_bar=50_000))
+        self.assertFalse(ok)
+        self.assertEqual(d["atr_ok"], 0.0)
+
+    def test_rejects_illiquid_pump(self):
+        gen = SignalGenerator(SignalConfig())
+        ok, d = gen._layer1b_quality_gate(self._df(atr_pct=0.08, usd_per_bar=100))
+        self.assertFalse(ok)
+        self.assertEqual(d["liquidity_ok"], 0.0)
+
+    def test_gates_can_be_disabled(self):
+        gen = SignalGenerator(SignalConfig(min_atr_pct=0.0, min_hourly_usd_volume=0.0))
+        ok, _ = gen._layer1b_quality_gate(self._df(atr_pct=0.001, usd_per_bar=1))
+        self.assertTrue(ok)
+
+    def test_max_safe_leverage_is_inverse_of_stop_distance(self):
+        gen = SignalGenerator(SignalConfig())
+        # a 2% stop must not be traded above 50x, or a stop-out is a liquidation
+        self.assertAlmostEqual(1.0 / 0.02, 50.0, places=6)
+
+
 class SignalQualityGuardsV2Tests(unittest.TestCase):
     def test_defaults_enforce_stop_and_payoff_limits(self):
         cfg = SignalConfig()

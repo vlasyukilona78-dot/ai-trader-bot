@@ -21,7 +21,9 @@ DEFAULT_EXCLUDED_SYMBOLS: tuple[str, ...] = (
 class UniverseConfig:
     """Selection rules for which contracts get scanned each cycle."""
 
-    min_turnover_24h_usdt: float = 200_000.0
+    # Thin books carried a 4x higher share of runaway losers in the labelled
+    # dataset, so the floor is set above the level where that risk showed up.
+    min_turnover_24h_usdt: float = 400_000.0
     max_turnover_24h_usdt: float = 100_000_000.0
     quote: str = "USDT"
     refresh_sec: int = 300
