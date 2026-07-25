@@ -196,6 +196,47 @@ def rsi_divergence(df: pd.DataFrame, *, lookback: int = 20, pivot: int = 3) -> d
     }
 
 
+def liquidation_histogram(
+    df: pd.DataFrame,
+    *,
+    lookback: int = 240,
+    bins: int = 48,
+    tiers: tuple[tuple[float, float], ...] = DEFAULT_LEVERAGE_TIERS,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Binned estimated long-liquidation density by price, for plotting.
+
+    Returns (bin_centres, weights); weights are normalised to a 0-1 scale so the
+    shape can be drawn without exposing raw volume units.
+    """
+    empty = (np.array([]), np.array([]))
+    if df.empty or len(df) < 20:
+        return empty
+
+    window = df.tail(lookback)
+    typical = ((pd.to_numeric(window["high"], errors="coerce")
+                + pd.to_numeric(window["low"], errors="coerce")
+                + pd.to_numeric(window["close"], errors="coerce")) / 3.0).to_numpy(dtype=float)
+    volume = pd.to_numeric(window["volume"], errors="coerce").to_numpy(dtype=float)
+
+    prices: list[float] = []
+    weights: list[float] = []
+    for entry_px, vol in zip(typical, volume):
+        if not np.isfinite(entry_px) or not np.isfinite(vol) or vol <= 0 or entry_px <= 0:
+            continue
+        for lev, weight in tiers:
+            prices.append(entry_px * (1.0 - 1.0 / lev))
+            weights.append(vol * weight)
+
+    if not prices:
+        return empty
+
+    hist, edges = np.histogram(np.asarray(prices), bins=bins, weights=np.asarray(weights))
+    if hist.max() <= 0:
+        return empty
+    centres = (edges[:-1] + edges[1:]) / 2.0
+    return centres, hist / hist.max()
+
+
 def estimate_liquidation_map(
     df: pd.DataFrame,
     price: float,

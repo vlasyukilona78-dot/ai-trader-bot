@@ -75,6 +75,17 @@ class SignalConfig:
     # Layer 2 measured NEGATIVE on the same dataset (-0.0057 with divergence
     # versus +0.0245 without), so it is off unless explicitly re-enabled.
     weakness_layer_enabled: bool = False
+    # Each indicator carries its signal on a different timeframe. The 4h RSI
+    # separated outcomes where the 1h reading did not: requiring it above ~62 cut
+    # the worst drawdown from 1.57 legs to 0.43 out of sample while keeping ~11
+    # signals a day. 0 disables the check.
+    min_rsi_4h: float = 61.6
+    # Same idea, tighter tail but fewer signals; opt-in.
+    min_rsi_1h: float = 0.0
+    # Multi-timeframe level confluence measured NEGATIVE across the population
+    # (95.2% resolved with no overhead zone versus 84.6% with three), so it is
+    # available as a filter but off by default.
+    require_confluence: int = 0
     # The strategy thesis is short-only (low-cap alts trend down); the long/panic
     # side is opt-in rather than on by default.
     enable_long_side: bool = False
@@ -97,6 +108,9 @@ class SignalContext:
     # Market benchmark (BTC) OHLCV, used to tell an engineered single-coin pump
     # apart from the whole board rallying.
     benchmark: pd.DataFrame | None = None
+    # Higher-timeframe bars for this symbol, so indicators can be read on the
+    # timeframe where they actually carry signal rather than all on one.
+    htf_frame: pd.DataFrame | None = None
 
 
 @dataclass
@@ -300,7 +314,12 @@ class SignalGenerator:
             return "LONG", metrics
         return None, metrics
 
-    def _layer1c_market_context(self, df: pd.DataFrame, benchmark: pd.DataFrame | None) -> tuple[bool, dict[str, float]]:
+    def _layer1c_market_context(
+        self,
+        df: pd.DataFrame,
+        benchmark: pd.DataFrame | None,
+        htf_frame: pd.DataFrame | None = None,
+    ) -> tuple[bool, dict[str, float]]:
         """Reject moves the whole market is making, and optionally ones with no
         overhead level to stall into.
 
@@ -326,6 +345,19 @@ class SignalGenerator:
         details["relative_strength_ok"] = 1.0 if rs_ok else 0.0
         details["min_relative_strength"] = float(cfg.min_relative_strength)
 
+        # Higher-timeframe momentum, read on its own timeframe rather than
+        # resampled from the entry frame, which is too short to carry it.
+        htf_ok = True
+        if cfg.min_rsi_4h > 0 and htf_frame is not None and not htf_frame.empty and len(htf_frame) >= 20:
+            from core.indicators import compute_indicators
+
+            rsi_htf = float(compute_indicators(htf_frame.tail(200)).iloc[-1].get("rsi", float("nan")))
+            details["rsi_htf"] = rsi_htf
+            details["min_rsi_htf"] = float(cfg.min_rsi_4h)
+            if rsi_htf == rsi_htf:
+                htf_ok = rsi_htf >= cfg.min_rsi_4h
+            details["rsi_htf_ok"] = 1.0 if htf_ok else 0.0
+
         level_ok = True
         if cfg.require_level_overhead:
             close = self._safe(df.iloc[-1].get("close"))
@@ -335,7 +367,7 @@ class SignalGenerator:
             details["level_dist"] = float(dist) if dist == dist else 0.0
             details["level_ok"] = 1.0 if level_ok else 0.0
 
-        return bool(rs_ok and level_ok), details
+        return bool(rs_ok and htf_ok and level_ok), details
 
     def _layer1b_quality_gate(self, df: pd.DataFrame, atr_floor: float | None = None) -> tuple[bool, dict[str, float]]:
         """Reject pumps that historically fail to resolve: calm or illiquid ones.
@@ -698,7 +730,7 @@ class SignalGenerator:
                 trace["failed_layer"] = "layer1b_quality_gate"
                 return None
 
-            market_ok, market = self._layer1c_market_context(df, context.benchmark)
+            market_ok, market = self._layer1c_market_context(df, context.benchmark, context.htf_frame)
             trace["layers"]["layer1c_market_context"] = {"passed": market_ok, "details": market}
             if not market_ok:
                 trace["failed_layer"] = "layer1c_market_context"

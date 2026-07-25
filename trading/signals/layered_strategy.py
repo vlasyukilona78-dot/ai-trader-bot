@@ -24,10 +24,16 @@ class LayeredPumpStrategy(StrategyInterface):
             VolatilityContextConfig(fallback_floor=self._generator.config.min_atr_pct)
         )
         self._benchmark = None
+        self._htf_cache = None
 
     def set_benchmark(self, frame):
         """Market reference (BTC OHLCV), refreshed once per scan cycle."""
         self._benchmark = frame
+
+    def set_htf_cache(self, cache):
+        """Source of higher-timeframe bars per symbol, so indicators can be read
+        on the timeframe where they carry signal rather than all on the entry one."""
+        self._htf_cache = cache
 
     def _trace_meta(self) -> dict:
         trace = self._generator.last_diagnostics if isinstance(self._generator.last_diagnostics, dict) else {}
@@ -74,6 +80,7 @@ class LayeredPumpStrategy(StrategyInterface):
                 long_short_ratio=context.long_short_ratio,
                 atr_floor=self._volatility.floor(),
                 benchmark=self._benchmark,
+                htf_frame=self._htf_cache.get(context.symbol) if self._htf_cache is not None else None,
             )
         )
         trace_meta = self._trace_meta()

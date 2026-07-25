@@ -310,6 +310,10 @@ def main() -> int:
     )
     pipeline = FeaturePipeline()
     strategy = _build_strategy(args.strategy)
+    if hasattr(strategy, "set_htf_cache"):
+        from trading.market_data.timeframe_cache import HigherTimeframeCache
+
+        strategy.set_htf_cache(HigherTimeframeCache(feed))
     counters = MetricsCounter()
     alerters = _build_alerters(cfg)
     sentiment_feed = (
