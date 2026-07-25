@@ -62,6 +62,19 @@ class SignalConfig:
     min_atr_pct: float = 0.046
     min_hourly_usd_volume: float = 100_000.0
     liquidity_lookback_bars: int = 12
+    # Measured on 5042 labelled events: requiring the coin to have outrun BTC cut
+    # the worst drawdown from 11.84 to 1.57 legs with expectancy unchanged, and
+    # held out of sample. A move the whole market is making is beta, not an
+    # engineered pump, and fading it is a different trade.
+    min_relative_strength: float = 0.05
+    relative_strength_lookback: int = 24
+    # Optional and off by default: an overhead level cuts the tail further still
+    # (0.77 legs) but more than halves the number of signals.
+    require_level_overhead: bool = False
+    min_level_dist_pct: float = 0.018
+    # Layer 2 measured NEGATIVE on the same dataset (-0.0057 with divergence
+    # versus +0.0245 without), so it is off unless explicitly re-enabled.
+    weakness_layer_enabled: bool = False
     # The strategy thesis is short-only (low-cap alts trend down); the long/panic
     # side is opt-in rather than on by default.
     enable_long_side: bool = False
@@ -81,6 +94,9 @@ class SignalContext:
     # SignalConfig.min_atr_pct, so the gate tracks the current market regime
     # instead of a number fitted to one period.
     atr_floor: float | None = None
+    # Market benchmark (BTC) OHLCV, used to tell an engineered single-coin pump
+    # apart from the whole board rallying.
+    benchmark: pd.DataFrame | None = None
 
 
 @dataclass
@@ -283,6 +299,43 @@ class SignalGenerator:
         if panic:
             return "LONG", metrics
         return None, metrics
+
+    def _layer1c_market_context(self, df: pd.DataFrame, benchmark: pd.DataFrame | None) -> tuple[bool, dict[str, float]]:
+        """Reject moves the whole market is making, and optionally ones with no
+        overhead level to stall into.
+
+        Both were measured on the labelled dataset as tail-risk filters rather
+        than profit boosters: they barely move expectancy but collapse the worst
+        drawdown, which is what actually decides whether an account survives.
+        """
+        from core.levels import find_horizontal_levels, nearest_level_above
+        from core.pump_features import relative_strength
+
+        cfg = self.config
+        details: dict[str, float] = {}
+
+        rs = relative_strength(df, benchmark, lookback=cfg.relative_strength_lookback)
+        details.update({k: float(v) for k, v in rs.items()})
+
+        value = rs.get("relative_strength")
+        if cfg.min_relative_strength > 0 and benchmark is not None and value is not None and value == value:
+            rs_ok = value >= cfg.min_relative_strength
+        else:
+            # No benchmark available: do not silently block every signal.
+            rs_ok = True
+        details["relative_strength_ok"] = 1.0 if rs_ok else 0.0
+        details["min_relative_strength"] = float(cfg.min_relative_strength)
+
+        level_ok = True
+        if cfg.require_level_overhead:
+            close = self._safe(df.iloc[-1].get("close"))
+            overhead = nearest_level_above(find_horizontal_levels(df), close)
+            dist = (overhead.price - close) / close if (overhead and close > 0) else float("nan")
+            level_ok = bool(overhead is not None and dist >= cfg.min_level_dist_pct)
+            details["level_dist"] = float(dist) if dist == dist else 0.0
+            details["level_ok"] = 1.0 if level_ok else 0.0
+
+        return bool(rs_ok and level_ok), details
 
     def _layer1b_quality_gate(self, df: pd.DataFrame, atr_floor: float | None = None) -> tuple[bool, dict[str, float]]:
         """Reject pumps that historically fail to resolve: calm or illiquid ones.
@@ -645,11 +698,21 @@ class SignalGenerator:
                 trace["failed_layer"] = "layer1b_quality_gate"
                 return None
 
-        layer2_ok, layer2 = self._layer2_weakness_confirmation(df, side)
-        trace["layers"]["layer2_weakness_confirmation"] = {"passed": layer2_ok, "details": layer2}
-        if not layer2_ok:
-            trace["failed_layer"] = "layer2_weakness_confirmation"
-            return None
+            market_ok, market = self._layer1c_market_context(df, context.benchmark)
+            trace["layers"]["layer1c_market_context"] = {"passed": market_ok, "details": market}
+            if not market_ok:
+                trace["failed_layer"] = "layer1c_market_context"
+                return None
+
+        if self.config.weakness_layer_enabled:
+            layer2_ok, layer2 = self._layer2_weakness_confirmation(df, side)
+            trace["layers"]["layer2_weakness_confirmation"] = {"passed": layer2_ok, "details": layer2}
+            if not layer2_ok:
+                trace["failed_layer"] = "layer2_weakness_confirmation"
+                return None
+        else:
+            layer2 = {"skipped": 1.0}
+            trace["layers"]["layer2_weakness_confirmation"] = {"passed": True, "details": layer2}
 
         layer3_ok, layer3 = self._layer3_entry_location(df, side, context.volume_profile)
         trace["layers"]["layer3_entry_location"] = {"passed": layer3_ok, "details": layer3}

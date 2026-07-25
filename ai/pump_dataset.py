@@ -16,6 +16,15 @@ import numpy as np
 import pandas as pd
 
 from core.indicators import compute_indicators
+from core.levels import (
+    distance_to_fib,
+    estimate_liquidation_map,
+    find_horizontal_levels,
+    multi_timeframe_confluence,
+    nearest_level_above,
+    rsi_divergence,
+)
+from core.pump_features import build_pump_features
 from trading.market_data.history import HistoryCollector
 
 
@@ -132,7 +141,14 @@ def _rsi_at(df: pd.DataFrame, ts: int) -> float:
     return float(enriched.iloc[-1].get("rsi", float("nan")))
 
 
-def build_features(event: PumpEvent, df_1h: pd.DataFrame, df_15m: pd.DataFrame, funding: pd.DataFrame) -> dict:
+def build_features(
+    event: PumpEvent,
+    df_1h: pd.DataFrame,
+    df_15m: pd.DataFrame,
+    funding: pd.DataFrame,
+    df_4h: pd.DataFrame | None = None,
+    benchmark_1h: pd.DataFrame | None = None,
+) -> dict:
     """Everything knowable at the moment the pump fires - no forward data."""
     hist = df_1h[df_1h["time"] <= event.ts]
     if len(hist) < 60:
@@ -197,6 +213,28 @@ def build_features(event: PumpEvent, df_1h: pd.DataFrame, df_15m: pd.DataFrame, 
         feats["funding_rate"] = float("nan")
         feats["funding_mean_3d"] = float("nan")
 
+    # --- chart structure: the techniques used manually in the reference channel ---
+    levels = find_horizontal_levels(enriched)
+    overhead = nearest_level_above(levels, close)
+    feats["level_dist"] = float((overhead.price - close) / close) if overhead else float("nan")
+    feats["level_strength"] = float(overhead.strength) if overhead else 0.0
+    feats["level_touches"] = float(overhead.touches) if overhead else 0.0
+    feats["level_untouched_bars"] = float(overhead.last_touch_bars_ago) if overhead else float("nan")
+    feats["level_count_above"] = float(sum(1 for lv in levels if lv.price > close))
+
+    feats["fib_618_dist"] = distance_to_fib(hist, close, ratio="fib_618")
+    feats["fib_500_dist"] = distance_to_fib(hist, close, ratio="fib_500")
+
+    m15 = df_15m[df_15m["time"] <= event.ts] if not df_15m.empty else pd.DataFrame()
+    h4 = df_4h[df_4h["time"] <= event.ts] if df_4h is not None and not df_4h.empty else pd.DataFrame()
+    feats.update(multi_timeframe_confluence({"15m": m15.tail(400), "1h": hist.tail(400), "4h": h4.tail(400)}, close))
+
+    feats.update(rsi_divergence(enriched))
+    feats.update(estimate_liquidation_map(hist, close))
+
+    bench = benchmark_1h[benchmark_1h["time"] <= event.ts] if benchmark_1h is not None and not benchmark_1h.empty else None
+    feats.update(build_pump_features(enriched, benchmark=bench))
+
     return feats
 
 
@@ -207,12 +245,14 @@ def build_symbol_rows(
     end_ts: int,
     event_cfg: EventConfig,
     label_cfg: LabelConfig,
+    benchmark_1h: pd.DataFrame | None = None,
 ) -> list[dict]:
     df_1h = collector.fetch_range(symbol, "Min60", start_ts, end_ts).reset_index()
     if df_1h.empty or len(df_1h) < 100:
         return []
     df_15m = collector.fetch_range(symbol, "Min15", start_ts, end_ts).reset_index()
     df_5m = collector.fetch_range(symbol, "Min5", start_ts, end_ts).reset_index()
+    df_4h = collector.fetch_range(symbol, "Hour4", start_ts, end_ts).reset_index()
     funding = collector.fetch_funding_history(symbol, pages=15)
 
     rows: list[dict] = []
@@ -225,7 +265,7 @@ def build_symbol_rows(
         fwd = fwd_src[(fwd_src["time"] >= ev.ts) & (fwd_src["time"] <= ev.ts + horizon)]
         if len(fwd) < 10:
             continue
-        feats = build_features(ev, df_1h, df_15m, funding)
+        feats = build_features(ev, df_1h, df_15m, funding, df_4h=df_4h, benchmark_1h=benchmark_1h)
         if not feats:
             continue
         labels = label_event(ev, fwd, label_cfg)

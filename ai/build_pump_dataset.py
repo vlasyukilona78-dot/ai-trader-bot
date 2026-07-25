@@ -52,10 +52,18 @@ def main() -> int:
     event_cfg = EventConfig(min_move_pct=args.min_move, lookback_hours=args.lookback_hours)
     label_cfg = LabelConfig(horizon_hours=args.horizon_hours)
 
+    # BTC serves as the market benchmark, so a single-coin pump can be told apart
+    # from the whole board moving together.
+    benchmark = HistoryCollector(client, HistoryConfig(cache_dir=args.cache_dir)).fetch_range(
+        "BTCUSDT", "Min60", start, now
+    ).reset_index()
+    print(f"benchmark BTC bars: {len(benchmark)}")
+
     def work(symbol: str):
         collector = HistoryCollector(MexcContractClient(), HistoryConfig(cache_dir=args.cache_dir))
         try:
-            return build_symbol_rows(symbol, collector, start, now, event_cfg, label_cfg)
+            return build_symbol_rows(symbol, collector, start, now, event_cfg, label_cfg,
+                                     benchmark_1h=benchmark)
         except Exception as exc:  # one bad symbol must not kill the run
             print(f"  {symbol}: failed ({exc})")
             return []

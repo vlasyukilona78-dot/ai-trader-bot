@@ -105,6 +105,14 @@ def run_cycle(
     else:
         sentiment_value, sentiment_source = 50.0, "fallback_neutral_50"
 
+    # One market reference per cycle lets the strategy tell an engineered pump
+    # apart from the whole board moving together.
+    if hasattr(strategy, "set_benchmark"):
+        try:
+            strategy.set_benchmark(feed.fetch_frame(symbol="BTCUSDT", timeframe=timeframe, candles=candles_limit).ohlcv)
+        except Exception:
+            strategy.set_benchmark(None)
+
     for symbol in symbols:
         try:
             snapshot = sync.snapshot(symbol)

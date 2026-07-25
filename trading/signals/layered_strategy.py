@@ -23,6 +23,11 @@ class LayeredPumpStrategy(StrategyInterface):
         self._volatility = volatility_context or VolatilityContext(
             VolatilityContextConfig(fallback_floor=self._generator.config.min_atr_pct)
         )
+        self._benchmark = None
+
+    def set_benchmark(self, frame):
+        """Market reference (BTC OHLCV), refreshed once per scan cycle."""
+        self._benchmark = frame
 
     def _trace_meta(self) -> dict:
         trace = self._generator.last_diagnostics if isinstance(self._generator.last_diagnostics, dict) else {}
@@ -68,6 +73,7 @@ class LayeredPumpStrategy(StrategyInterface):
                 funding_rate=context.funding_rate,
                 long_short_ratio=context.long_short_ratio,
                 atr_floor=self._volatility.floor(),
+                benchmark=self._benchmark,
             )
         )
         trace_meta = self._trace_meta()
