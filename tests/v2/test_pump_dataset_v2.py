@@ -5,7 +5,15 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from ai.pump_dataset import EventConfig, LabelConfig, PumpEvent, detect_events, label_event
+from ai.pump_dataset import (
+    BAR_SECONDS_1H,
+    EventConfig,
+    LabelConfig,
+    PumpEvent,
+    _closed_by,
+    detect_events,
+    label_event,
+)
 
 
 def _hourly(closes: list[float], start_ts: int = 1_700_000_000) -> pd.DataFrame:
@@ -106,6 +114,45 @@ class LabelEventV2Tests(unittest.TestCase):
         out = label_event(ev, fwd, LabelConfig())
         self.assertAlmostEqual(out["mae_pct"], (104.0 * 1.0005 - 100.0) / 100.0, places=4)
         self.assertAlmostEqual(out["mfe_pct"], (100.0 - 98.0 * 0.9995) / 100.0, places=4)
+
+
+class NoLookAheadV2Tests(unittest.TestCase):
+    """MEXC stamps a bar with its OPEN time, so filtering on the stamp alone lets
+    a bar that is still forming at the decision moment into the feature set. Both
+    the forward window and every higher timeframe must respect the close."""
+
+    def test_only_bars_finished_by_the_decision_are_kept(self):
+        # 4h bars stamped at 0, 14400, 28800; decision at 18000
+        frame = pd.DataFrame({"time": [0, 14400, 28800], "close": [1.0, 2.0, 3.0]})
+        kept = _closed_by(frame, 14400, 18000)
+        # the 14400 bar closes at 28800, after the decision - it must be excluded
+        self.assertEqual(list(kept["time"]), [0])
+
+    def test_a_bar_closing_exactly_on_the_decision_is_included(self):
+        frame = pd.DataFrame({"time": [0, 3600], "close": [1.0, 2.0]})
+        kept = _closed_by(frame, 3600, 7200)
+        self.assertEqual(list(kept["time"]), [0, 3600])
+
+    def test_empty_and_missing_frames_are_handled(self):
+        self.assertTrue(_closed_by(pd.DataFrame(), 3600, 100).empty)
+        self.assertTrue(_closed_by(None, 3600, 100).empty)
+
+    def test_decision_lags_the_event_stamp_by_one_bar(self):
+        self.assertEqual(BAR_SECONDS_1H, 3600)
+
+    def test_time_to_target_is_measured_from_the_decision_not_the_stamp(self):
+        ev = PumpEvent(symbol="T", ts=1_700_000_000, entry=100.0, move_pct=0.1, run_up_bars=3)
+        # forward frame starts one hour after the stamp, target hit on its 3rd bar
+        start = ev.ts + BAR_SECONDS_1H
+        fwd = pd.DataFrame({
+            "time": [start, start + 300, start + 600],
+            "open": [100.0, 99.0, 96.0], "high": [100.0, 99.0, 96.0],
+            "low": [100.0, 99.0, 96.0], "close": [100.0, 99.0, 96.0],
+            "volume": [1.0, 1.0, 1.0],
+        })
+        out = label_event(ev, fwd, LabelConfig(dca_target_pct=0.03))
+        # 10 minutes after the decision, not 70 minutes after the stamp
+        self.assertEqual(out["time_to_target_min"], 10)
 
 
 if __name__ == "__main__":

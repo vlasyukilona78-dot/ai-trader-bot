@@ -28,6 +28,11 @@ from core.pump_features import build_pump_features
 from trading.market_data.history import HistoryCollector
 
 
+# Events are detected on hourly bars, and MEXC stamps a bar with its open time,
+# so the decision moment is one bar after the stamp.
+BAR_SECONDS_1H = 3600
+
+
 @dataclass
 class EventConfig:
     min_move_pct: float = 0.05
@@ -99,7 +104,8 @@ def label_event(event: PumpEvent, df_fwd: pd.DataFrame, cfg: LabelConfig) -> dic
 
     hit = low[low <= entry * (1 - cfg.dca_target_pct)]
     time_to_target_min = (
-        int((int(df_fwd["time"].loc[hit.index[0]]) - event.ts) / 60) if len(hit) else -1
+        # measured from the first forward bar, i.e. the decision moment
+        int((int(df_fwd["time"].loc[hit.index[0]]) - int(df_fwd["time"].iloc[0])) / 60) if len(hit) else -1
     )
 
     # Replay the averaging plan: add a leg at each step above entry, take profit
@@ -141,6 +147,18 @@ def _rsi_at(df: pd.DataFrame, ts: int) -> float:
     return float(enriched.iloc[-1].get("rsi", float("nan")))
 
 
+def _closed_by(frame: pd.DataFrame, bar_seconds: int, decision_ts: int) -> pd.DataFrame:
+    """Bars that had actually finished by the decision moment.
+
+    Filtering on the stamp alone is not enough: MEXC stamps a bar with its open,
+    so a 4h bar stamped before the decision can still be mid-formation then, and
+    reading an indicator off it would be look-ahead.
+    """
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    return frame[frame["time"] + bar_seconds <= decision_ts]
+
+
 def build_features(
     event: PumpEvent,
     df_1h: pd.DataFrame,
@@ -148,9 +166,13 @@ def build_features(
     funding: pd.DataFrame,
     df_4h: pd.DataFrame | None = None,
     benchmark_1h: pd.DataFrame | None = None,
+    decision_ts: int | None = None,
 ) -> dict:
     """Everything knowable at the moment the pump fires - no forward data."""
-    hist = df_1h[df_1h["time"] <= event.ts]
+    decision_ts = decision_ts if decision_ts is not None else event.ts + BAR_SECONDS_1H
+    # The signal bar itself is stamped event.ts and closes exactly at decision_ts,
+    # so it is known and included.
+    hist = df_1h[df_1h["time"] + BAR_SECONDS_1H <= decision_ts]
     if len(hist) < 60:
         return {}
 
@@ -177,7 +199,7 @@ def build_features(
         "move_pct": event.move_pct,
         "run_up_bars": event.run_up_bars,
         "rsi_1h": float(last.get("rsi", float("nan"))),
-        "rsi_15m": _rsi_at(df_15m, event.ts) if not df_15m.empty else float("nan"),
+        "rsi_15m": _rsi_at(_closed_by(df_15m, 900, decision_ts), decision_ts),
         "volume_spike_1h": float(last.get("volume_spike", float("nan"))),
         "atr_pct_1h": atr / close if close and np.isfinite(atr) else float("nan"),
         "change_24h": pct_change(24),
@@ -206,7 +228,7 @@ def build_features(
         feats["rsi_4h"] = float("nan")
 
     if not funding.empty:
-        prior = funding[funding["time"] <= event.ts]
+        prior = funding[funding["time"] <= decision_ts]
         feats["funding_rate"] = float(prior["funding_rate"].iloc[-1]) if len(prior) else float("nan")
         feats["funding_mean_3d"] = float(prior["funding_rate"].tail(9).mean()) if len(prior) else float("nan")
     else:
@@ -225,14 +247,15 @@ def build_features(
     feats["fib_618_dist"] = distance_to_fib(hist, close, ratio="fib_618")
     feats["fib_500_dist"] = distance_to_fib(hist, close, ratio="fib_500")
 
-    m15 = df_15m[df_15m["time"] <= event.ts] if not df_15m.empty else pd.DataFrame()
-    h4 = df_4h[df_4h["time"] <= event.ts] if df_4h is not None and not df_4h.empty else pd.DataFrame()
+    m15 = _closed_by(df_15m, 900, decision_ts)
+    h4 = _closed_by(df_4h, 14400, decision_ts)
     feats.update(multi_timeframe_confluence({"15m": m15.tail(400), "1h": hist.tail(400), "4h": h4.tail(400)}, close))
 
     feats.update(rsi_divergence(enriched))
     feats.update(estimate_liquidation_map(hist, close))
 
-    bench = benchmark_1h[benchmark_1h["time"] <= event.ts] if benchmark_1h is not None and not benchmark_1h.empty else None
+    bench = _closed_by(benchmark_1h, BAR_SECONDS_1H, decision_ts)
+    bench = bench if not bench.empty else None
     feats.update(build_pump_features(enriched, benchmark=bench))
 
     return feats
@@ -259,17 +282,24 @@ def build_symbol_rows(
     horizon = label_cfg.horizon_hours * 3600
     for ev in detect_events(df_1h, event_cfg):
         ev.symbol = symbol
-        if ev.ts + horizon > end_ts:
+        # MEXC stamps a bar with its OPEN time, but the event is only knowable at
+        # that bar's close. Labelling forward from ev.ts would let up to an hour
+        # of pre-decision price action into MAE/MFE, so the window starts one bar
+        # later - the first moment the trade could actually have been taken.
+        decision_ts = ev.ts + BAR_SECONDS_1H
+        if decision_ts + horizon > end_ts:
             continue  # not enough forward data to label honestly
         fwd_src = df_5m if not df_5m.empty else df_15m
-        fwd = fwd_src[(fwd_src["time"] >= ev.ts) & (fwd_src["time"] <= ev.ts + horizon)]
+        fwd = fwd_src[(fwd_src["time"] >= decision_ts) & (fwd_src["time"] <= decision_ts + horizon)]
         if len(fwd) < 10:
             continue
-        feats = build_features(ev, df_1h, df_15m, funding, df_4h=df_4h, benchmark_1h=benchmark_1h)
+        feats = build_features(ev, df_1h, df_15m, funding, df_4h=df_4h,
+                               benchmark_1h=benchmark_1h, decision_ts=decision_ts)
         if not feats:
             continue
         labels = label_event(ev, fwd, label_cfg)
         if not labels:
             continue
-        rows.append({"symbol": symbol, "ts": ev.ts, "entry": ev.entry, **feats, **labels})
+        rows.append({"symbol": symbol, "ts": ev.ts, "decision_ts": decision_ts,
+                     "entry": ev.entry, **feats, **labels})
     return rows
