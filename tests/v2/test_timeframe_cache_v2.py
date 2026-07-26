@@ -96,10 +96,24 @@ class HigherTimeframeGateV2Tests(unittest.TestCase):
         ok, d = gen._layer1c_market_context(self._df([100.0] * 40), None, rising_htf)
         self.assertTrue(ok)
 
-    def test_missing_higher_timeframe_does_not_block(self):
+    def test_missing_higher_timeframe_blocks_by_default(self):
+        """Fail closed. A misconfigured interval or a failed fetch yields an empty
+        frame, and passing on that silently disables a gate adopted precisely
+        because it cut the tail - the bot would keep trading while believing it
+        was protected."""
         gen = SignalGenerator(SignalConfig(min_relative_strength=0.0, min_rsi_4h=61.6))
+        ok, d = gen._layer1c_market_context(self._df([100.0] * 40), None, None)
+        self.assertFalse(ok)
+        self.assertEqual(d["htf_available"], 0.0)
+
+    def test_missing_higher_timeframe_can_be_allowed_explicitly(self):
+        gen = SignalGenerator(SignalConfig(min_relative_strength=0.0, min_rsi_4h=61.6,
+                                           require_htf=False))
         ok, _ = gen._layer1c_market_context(self._df([100.0] * 40), None, None)
         self.assertTrue(ok)
+
+    def test_default_is_to_require_the_higher_timeframe(self):
+        self.assertTrue(SignalConfig().require_htf)
 
     def test_default_threshold_matches_the_measured_value(self):
         self.assertEqual(SignalConfig().min_rsi_4h, 61.6)

@@ -162,9 +162,11 @@ def simulate_portfolio(
 
         committed = sum(n for _, _, n in open_positions)
         needed = float(row["max_deployed"]) * cfg.leg_notional
-        cap = cfg.max_total_notional if cfg.max_total_notional is not None else cfg.capital
+        # Capacity is bounded by what is left, not by the starting balance: two
+        # trades each losing most of the account must not both be affordable.
+        available = min(equity, cfg.max_total_notional if cfg.max_total_notional is not None else equity)
 
-        if len(open_positions) >= cfg.max_concurrent or committed + needed > cap:
+        if equity <= 0 or len(open_positions) >= cfg.max_concurrent or committed + needed > available:
             skipped += 1
             continue
 

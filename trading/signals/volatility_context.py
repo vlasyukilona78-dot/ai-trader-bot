@@ -35,6 +35,12 @@ class VolatilityContext:
     def __init__(self, config: VolatilityContextConfig | None = None):
         self.config = config or VolatilityContextConfig()
         self._observations: dict[str, _Observation] = {}
+        # The floor is frozen from the previous completed sweep. Reading the
+        # in-progress dictionary would make a candidate's fate depend on where it
+        # happened to sit in the scan order: the same coin was blocked when it
+        # came first and admitted after a run of calm symbols had dragged the
+        # percentile down.
+        self._frozen: list[float] = []
 
     def observe(self, symbol: str, atr_pct: float, *, now: float | None = None):
         if atr_pct is None or atr_pct != atr_pct or atr_pct <= 0:
@@ -49,10 +55,18 @@ class VolatilityContext:
             del self._observations[s]
         return sorted(o.value for o in self._observations.values())
 
+    def start_sweep(self, *, now: float | None = None) -> None:
+        """Freeze the distribution that this sweep will be judged against.
+
+        Called once per scan, before any symbol is evaluated, so every candidate
+        in the sweep faces the same floor regardless of ordering.
+        """
+        self._frozen = self._fresh_values(now)
+
     def floor(self, *, now: float | None = None) -> float:
-        """Current ATR cutoff. Falls back to the fixed floor until enough symbols
-        have been seen, so a cold start cannot admit everything."""
-        values = self._fresh_values(now)
+        """ATR cutoff for the current sweep. Falls back to the fixed floor until
+        enough symbols have been seen, so a cold start cannot admit everything."""
+        values = self._frozen if self._frozen else self._fresh_values(now)
         if len(values) < self.config.min_observations:
             return self.config.fallback_floor
 

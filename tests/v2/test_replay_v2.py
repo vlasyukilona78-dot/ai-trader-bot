@@ -48,16 +48,31 @@ class ReplayMechanicsV2Tests(unittest.TestCase):
         self.assertEqual(r.exit_reason, "horizon")
         self.assertAlmostEqual(r.pnl_on_initial, 0.01, places=6)
 
-    def test_runaway_price_is_stopped_and_the_loss_is_bounded_by_capital(self):
-        """A short into a coin that keeps going must not accrue an unbounded loss;
-        the risk stop caps it at roughly the capital committed."""
-        cfg = ReplayConfig(costs=FREE, max_loss_on_deployed=1.0)
-        bars = _bars([(120.0, 118.0, 119.0), (200.0, 150.0, 190.0), (400.0, 300.0, 350.0)])
-        r = replay_short(bars, 100.0, cfg)
+    def test_stop_fires_before_a_higher_averaging_level(self):
+        """With a stop at 105 and an add at 108, a bar reaching 110 traded through
+        the stop first. Filling the add and staying in would keep a position the
+        market had already closed."""
+        cfg = ReplayConfig(costs=FREE, dca_step_pct=0.08, stop_pct_from_blended=0.05,
+                           max_loss_on_deployed=None)
+        r = replay_short(_bars([(110.0, 104.0, 106.0)]), 100.0, cfg)
         self.assertEqual(r.exit_reason, "stop")
-        # loss is on the order of what was deployed, not of the runaway move
-        self.assertGreaterEqual(r.pnl_on_initial, -r.max_deployed * 1.05)
+        self.assertEqual(r.legs, 1)  # no averaging leg was added
+
+    def test_stopped_loss_is_bounded_when_price_does_not_gap(self):
+        cfg = ReplayConfig(costs=FREE, max_loss_on_deployed=1.0, max_adds=0)
+        # the bar trades through the stop rather than opening beyond it
+        r = replay_short(_bars([(260.0, 90.0, 250.0)]), 100.0, cfg)
+        self.assertEqual(r.exit_reason, "stop")
         self.assertAlmostEqual(r.pnl_on_deployed, -1.0, delta=0.05)
+
+    def test_a_gap_through_the_stop_costs_more_than_the_stop_price(self):
+        """The stop is not a guaranteed fill. If the bar's whole range sits above
+        it, the exit happens at the worst price actually available, and the loss
+        exceeds what the stop nominally risked."""
+        cfg = ReplayConfig(costs=FREE, max_loss_on_deployed=1.0, max_adds=0)
+        r = replay_short(_bars([(400.0, 300.0, 350.0)]), 100.0, cfg)
+        self.assertEqual(r.exit_reason, "stop")
+        self.assertLess(r.pnl_on_deployed, -1.0)
 
 
 class LegBlendingV2Tests(unittest.TestCase):

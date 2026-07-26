@@ -28,7 +28,10 @@ class MarketContextGateV2Tests(unittest.TestCase):
     is not the engineered pump the strategy fades."""
 
     def _gen(self, **over) -> SignalGenerator:
-        cfg = {"min_relative_strength": 0.05, "relative_strength_lookback": 24}
+        # these cases exercise the relative-strength leg, so the higher-timeframe
+        # gate is switched off rather than blocking on an absent frame
+        cfg = {"min_relative_strength": 0.05, "relative_strength_lookback": 24,
+               "min_rsi_4h": 0.0}
         cfg.update(over)
         return SignalGenerator(SignalConfig(**cfg))
 

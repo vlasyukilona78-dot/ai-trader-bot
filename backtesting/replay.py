@@ -38,10 +38,15 @@ _LEVEL_EPS = 1e-9
 
 @dataclass
 class ExecutionCosts:
-    """Defaults are the values measured live on MEXC contracts, not guesses."""
+    """MEXC's published API futures rates from 2026-06-01, not the older 0.02%/0%.
 
-    taker_fee: float = 0.0002
-    maker_fee: float = 0.0
+    The contract-detail endpoint still advertises the legacy promotional numbers,
+    so reading fees from there understates cost by three to four times. Spread and
+    slippage are the values measured live across the traded universe.
+    """
+
+    taker_fee: float = 0.0008
+    maker_fee: float = 0.0006
     half_spread: float = 0.000145
     slippage: float = 0.00014
 
@@ -124,59 +129,67 @@ def replay_short(
     def blended() -> float:
         return deployed / qty
 
+    def current_stop() -> float | None:
+        avg_now = blended()
+        stop = None
+        if cfg.stop_pct_from_blended is not None:
+            stop = avg_now * (1.0 + cfg.stop_pct_from_blended)
+        if cfg.max_loss_on_deployed is not None:
+            loss_stop = avg_now + cfg.max_loss_on_deployed * deployed / qty
+            stop = loss_stop if stop is None else min(stop, loss_stop)
+        return stop
+
+    def finish(reason: str, exit_at: float, bar_index: int) -> ReplayResult:
+        nonlocal fees
+        avg_now = blended()
+        px = _exit_fill(exit_at, cfg.costs)
+        fees += px * qty * exit_fee_rate
+        pnl = (avg_now - px) * qty - fees
+        return ReplayResult(reason, pnl / unit_notional, pnl / deployed, adds + 1,
+                            deployed, worst_dd, bar_index + 1, fees / unit_notional, px, avg_now)
+
     for i in range(len(high)):
-        h, l, c = high[i], low[i], close[i]
+        h, l = high[i], low[i]
         if not (np.isfinite(h) and np.isfinite(l)):
             continue
 
-        # 1) adverse extreme first: averaging legs fill on the way up.
-        # The tolerance matters: entry * (1 + 0.10) lands a hair above a bar that
-        # touched the level exactly, and without it a real fill is silently missed.
-        while adds < cfg.max_adds and h >= entry_price * (1.0 + cfg.dca_step_pct * (adds + 1)) * (1.0 - _LEVEL_EPS):
+        # Walk the bar upwards in price order. Filling every averaging leg first
+        # and only then testing the stop lets a position survive a level it had
+        # already traded through: with a stop at 105 and an add at 108, a bar
+        # reaching 110 must stop out, not average in. Levels are therefore
+        # interleaved and taken in the order price would have reached them.
+        while True:
+            stop_price = current_stop()
+            next_add = (entry_price * (1.0 + cfg.dca_step_pct * (adds + 1))
+                        if adds < cfg.max_adds else None)
+
+            stop_hit = stop_price is not None and h >= stop_price * (1.0 - _LEVEL_EPS)
+            add_hit = next_add is not None and h >= next_add * (1.0 - _LEVEL_EPS)
+
+            if stop_hit and (not add_hit or stop_price <= next_add):
+                # a bar that gaps above the stop cannot fill at the stop price
+                exit_at = max(stop_price, low[i]) if low[i] > stop_price else stop_price
+                return finish("stop", exit_at, i)
+
+            if not add_hit:
+                break
+
             adds += 1
-            add_price = entry_price * (1.0 + cfg.dca_step_pct * adds)
-            add_fill = _entry_fill(add_price, cfg.costs)
+            add_fill = _entry_fill(next_add, cfg.costs)
             add_notional = unit_notional if cfg.equal_notional_legs else add_fill * (unit_notional / fill)
             qty += add_notional / add_fill
             deployed += add_notional
             fees += add_notional * entry_fee_rate
 
         avg = blended()
-        # floating loss at the bar's worst point, measured against the first leg
-        floating = (h - avg) * qty / unit_notional
-        worst_dd = max(worst_dd, floating)
+        worst_dd = max(worst_dd, (h - avg) * qty / unit_notional)
 
-        # 2) risk stop, before any favourable exit on the same bar
-        stop_price = None
-        if cfg.stop_pct_from_blended is not None:
-            stop_price = avg * (1.0 + cfg.stop_pct_from_blended)
-        if cfg.max_loss_on_deployed is not None:
-            loss_stop = avg + cfg.max_loss_on_deployed * deployed / qty
-            stop_price = loss_stop if stop_price is None else min(stop_price, loss_stop)
-
-        if stop_price is not None and h >= stop_price:
-            px = _exit_fill(stop_price, cfg.costs)
-            fees += px * qty * exit_fee_rate
-            pnl = (avg - px) * qty - fees
-            return ReplayResult("stop", pnl / unit_notional, pnl / deployed, adds + 1,
-                                deployed, worst_dd, i + 1, fees / unit_notional, px, avg)
-
-        # 3) target
         target_price = avg * (1.0 - cfg.target_pct)
         if l <= target_price:
-            px = _exit_fill(target_price, cfg.costs)
-            fees += px * qty * exit_fee_rate
-            pnl = (avg - px) * qty - fees
-            return ReplayResult("target", pnl / unit_notional, pnl / deployed, adds + 1,
-                                deployed, worst_dd, i + 1, fees / unit_notional, px, avg)
+            return finish("target", target_price, i)
 
     # horizon reached: mark out at the last close
-    avg = blended()
-    px = _exit_fill(float(close[-1]), cfg.costs)
-    fees += px * qty * exit_fee_rate
-    pnl = (avg - px) * qty - fees
-    return ReplayResult("horizon", pnl / unit_notional, pnl / deployed, adds + 1,
-                        deployed, worst_dd, len(high), fees / unit_notional, px, avg)
+    return finish("horizon", float(close[-1]), len(high) - 1)
 
 
 def summarise(results: list[ReplayResult]) -> dict[str, float]:

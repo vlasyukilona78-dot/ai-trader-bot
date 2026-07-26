@@ -30,6 +30,10 @@ class LayeredPumpStrategy(StrategyInterface):
         """Market reference (BTC OHLCV), refreshed once per scan cycle."""
         self._benchmark = frame
 
+    def begin_sweep(self):
+        """Freeze the cross-sectional volatility floor for one scan pass."""
+        self._volatility.start_sweep()
+
     def set_htf_cache(self, cache):
         """Source of higher-timeframe bars per symbol, so indicators can be read
         on the timeframe where they carry signal rather than all on the entry one."""

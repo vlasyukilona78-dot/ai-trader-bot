@@ -51,6 +51,11 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers) 
         logger.warning("empty_universe", extra={"event": "scan"})
         return []
 
+    # Freeze the volatility distribution before evaluating anyone, so a
+    # candidate's fate does not depend on its position in the scan order.
+    if hasattr(strategy, "begin_sweep"):
+        strategy.begin_sweep()
+
     try:
         btc = feed.fetch_frame(symbol="BTCUSDT", timeframe=timeframe, candles=candles).ohlcv
         strategy.set_benchmark(btc)

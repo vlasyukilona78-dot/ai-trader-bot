@@ -80,6 +80,10 @@ class SignalConfig:
     # the worst drawdown from 1.57 legs to 0.43 out of sample while keeping ~11
     # signals a day. 0 disables the check.
     min_rsi_4h: float = 61.6
+    # When the higher-timeframe frame is missing the gate cannot be evaluated.
+    # Blocking is the safe answer: a silently absent filter is worse than no
+    # signal, because the signal still looks fully vetted.
+    require_htf: bool = True
     # Same idea, tighter tail but fewer signals; opt-in.
     min_rsi_1h: float = 0.0
     # Multi-timeframe level confluence measured NEGATIVE across the population
@@ -352,15 +356,24 @@ class SignalGenerator:
 
         # Higher-timeframe momentum, read on its own timeframe rather than
         # resampled from the entry frame, which is too short to carry it.
+        #
+        # Fail closed. A misconfigured interval or a failed fetch returns an
+        # empty frame, and treating that as a pass silently disables a gate that
+        # was adopted precisely because it cut the tail - the bot would keep
+        # trading while believing a filter was protecting it.
         htf_ok = True
-        if cfg.min_rsi_4h > 0 and htf_frame is not None and not htf_frame.empty and len(htf_frame) >= 20:
-            from core.indicators import compute_indicators
-
-            rsi_htf = float(compute_indicators(htf_frame.tail(200)).iloc[-1].get("rsi", float("nan")))
-            details["rsi_htf"] = rsi_htf
+        if cfg.min_rsi_4h > 0:
+            usable = htf_frame is not None and not htf_frame.empty and len(htf_frame) >= 20
             details["min_rsi_htf"] = float(cfg.min_rsi_4h)
-            if rsi_htf == rsi_htf:
-                htf_ok = rsi_htf >= cfg.min_rsi_4h
+            details["htf_available"] = 1.0 if usable else 0.0
+            if not usable:
+                htf_ok = not cfg.require_htf
+            else:
+                from core.indicators import compute_indicators
+
+                rsi_htf = float(compute_indicators(htf_frame.tail(200)).iloc[-1].get("rsi", float("nan")))
+                details["rsi_htf"] = rsi_htf
+                htf_ok = rsi_htf >= cfg.min_rsi_4h if rsi_htf == rsi_htf else not cfg.require_htf
             details["rsi_htf_ok"] = 1.0 if htf_ok else 0.0
 
         chase_ok = True
@@ -930,7 +943,14 @@ class SignalGenerator:
                 self.last_diagnostics = trace
                 return None
 
-            close_now = float(df.iloc[-1]["close"])
+            last = df.iloc[-1]
+            close_now = float(last["close"])
+            # Invalidation must read the extreme, not the close. A bar that takes
+            # out the structural level and then closes back inside it has already
+            # broken the setup - the stop would have been hit in real time - yet
+            # judging on the close alone would confirm the entry instead.
+            high_now = float(last.get("high", close_now))
+            low_now = float(last.get("low", close_now))
             pending.last_seen_bar_ts = bar_ts
 
             if pending.side == "LONG":
@@ -940,7 +960,7 @@ class SignalGenerator:
                     if pending.invalidate_level is not None
                     else pending.armed_close * (1.0 - self.config.confirmation_invalidate_pct)
                 )
-                invalidated = close_now <= floor
+                invalidated = low_now <= floor
             else:
                 confirmed = close_now < pending.armed_close
                 ceiling = (
@@ -948,7 +968,7 @@ class SignalGenerator:
                     if pending.invalidate_level is not None
                     else pending.armed_close * (1.0 + self.config.confirmation_invalidate_pct)
                 )
-                invalidated = close_now >= ceiling
+                invalidated = high_now >= ceiling
 
             if invalidated:
                 del self._pending[context.symbol]
