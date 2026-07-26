@@ -796,3 +796,64 @@ warm-up crosses a cadence gap rejected). Thresholds will be selected on replayed
 P&L including fees, with symbol-clustered confidence intervals.
 
 The bot remains stopped. No live execution, no credentials used.
+
+## Claude no-edge finding — 2026-07-26, supersedes the expectancy claims above
+
+The runtime calibration population was built (31,295 candidate rows, 278
+symbols) and then reduced by the data-quality guards this file prescribes:
+4,398 rows from 35 equity/commodity proxies and 10 rows whose 120-bar warm-up
+crossed a cadence gap. 26,887 rows across 226 symbols and 133 days survive.
+
+Thresholds were fitted on the first 60% by decision time, purged by the full
+48h label horizon, and reported once on the remainder. On the DCA accounting the
+result looked strong:
+
+```text
+test unfiltered: n=10189  mean +0.0134  CI [+0.0110,+0.0157]  win 83.0%
+test rule:       n=  338  mean +0.0207  CI [+0.0162,+0.0250]  win 94.4%
+walk-forward: 5/5 folds positive
+```
+
+That result does not survive contact with how the signals are used. It is P&L
+per unit of *deployed* capital under a plan that adds up to six legs at 8%
+steps. Averaging into a loser and exiting 3% below the blended entry produces a
+high win rate and a positive per-trade mean by construction, which is the
+martingale artifact this file warned about.
+
+Replaying the same rows as a single entry - one position, one stop, no
+averaging, which is how these signals are actually traded - removes the effect
+entirely. Grid over targets 2/3/5/8% and stops 3-50%, all 28 combinations
+negative, best -0.14%, clustered on the 0.217% round-trip cost.
+
+The decisive control is a random entry on the same symbols over the same window:
+
+```text
+tp/sl       random entry              bot signal
+3%/5%    -0.28% [-0.48,-0.08]     -0.29% [-0.95,+0.41]
+3%/12%   -0.31% [-0.62,-0.02]     -0.31% [-1.29,+0.63]
+5%/12%   -0.31% [-0.70,+0.08]     -0.14% [-1.34,+1.12]
+5%/20%   -0.44% [-0.99,+0.14]     -0.35% [-1.81,+1.14]
+```
+
+The signals are indistinguishable from random entries. Both sit at minus the
+transaction cost. Any true edge is smaller than roughly +/-0.5% per trade at
+this sample size, against a 0.217% cost.
+
+Uncensored adverse excursion before the 3% target, for the 338 rule-filtered
+test signals: p50 3.1%, p90 27.0%, p95 45.7%, p99 118.0%, max 132.9%. At 100x
+with a 2% position on cross margin, 4.44% of signals reach an account loss.
+
+Retracted: the earlier +0.0208 expectancy, the "significantly loss-making
+unfiltered / profitable filtered" split, and the portfolio result. All were
+measured on DCA-deployed accounting or on the simplified event population.
+
+What has never been tested is what the user actually asked for. In the current
+signal path: Fibonacci is absent; `require_level_overhead` defaults False;
+`weakness_layer_enabled` defaults False; the liquidation map reaches only the
+chart, not the decision; `require_confluence` and `min_rsi_1h` are declared and
+never consumed. What was measured and found edgeless is the generic
+band-breakout + RSI + volume pump fade, not the technique set the strategy is
+supposed to implement.
+
+The bot remains stopped. No configuration in this repository currently has
+demonstrated positive expectancy for a manually entered trade.
