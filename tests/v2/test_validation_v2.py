@@ -33,6 +33,27 @@ class WalkForwardV2Tests(unittest.TestCase):
     def test_too_little_data_yields_no_folds(self):
         self.assertEqual(walk_forward_folds(5), [])
 
+    def test_labels_reaching_into_the_test_block_are_purged_from_training(self):
+        """A 48h label decided just before the boundary is scored on price action
+        inside the test block, so training on it leaks the answer."""
+        n = 1000
+        ts = np.arange(n, dtype=float) * 3600  # one event per hour
+        plain = walk_forward_folds(n, n_folds=3)
+        purged = walk_forward_folds(n, n_folds=3, decision_ts=ts, label_horizon_sec=48 * 3600)
+
+        for (tr_plain, te_plain), (tr_purged, te_purged) in zip(plain, purged):
+            self.assertTrue(np.array_equal(te_plain, te_purged))  # test blocks unchanged
+            self.assertLess(len(tr_purged), len(tr_plain))        # training shrinks
+            boundary = ts[te_purged].min()
+            self.assertTrue(np.all(ts[tr_purged] + 48 * 3600 <= boundary))
+
+    def test_purge_scales_with_the_label_horizon(self):
+        n = 1000
+        ts = np.arange(n, dtype=float) * 3600
+        short = walk_forward_folds(n, n_folds=3, decision_ts=ts, label_horizon_sec=3600)
+        long = walk_forward_folds(n, n_folds=3, decision_ts=ts, label_horizon_sec=96 * 3600)
+        self.assertGreater(len(short[0][0]), len(long[0][0]))
+
 
 class ClusteredBootstrapV2Tests(unittest.TestCase):
     def test_clustering_widens_the_interval_versus_ignoring_it(self):

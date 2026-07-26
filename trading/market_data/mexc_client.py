@@ -25,6 +25,13 @@ _QUOTES = ("USDT", "USDC", "USD")
 
 _EMPTY_OHLCV = ["time", "open", "high", "low", "close", "volume"]
 
+# MEXC klines carry BOTH a contract count (`vol`) and the exact quote turnover
+# (`amount`). Multiplying price by `vol` and calling it USD is wrong by the
+# contract size, which differs per symbol - on BTC (contractSize 0.0001) it
+# overstates turnover ~10,000x, on CHILLGUY (contractSize 10) it understates it
+# 10x. Anything comparing liquidity across symbols must use `amount`.
+_TURNOVER_COLUMN = "turnover"
+
 
 class MexcContractClient:
     """Public market data client for MEXC USDT-perpetual contracts.
@@ -207,6 +214,8 @@ class MexcContractClient:
                     "low": pd.to_numeric(pd.Series(data["low"]), errors="coerce"),
                     "close": pd.to_numeric(pd.Series(data["close"]), errors="coerce"),
                     "volume": pd.to_numeric(pd.Series(data["vol"]), errors="coerce"),
+                    # exact quote turnover; see _TURNOVER_COLUMN note above
+                    _TURNOVER_COLUMN: pd.to_numeric(pd.Series(data.get("amount", [])), errors="coerce"),
                 }
             )
         except (KeyError, ValueError):

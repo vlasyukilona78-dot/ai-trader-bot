@@ -226,17 +226,20 @@ def build_features(
     close = float(last["close"])
 
     def pct_change(hours: int) -> float:
+        """NaN rather than a shorter window: a "30d change" computed from 5 days
+        of history is a different quantity, and silently mixing the two makes a
+        feature mean different things for different rows."""
         sub = hist.tail(hours + 1)
-        if len(sub) < 2:
+        if len(sub) < hours + 1:
             return float("nan")
         base = float(sub["close"].iloc[0])
         return (close - base) / base if base else float("nan")
 
     def headroom(hours: int) -> float:
         sub = hist.tail(hours + 1)
-        if sub.empty:
+        if len(sub) < hours + 1:
             return float("nan")
-        prior_high = float(sub["high"].iloc[:-1].max()) if len(sub) > 1 else close
+        prior_high = float(sub["high"].iloc[:-1].max())
         return (prior_high - close) / close
 
     atr = float(last.get("atr", float("nan")))

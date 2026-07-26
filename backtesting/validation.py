@@ -29,11 +29,20 @@ def walk_forward_folds(
     n_rows: int,
     n_folds: int = 4,
     min_train_frac: float = 0.4,
+    *,
+    decision_ts: np.ndarray | None = None,
+    label_horizon_sec: int = 48 * 3600,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """Expanding-window folds over chronologically ordered rows.
 
     Each fold trains on everything before its test block, which is how the
     strategy would actually have been calibrated in real time.
+
+    Splitting on row index alone is not enough when a label looks forward. An
+    event decided shortly before the boundary is scored on 48 hours of price
+    action that lie inside the test block, so it already knows part of what the
+    test is supposed to reveal. Supplying `decision_ts` purges those events from
+    training; without it the split is positional and that leakage stays.
     """
     if n_rows < 10 or n_folds < 1:
         return []
@@ -42,13 +51,23 @@ def walk_forward_folds(
     if start >= n_rows - 1:
         return []
 
+    ts = np.asarray(decision_ts, dtype=float) if decision_ts is not None else None
     edges = np.linspace(start, n_rows, n_folds + 1).astype(int)
     folds = []
     for i in range(n_folds):
         train_end, test_end = edges[i], edges[i + 1]
         if test_end <= train_end:
             continue
-        folds.append((np.arange(0, train_end), np.arange(train_end, test_end)))
+
+        train = np.arange(0, train_end)
+        test = np.arange(train_end, test_end)
+        if ts is not None and len(test):
+            # drop training events whose label window reaches into the test block
+            boundary = ts[test].min()
+            train = train[ts[train] + label_horizon_sec <= boundary]
+        if len(train) == 0:
+            continue
+        folds.append((train, test))
     return folds
 
 

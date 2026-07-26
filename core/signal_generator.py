@@ -400,11 +400,18 @@ class SignalGenerator:
 
         lookback = max(1, int(cfg.liquidity_lookback_bars))
         tail = df.tail(lookback)
-        usd_volume = float(
-            (pd.to_numeric(tail["close"], errors="coerce") * pd.to_numeric(tail["volume"], errors="coerce"))
-            .fillna(0.0)
-            .sum()
-        )
+        # `volume` on a MEXC kline is a contract count, so close*volume is only
+        # USD by accident - it is wrong by the contract size, which differs per
+        # symbol (BTC ~10,000x too high, CHILLGUY 10x too low). The exchange
+        # ships exact quote turnover alongside it; prefer that whenever present.
+        if "turnover" in tail.columns:
+            usd_volume = float(pd.to_numeric(tail["turnover"], errors="coerce").fillna(0.0).sum())
+        else:
+            usd_volume = float(
+                (pd.to_numeric(tail["close"], errors="coerce") * pd.to_numeric(tail["volume"], errors="coerce"))
+                .fillna(0.0)
+                .sum()
+            )
 
         effective_floor = cfg.min_atr_pct if atr_floor is None else atr_floor
         atr_ok = atr_pct >= effective_floor if effective_floor > 0 else True

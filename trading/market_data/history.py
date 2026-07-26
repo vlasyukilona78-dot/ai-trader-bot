@@ -21,6 +21,10 @@ _INTERVAL_SECONDS = {
 
 _MAX_BARS_PER_REQUEST = 2000
 _OHLCV_COLUMNS = ["time", "open", "high", "low", "close", "volume"]
+# Exact quote turnover from the kline. `volume` is a contract count and is not
+# comparable across symbols without the contract size, so liquidity work must
+# read this instead.
+_TURNOVER = "turnover"
 
 
 @dataclass
@@ -52,9 +56,16 @@ class HistoryCollector:
         if not os.path.exists(path):
             return pd.DataFrame(columns=_OHLCV_COLUMNS)
         try:
-            return pd.read_csv(path)
+            cached = pd.read_csv(path)
         except Exception:
             return pd.DataFrame(columns=_OHLCV_COLUMNS)
+
+        # Caches written before turnover was captured cannot be repaired from
+        # what they contain, and silently mixing them with new rows would leave
+        # half the history without comparable liquidity. Refetch instead.
+        if _TURNOVER not in cached.columns:
+            return pd.DataFrame(columns=_OHLCV_COLUMNS)
+        return cached
 
     def _write_cache(self, symbol: str, interval: str, df: pd.DataFrame):
         df.sort_values("time").drop_duplicates("time").to_csv(self._cache_path(symbol, interval), index=False)
@@ -76,8 +87,9 @@ class HistoryCollector:
                 "low": pd.to_numeric(pd.Series(data["low"]), errors="coerce"),
                 "close": pd.to_numeric(pd.Series(data["close"]), errors="coerce"),
                 "volume": pd.to_numeric(pd.Series(data["vol"]), errors="coerce"),
+                _TURNOVER: pd.to_numeric(pd.Series(data.get("amount", [])), errors="coerce"),
             }
-        ).dropna()
+        ).dropna(subset=_OHLCV_COLUMNS)
 
     def fetch_range(
         self,
