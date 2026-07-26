@@ -16,6 +16,8 @@ import argparse
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import os
+
 from core.indicators import compute_indicators
 from trading.market_data.feed import MarketDataFeed
 from trading.market_data.mexc_client import MexcContractClient
@@ -26,6 +28,7 @@ from trading.signals.layered_strategy import LayeredPumpStrategy
 from trading.signals.signal_types import IntentAction
 from trading.signals.strategy_interface import StrategyContext
 from trading.state.models import TradeState
+from trading.state.signal_observation_tracker import SignalObservationTracker
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,10 +44,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--interval-sec", type=int, default=300)
     p.add_argument("--loop", action="store_true")
     p.add_argument("--universe-refresh-sec", type=int, default=900)
+    p.add_argument("--observations", default="data/runtime/observations.json",
+                   help="Where forward outcomes of delivered signals are recorded")
+    p.add_argument("--observe-minutes", type=int, default=120,
+                   help="How long each signal is followed after delivery")
     return p.parse_args()
 
 
-def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers) -> list:
+def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
+              tracker=None, alerters=()) -> list:
     snapshot = universe.refresh()
     symbols = snapshot.symbols
     if not symbols:
@@ -103,6 +111,42 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers) 
         if intent.action in (IntentAction.SHORT_ENTRY, IntentAction.LONG_ENTRY)
     ]
 
+    if tracker is not None:
+        # Feed every scanned symbol forward, not just the ones that fired: an
+        # observation opened earlier is still running and needs its bars.
+        for sym, _, frame in evaluated:
+            try:
+                tracker.update_frame(sym, frame)
+            except Exception as exc:
+                logger.debug("tracker_update_failed=%s err=%s", sym, exc, extra={"event": "scan"})
+
+        for sym, intent, _ in signals:
+            meta = intent.metadata if isinstance(intent.metadata, dict) else {}
+            layer5 = (meta.get("layer_trace", {}).get("layers", {})
+                      .get("layer5_tp_sl", {}).get("details", {}))
+            try:
+                tracker.record_short(
+                    signal_id=str(meta.get("legacy_signal_id") or f"{sym}-{int(time.time()*1000)}"),
+                    symbol=sym,
+                    phase=intent.action.value,
+                    entry=float(layer5.get("entry") or 0.0),
+                    take_profit=float(layer5.get("tp") or 0.0),
+                    stop_loss=float(layer5.get("sl") or 0.0),
+                    signal_ts=time.time(),
+                    signal_bar_ts=None,
+                    delivered=bool(alerters),
+                    candidate_source="mexc_scan",
+                )
+            except Exception as exc:
+                logger.warning("tracker_record_failed=%s err=%s", sym, exc, extra={"event": "scan"})
+
+        try:
+            expired = tracker.expire_stale()
+            if expired:
+                logger.info("observations_expired=%d", expired, extra={"event": "scan"})
+        except Exception:
+            pass
+
     # Dropped symbols are reported, not swallowed: a scan that quietly covers
     # half the board is choosing a different universe than the one configured.
     logger.info(
@@ -134,6 +178,21 @@ def describe(symbol: str, intent) -> str:
     return " | ".join(parts)
 
 
+def build_alerters():
+    """Telegram only when both credentials are present; silence otherwise.
+
+    Observation must be able to run with no alerting configured at all, so a
+    missing token is a quiet no-op rather than a startup failure.
+    """
+    token = os.getenv("TELEGRAM_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID", "")
+    if not (token and chat_id):
+        return []
+    from trading.alerts.telegram import TelegramAlerter
+
+    return [TelegramAlerter(token=token, chat_id=chat_id)]
+
+
 def main() -> int:
     args = parse_args()
     logger = setup_logging("INFO")
@@ -153,15 +212,27 @@ def main() -> int:
     strategy = LayeredPumpStrategy()
     strategy.set_htf_cache(HigherTimeframeCache(feed))
 
-    logger.info("scanner_start venue=mexc execution=disabled timeframe=%s",
-                args.timeframe, extra={"event": "startup"})
+    alerters = build_alerters()
+    tracker = SignalObservationTracker(args.observations, horizon_minutes=args.observe_minutes)
+
+    logger.info(
+        "scanner_start venue=mexc execution=disabled timeframe=%s alerts=%d observations=%s",
+        args.timeframe, len(alerters), args.observations, extra={"event": "startup"},
+    )
 
     try:
         while True:
             signals = scan_once(universe=universe, feed=feed, strategy=strategy, logger=logger,
-                                timeframe=args.timeframe, candles=args.candles, workers=args.workers)
+                                timeframe=args.timeframe, candles=args.candles,
+                                workers=args.workers, tracker=tracker, alerters=alerters)
             for symbol, intent, _ in signals:
-                logger.info("%s", describe(symbol, intent), extra={"event": "signal"})
+                text = describe(symbol, intent)
+                logger.info("%s", text, extra={"event": "signal"})
+                for alerter in alerters:
+                    try:
+                        alerter.send(text)
+                    except Exception as exc:
+                        logger.warning("alert_failed=%s", exc, extra={"event": "signal"})
             if not args.loop:
                 break
             time.sleep(max(30, args.interval_sec))
