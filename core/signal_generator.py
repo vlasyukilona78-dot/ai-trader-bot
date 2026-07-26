@@ -46,6 +46,15 @@ class SignalConfig:
     # which is what makes an entry viable at 50-100x.
     pump_entry_max_dist_from_peak_pct: float = 0.015
     pump_stop_buffer_pct: float = 0.003
+    # The stop sits beyond the structural level by whichever is larger: the flat
+    # percentage above, or this multiple of ATR. Measured on the real pipeline, a
+    # flat 0.3% left the stop inside hourly noise and invalidated nearly every
+    # candidate before it could confirm.
+    stop_buffer_atr_mult: float = 0.5
+    # Anchor the swing on the higher timeframe. An hourly high is set by whatever
+    # wick printed; a 4h swing high is a level the market respected.
+    structural_anchor_htf: bool = True
+    structural_anchor_htf_bars: int = 12
     # Caps loss per trade, not liquidation distance: on cross margin with a small
     # position relative to equity, liquidation sits far beyond any sane stop, so this
     # is a risk-budget knob rather than a survival one.
@@ -525,13 +534,43 @@ class SignalGenerator:
         }
         return ok, details
 
-    def _window_extremes(self, df: pd.DataFrame) -> tuple[float, float]:
-        work = df.tail(max(5, int(self.config.pump_window_bars)))
+    def _window_extremes(
+        self,
+        df: pd.DataFrame,
+        htf_frame: pd.DataFrame | None = None,
+    ) -> tuple[float, float]:
+        """The swing the setup is measured against.
+
+        Taken from the higher timeframe when one is available. An hourly high is
+        set by whichever wick happened to print, so a stop referenced to it sits
+        inside ordinary noise and invalidation fires on almost every candidate;
+        a 4h swing high is a level the market actually respected.
+        """
+        if self.config.structural_anchor_htf and htf_frame is not None and len(htf_frame) >= 3:
+            bars = max(3, int(self.config.structural_anchor_htf_bars))
+            work = htf_frame.tail(bars)
+        else:
+            work = df.tail(max(5, int(self.config.pump_window_bars)))
         high = pd.to_numeric(work["high"], errors="coerce").max()
         low = pd.to_numeric(work["low"], errors="coerce").min()
         return float(high), float(low)
 
-    def _layer3_entry_near_peak(self, df: pd.DataFrame, side: str, vp: VolumeProfileLevels | None) -> tuple[bool, dict[str, float]]:
+    def _stop_buffer(self, df: pd.DataFrame, reference: float) -> float:
+        """Distance to place a stop beyond the structural level, in price.
+
+        A fixed percentage cannot serve coins whose hourly ranges differ tenfold:
+        0.3% is a wide berth on a quiet pair and pure noise on a volatile one,
+        which is exactly where this strategy operates. The buffer therefore
+        scales with ATR and keeps the percentage only as a floor.
+        """
+        cfg = self.config
+        pct_buffer = reference * max(0.0, cfg.pump_stop_buffer_pct)
+        atr = self._safe(df.iloc[-1].get("atr"), 0.0)
+        atr_buffer = atr * max(0.0, cfg.stop_buffer_atr_mult)
+        return max(pct_buffer, atr_buffer)
+
+    def _layer3_entry_near_peak(self, df: pd.DataFrame, side: str, vp: VolumeProfileLevels | None,
+                                htf_frame: pd.DataFrame | None = None) -> tuple[bool, dict[str, float]]:
         """Layer 3 (window mode): entry must sit close to the pump's own extreme.
 
         The legacy check waits for price to travel all the way back to VAH, but a pump
@@ -543,7 +582,7 @@ class SignalGenerator:
             return False, {"insufficient_history": 1.0}
 
         close = self._safe(df.iloc[-1].get("close"))
-        win_high, win_low = self._window_extremes(df)
+        win_high, win_low = self._window_extremes(df, htf_frame)
         max_dist = max(0.0, self.config.pump_entry_max_dist_from_peak_pct)
 
         if side == "SHORT":
@@ -571,10 +610,11 @@ class SignalGenerator:
         details.update(msb)
         return bool(entry_ok and msb_ok), details
 
-    def _layer3_entry_location(self, df: pd.DataFrame, side: str, vp: VolumeProfileLevels | None) -> tuple[bool, dict[str, float]]:
+    def _layer3_entry_location(self, df: pd.DataFrame, side: str, vp: VolumeProfileLevels | None,
+                               htf_frame: pd.DataFrame | None = None) -> tuple[bool, dict[str, float]]:
         """Layer 3: Entry location via Volume Profile levels + MSB."""
         if self.config.pump_window_enabled:
-            return self._layer3_entry_near_peak(df, side, vp)
+            return self._layer3_entry_near_peak(df, side, vp, htf_frame)
 
         if vp is None or len(df) < 2:
             return False, {"vp_missing": 1.0}
@@ -669,7 +709,8 @@ class SignalGenerator:
             "sentiment_source": source,
         }
 
-    def _layer5_structural_levels(self, df: pd.DataFrame, side: str, vp: VolumeProfileLevels | None) -> tuple[float, float, list[float]]:
+    def _layer5_structural_levels(self, df: pd.DataFrame, side: str, vp: VolumeProfileLevels | None,
+                                  htf_frame: pd.DataFrame | None = None) -> tuple[float, float, list[float]]:
         """Layer 5 (window mode): stop just beyond the pump extreme, not an ATR multiple.
 
         The thesis is invalidated by a new extreme, so that is where the stop belongs.
@@ -679,26 +720,26 @@ class SignalGenerator:
         """
         close = self._safe(df.iloc[-1].get("close"))
         atr = self._safe(df.iloc[-1].get("atr"), close * 0.01) or close * 0.01
-        win_high, win_low = self._window_extremes(df)
-        buf = max(0.0, self.config.pump_stop_buffer_pct)
+        win_high, win_low = self._window_extremes(df, htf_frame)
 
         if side == "SHORT":
-            sl = win_high * (1.0 + buf)
+            sl = win_high + self._stop_buffer(df, win_high)
             risk = max(sl - close, 1e-12)
             tp = vp.poc if (vp and vp.poc < close) else close - risk * self.config.risk_reward
             partial = [close - risk, (close + float(tp)) / 2.0]
         else:
-            sl = win_low * (1.0 - buf)
+            sl = win_low - self._stop_buffer(df, win_low)
             risk = max(close - sl, 1e-12)
             tp = vp.poc if (vp and vp.poc > close) else close + risk * self.config.risk_reward
             partial = [close + risk, (close + float(tp)) / 2.0]
 
         return float(tp), float(sl), [float(x) for x in partial]
 
-    def _layer5_tp_sl_levels(self, df: pd.DataFrame, side: str, vp: VolumeProfileLevels | None) -> tuple[float, float, list[float]]:
+    def _layer5_tp_sl_levels(self, df: pd.DataFrame, side: str, vp: VolumeProfileLevels | None,
+                             htf_frame: pd.DataFrame | None = None) -> tuple[float, float, list[float]]:
         """Layer 5: TP/SL levels via ATR + Volume Profile (with RR fallback)."""
         if self.config.pump_window_enabled:
-            return self._layer5_structural_levels(df, side, vp)
+            return self._layer5_structural_levels(df, side, vp, htf_frame)
 
         last = df.iloc[-1]
         close = self._safe(last.get("close"))
@@ -782,7 +823,7 @@ class SignalGenerator:
             layer2 = {"skipped": 1.0}
             trace["layers"]["layer2_weakness_confirmation"] = {"passed": True, "details": layer2}
 
-        layer3_ok, layer3 = self._layer3_entry_location(df, side, context.volume_profile)
+        layer3_ok, layer3 = self._layer3_entry_location(df, side, context.volume_profile, context.htf_frame)
         trace["layers"]["layer3_entry_location"] = {"passed": layer3_ok, "details": layer3}
         if not layer3_ok:
             trace["failed_layer"] = "layer3_entry_location"
@@ -816,7 +857,7 @@ class SignalGenerator:
         entry: float | None = None,
     ) -> SignalResult | None:
         entry = float(entry if entry is not None else df.iloc[-1]["close"])
-        tp, sl, partial_tps = self._layer5_tp_sl_levels(df, side, context.volume_profile)
+        tp, sl, partial_tps = self._layer5_tp_sl_levels(df, side, context.volume_profile, context.htf_frame)
         tp, sl = self._normalize_levels(entry=entry, tp=tp, sl=sl, side=side)
 
         stop_distance_pct = abs(sl - entry) / max(entry, 1e-12)
@@ -1038,9 +1079,11 @@ class SignalGenerator:
 
         invalidate_level: float | None = None
         if self.config.pump_window_enabled:
-            win_high, win_low = self._window_extremes(df)
-            buf = max(0.0, self.config.pump_stop_buffer_pct)
-            invalidate_level = win_high * (1.0 + buf) if side == "SHORT" else win_low * (1.0 - buf)
+            # Same level the stop will use, so a candidate is only abandoned where
+            # the trade itself would have been.
+            win_high, win_low = self._window_extremes(df, context.htf_frame)
+            invalidate_level = (win_high + self._stop_buffer(df, win_high) if side == "SHORT"
+                                else win_low - self._stop_buffer(df, win_low))
 
         self._pending[context.symbol] = PendingCandidate(
             symbol=context.symbol,

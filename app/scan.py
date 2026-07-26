@@ -178,6 +178,20 @@ def describe(symbol: str, intent) -> str:
     return " | ".join(parts)
 
 
+def load_env() -> None:
+    """Read .env if one is present.
+
+    The credentials live in .env, but nothing in the V2 stack loads it, so a
+    scanner started straight from the shell found no token and reported
+    alerts=0 while looking like it had started correctly.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    load_dotenv()
+
+
 def build_alerters():
     """Telegram only when both credentials are present; silence otherwise.
 
@@ -195,6 +209,7 @@ def build_alerters():
 
 def main() -> int:
     args = parse_args()
+    load_env()
     logger = setup_logging("INFO")
 
     client = MexcContractClient()
@@ -219,6 +234,14 @@ def main() -> int:
         "scanner_start venue=mexc execution=disabled timeframe=%s alerts=%d observations=%s",
         args.timeframe, len(alerters), args.observations, extra={"event": "startup"},
     )
+    if not alerters:
+        # Otherwise a scanner with no delivery path looks identical to a healthy
+        # one until the first signal is found and silently goes nowhere.
+        logger.warning(
+            "no_alert_channel: set TELEGRAM_TOKEN and CHAT_ID (.env or environment); "
+            "signals will only be written to the log",
+            extra={"event": "startup"},
+        )
 
     try:
         while True:

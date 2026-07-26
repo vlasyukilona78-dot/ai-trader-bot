@@ -35,6 +35,36 @@ from trading.signals.strategy_interface import StrategyContext
 from trading.state.models import TradeState
 
 
+def calibration_config() -> SignalConfig:
+    """A permissive config for building the population the gates are fitted on.
+
+    A gate cannot be calibrated on the population that survives it. With shipping
+    thresholds the replay emits nothing, so there is no sample to measure against;
+    opening the gates yields the candidate population, each row still carrying what
+    every gate measured, and a threshold can then be chosen by how it separates
+    forward outcomes.
+
+    This is a measurement instrument, never a trading configuration - it deliberately
+    removes the risk limits, so nothing that reads it should reach an exchange.
+    """
+    return SignalConfig(
+        # gates under calibration: measured on every row, enforced on none
+        min_atr_pct=0.0,
+        min_hourly_usd_volume=0.0,
+        pump_entry_max_dist_from_peak_pct=0.25,
+        min_relative_strength=0.0,
+        require_htf=False,
+        min_rsi_4h=0.0,
+        require_level_overhead=False,
+        # risk limits would truncate the sample before it can be measured
+        max_stop_distance_pct=0.0,
+        min_risk_reward=0.0,
+        # confirmation is a separate question and is evaluated on its own once the
+        # location gates are settled; here it would silently drop the sample again
+        confirmation_enabled=False,
+    )
+
+
 @dataclass
 class RuntimeEvent:
     symbol: str
@@ -61,6 +91,32 @@ class _StaticHtf:
 
     def get(self, symbol: str, **_):
         return _closed_by(self.frame, self.bar_seconds, self._decision_ts)
+
+
+# What each gate measured, carried onto the row so a threshold can be chosen by
+# comparing it against forward outcomes on this population. Fitting a threshold on
+# one population and applying it to another is what put min_atr_pct at the 96th
+# percentile of the bars it actually sees.
+_GATE_FEATURES: dict[str, tuple[str, ...]] = {
+    "layer1_pump_detection": ("run_up_pct", "drop_pct", "bars_since_peak", "retrace_from_high",
+                              "rsi", "volume_spike", "pump_event_bars"),
+    "layer1b_quality_gate": ("atr_pct", "usd_volume_recent"),
+    "layer1c_market_context": ("relative_strength", "rsi_htf", "level_dist_pct"),
+    "layer3_entry_location": ("dist_from_extreme_pct", "msb_confirmed"),
+    "layer4_fake_filter": ("sentiment_index", "vwap_dist_pct"),
+}
+
+
+def _gate_features(layers: dict) -> dict[str, float]:
+    """Flatten the gate measurements out of the layer trace."""
+    out: dict[str, float] = {}
+    for layer, fields in _GATE_FEATURES.items():
+        details = layers.get(layer, {}).get("details", {})
+        for field in fields:
+            value = details.get(field)
+            if isinstance(value, (int, float)):
+                out[f"{layer.split('_')[0]}_{field}"] = float(value)
+    return out
 
 
 def replay_runtime_signals(
@@ -108,8 +164,17 @@ def replay_runtime_signals(
             continue
 
         meta = intent.metadata if isinstance(intent.metadata, dict) else {}
-        layer5 = (meta.get("layer_trace", {}).get("layers", {})
-                  .get("layer5_tp_sl", {}).get("details", {}))
+        layers = meta.get("layer_trace", {}).get("layers", {})
+        layer5 = layers.get("layer5_tp_sl", {}).get("details", {})
+
+        diagnostics = {
+            "stop_distance_pct": float(layer5.get("stop_distance_pct") or 0.0),
+            "realized_risk_reward": float(layer5.get("realized_risk_reward") or 0.0),
+            "max_safe_leverage": float(layer5.get("max_safe_leverage") or 0.0),
+            "confidence": float(intent.confidence or 0.0),
+        }
+        diagnostics.update(_gate_features(layers))
+
         events.append(
             RuntimeEvent(
                 symbol=symbol,
@@ -119,12 +184,7 @@ def replay_runtime_signals(
                 side="SHORT" if intent.action is IntentAction.SHORT_ENTRY else "LONG",
                 stop=float(layer5.get("sl") or 0.0),
                 target=float(layer5.get("tp") or 0.0),
-                diagnostics={
-                    "stop_distance_pct": float(layer5.get("stop_distance_pct") or 0.0),
-                    "realized_risk_reward": float(layer5.get("realized_risk_reward") or 0.0),
-                    "max_safe_leverage": float(layer5.get("max_safe_leverage") or 0.0),
-                    "confidence": float(intent.confidence or 0.0),
-                },
+                diagnostics=diagnostics,
             )
         )
     return events
