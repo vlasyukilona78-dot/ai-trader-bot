@@ -47,6 +47,11 @@ class LabelConfig:
     dca_max_adds: int = 6
     dca_target_pct: float = 0.03
     good_mae_thresholds: tuple[float, ...] = (0.03, 0.05, 0.08)
+    # Forward history must actually cover the horizon. A window with holes in it
+    # can miss the bar that would have resolved or invalidated the trade, so an
+    # event is dropped rather than labelled from partial data.
+    min_forward_coverage: float = 0.90
+    max_forward_gap_bars: int = 12
 
 
 @dataclass
@@ -90,8 +95,13 @@ def detect_events(df_1h: pd.DataFrame, cfg: EventConfig) -> list[PumpEvent]:
     return events
 
 
-def label_event(event: PumpEvent, df_fwd: pd.DataFrame, cfg: LabelConfig) -> dict:
-    """Forward-looking outcome labels. df_fwd must start at or after the event."""
+def label_event(
+    event: PumpEvent,
+    df_fwd: pd.DataFrame,
+    cfg: LabelConfig,
+    decision_ts: int | None = None,
+) -> dict:
+    """Forward-looking outcome labels. df_fwd must start at or after the decision."""
     if df_fwd.empty:
         return {}
 
@@ -102,10 +112,14 @@ def label_event(event: PumpEvent, df_fwd: pd.DataFrame, cfg: LabelConfig) -> dic
     mae = float((high.max() - entry) / entry)
     mfe = float((entry - low.min()) / entry)
 
+    # Anchor elapsed time on the decision itself. Using the first delivered bar
+    # would silently measure from later than the decision whenever that bar is
+    # missing, understating how long the trade actually took.
+    origin_ts = int(decision_ts) if decision_ts is not None else int(df_fwd["time"].iloc[0])
+
     hit = low[low <= entry * (1 - cfg.dca_target_pct)]
     time_to_target_min = (
-        # measured from the first forward bar, i.e. the decision moment
-        int((int(df_fwd["time"].loc[hit.index[0]]) - int(df_fwd["time"].iloc[0])) / 60) if len(hit) else -1
+        int((int(df_fwd["time"].loc[hit.index[0]]) - origin_ts) / 60) if len(hit) else -1
     )
 
     # Replay the averaging plan: add a leg at each step above entry, take profit
@@ -145,6 +159,37 @@ def _rsi_at(df: pd.DataFrame, ts: int) -> float:
         return float("nan")
     enriched = compute_indicators(sub.tail(200))
     return float(enriched.iloc[-1].get("rsi", float("nan")))
+
+
+def forward_window_quality(
+    df_fwd: pd.DataFrame,
+    decision_ts: int,
+    horizon_sec: int,
+    bar_seconds: int,
+) -> dict[str, float]:
+    """Coverage and worst gap of a forward window, in bars.
+
+    Labels are only as trustworthy as the history behind them: a window missing
+    a stretch of bars can skip the move that would have resolved the trade, and
+    scoring it anyway quietly biases the result.
+    """
+    expected = max(1, int(horizon_sec // bar_seconds))
+    if df_fwd is None or df_fwd.empty:
+        return {"coverage": 0.0, "max_gap_bars": float(expected), "bars": 0.0, "expected_bars": float(expected)}
+
+    times = pd.to_numeric(df_fwd["time"], errors="coerce").dropna().astype("int64").sort_values()
+    coverage = len(times) / expected
+
+    boundaries = [decision_ts] + times.tolist() + [decision_ts + horizon_sec]
+    diffs = np.diff(np.asarray(boundaries, dtype=float))
+    max_gap = float(diffs.max() / bar_seconds) if len(diffs) else float(expected)
+
+    return {
+        "coverage": float(coverage),
+        "max_gap_bars": max_gap,
+        "bars": float(len(times)),
+        "expected_bars": float(expected),
+    }
 
 
 def _closed_by(frame: pd.DataFrame, bar_seconds: int, decision_ts: int) -> pd.DataFrame:
@@ -289,17 +334,33 @@ def build_symbol_rows(
         decision_ts = ev.ts + BAR_SECONDS_1H
         if decision_ts + horizon > end_ts:
             continue  # not enough forward data to label honestly
-        fwd_src = df_5m if not df_5m.empty else df_15m
-        fwd = fwd_src[(fwd_src["time"] >= decision_ts) & (fwd_src["time"] <= decision_ts + horizon)]
+
+        use_5m = not df_5m.empty
+        fwd_src = df_5m if use_5m else df_15m
+        fwd_bar_sec = 300 if use_5m else 900
+        # Half-open: a bar opening exactly at the horizon belongs to the next
+        # window, and including it would score price action past the horizon.
+        fwd = fwd_src[(fwd_src["time"] >= decision_ts) & (fwd_src["time"] < decision_ts + horizon)]
         if len(fwd) < 10:
             continue
+
+        quality = forward_window_quality(fwd, decision_ts, horizon, fwd_bar_sec)
+        if (
+            quality["coverage"] < label_cfg.min_forward_coverage
+            or quality["max_gap_bars"] > label_cfg.max_forward_gap_bars
+        ):
+            continue  # gapped history cannot be labelled honestly
+
         feats = build_features(ev, df_1h, df_15m, funding, df_4h=df_4h,
                                benchmark_1h=benchmark_1h, decision_ts=decision_ts)
         if not feats:
             continue
-        labels = label_event(ev, fwd, label_cfg)
+        labels = label_event(ev, fwd, label_cfg, decision_ts=decision_ts)
         if not labels:
             continue
-        rows.append({"symbol": symbol, "ts": ev.ts, "decision_ts": decision_ts,
-                     "entry": ev.entry, **feats, **labels})
+        rows.append({
+            "symbol": symbol, "ts": ev.ts, "decision_ts": decision_ts, "entry": ev.entry,
+            "fwd_coverage": quality["coverage"], "fwd_max_gap_bars": quality["max_gap_bars"],
+            **feats, **labels,
+        })
     return rows
