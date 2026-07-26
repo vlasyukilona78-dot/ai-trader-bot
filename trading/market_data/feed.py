@@ -15,8 +15,19 @@ class MarketFrame:
 
 
 class MarketDataFeed:
-    def __init__(self, base_url: str = "https://api.bybit.com", timeout: int = 8, max_retries: int = 2):
-        self._client = MarketDataClient(base_url=base_url, timeout=timeout, max_retries=max_retries)
+    def __init__(
+        self,
+        base_url: str = "https://api.bybit.com",
+        timeout: int = 8,
+        max_retries: int = 2,
+        client=None,
+    ):
+        # An explicit client lets the same feed serve a different venue. The
+        # MEXC client exposes the same fetch_ohlcv/fetch_ticker_meta surface and
+        # returns identically shaped frames, so nothing downstream changes.
+        self._client = client or MarketDataClient(
+            base_url=base_url, timeout=timeout, max_retries=max_retries
+        )
 
     def close(self):
         self._client.close()

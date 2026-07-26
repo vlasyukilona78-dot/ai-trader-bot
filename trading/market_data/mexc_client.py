@@ -33,6 +33,34 @@ _EMPTY_OHLCV = ["time", "open", "high", "low", "close", "volume"]
 _TURNOVER_COLUMN = "turnover"
 
 
+class _RateLimiter:
+    """Token bucket shared by every thread using one client.
+
+    Without it, scanning the universe concurrently silently loses symbols: at 8
+    workers MEXC dropped 13 of 60 requests and the client returned empty frames
+    that look exactly like "no data". Pacing requests keeps the whole universe
+    visible instead of trading a quieter subset by accident.
+    """
+
+    def __init__(self, rate_per_sec: float):
+        self.rate = max(0.1, rate_per_sec)
+        self._allowance = self.rate
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._allowance = min(self.rate, self._allowance + (now - self._last) * self.rate)
+                self._last = now
+                if self._allowance >= 1.0:
+                    self._allowance -= 1.0
+                    return
+                wait = (1.0 - self._allowance) / self.rate
+            time.sleep(min(wait, 0.25))
+
+
 class MexcContractClient:
     """Public market data client for MEXC USDT-perpetual contracts.
 
@@ -51,10 +79,12 @@ class MexcContractClient:
         timeout: int = 12,
         max_retries: int = 3,
         tickers_cache_ttl_sec: int = 20,
+        requests_per_sec: float = 8.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.max_retries = max_retries
+        self._limiter = _RateLimiter(requests_per_sec)
         self.tickers_cache_ttl_sec = tickers_cache_ttl_sec
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": "crypto-ai-bot/2.0", "Accept": "application/json"})
@@ -90,6 +120,7 @@ class MexcContractClient:
         delay = 0.5
         for attempt in range(max(1, self.max_retries)):
             try:
+                self._limiter.acquire()
                 response = self._session.get(url, params=params, timeout=self.timeout)
                 response.raise_for_status()
                 payload = response.json()
