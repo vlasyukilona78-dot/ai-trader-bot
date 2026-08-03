@@ -8,4 +8,4 @@ class TelegramAlerter:
         self._client = TelegramClient(token=token, chat_id=chat_id)
 
     def send(self, text: str):
-        self._client.send_text(text)
+        return bool(self._client.send_text(text))
