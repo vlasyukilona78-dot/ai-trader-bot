@@ -15,7 +15,11 @@ if PROJECT_RUNTIME_SITE_PACKAGES.exists():
     if runtime_site_packages not in sys.path:
         sys.path.insert(0, runtime_site_packages)
 
-from app.main import main
+from app.main import (
+    _acquire_runtime_instance_lock_file,
+    _release_runtime_instance_lock_file,
+    main,
+)
 
 PROJECT_RUNTIME_PYTHON = PROJECT_ROOT / ".runtime_env" / "Scripts" / "python.exe"
 PROJECT_VENV_PYTHON = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
@@ -254,6 +258,18 @@ def _run_dual_profile_supervisor() -> int:
         pass
     supervisor_log_path, supervisor_log_stream = _open_supervisor_run_log()
     supervisor_lock_handle = _acquire_supervisor_lock(log_stream=supervisor_log_stream)
+    try:
+        runtime_lock_handle = _acquire_runtime_instance_lock_file()
+    except OSError:
+        _emit_supervisor_log(
+            "[supervisor] another bot runtime is already active; startup refused",
+            supervisor_log_stream,
+        )
+        _release_supervisor_lock(supervisor_lock_handle)
+        if supervisor_log_stream is not None:
+            supervisor_log_stream.close()
+        return 3
+    os.environ["BOT_RUNTIME_LOCK_INHERITED"] = "true"
     _stop_previous_supervisor_if_needed(log_stream=supervisor_log_stream)
     _write_active_supervisor_state(pid=os.getpid(), log_path=str(supervisor_log_path))
     profiles = ("main", "early")
@@ -311,6 +327,8 @@ def _run_dual_profile_supervisor() -> int:
             thread.join(timeout=1)
         _clear_active_supervisor_state(pid=os.getpid())
         _release_supervisor_lock(supervisor_lock_handle)
+        _release_runtime_instance_lock_file(runtime_lock_handle)
+        os.environ.pop("BOT_RUNTIME_LOCK_INHERITED", None)
         if supervisor_log_stream is not None:
             try:
                 supervisor_log_stream.close()

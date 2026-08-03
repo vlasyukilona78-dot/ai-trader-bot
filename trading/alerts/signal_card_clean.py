@@ -293,3 +293,35 @@ def build_early_invalidation_text(*, symbol: str, timeframe: str, mode: str, rea
         lines.append(f"\u041f\u0440\u0438\u0447\u0438\u043d\u0430: {clean_reason}")
     return "\n".join(_normalize_human_text(line) for line in lines)
 
+
+def build_early_resolution_text(
+    *,
+    symbol: str,
+    timeframe: str,
+    mode: str,
+    favorable_excursion_pct: float,
+    adverse_excursion_pct: float,
+    current_move_pct: float,
+    tp_hit: bool,
+) -> str:
+    asset = _base_asset(symbol)
+    favorable = max(_as_float(favorable_excursion_pct), 0.0)
+    adverse = max(_as_float(adverse_excursion_pct), 0.0)
+    current = _as_float(current_move_pct)
+    status = (
+        "\u0446\u0435\u043b\u044c \u0434\u043e\u0441\u0442\u0438\u0433\u043d\u0443\u0442\u0430"
+        if tp_hit
+        else "\u043f\u0435\u0440\u0432\u0438\u0447\u043d\u0430\u044f \u0440\u0435\u0430\u043a\u0446\u0438\u044f \u0432\u043d\u0438\u0437 \u043e\u0442\u0440\u0430\u0431\u043e\u0442\u0430\u043b\u0430"
+    )
+    lines = [
+        "<b>\u0420\u0410\u041d\u041d\u0418\u0419 \u0428\u041e\u0420\u0422: \u0420\u0415\u0410\u041a\u0426\u0418\u042f \u041e\u0422\u0420\u0410\u0411\u041e\u0422\u0410\u041b\u0410</b>",
+        f"<b>{asset}</b> | <code>{symbol}</code>",
+        f"{_ICON_TIME} \u0422\u0424: {timeframe}\u043c | \u0420\u0435\u0436\u0438\u043c: {mode}",
+        f"\u0421\u0442\u0430\u0442\u0443\u0441: {status}",
+        f"\u041c\u0430\u043a\u0441. \u0434\u0432\u0438\u0436\u0435\u043d\u0438\u0435 \u0432 \u043f\u043e\u043b\u044c\u0437\u0443 \u0448\u043e\u0440\u0442\u0430: {favorable:.2f}%",
+        f"\u041c\u0430\u043a\u0441. \u0434\u0432\u0438\u0436\u0435\u043d\u0438\u0435 \u043f\u0440\u043e\u0442\u0438\u0432: {adverse:.2f}%",
+        f"\u0422\u0435\u043a\u0443\u0449\u0435\u0435 \u0434\u0432\u0438\u0436\u0435\u043d\u0438\u0435 \u043e\u0442 \u0441\u0438\u0433\u043d\u0430\u043b\u0430: {current:+.2f}%",
+        "\u0414\u0435\u0439\u0441\u0442\u0432\u0438\u0435: \u0437\u0430\u0449\u0438\u0442\u0438\u0442\u044c \u043f\u0440\u0438\u0431\u044b\u043b\u044c; \u0440\u0430\u043d\u043d\u0438\u0439 setup \u0431\u043e\u043b\u044c\u0448\u0435 \u043d\u0435 \u0430\u043a\u0442\u0438\u0432\u0435\u043d.",
+    ]
+    return "\n".join(_normalize_human_text(line) for line in lines)
+

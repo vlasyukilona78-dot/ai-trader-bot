@@ -13,18 +13,27 @@ try:
     from app.main import (
         _build_approved_early_candidate,
         _build_clean_context_chart_caption,
+        _build_early_signal_candidate,
+        _build_early_candidate_signature,
         _build_strategy,
         _build_main_signal_signature,
+        _build_pump_id,
         _build_early_watch_candidate,
         _build_higher_timeframe_chart,
         _build_ultra_entry_candidate,
         _alert_context_timeframe,
         _current_recent_peak_price,
+        _early_candidate_refresh_outcome,
         _enrich_intent_with_runtime_market_metadata,
         _format_chart_timeframe_label,
         _prepare_symbol_analysis,
+        _profile_includes_early,
+        _profile_includes_main,
+        _release_cross_process_alert,
         _remember_cached_alert,
         _remember_recent_candidate_realert,
+        _reserve_cross_process_alert,
+        _resolve_early_watch_pump_threshold,
         _scan_live_price_overlay_enabled,
         _send_alerts,
         _send_chart_or_text_alerts,
@@ -32,8 +41,12 @@ try:
         _should_block_recent_candidate_realert,
         _should_block_live_main_short_continuation,
         _should_block_recent_main_short_reentry,
+        _should_refresh_live_candidate,
         _signal_config_from_strategy_settings,
         _strategy_audit_log_payload,
+        _summarize_early_candidates,
+        _summarize_early_pump_context,
+        _summarize_data_quality_blocks,
     )
     from trading.alerts.signal_card import build_early_signal_caption
     from trading.alerts.signal_card_clean import build_early_signal_caption as build_early_signal_caption_clean
@@ -67,6 +80,27 @@ except Exception:
 
 @unittest.skipUnless(HAS_DEPS, "numpy/pandas not installed")
 class SignalGeneratorTests(unittest.TestCase):
+    def test_failed_alert_reservation_can_be_released_for_retry(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {
+                "ALERT_CROSS_PROCESS_DEDUPE_ENABLED": "true",
+                "ALERT_DEDUPE_LOCK_DIR": tmpdir,
+            },
+            clear=False,
+        ):
+            reservation = {
+                "kind": "early_watch",
+                "symbol": "BTCUSDT",
+                "signature": "bar-1",
+            }
+            self.assertTrue(_reserve_cross_process_alert(**reservation, cooldown_sec=3600))
+            self.assertFalse(_reserve_cross_process_alert(**reservation, cooldown_sec=3600))
+
+            _release_cross_process_alert(**reservation)
+
+            self.assertTrue(_reserve_cross_process_alert(**reservation, cooldown_sec=3600))
+
     @staticmethod
     def _build_df() -> pd.DataFrame:
         n = 120
@@ -204,6 +238,119 @@ class SignalGeneratorTests(unittest.TestCase):
 
         self.assertEqual(result.get("status"), "data_quality_blocked")
         self.assertEqual(result.get("reason"), "recent_zero_volume_cluster")
+
+    def test_data_quality_summary_groups_reasons_and_bounds_samples(self):
+        summary = _summarize_data_quality_blocks(
+            {
+                "ZZZUSDT": {"status": "data_quality_blocked", "reason": "recent_zero_volume_cluster"},
+                "AAAUSDT": {"status": "data_quality_blocked", "reason": "recent_zero_volume_cluster"},
+                "BBBUSDT": {"status": "data_quality_blocked", "reason": "stale_tail"},
+                "CCCUSDT": {"status": "ok"},
+                "DDDUSDT": {"status": "data_quality_blocked", "reason": ""},
+            },
+            sample_limit=1,
+        )
+
+        self.assertEqual(summary["count"], 4)
+        self.assertEqual(
+            summary["reasons"],
+            {
+                "recent_zero_volume_cluster": 2,
+                "stale_tail": 1,
+                "unknown": 1,
+            },
+        )
+        self.assertEqual(summary["samples"]["recent_zero_volume_cluster"], ["AAAUSDT"])
+        self.assertEqual(summary["samples"]["stale_tail"], ["BBBUSDT"])
+        self.assertEqual(summary["samples"]["unknown"], ["DDDUSDT"])
+
+    def test_both_profile_includes_main_guards_and_early_observation(self):
+        self.assertTrue(_profile_includes_main("both"))
+        self.assertTrue(_profile_includes_early("both"))
+        self.assertTrue(_profile_includes_main("main"))
+        self.assertFalse(_profile_includes_early("main"))
+        self.assertFalse(_profile_includes_main("early"))
+        self.assertTrue(_profile_includes_early("early"))
+
+    def test_early_candidate_summary_groups_phases_and_bounds_samples(self):
+        summary = _summarize_early_candidates(
+            {
+                "ZZZUSDT": {"phase": "watch"},
+                "AAAUSDT": {"phase": "WATCH"},
+                "BBBUSDT": {"phase": "setup"},
+                "CCCUSDT": None,
+            },
+            sample_limit=1,
+        )
+
+        self.assertEqual(summary["count"], 3)
+        self.assertEqual(summary["phases"], {"WATCH": 2, "SETUP": 1})
+        self.assertEqual(summary["samples"], {"WATCH": ["AAAUSDT"], "SETUP": ["BBBUSDT"]})
+
+    def test_early_watch_uses_its_configured_pump_threshold_below_main(self):
+        layer1 = {
+            "clean_pump_min_pct_used": 0.05,
+            "early_watch_clean_pump_min_pct_used": 0.04,
+        }
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("EARLY_WATCH_CLEAN_PUMP_MIN_PCT", None)
+            threshold = _resolve_early_watch_pump_threshold(layer1)
+
+        self.assertEqual(threshold, 0.04)
+
+    def test_early_watch_threshold_cannot_become_stricter_than_main(self):
+        layer1 = {
+            "clean_pump_min_pct_used": 0.05,
+            "early_watch_clean_pump_min_pct_used": 0.04,
+        }
+        with patch.dict(
+            os.environ,
+            {"EARLY_WATCH_CLEAN_PUMP_MIN_PCT": "0.06"},
+            clear=False,
+        ):
+            threshold = _resolve_early_watch_pump_threshold(layer1)
+
+        self.assertEqual(threshold, 0.05)
+
+    def test_early_pump_context_reports_configured_threshold_and_top_pumps(self):
+        def _prepared(pump_pct: float, *, early_min: float = 0.04):
+            return {
+                "status": "ok",
+                "intent": SimpleNamespace(
+                    metadata={
+                        "layer_trace": {
+                            "layers": {
+                                "layer1_pump_detection": {
+                                    "details": {
+                                        "clean_pump_pct": pump_pct,
+                                        "clean_pump_min_pct_used": 0.05,
+                                        "early_watch_clean_pump_min_pct_used": early_min,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                ),
+            }
+
+        summary = _summarize_early_pump_context(
+            {
+                "EARLYUSDT": _prepared(0.044),
+                "MAINUSDT": _prepared(0.061),
+                "QUIETUSDT": _prepared(0.018),
+                "SKIPUSDT": {"status": "data_quality_blocked"},
+            },
+            sample_limit=2,
+        )
+
+        self.assertEqual(summary["evaluated"], 3)
+        self.assertEqual(summary["explicit_early_thresholds"], 3)
+        self.assertEqual(summary["early_pump_qualified"], 2)
+        self.assertEqual(summary["main_pump_qualified"], 1)
+        self.assertEqual(
+            [row["symbol"] for row in summary["top_pumps"]],
+            ["MAINUSDT", "EARLYUSDT"],
+        )
 
     def test_format_chart_timeframe_label_formats_hours_cleanly(self):
         self.assertEqual(_format_chart_timeframe_label("1"), "1m")
@@ -3285,6 +3432,142 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(sig_a, sig_b)
         self.assertNotIn("legacy|", sig_a)
 
+    def test_pump_id_is_stable_when_same_impulse_prints_a_new_high(self):
+        df = self._build_df().tail(60).copy()
+        first_id = _build_pump_id(symbol="BTCUSDT", timeframe="1", enriched=df)
+        next_ts = df.index[-1] + pd.Timedelta(minutes=1)
+        next_row = df.iloc[-1].copy()
+        next_row["high"] = float(df["high"].max()) + 0.8
+        next_row["close"] = float(df["close"].iloc[-1]) + 0.2
+        extended = pd.concat([df, pd.DataFrame([next_row], index=[next_ts])])
+
+        second_id = _build_pump_id(symbol="BTCUSDT", timeframe="1", enriched=extended)
+
+        self.assertTrue(first_id)
+        self.assertEqual(first_id, second_id)
+
+    def test_early_signature_uses_pump_lifecycle_instead_of_bar_timestamp(self):
+        df = self._build_df().tail(60).copy()
+        pump_id = _build_pump_id(symbol="BTCUSDT", timeframe="1", enriched=df)
+        candidate = {
+            "phase": "WATCH",
+            "entry": 108.5,
+            "tp": 102.0,
+            "sl": 114.0,
+            "pump_id": pump_id,
+        }
+        first = _build_early_candidate_signature(candidate, df)
+        moved_index = df.copy()
+        moved_index.index = moved_index.index + pd.Timedelta(minutes=1)
+
+        second = _build_early_candidate_signature(candidate, moved_index)
+
+        self.assertEqual(first, second)
+        self.assertIn(pump_id, first)
+
+    def test_hold_after_layer1_requests_live_candidate_refresh(self):
+        intent = SimpleNamespace(
+            action=IntentAction.HOLD,
+            metadata={
+                "layer_trace": {
+                    "layers": {
+                        "layer1_pump_detection": {"passed": True},
+                    }
+                }
+            },
+        )
+
+        self.assertTrue(_should_refresh_live_candidate(intent, None))
+
+    def test_early_candidate_refresh_outcome_distinguishes_rejection_and_phase_change(self):
+        self.assertEqual(
+            _early_candidate_refresh_outcome({"phase": "WATCH"}, {"phase": "watch"}),
+            "stable",
+        )
+        self.assertEqual(
+            _early_candidate_refresh_outcome({"phase": "WATCH"}, {"phase": "SETUP"}),
+            "phase_changed",
+        )
+        self.assertEqual(
+            _early_candidate_refresh_outcome({"phase": "WATCH"}, None),
+            "rejected",
+        )
+        self.assertEqual(_early_candidate_refresh_outcome(None, None), "not_applicable")
+
+    def test_legacy_early_fallback_is_disabled_by_default(self):
+        df = self._build_df()
+        intent = SimpleNamespace(action=IntentAction.SHORT_ENTRY)
+        with (
+            patch("app.main._build_approved_early_candidate", return_value=None),
+            patch("app.main._build_early_watch_candidate", return_value={"phase": "WATCH"}),
+            patch.dict(
+                os.environ,
+                {
+                    "EARLY_PRE_MAIN_ENABLED": "0",
+                    "EARLY_LEGACY_FALLBACK_ENABLED": "0",
+                },
+                clear=False,
+            ),
+        ):
+            candidate = _build_early_signal_candidate(
+                symbol="BTCUSDT",
+                timeframe="1",
+                mode="demo",
+                enriched=df,
+                intent=intent,
+            )
+
+        self.assertIsNone(candidate)
+
+    def test_enabled_pre_main_early_path_accepts_hold_and_is_labeled(self):
+        df = self._build_df()
+        intent = SimpleNamespace(action=IntentAction.HOLD)
+        with (
+            patch("app.main._build_approved_early_candidate", return_value=None),
+            patch("app.main._build_early_watch_candidate", return_value={"phase": "WATCH"}) as detector,
+            patch.dict(
+                os.environ,
+                {
+                    "EARLY_PRE_MAIN_ENABLED": "1",
+                    "EARLY_LEGACY_FALLBACK_ENABLED": "0",
+                },
+                clear=False,
+            ),
+        ):
+            candidate = _build_early_signal_candidate(
+                symbol="BTCUSDT",
+                timeframe="1",
+                mode="paper",
+                enriched=df,
+                intent=intent,
+            )
+
+        detector.assert_called_once()
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate["candidate_source"], "pre_main")
+        self.assertTrue(candidate["pump_id"])
+
+    def test_enabled_legacy_early_fallback_is_labeled(self):
+        df = self._build_df()
+        intent = SimpleNamespace(action=IntentAction.SHORT_ENTRY)
+        with (
+            patch("app.main._build_approved_early_candidate", return_value=None),
+            patch("app.main._build_early_watch_candidate", return_value={"phase": "WATCH"}),
+            patch.dict(os.environ, {"EARLY_LEGACY_FALLBACK_ENABLED": "1"}, clear=False),
+        ):
+            os.environ.pop("EARLY_PRE_MAIN_ENABLED", None)
+            candidate = _build_early_signal_candidate(
+                symbol="BTCUSDT",
+                timeframe="1",
+                mode="demo",
+                enriched=df,
+                intent=intent,
+            )
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate["candidate_source"], "legacy")
+        self.assertTrue(candidate["pump_id"])
+
     def test_ultra_entry_candidate_accepts_only_precision_a_plus(self):
         df = self._build_df()
         intent = SimpleNamespace(
@@ -3664,6 +3947,115 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertIn("oi_overheated", missing)
         self.assertEqual(layer4.get("fail_due_to_derivatives_context"), 1.0)
         self.assertEqual(layer4.get("fail_due_to_price_structure"), 0.0)
+
+    def test_layer4_fake_filter_allows_narrow_failed_reclaim_structural_override(self):
+        df = self._build_df()
+        df.iloc[-1, df.columns.get_loc("vwap")] = 120.0
+        signal_gen = SignalGenerator(SignalConfig())
+
+        passed, layer4 = signal_gen._layer4_fake_filter(
+            df=df,
+            side="SHORT",
+            sentiment_index=None,
+            sentiment_source="unavailable",
+            funding_rate=-0.0023,
+            funding_source="live_api",
+            long_short_ratio=1.56,
+            long_short_ratio_source="live_api",
+            open_interest_ratio=1.0,
+            oi_source="live_api",
+            layer2={
+                "failed_reclaim": 1.0,
+                "weakness_strength": 0.60,
+            },
+            layer3={
+                "failed_reclaim": 1.0,
+                "sweep_reclaim_entry_ok": 1.0,
+                "fresh_reaction_from_high": 1.0,
+                "downside_displacement_confirmed": 1.0,
+                "meaningfully_below_vah": 1.0,
+                "acceptance_above_swing_high": 0.0,
+                "continuation_above_fast_value": 0.0,
+                "high_mtf_continuation": 0.0,
+                "entry_location_strength": 1.0,
+                "distance_from_recent_high_pct": 0.031,
+            },
+        )
+
+        self.assertTrue(passed)
+        self.assertEqual(layer4.get("strict_passed"), 0.0)
+        self.assertEqual(layer4.get("structural_override_used"), 1.0)
+        self.assertEqual(layer4.get("structural_override_lsr_ok"), 1.0)
+        self.assertEqual(layer4.get("structural_override_funding_ok"), 1.0)
+        self.assertEqual(layer4.get("missing_conditions"), "")
+
+    def test_layer4_structural_override_blocks_extreme_negative_funding(self):
+        df = self._build_df()
+        signal_gen = SignalGenerator(SignalConfig())
+        layer2 = {"failed_reclaim": 1.0, "weakness_strength": 1.0}
+        layer3 = {
+            "failed_reclaim": 1.0,
+            "sweep_reclaim_entry_ok": 1.0,
+            "fresh_reaction_from_high": 1.0,
+            "downside_displacement_confirmed": 1.0,
+            "meaningfully_below_vah": 1.0,
+            "entry_location_strength": 1.0,
+            "distance_from_recent_high_pct": 0.02,
+        }
+
+        passed, layer4 = signal_gen._layer4_fake_filter(
+            df=df,
+            side="SHORT",
+            sentiment_index=None,
+            sentiment_source="unavailable",
+            funding_rate=-0.004,
+            funding_source="live_api",
+            long_short_ratio=1.70,
+            long_short_ratio_source="live_api",
+            open_interest_ratio=1.0,
+            oi_source="live_api",
+            layer2=layer2,
+            layer3=layer3,
+        )
+
+        self.assertFalse(passed)
+        self.assertEqual(layer4.get("structural_override_used"), 0.0)
+        self.assertEqual(layer4.get("structural_override_funding_ok"), 0.0)
+        self.assertIn("funding_supports_short", str(layer4.get("missing_conditions", "")))
+
+    def test_layer4_structural_override_requires_live_lsr_and_nearby_peak(self):
+        df = self._build_df()
+        signal_gen = SignalGenerator(SignalConfig())
+        layer2 = {"failed_reclaim": 1.0, "weakness_strength": 1.0}
+        layer3 = {
+            "failed_reclaim": 1.0,
+            "sweep_reclaim_entry_ok": 1.0,
+            "fresh_reaction_from_high": 1.0,
+            "downside_displacement_confirmed": 1.0,
+            "meaningfully_below_vah": 1.0,
+            "entry_location_strength": 1.0,
+            "distance_from_recent_high_pct": 0.06,
+        }
+
+        passed, layer4 = signal_gen._layer4_fake_filter(
+            df=df,
+            side="SHORT",
+            sentiment_index=None,
+            sentiment_source="unavailable",
+            funding_rate=-0.001,
+            funding_source="live_api",
+            long_short_ratio=1.70,
+            long_short_ratio_source="unavailable",
+            open_interest_ratio=1.0,
+            oi_source="live_api",
+            layer2=layer2,
+            layer3=layer3,
+        )
+
+        self.assertFalse(passed)
+        self.assertEqual(layer4.get("structural_override_used"), 0.0)
+        self.assertEqual(layer4.get("structural_override_lsr_ok"), 0.0)
+
     def test_layer4_fake_filter_pass_with_softened_funding_threshold(self):
         df = self._build_df()
         cfg = SignalConfig()

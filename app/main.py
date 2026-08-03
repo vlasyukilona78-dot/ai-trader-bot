@@ -17,10 +17,94 @@ from typing import TYPE_CHECKING
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_RUNTIME_SITE_PACKAGES = PROJECT_ROOT / ".runtime_env" / "Lib" / "site-packages"
+PROJECT_MATPLOTLIB_CACHE = PROJECT_ROOT / "data" / "runtime" / "matplotlib"
+PROJECT_RUNTIME_INSTANCE_LOCK = PROJECT_ROOT / "data" / "runtime" / "bot_runtime.lock"
+_RUNTIME_INSTANCE_LOCK_HANDLE = None
+try:
+    PROJECT_MATPLOTLIB_CACHE.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(PROJECT_MATPLOTLIB_CACHE))
+except Exception:
+    pass
 if PROJECT_RUNTIME_SITE_PACKAGES.exists():
     runtime_site_packages = str(PROJECT_RUNTIME_SITE_PACKAGES)
     if runtime_site_packages not in sys.path:
         sys.path.insert(0, runtime_site_packages)
+
+
+def _acquire_runtime_instance_lock_file(path: Path = PROJECT_RUNTIME_INSTANCE_LOCK):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+", encoding="utf-8", buffering=1)
+    try:
+        handle.seek(0)
+        if handle.read(1) == "":
+            handle.seek(0)
+            handle.write(" ")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        handle.seek(1)
+        handle.truncate()
+        handle.write(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "cwd": str(PROJECT_ROOT),
+                    "updated_at": int(time.time()),
+                },
+                ensure_ascii=False,
+            )
+        )
+        handle.flush()
+        return handle
+    except Exception:
+        handle.close()
+        raise
+
+
+def _release_runtime_instance_lock_file(handle) -> None:
+    if handle is None:
+        return
+    try:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        handle.close()
+    except Exception:
+        pass
+
+
+def _claim_runtime_instance_lock(logger) -> bool:
+    global _RUNTIME_INSTANCE_LOCK_HANDLE
+    if _env_flag("BOT_RUNTIME_LOCK_INHERITED", False):
+        return True
+    if _RUNTIME_INSTANCE_LOCK_HANDLE is not None:
+        return True
+    try:
+        _RUNTIME_INSTANCE_LOCK_HANDLE = _acquire_runtime_instance_lock_file()
+    except OSError:
+        logger.error(
+            "startup_refused reason=another_bot_instance_active lock=%s",
+            PROJECT_RUNTIME_INSTANCE_LOCK,
+            extra={"event": "startup_duplicate_instance"},
+        )
+        return False
+    return True
 
 import numpy as np
 import pandas as pd
@@ -35,6 +119,7 @@ from trading.alerts.discord import DiscordAlerter
 from trading.alerts.signal_card_clean import (
     _normalize_human_text,
     build_early_invalidation_text,
+    build_early_resolution_text,
     build_early_signal_caption,
     build_signal_caption,
     build_symbol_copy_reply_markup,
@@ -43,8 +128,9 @@ from trading.alerts.telegram import TelegramAlerter
 from trading.execution.engine import ExecutionEngine, ExecutionOutcome
 from trading.exchange.bybit_adapter import BybitAdapter
 from trading.exchange.bybit_endpoints import resolve_public_http_base_url
-from trading.exchange.schemas import ClosedPnlSnapshot, PositionSide
+from trading.exchange.schemas import ClosedPnlSnapshot, PositionSide, PositionSnapshot
 from trading.market_data.feed import MarketDataFeed
+from trading.market_data.reconciliation import ExchangeSnapshot
 from trading.metrics.counters import MetricsCounter
 from trading.metrics.logging import setup_logging
 from trading.risk.engine import RiskEngine
@@ -58,6 +144,8 @@ from trading.signals.versioning import ULTRA_V2_VERSION
 from trading.state.machine import StateMachine
 from trading.state.models import StateRecord, TradeState
 from trading.state.persistence import RuntimeStore
+from trading.state.signal_observation_tracker import SignalObservationTracker
+from trading.state.signal_position_tracker import SignalPositionTracker
 
 if TYPE_CHECKING:
     from trading.features.pipeline import FeaturePipeline
@@ -169,6 +257,27 @@ def _early_config_float(name: str, default: float) -> float:
     return _as_float(os.getenv(name), default)
 
 
+def _resolve_early_watch_pump_threshold(layer1: Mapping[str, object]) -> float:
+    confirmed_pump_min = max(_as_float(layer1.get("clean_pump_min_pct_used"), 0.05), 0.0)
+    strategy_early_pump_min = max(
+        0.0,
+        _as_float(
+            layer1.get("early_watch_clean_pump_min_pct_used"),
+            confirmed_pump_min,
+        ),
+    )
+    configured_early_pump_min = max(
+        0.0,
+        _early_config_float(
+            "EARLY_WATCH_CLEAN_PUMP_MIN_PCT",
+            strategy_early_pump_min,
+        ),
+    )
+    if confirmed_pump_min <= 0.0:
+        return configured_early_pump_min
+    return min(confirmed_pump_min, configured_early_pump_min)
+
+
 def _early_quality_grade(score: float) -> str:
     if score >= 8.5:
         return "A+"
@@ -214,6 +323,8 @@ def _build_strategy(name: str, *, signal_config: SignalConfig | None = None):
 
 
 def _build_alerters(cfg: RuntimeConfig):
+    if not _env_flag("ALERTS_ENABLED", True):
+        return []
     out = []
     if cfg.alerts.telegram_token and cfg.alerts.telegram_chat_id:
         out.append(TelegramAlerter(token=cfg.alerts.telegram_token, chat_id=cfg.alerts.telegram_chat_id))
@@ -223,6 +334,8 @@ def _build_alerters(cfg: RuntimeConfig):
 
 
 def _build_ultra_early_alerters(cfg: RuntimeConfig):
+    if not _env_flag("ALERTS_ENABLED", True) or not _env_flag("ULTRA_ALERTS_ENABLED", True):
+        return []
     token = str(
         os.getenv("TELEGRAM_ULTRA_TOKEN")
         or os.getenv("ULTRA_TELEGRAM_TOKEN")
@@ -408,15 +521,22 @@ def _log_alert_delivery(logger, *, event: str, attempted: int, sent: int, skip_r
 
 
 _SIGNAL_EVENT_METADATA_KEYS = {
+    "candidate_source",
     "clean_pump_pct",
     "confidence",
+    "execution_accepted",
+    "execution_reason",
+    "execution_status",
     "entry_location_strength",
     "funding_rate",
     "long_short_ratio",
     "open_interest_abs",
     "phase",
     "profile",
+    "pump_id",
     "quality_score",
+    "risk_approved",
+    "risk_reason",
     "rsi",
     "sentiment_index",
     "setup_score",
@@ -427,10 +547,33 @@ _SIGNAL_EVENT_METADATA_KEYS = {
     "orderbook_depth_ratio",
     "bid_ask_imbalance",
     "aggressor_exhaustion",
+    "aggressor_exhaustion_source",
+    "taker_buy_ratio",
+    "trade_flow_delta",
+    "trade_flow_samples",
     "turnover24h_usdt",
     "volume_spike",
     "watch_score",
     "weakness_strength",
+    "market_setup",
+    "mtf_native_15m",
+    "mtf_native_1h",
+    "mtf_ready_5m",
+    "mtf_ready_15m",
+    "mtf_ready_1h",
+    "ml_shadow_enabled",
+    "ml_shadow_governed",
+    "ml_shadow_horizon",
+    "ml_shadow_probability",
+    "ml_shadow_reason",
+    "ml_shadow_version",
+    "managed_exit",
+    "managed_exit_details",
+    "managed_exit_reason",
+    "exit_type",
+    "shadow_position",
+    "best_price",
+    "price_return",
 }
 
 
@@ -457,6 +600,128 @@ def _compact_signal_metadata(*items: Mapping[str, object] | None) -> dict[str, o
             if key in item:
                 compact[key] = _json_safe_value(item.get(key))
     return compact
+
+
+def _ml_shadow_candidate(intent, early_candidate: Mapping[str, object] | None = None) -> bool:
+    action = getattr(intent, "action", IntentAction.HOLD)
+    if action in (IntentAction.LONG_ENTRY, IntentAction.SHORT_ENTRY):
+        return True
+    if isinstance(early_candidate, Mapping):
+        return True
+    metadata = getattr(intent, "metadata", None)
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    trace = metadata.get("layer_trace", {})
+    trace = trace if isinstance(trace, Mapping) else {}
+    layers = trace.get("layers", {})
+    layers = layers if isinstance(layers, Mapping) else {}
+    layer1 = layers.get("layer1_pump_detection", {})
+    return bool(isinstance(layer1, Mapping) and layer1.get("passed"))
+
+
+def _attach_ml_shadow_prediction(
+    *,
+    intent,
+    features,
+    service,
+    early_candidate: Mapping[str, object] | None = None,
+):
+    """Attach advisory ML output without changing the strategy decision."""
+    if service is None or not _ml_shadow_candidate(intent, early_candidate):
+        return intent
+
+    metadata = dict(getattr(intent, "metadata", {}) or {})
+    artifacts = getattr(service, "artifacts", None)
+    version = str(getattr(artifacts, "version", "") or "unknown")
+    feature_names = [str(name) for name in (getattr(artifacts, "feature_names", None) or [])]
+    feature_row = getattr(getattr(features, "row", None), "values", None)
+    feature_row = feature_row if isinstance(feature_row, Mapping) else {}
+    prediction_meta: dict[str, object] = {
+        "ml_shadow_enabled": False,
+        "ml_shadow_governed": bool(getattr(artifacts, "manifest", None)),
+        "ml_shadow_probability": 0.5,
+        "ml_shadow_horizon": 8.0,
+        "ml_shadow_reason": "model_unavailable",
+        "ml_shadow_version": version,
+    }
+    try:
+        if not feature_names:
+            prediction_meta["ml_shadow_reason"] = "feature_contract_missing"
+        else:
+            missing = [name for name in feature_names if name not in feature_row]
+            if missing:
+                prediction_meta["ml_shadow_reason"] = "feature_parity_missing"
+            else:
+                exact_features = {name: float(feature_row[name]) for name in feature_names}
+                result = service.predict(exact_features)
+                result_reason = str(getattr(result, "reason", "") or "unknown")
+                if bool(getattr(result, "model_enabled", False)) and not prediction_meta["ml_shadow_governed"]:
+                    result_reason = f"{result_reason}:ungoverned_artifact"
+                prediction_meta.update(
+                    {
+                        "ml_shadow_enabled": bool(getattr(result, "model_enabled", False)),
+                        "ml_shadow_probability": float(getattr(result, "probability", 0.5)),
+                        "ml_shadow_horizon": float(getattr(result, "horizon", 8.0)),
+                        "ml_shadow_reason": result_reason,
+                    }
+                )
+    except Exception as exc:
+        prediction_meta["ml_shadow_reason"] = f"inference_error:{type(exc).__name__}"
+
+    intent.metadata = {**metadata, **prediction_meta}
+    return intent
+
+
+def _load_ml_shadow_service(*, model_dir: str, logger):
+    if not _env_flag("ML_SHADOW_ENABLED", True):
+        logger.info(
+            "ml_shadow enabled=false reason=disabled_by_config",
+            extra={"event": "ml_shadow"},
+        )
+        return None
+    try:
+        import warnings
+
+        from ai.inference.artifact_loader import load_artifacts
+        from ai.inference.model_service import ModelService
+
+        with warnings.catch_warnings(record=True) as compatibility_warnings:
+            warnings.simplefilter("always")
+            artifacts = load_artifacts(model_dir, strict=False)
+        if compatibility_warnings:
+            logger.warning(
+                "ml_shadow artifact_compatibility_warning count=%d model_dir=%s admission_control=false",
+                len(compatibility_warnings),
+                model_dir,
+                extra={"event": "ml_shadow_compatibility"},
+            )
+        if (
+            artifacts.classifier is None
+            or artifacts.regressor is None
+            or artifacts.scaler is None
+            or not artifacts.feature_names
+        ):
+            logger.warning(
+                "ml_shadow enabled=false reason=incomplete_artifacts model_dir=%s",
+                model_dir,
+                extra={"event": "ml_shadow"},
+            )
+            return None
+        logger.info(
+            "ml_shadow enabled=true admission_control=false version=%s features=%d manifest=%s model_dir=%s",
+            artifacts.version,
+            len(artifacts.feature_names),
+            bool(artifacts.manifest),
+            model_dir,
+            extra={"event": "ml_shadow"},
+        )
+        return ModelService(artifacts, strict_schema=True)
+    except Exception as exc:
+        logger.warning(
+            "ml_shadow enabled=false reason=load_error error=%s",
+            f"{type(exc).__name__}: {exc}",
+            extra={"event": "ml_shadow"},
+        )
+        return None
 
 
 def _candidate_confidence(candidate: Mapping[str, object] | None) -> float:
@@ -512,7 +777,7 @@ def _record_signal_event(
     delivery_attempted: int = 0,
     delivery_sent: int = 0,
     signal_signature: str = "",
-):
+) -> str:
     identity = "|".join(
         [
             str(symbol).upper(),
@@ -544,6 +809,294 @@ def _record_signal_event(
             "metadata": _compact_signal_metadata(metadata, candidate),
         }
     )
+    return signal_id
+
+
+def _record_short_signal_observation(
+    tracker: SignalObservationTracker | None,
+    *,
+    signal_id: str,
+    symbol: str,
+    phase: str,
+    entry: float,
+    tp: float,
+    sl: float,
+    signal_ts: float,
+    enriched,
+    delivered: bool,
+    candidate_source: str = "",
+    logger=APP_LOGGER,
+) -> None:
+    if tracker is None:
+        return
+    try:
+        signal_bar_ts = enriched.index[-1]
+        tracker.record_short(
+            signal_id=signal_id,
+            symbol=symbol,
+            phase=phase,
+            entry=entry,
+            take_profit=tp,
+            stop_loss=sl,
+            signal_ts=signal_ts,
+            signal_bar_ts=signal_bar_ts,
+            delivered=delivered,
+            candidate_source=candidate_source,
+        )
+    except Exception as exc:
+        logger.debug(
+            "signal_observation_record_failed symbol=%s signal_id=%s err=%s",
+            symbol,
+            signal_id,
+            exc,
+            extra={"event": "signal_observation_record_failed"},
+        )
+
+
+def _record_short_signal_position(
+    tracker: SignalPositionTracker | None,
+    *,
+    signal_id: str,
+    symbol: str,
+    entry: float,
+    tp: float,
+    sl: float,
+    signal_ts: float,
+    delivered: bool,
+    pump_id: str = "",
+    source: str = "signal",
+    logger=APP_LOGGER,
+) -> dict[str, object] | None:
+    """Start shadow management only for a short signal the user actually received."""
+    if tracker is None or not delivered:
+        return None
+    try:
+        return tracker.record_short(
+            symbol=symbol,
+            entry_price=entry,
+            stop_loss=sl,
+            take_profit=tp,
+            opened_at=signal_ts,
+            pump_id=pump_id,
+            signal_id=signal_id,
+            leverage=max(
+                0.0,
+                _as_float(os.getenv("MANUAL_REFERENCE_LEVERAGE", "0"), 0.0),
+            ),
+            source=source,
+        )
+    except Exception as exc:
+        logger.debug(
+            "signal_position_record_failed symbol=%s signal_id=%s err=%s",
+            symbol,
+            signal_id,
+            exc,
+            extra={"event": "signal_position_record_failed"},
+        )
+        return None
+
+
+def _early_observation_has_worked(
+    observation: Mapping[str, object] | None,
+    *,
+    min_favorable_pct: float = 0.8,
+    min_current_pct: float = 0.35,
+) -> bool:
+    if not isinstance(observation, Mapping):
+        return False
+    if bool(observation.get("tp_hit")):
+        return True
+    favorable = max(_as_float(observation.get("favorable_excursion_pct"), 0.0), 0.0)
+    adverse = max(_as_float(observation.get("adverse_excursion_pct"), 0.0), 0.0)
+    current = _as_float(observation.get("close_move_pct"), 0.0)
+    return bool(
+        favorable >= max(float(min_favorable_pct), adverse * 1.05)
+        and current >= float(min_current_pct)
+    )
+
+
+def _short_barrier_exit_from_observation(
+    observation: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    """Resolve the first observed short TP/SL hit; ties are conservatively a stop."""
+    if not isinstance(observation, Mapping):
+        return None
+    stop_loss = _as_float(observation.get("stop_loss"), 0.0)
+    take_profit = _as_float(observation.get("take_profit"), 0.0)
+    sl_hit_ts = _as_float(observation.get("sl_hit_ts"), 0.0)
+    tp_hit_ts = _as_float(observation.get("tp_hit_ts"), 0.0)
+    sl_hit = stop_loss > 0.0 and sl_hit_ts > 0.0
+    tp_hit = take_profit > 0.0 and tp_hit_ts > 0.0
+    if not sl_hit and not tp_hit:
+        return None
+    if sl_hit and (not tp_hit or sl_hit_ts <= tp_hit_ts):
+        return {
+            "reason": "signal_shadow_stop_loss_hit",
+            "exit_type": "stop_loss_hit",
+            "exit_price": stop_loss,
+            "hit_ts": sl_hit_ts,
+        }
+    return {
+        "reason": "signal_shadow_take_profit_hit",
+        "exit_type": "take_profit_hit",
+        "exit_price": take_profit,
+        "hit_ts": tp_hit_ts,
+    }
+
+
+def _build_exit_signal_caption(
+    *,
+    symbol: str,
+    mark_price: float,
+    intent,
+    entry_price: float,
+    best_price: float,
+) -> str:
+    metadata = intent.metadata if isinstance(getattr(intent, "metadata", None), Mapping) else {}
+    details = metadata.get("managed_exit_details", {})
+    details = details if isinstance(details, Mapping) else {}
+    underlying_return = (
+        (entry_price - mark_price) / entry_price
+        if entry_price > 0.0 and mark_price > 0.0
+        else 0.0
+    )
+    best_return = (
+        (entry_price - best_price) / entry_price
+        if entry_price > 0.0 and best_price > 0.0
+        else max(0.0, underlying_return)
+    )
+    retention = (
+        max(0.0, min(underlying_return / best_return, 1.0))
+        if best_return > 1e-9
+        else 0.0
+    )
+    exit_type = str(metadata.get("exit_type") or metadata.get("managed_exit_reason") or intent.reason)
+    holding_minutes = _as_float(details.get("holding_minutes"), 0.0)
+    return "\n".join(
+        [
+            "<b>ВЫХОД ИЗ ШОРТА</b>",
+            f"Монета: <code>{str(symbol).replace('/', '').upper()}</code>",
+            f"Цена выхода: <b>{_format_alert_price_bucket(mark_price)}</b>",
+            f"Движение цены от входа: <b>{underlying_return * 100.0:+.2f}%</b>",
+            f"Лучшее движение: {best_return * 100.0:+.2f}%",
+            f"Сохранено движения: {retention * 100.0:.0f}%",
+            f"Время в сценарии: {holding_minutes:.1f} мин",
+            f"Причина: <code>{exit_type}</code>",
+        ]
+    )
+
+
+def _record_strategy_decision_event(
+    *,
+    symbol: str,
+    timeframe: str,
+    mode: str,
+    intent,
+    enriched,
+    mark_price: float,
+    runtime_inputs: Mapping[str, object] | None = None,
+    early_candidate: Mapping[str, object] | None = None,
+) -> None:
+    if not _env_flag("DECISION_EVENT_LOG_ENABLED", True):
+        return
+
+    metadata = getattr(intent, "metadata", None)
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    trace = metadata.get("layer_trace", {})
+    trace = trace if isinstance(trace, Mapping) else {}
+    layers = trace.get("layers", {})
+    layers = layers if isinstance(layers, Mapping) else {}
+    layer1 = layers.get("layer1_pump_detection", {})
+    layer1_passed = bool(isinstance(layer1, Mapping) and layer1.get("passed"))
+    action = getattr(intent, "action", IntentAction.HOLD)
+    if not layer1_passed and action not in {
+        IntentAction.LONG_ENTRY,
+        IntentAction.SHORT_ENTRY,
+        IntentAction.EXIT_LONG,
+        IntentAction.EXIT_SHORT,
+    }:
+        return
+
+    bar_ts = ""
+    latest: Mapping[str, object] = {}
+    if enriched is not None and not getattr(enriched, "empty", True):
+        try:
+            bar_ts = pd.Timestamp(enriched.index[-1]).isoformat()
+            latest = enriched.iloc[-1]
+        except Exception:
+            latest = {}
+    pump_id = str(metadata.get("pump_id") or "")
+    failed_layer = str(metadata.get("layer_failed") or trace.get("failed_layer") or "")
+    decision_signature = "|".join(
+        [
+            bar_ts,
+            str(getattr(action, "value", action)),
+            str(getattr(intent, "reason", "") or ""),
+            failed_layer,
+            pump_id,
+        ]
+    )
+    if not _reserve_cross_process_alert(
+        kind="strategy_decision",
+        symbol=symbol,
+        signature=decision_signature,
+        cooldown_sec=max(60, _as_int(os.getenv("DECISION_EVENT_DEDUPE_SEC", "180"), 180)),
+    ):
+        return
+
+    latest_mapping = latest.to_dict() if hasattr(latest, "to_dict") else latest
+    compact_market = _compact_signal_metadata(
+        runtime_inputs,
+        latest_mapping if isinstance(latest_mapping, Mapping) else None,
+        early_candidate,
+        metadata,
+    )
+    identity = "|".join(
+        [
+            str(symbol).replace("/", "").upper(),
+            decision_signature,
+            f"{float(mark_price):.12g}",
+        ]
+    )
+    event_id = hashlib.sha1(identity.encode("utf-8", errors="ignore")).hexdigest()[:20]
+    raw_path = str(os.getenv("DECISION_EVENT_LOG_PATH", "data/runtime/decision_events.jsonl")).strip()
+    if not raw_path:
+        return
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    record = {
+        "ts": time.time(),
+        "event_id": event_id,
+        "event_type": "strategy_decision",
+        "symbol": str(symbol).replace("/", "").upper(),
+        "timeframe": str(timeframe),
+        "mode": str(mode),
+        "bar_ts": bar_ts,
+        "pump_id": pump_id,
+        "action": str(getattr(action, "value", action)),
+        "reason": str(getattr(intent, "reason", "") or ""),
+        "confidence": float(getattr(intent, "confidence", 0.0) or 0.0),
+        "mark_price": float(mark_price),
+        "failed_layer": failed_layer,
+        "admission_status": str(metadata.get("admission_status") or ""),
+        "admission_reason": str(metadata.get("admission_reason") or ""),
+        "candidate_source": str((early_candidate or {}).get("candidate_source") or ""),
+        "market": compact_market,
+        "layer_trace": _json_safe_value(trace),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
+            handle.write("\n")
+    except Exception as exc:
+        APP_LOGGER.debug(
+            "decision_event_log_failed path=%s err=%s",
+            path,
+            exc,
+            extra={"event": "decision_event_log_failed"},
+        )
 
 
 def _reserve_cross_process_alert(
@@ -608,6 +1161,45 @@ def _reserve_cross_process_alert(
     except Exception:
         # Dedupe must never become a trading blocker if the filesystem is unavailable.
         return True
+
+
+def _release_cross_process_alert(
+    *,
+    kind: str,
+    symbol: str,
+    signature: str,
+) -> None:
+    """Release a reservation when the alert was not delivered.
+
+    Reservations are created before the network call to prevent duplicate sends from
+    concurrent processes. A failed network call must not keep that reservation for the
+    full signal cooldown, otherwise a transient VPN/proxy outage silently drops the
+    alert instead of allowing the still-valid candidate to retry on the next cycle.
+    """
+    if not _env_flag("ALERT_CROSS_PROCESS_DEDUPE_ENABLED", True):
+        return
+
+    normalized_kind = str(kind or "alert").strip().lower() or "alert"
+    normalized_symbol = str(symbol or "").replace("/", "").upper()
+    normalized_signature = str(signature or "").strip()
+    if not normalized_symbol or not normalized_signature:
+        return
+
+    raw_dir = str(os.getenv("ALERT_DEDUPE_LOCK_DIR", "data/runtime/alert_locks")).strip()
+    lock_dir = Path(raw_dir)
+    if not lock_dir.is_absolute():
+        lock_dir = PROJECT_ROOT / lock_dir
+    digest = hashlib.sha1(
+        "|".join([normalized_kind, normalized_symbol, normalized_signature]).encode(
+            "utf-8",
+            errors="ignore",
+        )
+    ).hexdigest()
+    try:
+        (lock_dir / f"{digest}.lock").unlink(missing_ok=True)
+    except Exception:
+        # Delivery retry is best-effort; failure to remove a lock must not break a scan.
+        return
 
 
 
@@ -753,6 +1345,43 @@ def _update_cached_signal_state(
     cache[symbol] = merged
 
 
+def _close_early_lifecycle_after_managed_exit(
+    cache: dict[str, object],
+    *,
+    symbol: str,
+    now_ts: float,
+    cooldown_sec: int,
+) -> bool:
+    current = cache.get(symbol)
+    if not isinstance(current, Mapping) or not str(current.get("active_phase") or ""):
+        return False
+    _update_cached_signal_state(
+        cache,
+        symbol=symbol,
+        payload={
+            "active_phase": "",
+            "last_emitted_phase": str(
+                current.get("last_emitted_phase")
+                or current.get("active_phase")
+                or ""
+            ),
+            "cooldown_until_ts": max(
+                _as_float(current.get("cooldown_until_ts"), 0.0),
+                float(now_ts) + max(0, int(cooldown_sec)),
+            ),
+            "last_emitted_ts": float(now_ts),
+            "inactive_cycles": 0,
+            "signal_id": "",
+            "last_signature": str(current.get("last_signature") or ""),
+            "signature_cooldown_until_ts": max(
+                _as_float(current.get("signature_cooldown_until_ts"), 0.0),
+                float(now_ts) + max(0, int(cooldown_sec)),
+            ),
+        },
+    )
+    return True
+
+
 def _format_alert_price_bucket(value: float) -> str:
     price = _as_float(value, 0.0)
     if price <= 0:
@@ -778,17 +1407,131 @@ def _build_main_signal_signature(
         except Exception:
             bar_ts = ""
 
+    metadata = getattr(intent, "metadata", None)
+    pump_id = str(metadata.get("pump_id") or "") if isinstance(metadata, Mapping) else ""
     return "|".join(
         [
             str(symbol).replace("/", "").upper(),
             str(getattr(intent, "action", "") or ""),
             str(getattr(intent, "reason", "") or ""),
-            bar_ts,
+            pump_id or bar_ts,
             _format_alert_price_bucket(mark_price),
             _format_alert_price_bucket(getattr(intent, "take_profit", None)),
             _format_alert_price_bucket(getattr(intent, "stop_loss", None)),
         ]
     )
+
+
+def _build_pump_id(
+    *,
+    symbol: str,
+    timeframe: str,
+    enriched,
+    lookback: int = 320,
+    pump_origin_lookback: int = 240,
+) -> str:
+    if enriched is None or getattr(enriched, "empty", True):
+        return ""
+    try:
+        sample = enriched.tail(max(24, int(lookback)))
+        highs = pd.to_numeric(sample["high"], errors="coerce")
+        closes = pd.to_numeric(sample["close"], errors="coerce")
+        if highs.dropna().empty or closes.dropna().empty:
+            return ""
+        peak_label = highs.idxmax()
+        peak_position = int(sample.index.get_loc(peak_label))
+        origin_start = max(0, peak_position - max(12, int(pump_origin_lookback)))
+        origin_slice = closes.iloc[origin_start : peak_position + 1].dropna()
+        if origin_slice.empty:
+            return ""
+        origin_label = origin_slice.idxmin()
+        origin_price = float(origin_slice.loc[origin_label])
+        origin_ts = pd.Timestamp(origin_label)
+        if origin_ts.tzinfo is not None:
+            origin_ts = origin_ts.tz_convert("UTC")
+        identity = "|".join(
+            [
+                str(symbol).replace("/", "").upper(),
+                str(timeframe),
+                origin_ts.isoformat(),
+                _format_alert_price_bucket(origin_price),
+            ]
+        )
+        return hashlib.sha1(identity.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    except Exception:
+        return ""
+
+
+def _build_shadow_short_exit_intent(
+    *,
+    strategy,
+    symbol: str,
+    timeframe: str,
+    enriched,
+    mark_price: float,
+    snapshot,
+    shadow_position: Mapping[str, object],
+    trace_meta: Mapping[str, object] | None = None,
+) -> StrategyIntent | None:
+    local_strategy = _clone_strategy_for_parallel(strategy)
+    evaluator = getattr(local_strategy, "_managed_short_exit_intent", None)
+    if not callable(evaluator):
+        return None
+
+    entry_price = _as_float(shadow_position.get("entry_price"), 0.0)
+    if entry_price <= 0:
+        return None
+    shadow_frame = enriched.copy()
+    shadow_frame.attrs.update(getattr(enriched, "attrs", {}) or {})
+    shadow_frame.attrs["tracked_best_price"] = _as_float(
+        shadow_position.get("best_price"),
+        entry_price,
+    )
+    synthetic_position = PositionSnapshot(
+        symbol=str(symbol).replace("/", "").upper(),
+        side=PositionSide.SHORT,
+        qty=1.0,
+        entry_price=entry_price,
+        liq_price=0.0,
+        leverage=max(1.0, _as_float(shadow_position.get("leverage"), 1.0)),
+        position_idx=2,
+        stop_loss=_as_float(shadow_position.get("stop_loss"), 0.0) or None,
+    )
+    shadow_exchange = ExchangeSnapshot(
+        symbol=str(symbol).replace("/", "").upper(),
+        account=snapshot.account,
+        positions=[synthetic_position],
+        open_orders=[],
+    )
+    context = StrategyContext(
+        symbol=symbol,
+        market_ohlcv=shadow_frame,
+        mark_price=mark_price,
+        exchange=shadow_exchange,
+        synced_state=TradeState.SHORT,
+        timeframe=timeframe,
+        synced_state_updated_at=_as_float(shadow_position.get("opened_at"), time.time()),
+    )
+    try:
+        intent = evaluator(
+            context=context,
+            enriched=shadow_frame,
+            volume_profile=compute_volume_profile(shadow_frame),
+            trace_meta=dict(trace_meta or {}),
+        )
+    except Exception:
+        return None
+    if intent is None or intent.action != IntentAction.EXIT_SHORT:
+        return None
+    intent.metadata = {
+        **(dict(intent.metadata) if isinstance(intent.metadata, Mapping) else {}),
+        "shadow_position": True,
+        "pump_id": str(shadow_position.get("pump_id") or ""),
+        "signal_id": str(shadow_position.get("signal_id") or ""),
+        "best_price": _as_float(shadow_position.get("best_price"), entry_price),
+        "entry_price": entry_price,
+    }
+    return intent
 
 
 def _format_signature_price(value: object) -> str:
@@ -817,13 +1560,14 @@ def _build_early_candidate_signature(candidate: Mapping[str, object], enriched) 
             last_bar_ts = last_bar.isoformat()
     except Exception:
         last_bar_ts = ""
+    lifecycle_key = str(candidate.get("pump_id") or "") or last_bar_ts
     return "|".join(
         [
             phase,
+            lifecycle_key,
             _format_signature_price(candidate.get("entry")),
             _format_signature_price(candidate.get("tp")),
             _format_signature_price(candidate.get("sl")),
-            last_bar_ts,
         ]
     )
 
@@ -1077,8 +1821,13 @@ def _scan_live_price_overlay_enabled(timeframe: str) -> bool:
 
 
 def _analysis_worker_count(candidate_count: int) -> int:
-    configured = _as_int(os.getenv("CONCURRENT_TASKS", "8"), 8)
-    return max(1, min(max(1, configured), max(1, candidate_count)))
+    cpu_default = min(32, max(8, int(os.cpu_count() or 8)))
+    configured = _as_int(os.getenv("CONCURRENT_TASKS", str(cpu_default)), cpu_default)
+    safe_cap = max(
+        1,
+        min(64, _as_int(os.getenv("MARKET_ANALYSIS_MAX_WORKERS", "32"), 32)),
+    )
+    return max(1, min(max(1, configured), safe_cap, max(1, candidate_count)))
 
 
 def _clone_pipeline(pipeline: "FeaturePipeline") -> "FeaturePipeline":
@@ -1104,6 +1853,7 @@ def _prepare_symbol_analysis(
     include_liquidations: bool = False,
     overlay_live_price: bool = False,
     append_live_bucket: bool | None = None,
+    ticker_meta: dict[str, object] | None = None,
 ) -> dict[str, object]:
     result: dict[str, object] = {
         "symbol": symbol,
@@ -1116,6 +1866,7 @@ def _prepare_symbol_analysis(
             "symbol": symbol,
             "timeframe": timeframe,
             "candles": candles_limit,
+            "ticker_meta": ticker_meta,
             "include_liquidations": include_liquidations,
             "include_derivatives": include_derivatives,
             "overlay_live_price": overlay_live_price,
@@ -1127,6 +1878,7 @@ def _prepare_symbol_analysis(
             if "unexpected keyword" not in str(exc):
                 raise
             frame_kwargs.pop("append_live_bucket", None)
+            frame_kwargs.pop("ticker_meta", None)
             try:
                 frame = feed.fetch_frame(**frame_kwargs)
             except TypeError as exc_without_append:
@@ -1183,6 +1935,127 @@ def _prepare_symbol_analysis(
         result["status"] = "error"
         result["error"] = f"{type(exc).__name__}: {exc}"
         return result
+
+
+def _summarize_data_quality_blocks(
+    prepared_contexts: Mapping[str, Mapping[str, object]],
+    *,
+    sample_limit: int = 8,
+) -> dict[str, object]:
+    """Build one bounded per-cycle diagnostic instead of logging every blocked symbol."""
+    reason_counts: Counter[str] = Counter()
+    reason_samples: dict[str, list[str]] = {}
+    bounded_sample_limit = max(0, int(sample_limit))
+
+    for symbol in sorted(prepared_contexts):
+        prepared = prepared_contexts.get(symbol)
+        if not isinstance(prepared, Mapping):
+            continue
+        if str(prepared.get("status") or "") != "data_quality_blocked":
+            continue
+
+        reason = str(prepared.get("reason") or "unknown").strip() or "unknown"
+        reason_counts[reason] += 1
+        samples = reason_samples.setdefault(reason, [])
+        if len(samples) < bounded_sample_limit:
+            samples.append(str(symbol))
+
+    ordered_reasons = dict(sorted(reason_counts.items(), key=lambda item: (-item[1], item[0])))
+    ordered_samples = {
+        reason: reason_samples.get(reason, [])
+        for reason in ordered_reasons
+    }
+    return {
+        "count": int(sum(reason_counts.values())),
+        "reasons": ordered_reasons,
+        "samples": ordered_samples,
+    }
+
+
+def _summarize_early_candidates(
+    candidates: Mapping[str, Mapping[str, object] | None],
+    *,
+    sample_limit: int = 8,
+) -> dict[str, object]:
+    phase_counts: Counter[str] = Counter()
+    phase_samples: dict[str, list[str]] = {}
+    bounded_sample_limit = max(0, int(sample_limit))
+
+    for symbol in sorted(candidates):
+        candidate = candidates.get(symbol)
+        if not isinstance(candidate, Mapping):
+            continue
+        phase = str(candidate.get("phase") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        phase_counts[phase] += 1
+        samples = phase_samples.setdefault(phase, [])
+        if len(samples) < bounded_sample_limit:
+            samples.append(str(symbol))
+
+    ordered_phases = dict(sorted(phase_counts.items(), key=lambda item: (-item[1], item[0])))
+    return {
+        "count": int(sum(phase_counts.values())),
+        "phases": ordered_phases,
+        "samples": {
+            phase: phase_samples.get(phase, [])
+            for phase in ordered_phases
+        },
+    }
+
+
+def _summarize_early_pump_context(
+    prepared_decisions: Mapping[str, Mapping[str, object]],
+    *,
+    sample_limit: int = 8,
+) -> dict[str, object]:
+    evaluated = 0
+    explicit_early_thresholds = 0
+    early_pump_qualified = 0
+    main_pump_qualified = 0
+    pump_rows: list[dict[str, object]] = []
+
+    for symbol in sorted(prepared_decisions):
+        prepared = prepared_decisions.get(symbol)
+        if not isinstance(prepared, Mapping) or str(prepared.get("status") or "") != "ok":
+            continue
+        intent = prepared.get("intent")
+        metadata = getattr(intent, "metadata", None)
+        if not isinstance(metadata, Mapping):
+            continue
+        layer1 = _extract_layer_details(metadata, "layer1_pump_detection")
+        if not layer1:
+            continue
+
+        evaluated += 1
+        clean_pump_pct = max(0.0, _as_float(layer1.get("clean_pump_pct"), 0.0))
+        main_pump_min = max(0.0, _as_float(layer1.get("clean_pump_min_pct_used"), 0.05))
+        if "early_watch_clean_pump_min_pct_used" in layer1:
+            explicit_early_thresholds += 1
+        early_pump_min = _resolve_early_watch_pump_threshold(layer1)
+        if clean_pump_pct + 1e-9 >= early_pump_min:
+            early_pump_qualified += 1
+        if clean_pump_pct + 1e-9 >= main_pump_min:
+            main_pump_qualified += 1
+        pump_rows.append(
+            {
+                "symbol": str(symbol),
+                "pump_pct": round(clean_pump_pct, 6),
+                "early_min": round(early_pump_min, 6),
+                "main_min": round(main_pump_min, 6),
+            }
+        )
+
+    bounded_sample_limit = max(0, int(sample_limit))
+    top_pumps = sorted(
+        pump_rows,
+        key=lambda row: (-_as_float(row.get("pump_pct"), 0.0), str(row.get("symbol") or "")),
+    )[:bounded_sample_limit]
+    return {
+        "evaluated": evaluated,
+        "explicit_early_thresholds": explicit_early_thresholds,
+        "early_pump_qualified": early_pump_qualified,
+        "main_pump_qualified": main_pump_qualified,
+        "top_pumps": top_pumps,
+    }
 
 
 def _clone_strategy_for_parallel(strategy):
@@ -1346,7 +2219,35 @@ def _should_refresh_live_candidate(intent, early_candidate: Mapping[str, object]
     action = getattr(intent, "action", None)
     if action in (IntentAction.LONG_ENTRY, IntentAction.SHORT_ENTRY):
         return True
-    return bool(early_candidate)
+    if early_candidate:
+        return True
+
+    metadata = getattr(intent, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return False
+    trace = metadata.get("layer_trace", {})
+    if not isinstance(trace, Mapping):
+        return False
+    layers = trace.get("layers", {})
+    if not isinstance(layers, Mapping):
+        return False
+    layer1 = layers.get("layer1_pump_detection", {})
+    return bool(isinstance(layer1, Mapping) and layer1.get("passed"))
+
+
+def _early_candidate_refresh_outcome(
+    before: Mapping[str, object] | None,
+    after: Mapping[str, object] | None,
+) -> str:
+    if not isinstance(before, Mapping):
+        return "not_applicable"
+    before_phase = str(before.get("phase") or "").strip().upper()
+    if not isinstance(after, Mapping):
+        return "rejected"
+    after_phase = str(after.get("phase") or "").strip().upper()
+    if after_phase != before_phase:
+        return "phase_changed"
+    return "stable"
 
 
 def _should_block_clean_pump(intent) -> bool:
@@ -1770,6 +2671,14 @@ def _refresh_symbol_decision_live(
 def _resolve_signal_profile(raw: str | None) -> str:
     profile = str(raw or "both").strip().lower()
     return profile if profile in {"both", "main", "early"} else "both"
+
+
+def _profile_includes_main(raw: str | None) -> bool:
+    return _resolve_signal_profile(raw) in {"both", "main"}
+
+
+def _profile_includes_early(raw: str | None) -> bool:
+    return _resolve_signal_profile(raw) in {"both", "early"}
 
 
 def _profiled_env_first_nonempty(profile: str, *names: str) -> str:
@@ -2371,6 +3280,8 @@ def _maybe_emit_ultra_early_signal(
     state: dict[str, dict[str, object]],
     stats: dict[str, int],
     logger,
+    signal_observation_tracker: SignalObservationTracker | None = None,
+    signal_position_tracker: SignalPositionTracker | None = None,
 ) -> bool:
     if not alerters or not _env_flag("ULTRA_EARLY_ENABLED", True):
         return False
@@ -2596,7 +3507,7 @@ def _maybe_emit_ultra_early_signal(
         sent=sent,
         skip_reason="no_alerters_configured" if attempted == 0 else "",
     )
-    _record_signal_event(
+    signal_id = _record_signal_event(
         symbol=symbol,
         phase=ultra_phase,
         side="SHORT",
@@ -2613,7 +3524,49 @@ def _maybe_emit_ultra_early_signal(
         delivery_sent=sent,
         signal_signature=signature,
     )
+    _record_short_signal_observation(
+        signal_observation_tracker,
+        signal_id=signal_id,
+        symbol=symbol,
+        phase=ultra_phase,
+        entry=entry,
+        tp=tp,
+        sl=sl,
+        signal_ts=now_ts,
+        enriched=enriched,
+        delivered=sent > 0,
+        candidate_source=str(
+            candidate.get("candidate_source")
+            or candidate.get("ultra_scenario")
+            or "ultra"
+        ),
+        logger=logger,
+    )
+    _record_short_signal_position(
+        signal_position_tracker,
+        signal_id=signal_id,
+        symbol=symbol,
+        entry=entry,
+        tp=tp,
+        sl=sl,
+        signal_ts=now_ts,
+        delivered=sent > 0,
+        pump_id=str(candidate.get("pump_id") or ""),
+        source=f"early_{ultra_phase.lower()}",
+        logger=logger,
+    )
     if sent <= 0:
+        stats["delivery_failed"] = int(stats.get("delivery_failed", 0)) + 1
+        _release_cross_process_alert(
+            kind="ultra_early_symbol",
+            symbol=symbol,
+            signature="symbol",
+        )
+        _release_cross_process_alert(
+            kind="ultra_early",
+            symbol=symbol,
+            signature=bar_signature or signature,
+        )
         return False
 
     stats["ultra_sent"] = int(stats.get("ultra_sent", 0)) + 1
@@ -3004,10 +3957,7 @@ def _build_early_watch_candidate(*, symbol: str, timeframe: str, mode: str, enri
     local_val = _as_float(row.get("val"), 0.0)
 
     confirmed_pump_min = max(_as_float(layer1.get("clean_pump_min_pct_used"), 0.05), 0.0)
-    early_pump_min = max(
-        confirmed_pump_min,
-        _early_config_float("EARLY_WATCH_CLEAN_PUMP_MIN_PCT", max(0.0195, confirmed_pump_min - 0.0220)),
-    )
+    early_pump_min = _resolve_early_watch_pump_threshold(layer1)
     early_structural_pump_min = max(
         early_pump_min,
         _early_config_float(
@@ -6061,14 +7011,43 @@ def _build_early_signal_candidate(*, symbol: str, timeframe: str, mode: str, enr
         intent=intent,
     )
     if candidate is not None:
-        return candidate
-    return _build_early_watch_candidate(
+        approved = dict(candidate)
+        approved["candidate_source"] = "approved"
+        approved["pump_id"] = _build_pump_id(
+            symbol=symbol,
+            timeframe=timeframe,
+            enriched=enriched,
+        )
+        return approved
+
+    pre_main_setting = os.getenv("EARLY_PRE_MAIN_ENABLED")
+    if pre_main_setting is not None:
+        pre_main_enabled = _env_flag("EARLY_PRE_MAIN_ENABLED", False)
+        candidate_source = "pre_main"
+    else:
+        # Backward compatibility for deployments that explicitly opted into
+        # the original name before the detector became a supported pre-main path.
+        pre_main_enabled = _env_flag("EARLY_LEGACY_FALLBACK_ENABLED", False)
+        candidate_source = "legacy"
+    if not pre_main_enabled:
+        return None
+    pre_main = _build_early_watch_candidate(
         symbol=symbol,
         timeframe=timeframe,
         mode=mode,
         enriched=enriched,
         intent=intent,
     )
+    if pre_main is None:
+        return None
+    pre_main_candidate = dict(pre_main)
+    pre_main_candidate["candidate_source"] = candidate_source
+    pre_main_candidate["pump_id"] = _build_pump_id(
+        symbol=symbol,
+        timeframe=timeframe,
+        enriched=enriched,
+    )
+    return pre_main_candidate
 
 
 def _strategy_audit_log_payload(strategy) -> dict[str, object]:
@@ -6749,6 +7728,9 @@ def run_cycle(
     online_retrainer=None,
     early_signal_learner=None,
     early_online_retrainer=None,
+    signal_position_tracker: SignalPositionTracker | None = None,
+    signal_observation_tracker: SignalObservationTracker | None = None,
+    ml_shadow_service=None,
     signal_profile: str = "both",
 ):
     sync.pull_adapter_events(adapter)
@@ -6769,6 +7751,45 @@ def run_cycle(
     prepared_decisions: dict[str, dict[str, object]] = {}
     analysis_workers = _analysis_worker_count(len(symbols))
     observation_only_profile = _is_observation_only_profile(signal_profile)
+    cycle_started_monotonic = time.monotonic()
+    cycle_progress_interval_sec = max(
+        5,
+        _as_int(os.getenv("BOT_CYCLE_PROGRESS_INTERVAL_SEC", "30"), 30),
+    )
+    cycle_progress_every = max(
+        1,
+        _as_int(os.getenv("BOT_CYCLE_PROGRESS_EVERY", "50"), 50),
+    )
+    last_cycle_progress_ts = cycle_started_monotonic
+
+    def _log_cycle_progress(
+        stage: str,
+        completed: int,
+        total: int,
+        *,
+        force: bool = False,
+    ) -> None:
+        nonlocal last_cycle_progress_ts
+        now_monotonic = time.monotonic()
+        safe_total = max(0, int(total))
+        safe_completed = max(0, min(int(completed), safe_total))
+        reached_batch = safe_completed > 0 and safe_completed % cycle_progress_every == 0
+        interval_elapsed = now_monotonic - last_cycle_progress_ts >= cycle_progress_interval_sec
+        if not force and safe_completed < safe_total and not reached_batch and not interval_elapsed:
+            return
+        logger.info(
+            "cycle_progress stage=%s processed=%s total=%s elapsed_sec=%.1f workers=%s profile=%s",
+            stage,
+            safe_completed,
+            safe_total,
+            now_monotonic - cycle_started_monotonic,
+            analysis_workers,
+            signal_profile,
+            extra={"event": "cycle_progress"},
+        )
+        last_cycle_progress_ts = now_monotonic
+
+    _log_cycle_progress("started", 0, len(symbols), force=True)
     intervention_alert_cooldown_sec = max(
         300,
         _as_int(os.getenv("INTERVENTION_ALERT_COOLDOWN_SEC", "10800"), 10800),
@@ -6790,7 +7811,32 @@ def run_cycle(
         _as_int(os.getenv("MAIN_SIGNAL_REENTRY_COOLDOWN_SEC", "1800"), 1800),
     )
     bulk_snapshots: dict[str, object] = {}
+    bulk_tickers: dict[str, dict[str, object]] = {}
     scan_overlay_live_price = _scan_live_price_overlay_enabled(timeframe)
+
+    ticker_snapshot_fetcher = getattr(feed, "fetch_tickers_snapshot", None)
+    if symbols and callable(ticker_snapshot_fetcher):
+        try:
+            ticker_snapshot = ticker_snapshot_fetcher(symbols)
+            if isinstance(ticker_snapshot, dict):
+                bulk_tickers = {
+                    str(symbol).replace("/", "").upper().strip(): dict(ticker)
+                    for symbol, ticker in ticker_snapshot.items()
+                    if isinstance(ticker, Mapping)
+                }
+        except Exception as exc:
+            logger.warning(
+                "bulk_ticker_snapshot_unavailable err=%s",
+                exc,
+                extra={"event": "bulk_ticker_snapshot_unavailable"},
+            )
+    logger.info(
+        "market_parallel_plan symbols=%s workers=%s bulk_tickers=%s",
+        len(symbols),
+        analysis_workers,
+        len(bulk_tickers),
+        extra={"event": "market_parallel_plan"},
+    )
 
     if symbols:
         if analysis_workers > 1 and len(symbols) > 1:
@@ -6808,11 +7854,12 @@ def run_cycle(
                             timeframe=timeframe,
                             candles_limit=candles_limit,
                             overlay_live_price=scan_overlay_live_price,
+                            ticker_meta=bulk_tickers.get(str(symbol).replace("/", "").upper().strip()),
                         ),
                     )
                     for symbol in symbols
                 ]
-                for symbol, future in futures:
+                for completed, (symbol, future) in enumerate(futures, start=1):
                     try:
                         prepared_contexts[symbol] = future.result()
                     except Exception as exc:
@@ -6821,8 +7868,9 @@ def run_cycle(
                             "status": "error",
                             "error": f"{type(exc).__name__}: {exc}",
                         }
+                    _log_cycle_progress("market_analysis", completed, len(symbols))
         else:
-            for symbol in symbols:
+            for completed, symbol in enumerate(symbols, start=1):
                 prepared_contexts[symbol] = _prepare_symbol_analysis(
                     symbol=symbol,
                     snapshot=None,
@@ -6832,7 +7880,20 @@ def run_cycle(
                     timeframe=timeframe,
                     candles_limit=candles_limit,
                     overlay_live_price=scan_overlay_live_price,
+                    ticker_meta=bulk_tickers.get(str(symbol).replace("/", "").upper().strip()),
                 )
+                _log_cycle_progress("market_analysis", completed, len(symbols))
+
+    _log_cycle_progress("market_analysis_complete", len(prepared_contexts), len(symbols), force=True)
+    data_quality_summary = _summarize_data_quality_blocks(prepared_contexts)
+    if int(data_quality_summary["count"]) > 0:
+        logger.info(
+            "data_quality_summary blocked=%s reasons=%s samples=%s",
+            data_quality_summary["count"],
+            data_quality_summary["reasons"],
+            data_quality_summary["samples"],
+            extra={"event": "data_quality_summary"},
+        )
 
     try:
         bulk_snapshots = sync.snapshot_many(symbols)
@@ -6840,7 +7901,7 @@ def run_cycle(
         logger.warning("bulk_snapshot_unavailable err=%s", exc, extra={"event": "bulk_snapshot_unavailable"})
         bulk_snapshots = {}
 
-    for symbol in symbols:
+    for context_index, symbol in enumerate(symbols, start=1):
         try:
             snapshot = bulk_snapshots.get(symbol) or sync.snapshot(symbol)
             if observation_only_profile:
@@ -7008,6 +8069,10 @@ def run_cycle(
         except Exception as exc:
             counters.inc("cycle_errors")
             logger.exception("cycle_error symbol=%s err=%s", symbol, exc, extra={"event": "cycle_error"})
+        finally:
+            _log_cycle_progress("context_build", context_index, len(symbols))
+
+    _log_cycle_progress("context_build_complete", len(symbols), len(symbols), force=True)
 
     precomputed_early_candidates: dict[str, dict[str, object] | None] = {}
 
@@ -7029,7 +8094,8 @@ def run_cycle(
                     )
                     for symbol, context in decision_contexts.items()
                 ]
-                for symbol, future in futures:
+                decision_total = len(futures)
+                for completed, (symbol, future) in enumerate(futures, start=1):
                     try:
                         prepared_decisions[symbol] = future.result()
                     except Exception as exc:
@@ -7038,8 +8104,10 @@ def run_cycle(
                             "status": "error",
                             "error": f"{type(exc).__name__}: {exc}",
                         }
+                    _log_cycle_progress("decision_prepare", completed, decision_total)
         else:
-            for symbol, context in decision_contexts.items():
+            decision_total = len(decision_contexts)
+            for completed, (symbol, context) in enumerate(decision_contexts.items(), start=1):
                 prepared_decisions[symbol] = _prepare_symbol_decision(
                     symbol=symbol,
                     snapshot=context["snapshot"],
@@ -7048,8 +8116,16 @@ def run_cycle(
                     timeframe=timeframe,
                     strategy=strategy,
                 )
+                _log_cycle_progress("decision_prepare", completed, decision_total)
 
-    if signal_profile != "main":
+    _log_cycle_progress(
+        "decision_prepare_complete",
+        len(prepared_decisions),
+        len(decision_contexts),
+        force=True,
+    )
+
+    if _profile_includes_early(signal_profile):
         for symbol, decision_prepared in prepared_decisions.items():
             if str(decision_prepared.get("status") or "") != "ok":
                 continue
@@ -7063,6 +8139,17 @@ def run_cycle(
                 )
             except Exception:
                 precomputed_early_candidates[symbol] = None
+        early_candidate_summary = _summarize_early_candidates(precomputed_early_candidates)
+        early_pump_context = _summarize_early_pump_context(prepared_decisions)
+        logger.info(
+            "early_candidate_summary evaluated=%s candidates=%s phases=%s samples=%s pump_context=%s",
+            len(precomputed_early_candidates),
+            early_candidate_summary["count"],
+            early_candidate_summary["phases"],
+            early_candidate_summary["samples"],
+            early_pump_context,
+            extra={"event": "early_candidate_summary"},
+        )
 
     processing_symbols = sorted(
         symbols,
@@ -7075,7 +8162,8 @@ def run_cycle(
         ),
     )
 
-    for symbol in processing_symbols:
+    processing_total = len(processing_symbols)
+    for processing_index, symbol in enumerate(processing_symbols, start=1):
         try:
             decision_prepared = prepared_decisions.get(symbol)
             if not decision_prepared:
@@ -7105,10 +8193,12 @@ def run_cycle(
             decision_prepared_ts = _as_float(decision_prepared.get("prepared_at"), 0.0)
             intent = decision_prepared["intent"]
             early_candidate = None
-            if signal_profile != "main":
+            early_candidate_live_refreshed = False
+            if _profile_includes_early(signal_profile):
                 early_candidate = precomputed_early_candidates.get(symbol)
 
             if _should_refresh_live_candidate(intent, early_candidate):
+                early_candidate_before_refresh = early_candidate
                 refreshed_decision = _refresh_symbol_decision_live(
                     symbol=symbol,
                     sync=sync,
@@ -7132,7 +8222,7 @@ def run_cycle(
                     )
                     decision_prepared_ts = _as_float(refreshed_decision.get("prepared_at"), time.time())
                     intent = refreshed_decision["intent"]
-                    if signal_profile != "main":
+                    if _profile_includes_early(signal_profile):
                         try:
                             early_candidate = _build_early_signal_candidate(
                                 symbol=symbol,
@@ -7143,10 +8233,263 @@ def run_cycle(
                             )
                         except Exception:
                             early_candidate = None
+                    early_candidate_live_refreshed = True
+                    early_refresh_outcome = _early_candidate_refresh_outcome(
+                        early_candidate_before_refresh,
+                        early_candidate,
+                    )
+                    if early_refresh_outcome in {"rejected", "phase_changed"}:
+                        early_signal_stats["pre_alert_refresh_rejected"] = int(
+                            early_signal_stats.get("pre_alert_refresh_rejected", 0)
+                        ) + 1
+                        logger.info(
+                            "early_candidate_refresh_rejected symbol=%s outcome=%s phase_before=%s phase_after=%s source=%s refreshed_action=%s refreshed_reason=%s",
+                            symbol,
+                            early_refresh_outcome,
+                            str((early_candidate_before_refresh or {}).get("phase") or ""),
+                            str((early_candidate or {}).get("phase") or ""),
+                            str((early_candidate_before_refresh or {}).get("candidate_source") or ""),
+                            str(getattr(intent, "action", "") or ""),
+                            str(getattr(intent, "reason", "") or ""),
+                            extra={"event": "early_candidate_refresh_rejected"},
+                        )
+
+            intent = _attach_ml_shadow_prediction(
+                intent=intent,
+                features=features,
+                service=ml_shadow_service,
+                early_candidate=early_candidate,
+            )
+
+            if signal_observation_tracker is not None:
+                try:
+                    signal_observation_tracker.update_frame(
+                        symbol,
+                        features.enriched,
+                        observed_at=time.time(),
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "signal_observation_update_failed symbol=%s err=%s",
+                        symbol,
+                        exc,
+                        extra={"event": "signal_observation_update_failed"},
+                    )
+
+            tracked_before_barrier = (
+                signal_position_tracker.active(symbol)
+                if signal_position_tracker is not None
+                else None
+            )
+            if (
+                isinstance(tracked_before_barrier, Mapping)
+                and signal_observation_tracker is not None
+            ):
+                barrier_observation = signal_observation_tracker.active_observation(
+                    signal_id=str(tracked_before_barrier.get("signal_id") or ""),
+                    symbol=symbol,
+                )
+                barrier_exit = _short_barrier_exit_from_observation(
+                    barrier_observation
+                )
+                if isinstance(barrier_exit, Mapping):
+                    barrier_reason = str(barrier_exit.get("reason") or "")
+                    barrier_exit_price = _as_float(
+                        barrier_exit.get("exit_price"),
+                        mark_price,
+                    )
+                    barrier_signature = "|".join(
+                        [
+                            str(tracked_before_barrier.get("signal_id") or ""),
+                            barrier_reason,
+                            _format_alert_price_bucket(barrier_exit_price),
+                        ]
+                    )
+                    if _reserve_cross_process_alert(
+                        kind="shadow_barrier_exit_short",
+                        symbol=symbol,
+                        signature=barrier_signature,
+                        cooldown_sec=max(
+                            300,
+                            _as_int(
+                                os.getenv("EXIT_SIGNAL_COOLDOWN_SEC", "14400"),
+                                14400,
+                            ),
+                        ),
+                    ):
+                        opened_at = _as_float(
+                            tracked_before_barrier.get("opened_at"),
+                            time.time(),
+                        )
+                        barrier_intent = StrategyIntent(
+                            symbol=symbol,
+                            action=IntentAction.EXIT_SHORT,
+                            reason=barrier_reason,
+                            confidence=1.0,
+                            metadata={
+                                "shadow_position": True,
+                                "pump_id": str(
+                                    tracked_before_barrier.get("pump_id") or ""
+                                ),
+                                "exit_type": str(
+                                    barrier_exit.get("exit_type") or barrier_reason
+                                ),
+                                "managed_exit_reason": barrier_reason,
+                                "managed_exit_details": {
+                                    "holding_minutes": max(
+                                        (
+                                            _as_float(
+                                                barrier_exit.get("hit_ts"),
+                                                time.time(),
+                                            )
+                                            - opened_at
+                                        )
+                                        / 60.0,
+                                        0.0,
+                                    )
+                                },
+                            },
+                        )
+                        barrier_caption = _build_exit_signal_caption(
+                            symbol=symbol,
+                            mark_price=barrier_exit_price,
+                            intent=barrier_intent,
+                            entry_price=_as_float(
+                                tracked_before_barrier.get("entry_price"),
+                                barrier_exit_price,
+                            ),
+                            best_price=_as_float(
+                                tracked_before_barrier.get("best_price"),
+                                barrier_exit_price,
+                            ),
+                        )
+                        barrier_attempted, barrier_sent = _send_alerts(
+                            alerters,
+                            barrier_caption,
+                            reply_markup=build_symbol_copy_reply_markup(symbol),
+                        )
+                        _log_alert_delivery(
+                            logger,
+                            event="shadow_barrier_exit_alert_delivery",
+                            attempted=barrier_attempted,
+                            sent=barrier_sent,
+                            skip_reason=(
+                                "no_alerters_configured"
+                                if barrier_attempted == 0
+                                else ""
+                            ),
+                        )
+                        if barrier_sent > 0:
+                            barrier_entry = _as_float(
+                                tracked_before_barrier.get("entry_price"),
+                                barrier_exit_price,
+                            )
+                            _record_signal_event(
+                                symbol=symbol,
+                                phase="EXIT",
+                                side="SHORT",
+                                timeframe=timeframe,
+                                mode=mode,
+                                entry=barrier_exit_price,
+                                tp=barrier_exit_price,
+                                sl=barrier_exit_price,
+                                confidence=1.0,
+                                reason=barrier_reason,
+                                metadata={
+                                    **dict(barrier_intent.metadata),
+                                    "entry_price": barrier_entry,
+                                    "best_price": _as_float(
+                                        tracked_before_barrier.get("best_price"),
+                                        barrier_exit_price,
+                                    ),
+                                    "price_return": (
+                                        (barrier_entry - barrier_exit_price)
+                                        / barrier_entry
+                                        if barrier_entry > 0.0
+                                        else 0.0
+                                    ),
+                                },
+                                delivery_attempted=barrier_attempted,
+                                delivery_sent=barrier_sent,
+                                signal_signature=barrier_signature,
+                            )
+                            closed_barrier_position = (
+                                signal_position_tracker.close(
+                                    symbol,
+                                    exit_price=barrier_exit_price,
+                                    reason=barrier_reason,
+                                )
+                                if signal_position_tracker is not None
+                                else None
+                            )
+                            if isinstance(closed_barrier_position, Mapping):
+                                _close_early_lifecycle_after_managed_exit(
+                                    early_signal_state,
+                                    symbol=symbol,
+                                    now_ts=time.time(),
+                                    cooldown_sec=max(
+                                        60,
+                                        _as_int(
+                                            os.getenv(
+                                                "EARLY_SIGNAL_COOLDOWN_SEC",
+                                                "1800",
+                                            ),
+                                            1800,
+                                        ),
+                                    ),
+                                )
+                                logger.info(
+                                    "shadow_barrier_exit_closed symbol=%s reason=%s exit_price=%.12g",
+                                    symbol,
+                                    barrier_reason,
+                                    barrier_exit_price,
+                                    extra={"event": "shadow_barrier_exit_closed"},
+                                )
+                        else:
+                            _release_cross_process_alert(
+                                kind="shadow_barrier_exit_short",
+                                symbol=symbol,
+                                signature=barrier_signature,
+                            )
+
+            shadow_active = False
+            if signal_position_tracker is not None:
+                shadow_record = signal_position_tracker.update_mark(symbol, mark_price)
+                if isinstance(shadow_record, Mapping):
+                    shadow_active = True
+                    has_live_short = any(
+                        getattr(position, "side", None) == PositionSide.SHORT
+                        and _as_float(getattr(position, "qty", 0.0), 0.0) > 0.0
+                        for position in getattr(snapshot, "positions", [])
+                    )
+                    if not has_live_short:
+                        shadow_exit = _build_shadow_short_exit_intent(
+                            strategy=strategy,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            enriched=features.enriched,
+                            mark_price=mark_price,
+                            snapshot=snapshot,
+                            shadow_position=shadow_record,
+                            trace_meta=intent.metadata if isinstance(intent.metadata, Mapping) else {},
+                        )
+                        if shadow_exit is not None:
+                            intent = shadow_exit
+                        elif intent.action in (IntentAction.LONG_ENTRY, IntentAction.SHORT_ENTRY):
+                            intent = StrategyIntent(
+                                symbol=symbol,
+                                action=IntentAction.HOLD,
+                                reason="signal_shadow_short_active",
+                                metadata={
+                                    **(dict(intent.metadata) if isinstance(intent.metadata, Mapping) else {}),
+                                    "shadow_position": True,
+                                    "pump_id": str(shadow_record.get("pump_id") or ""),
+                                },
+                            )
             _record_parallel_strategy_intent(strategy, intent)
 
             ultra_sent_now = False
-            if ultra_alerters and (observation_only_profile or current_state == TradeState.FLAT):
+            if ultra_alerters and not shadow_active and (observation_only_profile or current_state == TradeState.FLAT):
                 ultra_sent_now = _maybe_emit_ultra_early_signal(
                     symbol=symbol,
                     timeframe=timeframe,
@@ -7162,10 +8505,12 @@ def run_cycle(
                     state=ultra_signal_state,
                     stats=early_signal_stats,
                     logger=logger,
+                    signal_observation_tracker=signal_observation_tracker,
+                    signal_position_tracker=signal_position_tracker,
                 )
                 if (
                     ultra_sent_now
-                    and signal_profile != "main"
+                    and _profile_includes_early(signal_profile)
                     and _env_flag("EARLY_SUPPRESS_AFTER_ULTRA_SAME_CYCLE", True)
                 ):
                     early_candidate = None
@@ -7189,14 +8534,21 @@ def run_cycle(
                     reason="clean_pump_below_min",
                     metadata=intent.metadata if isinstance(intent.metadata, dict) else {},
                 )
-            elif signal_profile == "main" and _should_block_live_main_short_continuation(intent, features.enriched):
+            elif _profile_includes_main(signal_profile) and _should_block_live_main_short_continuation(
+                intent,
+                features.enriched,
+            ):
                 intent = StrategyIntent(
                     symbol=symbol,
                     action=IntentAction.HOLD,
                     reason="main_short_live_continuation",
                     metadata=intent.metadata if isinstance(intent.metadata, dict) else {},
                 )
-            elif signal_profile == "main" and getattr(intent, "action", None) == IntentAction.SHORT_ENTRY:
+            elif _profile_includes_main(signal_profile) and getattr(
+                intent,
+                "action",
+                None,
+            ) == IntentAction.SHORT_ENTRY:
                 recent_peak_price = _current_recent_peak_price(features.enriched, fallback_price=mark_price)
                 current_atr = max(
                     _as_float(features.enriched.iloc[-1].get("atr"), mark_price * 0.01),
@@ -7219,6 +8571,30 @@ def run_cycle(
                         metadata=intent.metadata if isinstance(intent.metadata, dict) else {},
                     )
 
+            pump_id = _build_pump_id(
+                symbol=symbol,
+                timeframe=timeframe,
+                enriched=features.enriched,
+            )
+            if pump_id:
+                intent.metadata = {
+                    **(dict(intent.metadata) if isinstance(intent.metadata, Mapping) else {}),
+                    "pump_id": pump_id,
+                }
+                if isinstance(early_candidate, Mapping) and not early_candidate.get("pump_id"):
+                    early_candidate = {**dict(early_candidate), "pump_id": pump_id}
+
+            _record_strategy_decision_event(
+                symbol=symbol,
+                timeframe=timeframe,
+                mode=mode,
+                intent=intent,
+                enriched=features.enriched,
+                mark_price=mark_price,
+                runtime_inputs=runtime_inputs,
+                early_candidate=early_candidate,
+            )
+
             decision = risk.evaluate(
                 intent=intent,
                 account=snapshot.account,
@@ -7227,7 +8603,18 @@ def run_cycle(
                 rules=rules,
             )
 
-            if signal_profile == "early" and intent.action != IntentAction.HOLD:
+            is_shadow_exit = bool(
+                intent.action == IntentAction.EXIT_SHORT
+                and isinstance(intent.metadata, Mapping)
+                and intent.metadata.get("shadow_position")
+            )
+            if is_shadow_exit:
+                outcome = ExecutionOutcome(
+                    accepted=False,
+                    status="IGNORED",
+                    reason="signal_shadow_exit_monitor_only",
+                )
+            elif signal_profile == "early" and intent.action != IntentAction.HOLD:
                 outcome = ExecutionOutcome(
                     accepted=False,
                     status="IGNORED",
@@ -7235,6 +8622,126 @@ def run_cycle(
                 )
             else:
                 outcome = execution.execute(intent=intent, risk=decision, snapshot=snapshot, mark_price=mark_price)
+
+            if intent.action == IntentAction.EXIT_SHORT:
+                exit_metadata = intent.metadata if isinstance(intent.metadata, Mapping) else {}
+                tracked_position = (
+                    signal_position_tracker.active(symbol)
+                    if signal_position_tracker is not None
+                    else None
+                )
+                entry_price = _as_float(exit_metadata.get("entry_price"), 0.0)
+                best_price = _as_float(exit_metadata.get("best_price"), 0.0)
+                if isinstance(tracked_position, Mapping):
+                    entry_price = entry_price or _as_float(tracked_position.get("entry_price"), 0.0)
+                    best_price = best_price or _as_float(tracked_position.get("best_price"), 0.0)
+                if entry_price <= 0.0:
+                    for position in getattr(snapshot, "positions", []):
+                        if getattr(position, "side", None) == PositionSide.SHORT:
+                            entry_price = _as_float(getattr(position, "entry_price", 0.0), 0.0)
+                            break
+                if best_price <= 0.0:
+                    best_price = min(entry_price, mark_price) if entry_price > 0.0 else mark_price
+                exit_signature = "|".join(
+                    [
+                        str(exit_metadata.get("pump_id") or ""),
+                        str(intent.reason or ""),
+                        _format_alert_price_bucket(mark_price),
+                    ]
+                )
+                if _reserve_cross_process_alert(
+                    kind="managed_exit_short",
+                    symbol=symbol,
+                    signature=exit_signature,
+                    cooldown_sec=max(300, _as_int(os.getenv("EXIT_SIGNAL_COOLDOWN_SEC", "14400"), 14400)),
+                ):
+                    exit_caption = _build_exit_signal_caption(
+                        symbol=symbol,
+                        mark_price=mark_price,
+                        intent=intent,
+                        entry_price=entry_price,
+                        best_price=best_price,
+                    )
+                    attempted, sent = _send_alerts(
+                        alerters,
+                        exit_caption,
+                        reply_markup=build_symbol_copy_reply_markup(symbol),
+                    )
+                    _log_alert_delivery(
+                        logger,
+                        event="managed_exit_alert_delivery",
+                        attempted=attempted,
+                        sent=sent,
+                        skip_reason="no_alerters_configured" if attempted == 0 else "",
+                    )
+                    price_return = (
+                        (entry_price - mark_price) / entry_price
+                        if entry_price > 0.0 and mark_price > 0.0
+                        else 0.0
+                    )
+                    _record_signal_event(
+                        symbol=symbol,
+                        phase="EXIT",
+                        side="SHORT",
+                        timeframe=timeframe,
+                        mode=mode,
+                        entry=mark_price,
+                        tp=mark_price,
+                        sl=mark_price,
+                        confidence=float(intent.confidence),
+                        reason=intent.reason,
+                        metadata={
+                            **dict(exit_metadata),
+                            "entry_price": entry_price,
+                            "best_price": best_price,
+                            "price_return": price_return,
+                        },
+                        delivery_attempted=attempted,
+                        delivery_sent=sent,
+                        signal_signature=exit_signature,
+                    )
+                    close_tracked_position = bool(
+                        sent > 0
+                        or (
+                            bool(getattr(outcome, "accepted", False))
+                            and _as_float(getattr(outcome, "filled_qty", 0.0), 0.0) > 0.0
+                        )
+                    )
+                    closed_signal_position = None
+                    if signal_position_tracker is not None and close_tracked_position:
+                        closed_signal_position = signal_position_tracker.close(
+                            symbol,
+                            exit_price=mark_price,
+                            reason=intent.reason,
+                        )
+                    if isinstance(closed_signal_position, Mapping):
+                        lifecycle_closed = _close_early_lifecycle_after_managed_exit(
+                            early_signal_state,
+                            symbol=symbol,
+                            now_ts=time.time(),
+                            cooldown_sec=max(
+                                60,
+                                _as_int(
+                                    os.getenv("EARLY_SIGNAL_COOLDOWN_SEC", "1800"),
+                                    1800,
+                                ),
+                            ),
+                        )
+                        if lifecycle_closed:
+                            logger.info(
+                                "early_signal_lifecycle_closed_by_managed_exit symbol=%s reason=%s",
+                                symbol,
+                                intent.reason,
+                                extra={
+                                    "event": "early_signal_lifecycle_closed_by_managed_exit"
+                                },
+                            )
+                    elif is_shadow_exit and sent <= 0:
+                        _release_cross_process_alert(
+                            kind="managed_exit_short",
+                            symbol=symbol,
+                            signature=exit_signature,
+                        )
 
             if (
                 not observation_only_profile
@@ -7247,7 +8754,7 @@ def run_cycle(
                 rec_state = execution.state_machine.get(symbol)
 
             if (
-                signal_profile == "main"
+                _profile_includes_main(signal_profile)
                 and getattr(intent, "action", None) == IntentAction.SHORT_ENTRY
                 and outcome.accepted
                 and outcome.filled_qty > 0
@@ -7409,12 +8916,13 @@ def run_cycle(
             cooldown_until_ts = _as_float(early_state.get("cooldown_until_ts"), 0.0)
             last_emitted_ts = _as_float(early_state.get("last_emitted_ts"), 0.0)
             inactive_cycles = _as_int(early_state.get("inactive_cycles"), 0)
+            active_signal_id = str(early_state.get("signal_id") or "")
             early_cooldown_sec = max(60, _as_int(os.getenv("EARLY_SIGNAL_COOLDOWN_SEC", "1800"), 1800))
             signature_cooldown_until_ts = _as_float(early_state.get("signature_cooldown_until_ts"), 0.0)
             last_signature = str(early_state.get("last_signature") or "")
             early_signature_cooldown_sec = max(
                 early_cooldown_sec,
-                _as_int(os.getenv("EARLY_SIGNAL_SIGNATURE_COOLDOWN_SEC", "2700"), 2700),
+                _as_int(os.getenv("EARLY_SIGNAL_SIGNATURE_COOLDOWN_SEC", "14400"), 14400),
             )
             early_symbol_cooldown_sec = max(
                 300,
@@ -7433,39 +8941,41 @@ def run_cycle(
                             early_signal_stats.get("suppressed_by_cooldown", 0)
                         ) + 1
                     elif phase != active_phase:
-                        refreshed_decision = _refresh_symbol_decision_live(
-                            symbol=symbol,
-                            sync=sync,
-                            execution=execution,
-                            feed=feed,
-                            pipeline=pipeline,
-                            timeframe=timeframe,
-                            candles_limit=candles_limit,
-                            strategy=strategy,
-                        )
-                        if refreshed_decision is not None:
-                            snapshot = refreshed_decision["snapshot"]
-                            rec_state = refreshed_decision["rec_state"]
-                            frame = refreshed_decision["frame"]
-                            runtime_inputs = refreshed_decision["runtime_inputs"]
-                            extras = refreshed_decision["extras"]
-                            features = refreshed_decision["features"]
-                            mark_price = _as_float(
-                                refreshed_decision.get("mark_price"),
-                                float(features.enriched.iloc[-1]["close"]),
+                        if not early_candidate_live_refreshed:
+                            refreshed_decision = _refresh_symbol_decision_live(
+                                symbol=symbol,
+                                sync=sync,
+                                execution=execution,
+                                feed=feed,
+                                pipeline=pipeline,
+                                timeframe=timeframe,
+                                candles_limit=candles_limit,
+                                strategy=strategy,
                             )
-                            decision_prepared_ts = _as_float(refreshed_decision.get("prepared_at"), time.time())
-                            intent = refreshed_decision["intent"]
-                            try:
-                                early_candidate = _build_early_signal_candidate(
-                                    symbol=symbol,
-                                    timeframe=timeframe,
-                                    mode=mode,
-                                    enriched=features.enriched,
-                                    intent=intent,
+                            if refreshed_decision is not None:
+                                snapshot = refreshed_decision["snapshot"]
+                                rec_state = refreshed_decision["rec_state"]
+                                frame = refreshed_decision["frame"]
+                                runtime_inputs = refreshed_decision["runtime_inputs"]
+                                extras = refreshed_decision["extras"]
+                                features = refreshed_decision["features"]
+                                mark_price = _as_float(
+                                    refreshed_decision.get("mark_price"),
+                                    float(features.enriched.iloc[-1]["close"]),
                                 )
-                            except Exception:
-                                early_candidate = None
+                                decision_prepared_ts = _as_float(refreshed_decision.get("prepared_at"), time.time())
+                                intent = refreshed_decision["intent"]
+                                try:
+                                    early_candidate = _build_early_signal_candidate(
+                                        symbol=symbol,
+                                        timeframe=timeframe,
+                                        mode=mode,
+                                        enriched=features.enriched,
+                                        intent=intent,
+                                    )
+                                except Exception:
+                                    early_candidate = None
+                                early_candidate_live_refreshed = True
                         if isinstance(early_candidate, Mapping) and str(early_candidate.get("phase") or "") == phase:
                             if _needs_pre_alert_refresh(
                                 prepared_ts=decision_prepared_ts,
@@ -7618,7 +9128,7 @@ def run_cycle(
                                 sent=sent,
                                 skip_reason="no_alerters_configured" if attempted == 0 else "",
                             )
-                            _record_signal_event(
+                            signal_id = _record_signal_event(
                                 symbol=symbol,
                                 phase=phase,
                                 side="SHORT",
@@ -7635,14 +9145,58 @@ def run_cycle(
                                 delivery_sent=sent,
                                 signal_signature=early_signature,
                             )
-                            early_signal_stats["watch_sent" if phase == "WATCH" else "setup_sent"] = int(
-                                early_signal_stats.get("watch_sent" if phase == "WATCH" else "setup_sent", 0)
-                            ) + 1
-                            if phase == "SETUP" and active_phase == "WATCH":
+                            _record_short_signal_observation(
+                                signal_observation_tracker,
+                                signal_id=signal_id,
+                                symbol=symbol,
+                                phase=phase,
+                                entry=_as_float(early_candidate.get("entry"), mark_price),
+                                tp=_as_float(early_candidate.get("tp"), mark_price * 0.99),
+                                sl=_as_float(early_candidate.get("sl"), mark_price * 1.01),
+                                signal_ts=cycle_ts,
+                                enriched=features.enriched,
+                                delivered=sent > 0,
+                                candidate_source=str(
+                                    early_candidate.get("candidate_source") or "early"
+                                ),
+                                logger=logger,
+                            )
+                            _record_short_signal_position(
+                                signal_position_tracker,
+                                signal_id=signal_id,
+                                symbol=symbol,
+                                entry=_as_float(early_candidate.get("entry"), mark_price),
+                                tp=_as_float(early_candidate.get("tp"), mark_price * 0.99),
+                                sl=_as_float(early_candidate.get("sl"), mark_price * 1.01),
+                                signal_ts=cycle_ts,
+                                delivered=sent > 0,
+                                pump_id=str(early_candidate.get("pump_id") or ""),
+                                source=f"early_{phase.lower()}",
+                                logger=logger,
+                            )
+                            if sent <= 0:
+                                early_signal_stats["delivery_failed"] = int(
+                                    early_signal_stats.get("delivery_failed", 0)
+                                ) + 1
+                                _release_cross_process_alert(
+                                    kind=f"early_{str(phase or '').lower()}_symbol",
+                                    symbol=symbol,
+                                    signature="symbol",
+                                )
+                                _release_cross_process_alert(
+                                    kind=f"early_{str(phase or '').lower()}",
+                                    symbol=symbol,
+                                    signature=early_bar_signature or early_signature,
+                                )
+                            else:
+                                early_signal_stats["watch_sent" if phase == "WATCH" else "setup_sent"] = int(
+                                    early_signal_stats.get("watch_sent" if phase == "WATCH" else "setup_sent", 0)
+                                ) + 1
+                            if sent > 0 and phase == "SETUP" and active_phase == "WATCH":
                                 early_signal_stats["watch_to_setup_promoted"] = int(
                                     early_signal_stats.get("watch_to_setup_promoted", 0)
                                 ) + 1
-                            if early_signal_learner is not None:
+                            if sent > 0 and early_signal_learner is not None:
                                 signal_price = _as_float(early_candidate.get("entry"), mark_price)
                                 tp_price = _as_float(early_candidate.get("tp"), signal_price * 0.99)
                                 sl_price = _as_float(early_candidate.get("sl"), signal_price * 1.01)
@@ -7660,26 +9214,28 @@ def run_cycle(
                                     success_move_pct=min(max(downside_target * 0.55, 0.004), 0.03),
                                     failure_move_pct=min(max(upside_risk * 0.60, 0.0035), 0.025),
                                 )
-                            _update_cached_signal_state(
-                                early_signal_state,
-                                symbol=symbol,
-                                payload={
-                                    "active_phase": phase,
-                                    "last_emitted_phase": phase,
-                                    "cooldown_until_ts": cycle_ts + early_cooldown_sec,
-                                    "last_emitted_ts": cycle_ts,
-                                    "inactive_cycles": 0,
-                                    "last_signature": early_signature,
-                                    "signature_cooldown_until_ts": cycle_ts + early_signature_cooldown_sec,
-                                },
-                            )
-                            _remember_recent_candidate_realert(
-                                early_signal_state,
-                                symbol=symbol,
-                                candidate=early_candidate,
-                                now_ts=cycle_ts,
-                            )
-                            emitted_early_phase = phase
+                            if sent > 0:
+                                _update_cached_signal_state(
+                                    early_signal_state,
+                                    symbol=symbol,
+                                    payload={
+                                        "active_phase": phase,
+                                        "last_emitted_phase": phase,
+                                        "cooldown_until_ts": cycle_ts + early_cooldown_sec,
+                                        "last_emitted_ts": cycle_ts,
+                                        "inactive_cycles": 0,
+                                        "signal_id": signal_id,
+                                        "last_signature": early_signature,
+                                        "signature_cooldown_until_ts": cycle_ts + early_signature_cooldown_sec,
+                                    },
+                                )
+                                _remember_recent_candidate_realert(
+                                    early_signal_state,
+                                    symbol=symbol,
+                                    candidate=early_candidate,
+                                    now_ts=cycle_ts,
+                                )
+                                emitted_early_phase = phase
 
             if intent.action in (IntentAction.LONG_ENTRY, IntentAction.SHORT_ENTRY):
                 if active_phase or emitted_early_phase:
@@ -7693,6 +9249,7 @@ def run_cycle(
                         "cooldown_until_ts": max(cooldown_until_ts, cycle_ts + early_cooldown_sec),
                         "last_emitted_ts": cycle_ts,
                         "inactive_cycles": 0,
+                        "signal_id": "",
                         "last_signature": last_signature,
                         "signature_cooldown_until_ts": max(
                             signature_cooldown_until_ts,
@@ -7728,25 +9285,84 @@ def run_cycle(
                         continue
                     if inactive_cycles < invalidation_miss_limit:
                         continue
-                    invalidation_text = build_early_invalidation_text(
-                        symbol=symbol,
-                        timeframe=timeframe,
-                        mode=mode,
-                        reason="\u0441\u0446\u0435\u043d\u0430\u0440\u0438\u0439 \u0441\u043b\u043e\u043c\u0430\u043d \u0438\u043b\u0438 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u0435 \u043d\u0435 \u043f\u0440\u0438\u0448\u043b\u043e",
+                    observation = (
+                        signal_observation_tracker.active_observation(
+                            signal_id=active_signal_id,
+                            symbol=symbol,
+                        )
+                        if signal_observation_tracker is not None
+                        else None
                     )
+                    observation_worked = _early_observation_has_worked(
+                        observation,
+                        min_favorable_pct=max(
+                            0.1,
+                            _as_float(
+                                os.getenv("EARLY_RESOLUTION_MIN_FAVORABLE_PCT", "0.8"),
+                                0.8,
+                            ),
+                        ),
+                        min_current_pct=max(
+                            0.0,
+                            _as_float(
+                                os.getenv("EARLY_RESOLUTION_MIN_CURRENT_PCT", "0.35"),
+                                0.35,
+                            ),
+                        ),
+                    )
+                    if observation_worked:
+                        lifecycle_text = build_early_resolution_text(
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            mode=mode,
+                            favorable_excursion_pct=_as_float(
+                                observation.get("favorable_excursion_pct"), 0.0
+                            ),
+                            adverse_excursion_pct=_as_float(
+                                observation.get("adverse_excursion_pct"), 0.0
+                            ),
+                            current_move_pct=_as_float(
+                                observation.get("close_move_pct"), 0.0
+                            ),
+                            tp_hit=bool(observation.get("tp_hit")),
+                        )
+                        lifecycle_event = "early_signal_resolved_delivery"
+                        early_signal_stats["resolved_profitable"] = int(
+                            early_signal_stats.get("resolved_profitable", 0)
+                        ) + 1
+                        logger.info(
+                            "early_signal_resolved symbol=%s signal_id=%s favorable_pct=%.4f adverse_pct=%.4f current_pct=%.4f tp_hit=%s",
+                            symbol,
+                            active_signal_id,
+                            _as_float(observation.get("favorable_excursion_pct"), 0.0),
+                            _as_float(observation.get("adverse_excursion_pct"), 0.0),
+                            _as_float(observation.get("close_move_pct"), 0.0),
+                            bool(observation.get("tp_hit")),
+                            extra={"event": "early_signal_resolved"},
+                        )
+                    else:
+                        lifecycle_text = build_early_invalidation_text(
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            mode=mode,
+                            reason="\u0441\u0446\u0435\u043d\u0430\u0440\u0438\u0439 \u0441\u043b\u043e\u043c\u0430\u043d \u0438\u043b\u0438 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u0435 \u043d\u0435 \u043f\u0440\u0438\u0448\u043b\u043e",
+                        )
+                        lifecycle_event = "early_signal_invalidated_delivery"
+                        early_signal_stats["invalidated"] = int(
+                            early_signal_stats.get("invalidated", 0)
+                        ) + 1
                     attempted, sent = _send_alerts(
                         alerters,
-                        invalidation_text,
+                        lifecycle_text,
                         reply_markup=build_symbol_copy_reply_markup(symbol),
                     )
                     _log_alert_delivery(
                         logger,
-                        event="early_signal_invalidated_delivery",
+                        event=lifecycle_event,
                         attempted=attempted,
                         sent=sent,
                         skip_reason="no_alerters_configured" if attempted == 0 else "",
                     )
-                    early_signal_stats["invalidated"] = int(early_signal_stats.get("invalidated", 0)) + 1
                     _update_cached_signal_state(
                         early_signal_state,
                         symbol=symbol,
@@ -7756,6 +9372,7 @@ def run_cycle(
                             "cooldown_until_ts": cycle_ts + early_cooldown_sec,
                             "last_emitted_ts": cycle_ts,
                             "inactive_cycles": 0,
+                            "signal_id": "",
                             "last_signature": last_signature,
                             "signature_cooldown_until_ts": max(
                                 signature_cooldown_until_ts,
@@ -7773,39 +9390,41 @@ def run_cycle(
                             early_signal_stats.get("suppressed_by_cooldown", 0)
                         ) + 1
                     elif phase != active_phase:
-                        refreshed_decision = _refresh_symbol_decision_live(
-                            symbol=symbol,
-                            sync=sync,
-                            execution=execution,
-                            feed=feed,
-                            pipeline=pipeline,
-                            timeframe=timeframe,
-                            candles_limit=candles_limit,
-                            strategy=strategy,
-                        )
-                        if refreshed_decision is not None:
-                            snapshot = refreshed_decision["snapshot"]
-                            rec_state = refreshed_decision["rec_state"]
-                            frame = refreshed_decision["frame"]
-                            runtime_inputs = refreshed_decision["runtime_inputs"]
-                            extras = refreshed_decision["extras"]
-                            features = refreshed_decision["features"]
-                            mark_price = _as_float(
-                                refreshed_decision.get("mark_price"),
-                                float(features.enriched.iloc[-1]["close"]),
+                        if not early_candidate_live_refreshed:
+                            refreshed_decision = _refresh_symbol_decision_live(
+                                symbol=symbol,
+                                sync=sync,
+                                execution=execution,
+                                feed=feed,
+                                pipeline=pipeline,
+                                timeframe=timeframe,
+                                candles_limit=candles_limit,
+                                strategy=strategy,
                             )
-                            decision_prepared_ts = _as_float(refreshed_decision.get("prepared_at"), time.time())
-                            intent = refreshed_decision["intent"]
-                            try:
-                                early_candidate = _build_early_signal_candidate(
-                                    symbol=symbol,
-                                    timeframe=timeframe,
-                                    mode=mode,
-                                    enriched=features.enriched,
-                                    intent=intent,
+                            if refreshed_decision is not None:
+                                snapshot = refreshed_decision["snapshot"]
+                                rec_state = refreshed_decision["rec_state"]
+                                frame = refreshed_decision["frame"]
+                                runtime_inputs = refreshed_decision["runtime_inputs"]
+                                extras = refreshed_decision["extras"]
+                                features = refreshed_decision["features"]
+                                mark_price = _as_float(
+                                    refreshed_decision.get("mark_price"),
+                                    float(features.enriched.iloc[-1]["close"]),
                                 )
-                            except Exception:
-                                early_candidate = None
+                                decision_prepared_ts = _as_float(refreshed_decision.get("prepared_at"), time.time())
+                                intent = refreshed_decision["intent"]
+                                try:
+                                    early_candidate = _build_early_signal_candidate(
+                                        symbol=symbol,
+                                        timeframe=timeframe,
+                                        mode=mode,
+                                        enriched=features.enriched,
+                                        intent=intent,
+                                    )
+                                except Exception:
+                                    early_candidate = None
+                                early_candidate_live_refreshed = True
                         if not isinstance(early_candidate, Mapping):
                             continue
                         if str(early_candidate.get("phase") or "") != phase:
@@ -7920,7 +9539,7 @@ def run_cycle(
                             sent=sent,
                             skip_reason="no_alerters_configured" if attempted == 0 else "",
                         )
-                        _record_signal_event(
+                        signal_id = _record_signal_event(
                             symbol=symbol,
                             phase=phase,
                             side="SHORT",
@@ -7937,14 +9556,58 @@ def run_cycle(
                             delivery_sent=sent,
                             signal_signature=early_signature,
                         )
-                        early_signal_stats["watch_sent" if phase == "WATCH" else "setup_sent"] = int(
-                            early_signal_stats.get("watch_sent" if phase == "WATCH" else "setup_sent", 0)
-                        ) + 1
-                        if phase == "SETUP" and active_phase == "WATCH":
+                        _record_short_signal_observation(
+                            signal_observation_tracker,
+                            signal_id=signal_id,
+                            symbol=symbol,
+                            phase=phase,
+                            entry=_as_float(early_candidate.get("entry"), mark_price),
+                            tp=_as_float(early_candidate.get("tp"), mark_price * 0.99),
+                            sl=_as_float(early_candidate.get("sl"), mark_price * 1.01),
+                            signal_ts=cycle_ts,
+                            enriched=features.enriched,
+                            delivered=sent > 0,
+                            candidate_source=str(
+                                early_candidate.get("candidate_source") or "early"
+                            ),
+                            logger=logger,
+                        )
+                        _record_short_signal_position(
+                            signal_position_tracker,
+                            signal_id=signal_id,
+                            symbol=symbol,
+                            entry=_as_float(early_candidate.get("entry"), mark_price),
+                            tp=_as_float(early_candidate.get("tp"), mark_price * 0.99),
+                            sl=_as_float(early_candidate.get("sl"), mark_price * 1.01),
+                            signal_ts=cycle_ts,
+                            delivered=sent > 0,
+                            pump_id=str(early_candidate.get("pump_id") or ""),
+                            source=f"early_{phase.lower()}",
+                            logger=logger,
+                        )
+                        if sent <= 0:
+                            early_signal_stats["delivery_failed"] = int(
+                                early_signal_stats.get("delivery_failed", 0)
+                            ) + 1
+                            _release_cross_process_alert(
+                                kind=f"early_{str(phase or '').lower()}_symbol",
+                                symbol=symbol,
+                                signature="symbol",
+                            )
+                            _release_cross_process_alert(
+                                kind=f"early_{str(phase or '').lower()}",
+                                symbol=symbol,
+                                signature=early_bar_signature or early_signature,
+                            )
+                        else:
+                            early_signal_stats["watch_sent" if phase == "WATCH" else "setup_sent"] = int(
+                                early_signal_stats.get("watch_sent" if phase == "WATCH" else "setup_sent", 0)
+                            ) + 1
+                        if sent > 0 and phase == "SETUP" and active_phase == "WATCH":
                             early_signal_stats["watch_to_setup_promoted"] = int(
                                 early_signal_stats.get("watch_to_setup_promoted", 0)
                             ) + 1
-                        if early_signal_learner is not None:
+                        if sent > 0 and early_signal_learner is not None:
                             signal_price = _as_float(early_candidate.get("entry"), mark_price)
                             tp_price = _as_float(early_candidate.get("tp"), signal_price * 0.99)
                             sl_price = _as_float(early_candidate.get("sl"), signal_price * 1.01)
@@ -7962,59 +9625,29 @@ def run_cycle(
                                 success_move_pct=min(max(downside_target * 0.55, 0.004), 0.03),
                                 failure_move_pct=min(max(upside_risk * 0.60, 0.0035), 0.025),
                             )
-                        _update_cached_signal_state(
-                            early_signal_state,
-                            symbol=symbol,
-                            payload={
-                                "active_phase": phase,
-                                "last_emitted_phase": phase,
-                                "cooldown_until_ts": cycle_ts + early_cooldown_sec,
-                                "last_emitted_ts": cycle_ts,
-                                "inactive_cycles": 0,
-                                "last_signature": early_signature,
-                                "signature_cooldown_until_ts": cycle_ts + early_signature_cooldown_sec,
-                            },
-                        )
-                        _remember_recent_candidate_realert(
-                            early_signal_state,
-                            symbol=symbol,
-                            candidate=early_candidate,
-                            now_ts=cycle_ts,
-                        )
+                        if sent > 0:
+                            _update_cached_signal_state(
+                                early_signal_state,
+                                symbol=symbol,
+                                payload={
+                                    "active_phase": phase,
+                                    "last_emitted_phase": phase,
+                                    "cooldown_until_ts": cycle_ts + early_cooldown_sec,
+                                    "last_emitted_ts": cycle_ts,
+                                    "inactive_cycles": 0,
+                                    "signal_id": signal_id,
+                                    "last_signature": early_signature,
+                                    "signature_cooldown_until_ts": cycle_ts + early_signature_cooldown_sec,
+                                },
+                            )
+                            _remember_recent_candidate_realert(
+                                early_signal_state,
+                                symbol=symbol,
+                                candidate=early_candidate,
+                                now_ts=cycle_ts,
+                            )
 
-            if intent.action in (IntentAction.LONG_ENTRY, IntentAction.SHORT_ENTRY) and outcome.accepted:
-                refreshed_decision = _refresh_symbol_decision_live(
-                    symbol=symbol,
-                    sync=sync,
-                    execution=execution,
-                    feed=feed,
-                    pipeline=pipeline,
-                    timeframe=timeframe,
-                    candles_limit=candles_limit,
-                    strategy=strategy,
-                )
-                if refreshed_decision is not None:
-                    snapshot = refreshed_decision["snapshot"]
-                    rec_state = refreshed_decision["rec_state"]
-                    frame = refreshed_decision["frame"]
-                    runtime_inputs = refreshed_decision["runtime_inputs"]
-                    extras = refreshed_decision["extras"]
-                    features = refreshed_decision["features"]
-                    mark_price = _as_float(
-                        refreshed_decision.get("mark_price"),
-                        float(features.enriched.iloc[-1]["close"]),
-                    )
-                    decision_prepared_ts = _as_float(refreshed_decision.get("prepared_at"), time.time())
-                    intent = refreshed_decision["intent"]
-                    decision = risk.evaluate(
-                        intent=intent,
-                        account=snapshot.account,
-                        existing_positions=snapshot.positions,
-                        mark_price=mark_price,
-                        rules=rules,
-                    )
-                    if intent.action not in (IntentAction.LONG_ENTRY, IntentAction.SHORT_ENTRY) or not decision.approved:
-                        continue
+            if intent.action in (IntentAction.LONG_ENTRY, IntentAction.SHORT_ENTRY):
                 signal_signature = _build_main_signal_signature(
                     symbol=symbol,
                     intent=intent,
@@ -8126,7 +9759,7 @@ def run_cycle(
                     sent=sent,
                     skip_reason="no_alerters_configured" if attempted == 0 else "",
                 )
-                _record_signal_event(
+                signal_id = _record_signal_event(
                     symbol=symbol,
                     phase="ENTRY",
                     side="SHORT" if intent.action == IntentAction.SHORT_ENTRY else "LONG",
@@ -8137,28 +9770,111 @@ def run_cycle(
                     sl=float(intent.stop_loss or mark_price),
                     confidence=float(intent.confidence),
                     reason=intent.reason,
-                    metadata=intent.metadata if isinstance(intent.metadata, Mapping) else {},
+                    metadata={
+                        **(dict(intent.metadata) if isinstance(intent.metadata, Mapping) else {}),
+                        "market_setup": True,
+                        "risk_approved": bool(decision.approved),
+                        "risk_reason": str(decision.reason or ""),
+                        "execution_accepted": bool(outcome.accepted),
+                        "execution_status": str(outcome.status or ""),
+                        "execution_reason": str(outcome.reason or ""),
+                    },
                     delivery_attempted=attempted,
                     delivery_sent=sent,
                     signal_signature=signal_signature,
                 )
-                _remember_cached_alert(
-                    signal_alert_cache,
-                    symbol=symbol,
-                    key=signal_signature,
-                    now_ts=signal_now_ts,
-                    cooldown_sec=signal_alert_cooldown_sec,
-                )
-                _remember_symbol_rate_limited_alert(
-                    signal_alert_cache,
-                    symbol=symbol,
-                    now_ts=signal_now_ts,
-                    cooldown_sec=signal_symbol_cooldown_sec,
-                )
+                if intent.action == IntentAction.SHORT_ENTRY:
+                    _record_short_signal_observation(
+                        signal_observation_tracker,
+                        signal_id=signal_id,
+                        symbol=symbol,
+                        phase="ENTRY",
+                        entry=mark_price,
+                        tp=float(intent.take_profit or mark_price),
+                        sl=float(intent.stop_loss or mark_price),
+                        signal_ts=signal_now_ts,
+                        enriched=features.enriched,
+                        delivered=sent > 0,
+                        candidate_source="main",
+                        logger=logger,
+                    )
+                if sent > 0:
+                    _remember_cached_alert(
+                        signal_alert_cache,
+                        symbol=symbol,
+                        key=signal_signature,
+                        now_ts=signal_now_ts,
+                        cooldown_sec=signal_alert_cooldown_sec,
+                    )
+                    _remember_symbol_rate_limited_alert(
+                        signal_alert_cache,
+                        symbol=symbol,
+                        now_ts=signal_now_ts,
+                        cooldown_sec=signal_symbol_cooldown_sec,
+                    )
+                else:
+                    _release_cross_process_alert(
+                        kind=f"main_{str(intent.action.value).lower()}_symbol",
+                        symbol=symbol,
+                        signature="symbol",
+                    )
+                    _release_cross_process_alert(
+                        kind=f"main_{str(intent.action.value).lower()}",
+                        symbol=symbol,
+                        signature=signal_signature,
+                    )
+                if intent.action == IntentAction.SHORT_ENTRY:
+                    recent_peak_price = _current_recent_peak_price(features.enriched, fallback_price=mark_price)
+                    current_atr = max(
+                        _as_float(features.enriched.iloc[-1].get("atr"), mark_price * 0.01),
+                        mark_price * 0.0015,
+                        1e-8,
+                    )
+                    _remember_recent_main_short_reentry(
+                        signal_alert_cache,
+                        symbol=symbol,
+                        now_ts=signal_now_ts,
+                        entry_price=mark_price,
+                        recent_peak_price=recent_peak_price,
+                        atr=current_atr,
+                    )
+                    if signal_position_tracker is not None and sent > 0:
+                        signal_position_tracker.record_short(
+                            symbol=symbol,
+                            entry_price=mark_price,
+                            stop_loss=float(intent.stop_loss or 0.0),
+                            take_profit=float(intent.take_profit or 0.0),
+                            opened_at=signal_now_ts,
+                            pump_id=str(
+                                intent.metadata.get("pump_id") or ""
+                                if isinstance(intent.metadata, Mapping)
+                                else ""
+                            ),
+                            signal_id=signal_signature,
+                            leverage=max(
+                                0.0,
+                                _as_float(os.getenv("MANUAL_REFERENCE_LEVERAGE", "0"), 0.0),
+                            ),
+                        )
 
         except Exception as exc:
             counters.inc("cycle_errors")
             logger.exception("cycle_error symbol=%s err=%s", symbol, exc, extra={"event": "cycle_error"})
+        finally:
+            _log_cycle_progress("decision_evaluate", processing_index, processing_total)
+
+    if signal_observation_tracker is not None:
+        expired_observations = signal_observation_tracker.expire_stale(
+            observed_at=time.time(),
+        )
+        if expired_observations > 0:
+            logger.warning(
+                "signal_observation_expired_incomplete count=%s",
+                expired_observations,
+                extra={"event": "signal_observation_expired_incomplete"},
+            )
+
+    _log_cycle_progress("completed", processing_total, processing_total, force=True)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Bybit Futures Bot V2")
@@ -8172,6 +9888,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     logger = setup_logging("INFO")
+    if not _claim_runtime_instance_lock(logger):
+        return 3
     _load_dotenv_file()
     requested_signal_profile = args.signal_profile or os.getenv("BOT_SIGNAL_PROFILE")
     if not requested_signal_profile and str(os.getenv("BOT_RUNTIME_MODE", "")).strip().lower() == "demo":
@@ -8388,6 +10106,16 @@ def main() -> int:
             extra={"event": "trade_learning_disabled"},
         )
 
+    shadow_model_dir = (
+        _profiled_model_dir(str(app_settings.ml.model_dir), signal_profile)
+        if signal_profile == "early"
+        else str(app_settings.ml.model_dir)
+    )
+    ml_shadow_service = _load_ml_shadow_service(
+        model_dir=shadow_model_dir,
+        logger=logger,
+    )
+
     startup_text = (
         f"<b>\u0421\u0422\u0410\u0420\u0422 \u0411\u041e\u0422\u0410</b>\n"
         f"\u0420\u0435\u0436\u0438\u043c: {cfg.mode}\n"
@@ -8414,15 +10142,67 @@ def main() -> int:
     intervention_alert_cache: dict[str, str] = {}
     decision_log_cache: dict[str, str] = {}
     signal_alert_cache: dict[str, str] = {}
+    signal_position_path = Path(
+        str(
+            os.getenv(
+                "SIGNAL_POSITION_TRACKER_PATH",
+                "data/runtime/signal_positions.json",
+            )
+        ).strip()
+        or "data/runtime/signal_positions.json"
+    )
+    if not signal_position_path.is_absolute():
+        signal_position_path = PROJECT_ROOT / signal_position_path
+    signal_position_tracker = SignalPositionTracker(
+        signal_position_path,
+        enabled=(
+            signal_profile in {"main", "early", "both"}
+            and _env_flag("SIGNAL_POSITION_TRACKING_ENABLED", True)
+        ),
+    )
+    signal_observation_path = Path(
+        str(
+            os.getenv(
+                "SIGNAL_OBSERVATION_TRACKER_PATH",
+                "data/runtime/signal_observations.json",
+            )
+        ).strip()
+        or "data/runtime/signal_observations.json"
+    )
+    if not signal_observation_path.is_absolute():
+        signal_observation_path = PROJECT_ROOT / signal_observation_path
+    signal_observation_tracker = SignalObservationTracker(
+        signal_observation_path,
+        enabled=_env_flag("SIGNAL_OBSERVATION_TRACKING_ENABLED", True),
+        horizon_minutes=max(
+            15,
+            _as_int(os.getenv("SIGNAL_OBSERVATION_HORIZON_MINUTES", "90"), 90),
+        ),
+        reaction_threshold_pct=max(
+            0.0001,
+            _as_float(os.getenv("SIGNAL_OBSERVATION_REACTION_THRESHOLD_PCT", "0.0035"), 0.0035),
+        ),
+    )
+    logger.info(
+        "signal_observation_tracker enabled=%s active=%s horizon_minutes=%s path=%s",
+        signal_observation_tracker.enabled,
+        signal_observation_tracker.active_count(),
+        int(signal_observation_tracker.horizon_sec / 60),
+        signal_observation_path,
+        extra={"event": "signal_observation_tracker"},
+    )
     early_signal_state: dict[str, dict[str, object]] = {}
     ultra_signal_state: dict[str, dict[str, object]] = {}
     early_signal_stats: dict[str, int] = {
         "watch_sent": 0,
         "setup_sent": 0,
         "ultra_sent": 0,
+        "delivery_failed": 0,
         "watch_to_setup_promoted": 0,
         "entry_confirmed": 0,
         "invalidated": 0,
+        "resolved_profitable": 0,
+        "pre_alert_refresh_rejected": 0,
         "suppressed_by_cooldown": 0,
         "ultra_suppressed": 0,
     }
@@ -8455,6 +10235,9 @@ def main() -> int:
                 online_retrainer=online_retrainer,
                 early_signal_learner=early_signal_learner,
                 early_online_retrainer=early_online_retrainer,
+                signal_position_tracker=signal_position_tracker,
+                signal_observation_tracker=signal_observation_tracker,
+                ml_shadow_service=ml_shadow_service,
                 signal_profile=signal_profile,
             )
 
@@ -8463,6 +10246,11 @@ def main() -> int:
                 runtime_store.maintenance()
                 last_maintenance_ts = now
 
+            # A full-market cycle can take longer than the websocket staleness
+            # threshold. Ingest messages accumulated during the cycle before
+            # reporting health so a healthy stream is not shown as stale merely
+            # because the scan itself took more than 20 seconds.
+            sync.pull_adapter_events(adapter)
             health = sync.health()
             strategy_audit_payload = _strategy_audit_log_payload(strategy)
             now_ts = time.time()
