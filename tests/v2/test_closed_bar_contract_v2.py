@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -11,6 +12,7 @@ from trading.market_data.bar_contract import (
     retain_closed_bars,
 )
 from trading.market_data.feed import MarketDataFeed
+from trading.market_data.mexc_client import MexcContractClient
 
 
 def _bars() -> pd.DataFrame:
@@ -123,6 +125,16 @@ class ClosedMarketFrameV2Tests(unittest.TestCase):
             frame.last_bar_close_ts,
             pd.Timestamp("2026-01-01T13:00:00Z").timestamp(),
         )
+
+    def test_empty_mexc_response_keeps_timezone_aware_bar_index(self):
+        client = MexcContractClient()
+        with patch.object(client, "_request_public", return_value={"data": {}}):
+            frame = client.fetch_ohlcv("BTCUSDT", "60", 10)
+        client.close()
+
+        self.assertTrue(frame.empty)
+        self.assertIsInstance(frame.index, pd.DatetimeIndex)
+        self.assertIsNotNone(frame.index.tz)
 
 
 if __name__ == "__main__":

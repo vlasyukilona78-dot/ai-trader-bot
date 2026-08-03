@@ -33,6 +33,12 @@ _EMPTY_OHLCV = ["time", "open", "high", "low", "close", "volume"]
 _TURNOVER_COLUMN = "turnover"
 
 
+def _empty_ohlcv_frame() -> pd.DataFrame:
+    frame = pd.DataFrame(columns=_EMPTY_OHLCV)
+    frame.index = pd.DatetimeIndex([], tz="UTC", name="datetime")
+    return frame
+
+
 class _RateLimiter:
     """Token bucket shared by every thread using one client.
 
@@ -233,7 +239,7 @@ class MexcContractClient:
         payload = self._request_public(f"/api/v1/contract/kline/{mexc_symbol}", params=params)
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, dict) or not data.get("time"):
-            return pd.DataFrame(columns=_EMPTY_OHLCV)
+            return _empty_ohlcv_frame()
 
         try:
             df = pd.DataFrame(
@@ -250,7 +256,7 @@ class MexcContractClient:
                 }
             )
         except (KeyError, ValueError):
-            return pd.DataFrame(columns=_EMPTY_OHLCV)
+            return _empty_ohlcv_frame()
 
         df = df.dropna(subset=_EMPTY_OHLCV)
         df = df.sort_values("time").reset_index(drop=True)
