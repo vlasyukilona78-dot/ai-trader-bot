@@ -1,6 +1,172 @@
 # AI collaboration handoff
 
-Updated: 2026-07-26, Europe/Moscow
+Updated: 2026-08-03, Europe/Moscow
+
+## Current authoritative checkpoint — 2026-08-03
+
+This section supersedes the historical scanner-state statements below. The
+earlier audits are retained because their research findings and the reasons for
+the fixes remain useful, but forming-bar evaluation, observation backfill,
+cross-thread strategy-state contamination, duplicate population cycles, false
+Telegram delivery confirmation, and missing population-journal wiring have now
+been addressed by the committed causal scanner series.
+
+### Repository and validation state
+
+- MEXC remains the explicitly selected target exchange and this worktree remains
+  the implementation base.
+- Local branch: `claude/codex-project-review-04581e`.
+- Tracking branch: `origin/claude/codex-project-review-04581e`.
+- Local HEAD and the remote tracking ref both point to `98217df`; the branch is
+  neither ahead nor behind. This handoff update is the only expected
+  uncommitted follow-up change.
+- Final causal scanner series, inclusive from `e3dcd45` through `e945206`:
+
+```text
+e3dcd45 feat(observation): add deterministic population decision journal
+bdcdf51 fix(market-data): enforce explicit closed-bar cutoffs
+42d972b fix(strategy): isolate mutable signal state during parallel scans
+58de7bb fix(observation): make population cycles complete and deduplicated
+2a04ebd fix(market-data): preserve the empty closed-frame contract
+5c08afe fix(alerts): report confirmed Telegram delivery
+e945206 feat(scanner): journal causal decisions from closed MEXC bars
+98217df feat(backtest): define causal single-position contract
+```
+
+- Validation on the final committed source tree:
+
+```text
+full pytest: 340 passed, 4 skipped, 2 warnings
+```
+
+### Final causal scanner contract
+
+One invocation of `scan_once()` now has one point-in-time universe and one
+causal clock:
+
+1. Refresh and freeze the ordered `UniverseSnapshot`.
+2. Capture one `scan_observed_at` and derive one fixed-interval
+   `candle_cutoff_ts` with `closed_boundary_ts()`.
+3. Fetch both the BTC benchmark and every universe symbol through
+   `fetch_closed_frame(..., as_of=candle_cutoff_ts)`. The same cutoff is used by
+   every worker. Empty MEXC responses preserve a timezone-aware empty-frame
+   contract and become `no_data`, not malformed bars.
+4. Validate the frame metadata against its actual last closed bar. The strategy
+   receives the last closed `close` as `mark_price`, never the later live ticker,
+   and receives the same cutoff through `StrategyContext.candle_cutoff_ts` so
+   higher-timeframe reads are bounded by the decision clock.
+5. Run the shared layered strategy with its mutable diagnostics, confirmation
+   state, and volatility context isolated under the committed thread-safety
+   contract. Workers return immutable typed outcomes and do not mutate shared
+   skip counters.
+6. Capture `decision_ts` only after strategy generation returns. Aggregate on
+   the main thread in the original universe order.
+
+The population journal records exactly one `PopulationDecision` for every
+ordered universe symbol, including entries, holds and failures. Supported
+statuses are `evaluated`, `no_data`, `short_history`,
+`invalid_bar_contract`, `data_error`, `data_quality_error`, and
+`strategy_error`. Real base-bar open/close timestamps are mandatory whenever a
+bar exists and remain `null` when no valid bar exists. Exceptions are persisted
+only as `safe_error_code`; exception messages and tracebacks are excluded.
+
+`cycle_id`, `input_hash`, and `snapshot_id` are canonical SHA-256 identifiers.
+Equivalent timeframe aliases hash through their fixed duration, wall-clock
+decision timestamps do not change causal IDs, and the legacy timestamp-based
+signal ID is excluded from causal metadata. Every row carries `cycle_ordinal`
+and `cycle_size`; `append_cycle()` rejects incomplete, unordered or duplicate
+symbol batches. A repeated final `cycle_id` is not appended and its repeated
+signal is suppressed.
+
+Observation tracking uses `snapshot_id` as the stable signal ID,
+`signal_ts=decision_ts`, and `signal_bar_ts` equal to the last closed bar's open
+timestamp. Previous observations are updated only from available closed frames;
+new LONG entries are not passed to the SHORT tracker. A new SHORT observation is
+initially recorded as undelivered. It is marked delivered only after an alert
+channel returns confirmed success; a configured channel alone is not delivery.
+
+The public `scan_once()` return contract remains a list of entry tuples. The
+runtime population journal defaults to
+`data/runtime/mexc_population_decisions.jsonl`; it can be redirected with
+`--population-journal` or explicitly disabled with
+`--disable-population-journal`.
+
+### Executable single-position research contract
+
+Commit `98217df` adds `backtesting/single_position.py`. It is deliberately
+separate from the historical DCA replay and is the only contract that future
+model labels may target. It is offline/research-only and has no order-submission
+path.
+
+The v1 contract is explicit and fail-closed:
+
+- SHORT only, one market entry at the first bar open exactly at `decision_ts`,
+  one absolute stop, one absolute take-profit, no DCA and global concurrency
+  exactly one;
+- a complete gap-free closed-bar horizon is mandatory; stale setups already
+  beyond stop or target at entry are recorded as unfilled and receive no
+  artificial win;
+- stop wins a same-bar stop/target ambiguity, a stop gap exits at the worse open,
+  and a target gap receives no optimistic price improvement;
+- quantity is bounded simultaneously by equity risk budget, maximum quote
+  notional, maximum leverage, quantity step, minimum quantity and minimum
+  notional;
+- entry/exit fees, half-spread and directional slippage are explicit inputs;
+  timestamped funding is explicit, with positive rates paying a SHORT;
+- intrabar exits receive only funding known by that bar's open, because OHLC
+  cannot prove that a later payment occurred before the exit;
+- the result reports fills, reason, timestamps, size, gross PnL, fees, funding,
+  net PnL, return on notional and return on risk;
+- chronological portfolio selection ranks simultaneous candidates only by their
+  causal score and prevents overlap until the selected position exits.
+
+The focused contract suite has 11 tests and is included in the 340-test full
+MEXC result above. This defines mechanics; it does not demonstrate edge.
+
+### Safety and credentials boundary
+
+- The MEXC scanner is signals-only and uses public market data. It has no MEXC
+  private adapter and no code path that can place, amend or cancel an order.
+- Operational mode remains observation/paper-only. The scanner and trading bot
+  are stopped; no live capital is authorised and the no-edge finding remains in
+  force.
+- Credential rotation is deliberately deferred to the user. Because `.env` was
+  historically tracked, existing Bybit keys/secrets, Telegram bot token and any
+  proxy credentials must be treated as compromised until rotated.
+- Deferred rotation does not block local tests, offline research or collection
+  from credential-free public MEXC endpoints. It does block all private API,
+  testnet/live execution and outbound Telegram use. Do not load or reuse the
+  historical credentials merely because the delivery path now reports success
+  correctly.
+
+### Required next order
+
+1. **Wire versioned labels to the frozen contract.** Build every future outcome
+   from `SinglePositionContract` v1, persist the complete contract/config
+   fingerprint with each dataset, and compare its behaviour with independent
+   hand-computed fixtures. Do not reuse the historical DCA labels.
+2. **Collect the runtime population.** Run the signals-only scanner in controlled
+   paper observation, preserve complete point-in-time universe cycles and all
+   HOLD/error rows, and monitor coverage and data-quality statuses. Do not build
+   the next dataset only from fired events.
+3. **Run purged chronological validation.** Use decision-time cohort boundaries,
+   a global purge/embargo at least as long as the 48-hour label horizon,
+   point-in-time universe inputs, per-timeframe warm-up/cadence validation,
+   symbol-clustered confidence intervals and a paired random-entry baseline.
+4. **Replace the legacy trainer before training.** The current `ai/train.py`
+   still targets `target_win/target_horizon`, selects XGBoost before LightGBM in
+   `auto` mode, uses a simple 80/20 split and fits its calibrator on that test
+   block. It is not the new evaluation path and must remain disconnected.
+5. **Establish the first ML baseline.** Fit a small CPU LightGBM model on the
+   causal tabular runtime-population features to estimate TP-first, SL-first and
+   timeout/net-EV outcomes. Calibrate on a later past-only validation slice and
+   compare `rules only`, random entry and `rules + LightGBM` on untouched future
+   folds after all costs. Keep it shadow/paper-only and accept another no-edge
+   result without threshold or model shopping.
+
+Private MEXC execution and any live deployment remain a separate later project,
+conditional on repeated, reproducible future-fold edge under the frozen
+single-position contract.
 
 ## Independent Codex review
 
