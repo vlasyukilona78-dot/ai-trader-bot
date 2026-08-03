@@ -43,21 +43,38 @@ def _contract(*, costs: ExecutionCosts = FREE, horizon_bars: int = 2) -> SingleP
     )
 
 
-def _plan(symbol: str = "AAAUSDT", decision_ts: float = 1000.0) -> EntryPlan:
+_DECISION_TS = 900.0
+_ACTIONABLE_TS = 950.0
+# the first 300s boundary strictly after the decision became actionable
+_ENTRY_BAR_OPEN_TS = 1200.0
+_COHORT = "cycle-1"
+
+
+def _plan(
+    symbol: str = "AAAUSDT",
+    *,
+    cohort_id: str = _COHORT,
+    decision_ts: float = _DECISION_TS,
+    actionable_ts: float = _ACTIONABLE_TS,
+    entry_bar_open_ts: float = _ENTRY_BAR_OPEN_TS,
+) -> EntryPlan:
     return EntryPlan(
         symbol=symbol,
+        cohort_id=cohort_id,
         decision_ts=decision_ts,
+        actionable_ts=actionable_ts,
+        entry_bar_open_ts=entry_bar_open_ts,
         decision_price=100.0,
         stop_price=105.0,
         take_profit_price=95.0,
     )
 
 
-def _bars(rows, decision_ts: float = 1000.0) -> pd.DataFrame:
+def _bars(rows, start_ts: float = _ENTRY_BAR_OPEN_TS) -> pd.DataFrame:
     return pd.DataFrame(
         [
             {
-                "time": decision_ts + index * 300,
+                "time": start_ts + index * 300,
                 "open": open_price,
                 "high": high,
                 "low": low,
@@ -181,23 +198,44 @@ class SinglePositionReplayV2Tests(unittest.TestCase):
 
 
 class SinglePositionSelectionV2Tests(unittest.TestCase):
-    def _result(self, symbol: str, decision_ts: float, exit_ts: float):
-        bars = _bars(
-            [(100.0, 101.0, 99.0, 100.0), (100.0, 101.0, 99.0, 100.0)],
+    def _scored(
+        self,
+        score: float,
+        symbol: str,
+        exit_ts: float,
+        *,
+        cohort_id: str = _COHORT,
+        entry_bar_open_ts: float = _ENTRY_BAR_OPEN_TS,
+        decision_ts: float = _DECISION_TS,
+    ) -> ScoredCandidate:
+        plan = _plan(
+            symbol=symbol,
+            cohort_id=cohort_id,
             decision_ts=decision_ts,
+            actionable_ts=entry_bar_open_ts - 250.0,
+            entry_bar_open_ts=entry_bar_open_ts,
         )
         result = replay_single_short(
-            bars,
-            plan=_plan(symbol=symbol, decision_ts=decision_ts),
+            _bars(
+                [(100.0, 101.0, 99.0, 100.0), (100.0, 101.0, 99.0, 100.0)],
+                start_ts=entry_bar_open_ts,
+            ),
+            plan=plan,
             contract=_contract(),
         )
-        return result.__class__(**{**result.__dict__, "exit_ts": exit_ts})
+        return ScoredCandidate(
+            score, plan, result.__class__(**{**result.__dict__, "exit_ts": exit_ts})
+        )
 
-    def test_highest_score_wins_timestamp_and_book_stays_single(self):
-        a = ScoredCandidate(0.6, self._result("AUSDT", 1000.0, 2000.0))
-        b = ScoredCandidate(0.9, self._result("BUSDT", 1000.0, 2000.0))
-        busy = ScoredCandidate(0.95, self._result("CUSDT", 1500.0, 2100.0))
-        later = ScoredCandidate(0.7, self._result("DUSDT", 2000.0, 2600.0))
+    def test_highest_score_wins_cohort_and_book_stays_single(self):
+        a = self._scored(0.6, "AUSDT", 2000.0)
+        b = self._scored(0.9, "BUSDT", 2000.0)
+        busy = self._scored(
+            0.95, "CUSDT", 2100.0, cohort_id="cycle-2", entry_bar_open_ts=1800.0
+        )
+        later = self._scored(
+            0.7, "DUSDT", 2600.0, cohort_id="cycle-3", entry_bar_open_ts=2400.0
+        )
 
         selection = select_single_position([a, later, busy, b], minimum_score=0.5)
 
@@ -205,14 +243,15 @@ class SinglePositionSelectionV2Tests(unittest.TestCase):
         self.assertEqual(selection.skipped_busy, 2)
 
     def test_threshold_and_unfilled_are_counted_without_selection(self):
-        below = ScoredCandidate(0.4, self._result("AUSDT", 1000.0, 1600.0))
+        below = self._scored(0.4, "AUSDT", 1600.0)
+        invalid_plan = _plan(symbol="BUSDT")
         invalid = replay_single_short(
             _bars([(106.0, 107.0, 105.5, 106.0), (106.0, 107.0, 105.0, 106.0)]),
-            plan=_plan(symbol="BUSDT"),
+            plan=invalid_plan,
             contract=_contract(),
         )
         selection = select_single_position(
-            [below, ScoredCandidate(0.8, invalid)],
+            [below, ScoredCandidate(0.8, invalid_plan, invalid)],
             minimum_score=0.5,
         )
 
@@ -221,15 +260,16 @@ class SinglePositionSelectionV2Tests(unittest.TestCase):
         self.assertEqual(selection.skipped_unfilled, 1)
 
     def test_unfilled_top_score_does_not_promote_runner_up_with_hindsight(self):
+        top_plan = _plan(symbol="TOPUSDT")
         invalid = replay_single_short(
             _bars([(106.0, 107.0, 105.5, 106.0), (106.0, 107.0, 105.0, 106.0)]),
-            plan=_plan(symbol="TOPUSDT"),
+            plan=top_plan,
             contract=_contract(),
         )
-        runner_up = self._result("RUNNERUSDT", 1000.0, 1600.0)
+        runner_up = self._scored(0.8, "RUNNERUSDT", 1600.0)
 
         selection = select_single_position(
-            [ScoredCandidate(0.9, invalid), ScoredCandidate(0.8, runner_up)],
+            [ScoredCandidate(0.9, top_plan, invalid), runner_up],
             minimum_score=0.5,
         )
 
