@@ -857,3 +857,178 @@ supposed to implement.
 
 The bot remains stopped. No configuration in this repository currently has
 demonstrated positive expectancy for a manually entered trade.
+
+## Codex independent review of Claude's nine follow-up commits — 2026-07-28
+
+Scope: commits `ead2aa1` through `9f71a86`, reviewed without changing strategy
+logic, thresholds, branches, or runtime state. The safe operational conclusion
+above remains unchanged: there is still no basis for live trading. The precise
+research claims and the new scanner are not ready to rely on, for the following
+reasons.
+
+### P1 runtime and observation blockers
+
+1. **The scanner evaluates forming candles.** `MexcContractClient.fetch_ohlcv()`
+   returns the current MEXC bar and `app/scan.py:67-98` immediately uses it for
+   the BTC benchmark and entry decision. `HigherTimeframeCache` does the same for
+   the 4h RSI/structural anchor. A live probe during an hour returned the bar
+   stamped at that hour's open. Offline code explicitly uses `_closed_by()`, so
+   scanner and calibration semantics differ and an alert can repaint before the
+   bar closes.
+2. **Every new observation is backfilled with pre-signal history.**
+   `app/scan.py:136` records `signal_bar_ts=None`; the tracker converts that to
+   `last_bar_ts=0`, so the next `update_frame()` consumes all 320 bars supplied
+   by the scanner. A probe immediately recorded historical min/max and both TP
+   and SL hits. Repeated changes to the current forming bar are then skipped
+   because its open timestamp has already been seen.
+3. **One stateful strategy is shared by all worker threads.**
+   `app/scan.py:105-106` calls one `LayeredPumpStrategy` concurrently.
+   `SignalGenerator.last_diagnostics`, pending confirmation state, and
+   `VolatilityContext` are mutable shared state. A deterministic two-thread
+   probe produced cross-symbol metadata (`A -> A`, `B -> A`), so an alert or
+   observation can receive another symbol's entry/SL/TP. The first volatility
+   sweep is also still order-dependent because an empty frozen list falls back
+   to the in-progress mutable observations.
+4. **Required market context still fails open.** A BTC fetch failure sets the
+   benchmark to `None`, and `core/signal_generator.py:357-363` treats the
+   relative-strength gate as passed. The test at
+   `tests/v2/test_scan_v2.py:123-127` currently codifies that unsafe behavior.
+   HTF absence now fails closed, but an arbitrarily stale cached HTF frame is
+   served indefinitely after later fetch failures.
+5. **Delivery accounting is not delivery accounting.** The tracker sets
+   `delivered=bool(alerters)` before Telegram is attempted. The Telegram wrapper
+   ignores a `False` send result, so a failed HTTP delivery can be recorded as
+   successful. Both LONG and SHORT intents are passed to `record_short()`.
+   Hourly frames also cannot measure the tracker's advertised
+   3/5/10/15/20-minute outcomes.
+6. **No single-instance lock or persistent alert dedup exists.** Two scanner
+   processes can send the same setup and concurrently replace the same
+   observations JSON. This regresses the duplicate-process protection already
+   present in the main runtime.
+
+The scanner is genuinely signals-only and has no private MEXC/order-placement
+path. That is a real safety improvement, but it does not make its alerts or
+observations valid yet.
+
+### Runtime-dataset parity blockers
+
+- `calibration_config()` disables confirmation and opens several gates, so its
+  rows are permissive pre-confirmation candidates, not delivered runtime
+  signals. Calling their comparison with random a comparison of "bot signals"
+  overstates what was tested.
+- Indicators are computed once over the full historical frame and an
+  ever-growing window is sent to the strategy. The scanner supplies only 320
+  bars each cycle. Cumulative VWAP therefore differs after bar 320 and can change
+  the Layer 4 result.
+- `_GATE_FEATURES` requests fields that the trace does not emit
+  (`level_dist_pct`, `msb_confirmed`, `sentiment_index`, `vwap_dist_pct`).
+  HTF RSI and overhead measurements are disabled by the calibration config, so
+  those columns are absent as well. The claim that every opened gate is still
+  measured is false.
+- The default scanner is Min60, but bar-count parameters retain minute-strategy
+  meanings: `pump_window_bars=45`, `confirmation_max_wait_bars=3`,
+  `msb_recent_bars=6`, and the comment describing a roughly 20-minute pump.
+  They now mean 45 hours, 3 hours, and 6 hours. The new dataset measures this
+  altered strategy, not the former Min1 technique.
+- Runtime rows are labelled by the old arithmetic equal-quantity DCA
+  `label_event()`, while `replay_short()` defaults to equal-notional legs. A
+  one-bar probe at entry 100/high 108/low 100.8 resolves under `label_event()` but
+  remains unresolved under the committed replay. Training labels and claimed
+  executable PnL therefore implement different position-sizing contracts.
+- `forward_window_quality()` still counts duplicate timestamps as coverage and
+  accepts a completely off-grid shifted window. The 90% default also permits
+  roughly 4.8 scattered hours to be absent from a 48-hour label. The later
+  warm-up-gap rejection and proxy removal were out-of-band CSV operations, not
+  committed builder logic.
+- Proxy removal uses broad substrings. It removed 109 `FARTCOINUSDT` rows, 208
+  `FILECOINUSDT` rows, and 313 `SPXUSDT` rows along with the intended stock/oil
+  proxies: 630 crypto rows were classified as TradFi solely because their names
+  contain `COIN` or `SPX`. The handoff's statement that all 35 removed symbols
+  are equity/commodity proxies is therefore false and the filtered population is
+  selection-biased.
+
+### Reproducibility and DCA denominator recheck
+
+The ignored local artifacts exist, but no committed command recreates them:
+
+```text
+runtime_calibration.csv
+sha256 ef52628b1e50464098686020403eb62dc0b30b88c309ca8769943146728cabb4
+31,295 rows / 261 symbols (not the documented 278)
+
+runtime_calibration_pnl.csv
+sha256 a56dff96b39108fd6be1f811d544e260fbb6e5a9a6ae5f86df7c308661fc23b1
+26,887 rows / 226 symbols
+```
+
+The documented 10,189-row DCA test is reproducible from the second file by
+sorting on `decision_ts`, taking row `int(26887 * 0.60)` as cutoff
+`1778522400`, and testing rows with
+`decision_ts > cutoff + 48 * 3600`. Its three denominators give opposite
+impressions:
+
+```text
+mean(pnl_on_initial / realised_legs)       +1.3362%
+symbol-cluster CI                         [+1.0911%, +1.5749%]
+
+mean(pnl_on_initial)                       -0.6192%
+symbol-cluster CI                         [-2.0023%, +0.5218%]
+
+sum(pnl_on_initial) / sum(realised_legs)   -0.4575%
+symbol-cluster ratio CI                    [-1.4438%, +0.3965%]
+```
+
+The stored `pnl` column is exactly `pnl_on_initial / legs`. Averaging that ratio
+per trade gives one cheap one-leg winner the same weight as a capital-heavy
+multi-leg loser and uses an ex-post denominator known only after the path. This
+is the systematic pro-averaging bias behind the earlier positive number. Honest
+capital accounting is statistically unresolved here; it does not establish a
+positive DCA edge.
+
+The 338-row rule cannot be reproduced: its predicates and fitted thresholds are
+not recorded, and there is no versioned grid/random-control script, seed,
+comparison JSON, manifest, or generated report. The single-entry/random table
+was added only as prose. Overlap of two separate confidence intervals is not a
+paired test of equality, and the statement that edge is bounded to roughly
+`+/-0.5%` contradicts the displayed bot intervals reaching
+`[-1.81%, +1.14%]`. The conservative statement is only that the current
+evidence does not demonstrate edge.
+
+### Replay and portfolio defects still affecting reported risk
+
+- `backtesting/replay.py:169-185` exits a stopped trade before adding the stop
+  bar to `worst_drawdown_on_initial`, so a one-bar stop reports zero drawdown.
+  It does not read `open`; a gap is approximated from `low`, which can
+  substantially understate the first executable buy-back price for a short.
+- `backtesting/validation.py:152-182` settles positions in insertion order rather
+  than `exit_ts` order. Reported max drawdown is therefore order-dependent and
+  ignores open-position mark-to-market drawdown entirely.
+- Funding, liquidation/margin mechanics, and a paired random-entry control
+  remain absent. These modules are useful path diagnostics, not a complete
+  executable-expectancy proof.
+
+### Scope and tests
+
+Commit `f7352f2` changes strategy defaults (`stop_buffer_atr_mult=0.5` and
+`structural_anchor_htf=True`) and therefore changes eligibility, stop, target,
+RR, confirmation invalidation, and signal count. That is a strategy change, not
+an infrastructure fix, and should not be merged without an explicit user
+decision.
+
+Genuine fixes retained in the review: MEXC `amount`/`amount24` turnover units,
+offline `+1h` decision alignment, HTF absence failing closed, next-bar wick
+invalidation, interleaved DCA stop/add ordering, public-only scanner wiring, and
+basic request pacing. They are incomplete in the edge cases above.
+
+Validation on the exact reviewed tree:
+
+```text
+focused changed-area tests: 87 passed
+full pytest: 287 passed, 4 skipped, 2 collection warnings
+```
+
+Green unit tests do not cover closed-bar parity, observation backfill,
+cross-thread trace isolation, multi-bar confirmation gaps, actual Telegram
+success, single-instance dedup, or reproduction of the published statistics.
+Keep the scanner and trading bot stopped until those blockers are resolved and
+fresh closed-data observation is repeated.
