@@ -10,6 +10,8 @@ __pycache__/
 venv/
 .venv/
 .runtime_env/
+.venv_flash_*/
+.venv_relocated_*/
 
 # IDE
 .idea/
@@ -43,3 +45,8 @@ tmp_*
 # OS
 .DS_Store
 Thumbs.db
+
+# Local recovery artifacts
+.git_corrupt_*/
+.git_mixed_*/
+recovery_snapshot_*.zip
