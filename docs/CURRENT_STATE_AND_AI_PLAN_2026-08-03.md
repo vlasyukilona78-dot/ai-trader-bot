@@ -2,8 +2,12 @@
 
 Актуально: **2026-08-03, Europe/Moscow**.
 
-Это основной документ для продолжения работы новой нейросетью. Он имеет приоритет
-над датированными preservation-планами и историческим `docs/AI_HANDOFF.md`.
+Это основной документ для root/Bybit, preservation и исторического контекста. Для
+целевой MEXC-линии его AI-разделы уточнены и частично заменены документом
+`.claude/worktrees/codex-project-review-04581e/docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md`
+на опубликованном checkpoint `f0b43d6`.
+Готовый порядок независимой проверки находится в
+`docs/CLAUDE_REVIEW_PROMPT_2026-08-03.md`.
 
 ## 1. Короткая формула проекта
 
@@ -44,7 +48,7 @@ Koteika Ultra — исследовательская система, котор�
 | Линия | Назначение | Functional anchor | Remote | Состояние |
 |---|---|---|---|---|
 | Root | сохранённый Bybit/runtime Phase 2, observation и operational tooling | `2f7e18f` | anchor опубликован в `origin/feat/phase2-layer1-pump-runtime-alignment` | `533 passed, 4 skipped, 3 warnings` |
-| MEXC | целевая causal research/signals-only реализация | `98217df` | anchor опубликован в `origin/claude/codex-project-review-04581e` | `340 passed, 4 skipped, 2 warnings` |
+| MEXC | целевая causal research/signals-only реализация | `f0b43d6` | опубликован в `origin/claude/codex-project-review-04581e` | `352 passed, 4 skipped, 2 warnings` |
 
 Docs-only коммиты после этих anchors могут изменить tip, но не меняют указанные
 functional checkpoints. `main` и root/Bybit не следует смешивать с MEXC без
@@ -64,7 +68,9 @@ functional checkpoints. `main` и root/Bybit не следует смешива�
 
 - Исправлены look-ahead в labels, turnover units, warm-up, purge, execution
   ordering, pathwise PnL replay и research verdict.
-- Публичный MEXC signals-only scanner с pacing и полным universe.
+- Публичный MEXC signals-only scanner с pacing и полной записью выбранной
+  point-in-time scan universe. Raw-ledger всех MEXC USDT contracts с причинами
+  включения/исключения ещё относится к Phase 2.
 - Один causal cutoff на цикл, только закрытые base/HTF bars, last closed close
   вместо live ticker, freshness/cadence/OHLCV validation.
 - Полный population journal: по одной записи на каждый point-in-time symbol,
@@ -74,6 +80,17 @@ functional checkpoints. `main` и root/Bybit не следует смешива�
   semantics.
 - Исполняемый research-контракт одной SHORT-позиции в
   `backtesting/single_position.py`.
+- Исправлен hindsight look-ahead при замене неисполненного лидера runner-up
+  (`0b010e8`).
+- Добавлен versioned feature contract с pinned executable schema hash, ролями
+  признаков и явной missingness (`3ff8de0`).
+- Каждый population row, включая HOLD/error, получает фиксированный
+  `feature_snapshot`; funding frozen-universe передаётся в StrategyContext.
+- Добавлен строгий consumer population journal с проверкой cycle/input/snapshot
+  IDs, schema/config drift и отдельным whitelist API для модельных признаков.
+- Единая стратегия, таблица моделей, external-tooling и Phase 0–10 описаны в
+  `.claude/worktrees/codex-project-review-04581e/docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md`
+  (`29536f1`, `f0b43d6`).
 
 ## 4. Preservation и работа без внешнего диска
 
@@ -151,8 +168,9 @@ success marker записывается атомарно последним. П�
 
 ## 5. Замороженный single-position contract v1
 
-`98217df` создаёт независимый от старого DCA модуль. Это механика будущих labels,
-а не торговая рекомендация.
+`98217df` создаёт независимый от старого DCA модуль, а `0b010e8` устраняет
+ретроспективную замену неисполненного top-score кандидата исполненным runner-up.
+Это механика будущих labels, а не торговая рекомендация.
 
 Контракт требует:
 
@@ -249,7 +267,14 @@ high-volume модель; Kimi K3 — только редкий offline escalato
 Никакому cloud LLM нельзя передавать `.env`, приватные позиции, account state,
 полную proprietary strategy или право генерировать entry/sizing/stop/TP.
 
-## 7. Идеальная последовательность реализации
+## 7. Историческая последовательность реализации
+
+Ниже сохранён первоначальный план до аудита feature contract. Для новых MEXC
+изменений он заменён более строгими Phase 0–10 из MEXC
+`.claude/worktrees/codex-project-review-04581e/docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md`.
+Следующая задача — не старый label-builder напрямую, а сначала Phase 1
+time/spec contract, затем Phase 2 unconditional feature parity и только после
+этого executable labels.
 
 ### Phase A — preservation и causal input contract — выполнено
 

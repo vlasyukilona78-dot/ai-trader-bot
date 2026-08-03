@@ -11,13 +11,18 @@ Before any edit, command that changes state, runtime start, branch switch, or
 strategy conclusion:
 
 1. Read `AGENTS.md`.
-2. Read `docs/CURRENT_STATE_AND_AI_PLAN_2026-08-03.md` in full. It is the
-   current authoritative operational and AI plan.
-3. Read `docs/PROJECT_HANDOFF_FOR_CLAUDE.md` for the detailed historical system
+2. Read `docs/CLAUDE_REVIEW_PROMPT_2026-08-03.md` in full. It gives the exact
+   two-worktree orientation, recent commits, code-review checklist and the
+   required response format for a fresh Claude account.
+3. Read `docs/CURRENT_STATE_AND_AI_PLAN_2026-08-03.md` for root/preservation
+   context. For the selected MEXC implementation, the authoritative strategy
+   and AI plan is
+   `.claude/worktrees/codex-project-review-04581e/docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md`.
+4. Read `docs/PROJECT_HANDOFF_FOR_CLAUDE.md` for the detailed historical system
    map. Use `docs/AI_HANDOFF.md` only as a historical audit log. It contains
    superseded positive DCA/expectancy findings and must not be treated as the
    current verdict.
-4. Run read-only Git orientation (`status`, `worktree list`, branch and HEAD)
+5. Run read-only Git orientation (`status`, `worktree list`, branch and HEAD)
    and state explicitly which worktree is being inspected.
 
 ## Critical repository state
@@ -25,10 +30,11 @@ strategy conclusion:
 - The root worktree is the preserved Bybit/runtime line:
   `feat/phase2-layer1-pump-runtime-alignment`; functional anchor `2f7e18f` is
   published to the same remote branch. Fresh validation: 533 passed, 4 skipped.
-- `.claude/worktrees/codex-project-review-04581e` is a separate, unmerged
-  MEXC/research line; functional anchor `98217df` is published to
-  `origin/claude/codex-project-review-04581e`. Fresh validation: 340 passed,
-  4 skipped.
+- `.claude/worktrees/codex-project-review-04581e` is the separate, unmerged,
+  selected MEXC/research line. The published AI foundation anchor is `f0b43d6`
+  on `origin/claude/codex-project-review-04581e`; verify the current descendant
+  HEAD because handoff-only commits may follow it. Fresh validation: 352 passed,
+  4 skipped, 2 known collection warnings.
 - A verified external receipt exists under
   `D:\koteika-preservation\koteika_preservation_20260803_135615_6d24c806`, but
   it captures older source heads `0c38863`/`9f71a86`, not the newer functional
@@ -56,10 +62,13 @@ strategy conclusion:
   found no edge for the tested single-position generic pump-fade after costs.
   Do not revive retracted DCA, `+0.0208 expectancy`, profitable-portfolio, or
   safe-leverage claims.
-- Causal scanner/population journaling and an executable one-entry/one-stop/
-  one-TP research contract are implemented. The next model path is LightGBM on
-  full runtime-population outcomes; causal TCN/Chronos are later challengers.
-  LLMs are timestamped context extractors only, never trading decision makers.
+- Causal scanner/population journaling, an executable one-entry/one-stop/one-TP
+  research contract, a versioned feature contract and a strict population
+  reader are implemented. Phase 0 is complete; Phase 1 time/spec and Phase 2
+  unconditional feature parity remain. The next model path is LightGBM plus a
+  separate EV head after prospective labels mature; CatBoost/XGBoost AFT and
+  causal TCN/Chronos are challengers. LLMs are timestamped context extractors
+  only, never trading decision makers.
 
 ## Runtime and trading safety
 

@@ -8,19 +8,20 @@
 стратегии.
 
 > [!IMPORTANT]
-> Текущий операционный источник истины —
-> `docs/CURRENT_STATE_AND_AI_PLAN_2026-08-03.md`. Он фиксирует выполненное
-> preservation, выбранную MEXC-линию, causal scanner, single-position contract и
-> AI-roadmap. Все hashes, dirty counts, «ahead 9», требования повторно выбрать
-> биржу и команды будущего времени ниже являются датированным контекстом, если
-> противоречат новому документу.
+> Начинать нужно с `docs/CLAUDE_REVIEW_PROMPT_2026-08-03.md`. Root/preservation
+> состояние уточняет `docs/CURRENT_STATE_AND_AI_PLAN_2026-08-03.md`, а текущий
+> MEXC AI/strategy источник истины находится в MEXC worktree:
+> `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md`, functional anchor `f0b43d6`.
+> Все старые hashes, dirty counts, «ahead 9», требования повторно выбрать биржу
+> и команды будущего времени ниже являются датированным контекстом.
 
 Актуальные functional anchors:
 
 - root/Bybit runtime: `2f7e18f`, опубликован в
   `origin/feat/phase2-layer1-pump-runtime-alignment`; `533 passed, 4 skipped`;
-- target MEXC research: `98217df`, опубликован в
-  `origin/claude/codex-project-review-04581e`; `340 passed, 4 skipped`;
+- target MEXC research AI foundation: `f0b43d6`, опубликован в
+  `origin/claude/codex-project-review-04581e`; `352 passed, 4 skipped`, два
+  известных collection warnings;
 - MEXC подтверждён как целевая площадка, scanner остаётся public-data,
   signals-only, бот остановлен;
 - проверенный same-disk checkpoint без USB:
@@ -30,9 +31,11 @@
 - no-edge verdict не изменён;
 - текущие tips не содержат `.env`, но credentials не ротированы и история не
   очищена: private API/Telegram/testnet/live запрещены;
-- следующий этап — versioned labels через frozen one-entry/one-stop/one-TP
-  contract, затем purged LightGBM shadow baseline. Causal TCN/Chronos являются
-  challengers; LLM разрешён только как timestamped context extractor.
+- следующий этап — Phase 1 time/spec contract, затем unconditional feature
+  parity и лишь после них executable labels через frozen one-entry/one-stop/
+  one-TP contract. LightGBM + отдельный EV-head является первым numeric
+  candidate; CatBoost/XGBoost AFT и causal TCN/Chronos — challengers; LLM
+  разрешён только как timestamped context extractor.
 
 ## 1. Самое важное в десяти пунктах
 
