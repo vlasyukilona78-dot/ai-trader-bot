@@ -342,8 +342,22 @@ Acceptance: schema стабильна, HOLD не теряются, старый 
 
 ### Phase 1 — P0 time/spec contract
 
-Slice 1 (выполнено, `a21a729`, `ce01c06`, `20d4b73`, `bab837b`) закрыл пункты
-4 (частично), 5 и 8:
+Slice 1 не был принят независимым ревью: 388 зелёных тестов не покрывали
+runtime- и schema-блокеры. Дефекты устранены тремя slice'ами
+(`8b03d59`, `577dd9d`, `7290863`). Ниже — состояние после них.
+
+Отозванные утверждения первой попытки:
+
+- «wall-clock не меняет hash» было верно только для `decision_ts`; сам снапшот
+  нёс `universe_refreshed_at`, то есть время всё-таки входило в identity.
+  Теперь wall-clock вынесен в `feature_provenance` вне `input_hash`.
+- «пустой цикл оставляет envelope» — envelope строился, но не сохранялся;
+  durable-записи не было. Теперь пишется header+footer, читается после рестарта.
+- «worker-order acceptance выполнена» — заявлено преждевременно: холодный старт
+  `VolatilityContext` оставался зависимым от порядка, потому что пустой frozen
+  snapshot проваливался к живым наблюдениям. Исправлено явным флагом sweep.
+
+Закрыты пункты 4 (частично), 5 и 8:
 
 - [x] `SourceTiming` фиксирует `request_started_at` / `received_at` /
   `source_as_of` / status для universe, benchmark и рыночных данных; отказавший
@@ -361,8 +375,25 @@ Slice 1 (выполнено, `a21a729`, `ce01c06`, `20d4b73`, `bab837b`) зак�
   `entry_ts` следует за исполнением, а не за решением.
 - [x] Schema bump: population journal v2, single-position contract v2; reader
   fail-closed на прежней версии.
-- [x] Пустая вселенная оставляет envelope вместо молчаливого возврата.
-- [x] Регрессия: `388 passed, 4 skipped, 2 known collection warnings`.
+- [x] Пустой и ошибочный цикл пишутся в журнал как header+footer и читаются
+  после рестарта.
+- [x] Envelope пишется один раз на цикл (header/rows/footer, row count и
+  checksum), а не копируется в каждую строку; 300 символов не падают.
+- [x] Writer запрещает смешение schema-версий, чужие строки в batch и склейку
+  оборванного хвоста.
+- [x] Reader пересобирает envelope и сверяет каждый cycle-level факт строки.
+- [x] `mexc_reversal_features_v2`: снапшот без wall-clock, провенанс рядом,
+  новый executable hash закреплён литералом.
+- [x] Тайминги разделены: universe ticker, contract details, benchmark,
+  base OHLCV, higher timeframe; кэш тикеров не выдаётся за свежий ответ.
+- [x] Холодный старт волатильности инвариантен к порядку воркеров (проверено на
+  реальной `LayeredPumpStrategy`, 28 символов, оба порядка).
+- [x] Регрессия: `423 passed, 4 skipped, 2 known collection warnings`.
+
+Что timing **не** доказывает: `entry_bar_open_ts` помечен
+`timing_basis="research_ranking_ready"`. Он обосновывает сравнимость когорты в
+research-replay и не утверждает, что живая signals-only доставка успела бы к
+этому бару — построение записи, fsync, возврат и канал доставки не измерены.
 
 Осталось в Phase 1:
 
@@ -380,9 +411,11 @@ Slice 1 (выполнено, `a21a729`, `ce01c06`, `20d4b73`, `bab837b`) зак�
 9. Получать point-in-time instrument specs: contract size, quantity step,
    minimum quantity/notional, leverage, timestamp и hash.
 
-Acceptance: worker count/order не меняет snapshot, ranking, entry или outcome
-(**выполнено и покрыто тестом**); первый execution bar действительно доступен
-после `actionable_ts` (**выполнено**).
+Acceptance: worker count/order не меняет snapshot, ranking, entry или outcome —
+**выполнено для cycle/cohort identity, entry timing и холодного старта
+волатильности**; полная acceptance требует ещё безусловного trace (Phase 2),
+пока поздние признаки зависят от того, где оборвался gate. Первый бар доступен
+после `actionable_ts` **в смысле research-ranking**, не execution.
 
 ### Phase 2 — unconditional causal feature parity
 

@@ -1360,3 +1360,101 @@ model training, the label builder and external dependencies are untouched.
 
 No edge is claimed or implied by this slice. It makes selection reproducible and
 the entry reachable; it does not make the strategy profitable.
+
+## Phase 1 rework after adversarial review — 2026-08-03
+
+The first Phase 1 slice was not accepted: 388 green tests did not cover several
+runtime and schema blockers. Sixteen findings were verified against the code and
+fixed in three reviewable slices. Scanner, external APIs and Telegram were not
+started; `.env` was not read.
+
+### Retracted from the first attempt
+
+- "Wall-clock timing does not change the snapshot hash" held only for
+  `decision_ts`. The snapshot itself carried `universe_refreshed_at`, so timing
+  did enter market identity.
+- "An empty universe leaves an envelope" - the envelope was built but never
+  persisted, so there was no durable evidence.
+- "Worker-order acceptance complete" - premature. The cold-start volatility floor
+  still depended on scan order.
+
+### Slice A `8b03d59` - runtime and backtest correctness
+
+The cutoff was derived after the universe refresh, so a refresh crossing a bar
+boundary produced a cutoff later than the cycle start: a false provenance claim
+and an envelope-invariant crash. It is frozen before the request now.
+
+EntryPlan gained `entry_eligible_ts`, and the replay requires the entry bar to be
+exactly the first reachable one - a later aligned bar silently measures a
+different trade. ScoredCandidate now requires the result to match the plan on
+decision_ts, entry_bar_open_ts and, when filled, entry_ts.
+
+Two cohorts targeting one bar are resolved by which became actionable first, not
+by cohort_id ordering, which is SHA order and causally meaningless. The bar is
+consumed by the attempt, not the fill: whether the leader filled is knowable only
+after that bar printed.
+
+VolatilityContext tested its frozen list for emptiness, so a cold start fell
+through to the live observations of the sweep in progress. A sweep is now an
+explicit flag; proved on the real LayeredPumpStrategy over 28 symbols in both
+orders.
+
+### Slice B `577dd9d` - journal and envelope schema
+
+The envelope was copied onto every decision row: quadratic in universe size, and
+past 256 symbols the ordered universe exceeded the per-row collection bound, so a
+300-symbol scan raised instead of journalling. It is now one header record, the
+rows, then a footer with row count and a digest over the ordered snapshot IDs.
+Journal schema moved to 3; two incompatible layouts must not both be called v2.
+
+The writer refuses a file whose first record declares another version, a batch
+mixing versions or carrying foreign rows, and a file whose tail lost its newline
+- appending there would glue two JSON objects into one unparseable line. Empty
+and error cycles are written and read back after a restart. The reader rebuilds
+the envelope from its own fields and requires every cycle-level fact on a row to
+equal it.
+
+### Slice C `7290863` - source and feature time contract
+
+Feature contract `mexc_reversal_features_v2`, executable hash
+`20f9f61d4e2d787c5ad05f54ee3ccd8b7f8ea3a99fe09bc38bbefe09872c496c` pinned by
+literal. The snapshot carries only `bar_cutoff_ts`; the universe response instant
+moved to `feature_provenance`, which is excluded from `input_hash` and carries
+the envelope hash so a row stays tied to the timing it was ranked under.
+
+Sources are reported separately - universe ticker, contract details, benchmark,
+base OHLCV, higher timeframe - each with its own request/response instants,
+status and cache provenance. A cached ticker response keeps the instant the
+exchange produced it instead of inheriting the current clock. `min()` clamping is
+gone; an inverted clock fails closed.
+
+The envelope declares `timing_basis="research_ranking_ready"`. It proves a
+research replay may rank this cohort and enter on that bar. It does not claim a
+live signals-only delivery could have reached it: record construction, the fsync,
+the return path and the channel are unmeasured and any can cross the boundary.
+
+### Tests
+
+```text
+423 passed, 4 skipped, 2 known collection warnings
+```
+
+Baseline before this rework was 388. Three consecutive full runs were identical.
+
+### Still open
+
+- P0 benchmark gate fails open at `core/signal_generator.py:358-362` while the
+  higher-timeframe gate beside it fails closed. Out of scope by instruction;
+  changing it changes signal counts and needs an explicit decision.
+- P0 layer trace still stops at the first failed gate, so late features are
+  structurally missing and the missingness mask correlates with the rule outcome.
+  This is Phase 2 and blocks full worker-order acceptance.
+- P1 base OHLCV and higher-timeframe timings are cycle aggregates over real
+  per-symbol spans; per-symbol rows do not yet carry their own.
+- P1 no cross-process lock on the journal; two scanners on one file still double
+  append.
+- P1 raw contract ledger, point-in-time instrument specs and the proposal/label
+  bridge remain unbuilt.
+
+No edge is claimed. This rework makes selection reproducible and the research
+entry reachable; it does not make the strategy profitable.
