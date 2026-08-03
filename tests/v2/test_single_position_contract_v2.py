@@ -220,6 +220,23 @@ class SinglePositionSelectionV2Tests(unittest.TestCase):
         self.assertEqual(selection.skipped_below_threshold, 1)
         self.assertEqual(selection.skipped_unfilled, 1)
 
+    def test_unfilled_top_score_does_not_promote_runner_up_with_hindsight(self):
+        invalid = replay_single_short(
+            _bars([(106.0, 107.0, 105.5, 106.0), (106.0, 107.0, 105.0, 106.0)]),
+            plan=_plan(symbol="TOPUSDT"),
+            contract=_contract(),
+        )
+        runner_up = self._result("RUNNERUSDT", 1000.0, 1600.0)
+
+        selection = select_single_position(
+            [ScoredCandidate(0.9, invalid), ScoredCandidate(0.8, runner_up)],
+            minimum_score=0.5,
+        )
+
+        self.assertEqual(selection.selected, ())
+        self.assertEqual(selection.skipped_unfilled, 1)
+        self.assertEqual(selection.skipped_busy, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

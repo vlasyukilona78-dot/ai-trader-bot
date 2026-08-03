@@ -428,9 +428,11 @@ def select_single_position(
 ) -> SinglePositionSelection:
     """Select a deterministic chronological portfolio with concurrency one.
 
-    At each decision timestamp only the highest score is considered.  Outcomes
-    never influence ranking; ``exit_ts`` is used only after a candidate has been
-    selected to determine when the book becomes free again.
+    At each decision timestamp only the highest score is selected for an entry
+    attempt. Outcomes never influence ranking: an unfilled top candidate cannot
+    be replaced retrospectively by a lower-ranked symbol from the same cohort.
+    ``exit_ts`` is used only after a filled candidate has been selected to
+    determine when the book becomes free again.
     """
 
     if not _finite(minimum_score):
@@ -460,8 +462,6 @@ def select_single_position(
         for candidate in group:
             if candidate.score < minimum_score:
                 skipped_below += 1
-            elif not candidate.result.filled or candidate.result.exit_ts is None:
-                skipped_unfilled += 1
             else:
                 eligible.append(candidate)
         if not eligible:
@@ -471,9 +471,12 @@ def select_single_position(
             continue
 
         chosen = eligible[0]
+        skipped_busy += len(eligible) - 1
+        if not chosen.result.filled or chosen.result.exit_ts is None:
+            skipped_unfilled += 1
+            continue
         selected.append(chosen)
         active_until = float(chosen.result.exit_ts)
-        skipped_busy += len(eligible) - 1
 
     return SinglePositionSelection(
         selected=tuple(selected),
