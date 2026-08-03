@@ -25,6 +25,7 @@ from core.volume_profile import compute_volume_profile
 RUNTIME_DIR = ROOT / "data" / "runtime"
 LOG_DIR = ROOT / "logs" / "runtime"
 BAR_HORIZONS: tuple[int, ...] = (3, 5, 10, 20)
+LOCAL_OBSERVATIONS_PATH = RUNTIME_DIR / "signal_observations_completed.jsonl"
 
 
 @dataclass
@@ -52,27 +53,48 @@ def _iso_utc(ts: float | None) -> str:
 
 
 def _latest_live_log() -> Path:
-    candidates = sorted(LOG_DIR.glob("bot_supervisor_live_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if candidates:
-        return candidates[0]
-    candidates = sorted(LOG_DIR.glob("bot_supervisor_*.stdout.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    patterns = (
+        "bot_supervisor_live_*.log",
+        "bot_supervisor_*.stdout.log",
+        "bot_*.stderr.log",
+        "bot_*.stdout.log",
+    )
+    candidates = sorted(
+        {
+            path
+            for pattern in patterns
+            for path in LOG_DIR.glob(pattern)
+            if path.is_file() and path.stat().st_size > 0
+        },
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
     if not candidates:
         raise FileNotFoundError(f"No runtime log found in {LOG_DIR}")
     return candidates[0]
 
 
 def _load_db_rows(db_path: Path) -> list[SignalEvent]:
+    if not db_path.exists() or db_path.stat().st_size <= 0:
+        return []
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """
-        SELECT id, symbol, action, state_before, risk_reason, exec_status, exec_reason,
-               order_id, order_link_id, ts, raw_json
-        FROM order_decisions
-        ORDER BY id ASC
-        """
-    ).fetchall()
-    conn.close()
+    try:
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='order_decisions'"
+        ).fetchone()
+        if table_exists is None:
+            return []
+        rows = conn.execute(
+            """
+            SELECT id, symbol, action, state_before, risk_reason, exec_status, exec_reason,
+                   order_id, order_link_id, ts, raw_json
+            FROM order_decisions
+            ORDER BY id ASC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
 
     events: list[SignalEvent] = []
     for row in rows:
@@ -146,8 +168,9 @@ def _load_signal_event_log(path: Path) -> list[SignalEvent]:
 
             phase = str(raw.get("phase") or "").upper()
             reason = str(raw.get("reason") or "")
-            profile = "early" if phase in {"WATCH", "SETUP", "ULTRA"} or "early" in reason else "main"
-            if phase == "ULTRA":
+            is_ultra = phase.startswith("ULTRA")
+            profile = "early" if phase in {"WATCH", "SETUP"} or is_ultra or "early" in reason else "main"
+            if is_ultra:
                 kind = "ultra_alert"
             elif phase in {"WATCH", "SETUP"}:
                 kind = "early_alert"
@@ -174,6 +197,24 @@ def _load_signal_event_log(path: Path) -> list[SignalEvent]:
             )
 
     return [event for event in events if event.symbol and event.ts > 0]
+
+
+def _load_completed_signal_observations(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    rows: dict[str, dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8-sig", errors="replace") as handle:
+        for line in handle:
+            try:
+                row = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(row, dict):
+                continue
+            signal_id = str(row.get("signal_id") or "").strip()
+            if signal_id and str(row.get("status") or "") == "completed":
+                rows[signal_id] = row
+    return rows
 
 
 def _parse_log_for_early_alerts(log_path: Path) -> list[SignalEvent]:
@@ -694,7 +735,125 @@ def _summarize_results(items: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
-def _analyze_signal(client: MarketDataClient, event: SignalEvent, *, timeframe: str = "1") -> dict[str, Any]:
+def _analyze_local_observation(
+    event: SignalEvent,
+    observation: dict[str, Any],
+    *,
+    timeframe: str,
+) -> dict[str, Any] | None:
+    raw_horizons = observation.get("horizon_metrics")
+    if not isinstance(raw_horizons, dict):
+        return None
+    metrics_15 = raw_horizons.get("15")
+    metrics_60 = raw_horizons.get("60")
+    if not isinstance(metrics_15, dict) or not isinstance(metrics_60, dict):
+        return None
+
+    down_15 = _safe_float(metrics_15.get("favorable_excursion_pct"), 0.0)
+    up_15 = _safe_float(metrics_15.get("adverse_excursion_pct"), 0.0)
+    down_60 = _safe_float(metrics_60.get("favorable_excursion_pct"), 0.0)
+    up_60 = _safe_float(metrics_60.get("adverse_excursion_pct"), 0.0)
+    minutes_to_down = metrics_60.get("minutes_to_first_favorable")
+    minutes_to_up = metrics_60.get("minutes_to_first_adverse")
+    down_minutes = None if minutes_to_down is None else _safe_float(minutes_to_down)
+    up_minutes = None if minutes_to_up is None else _safe_float(minutes_to_up)
+
+    first_reaction = "flat"
+    if down_minutes is not None and (up_minutes is None or down_minutes < up_minutes):
+        first_reaction = "down"
+    elif up_minutes is not None and (down_minutes is None or up_minutes < down_minutes):
+        first_reaction = "up"
+    elif down_minutes is not None and up_minutes is not None:
+        if down_15 >= max(0.35, up_15 + 0.1):
+            first_reaction = "down"
+        elif up_15 >= max(0.35, down_15 + 0.1):
+            first_reaction = "up"
+
+    timeframe_minutes = max(_timeframe_seconds(timeframe) / 60.0, 1.0 / 60.0)
+
+    def _bars_from_minutes(value: float | None) -> int | None:
+        if value is None:
+            return None
+        return max(1, int(round(float(value) / timeframe_minutes)))
+
+    bars_to_first_down = _bars_from_minutes(down_minutes)
+    bars_to_first_up = _bars_from_minutes(up_minutes)
+    tp_hit_60 = bool(metrics_60.get("tp_hit"))
+    sl_hit_60 = bool(metrics_60.get("sl_hit"))
+    verdict = _classify_short_signal_outcome(
+        kind=event.kind,
+        first_reaction=first_reaction,
+        up_15=up_15,
+        down_15=down_15,
+        up_60=up_60,
+        down_60=down_60,
+        tp_hit_60=tp_hit_60,
+        sl_hit_60=sl_hit_60,
+        bars_to_first_down_move=bars_to_first_down,
+        bars_to_first_up_move=bars_to_first_up,
+    )
+
+    bar_horizons: dict[str, dict[str, Any]] = {}
+    for horizon in BAR_HORIZONS:
+        horizon_minutes = horizon * timeframe_minutes
+        if not float(horizon_minutes).is_integer():
+            continue
+        payload = raw_horizons.get(str(int(horizon_minutes)))
+        if isinstance(payload, dict):
+            bar_horizons[str(horizon)] = payload
+
+    signal_bar_ts = _safe_float(observation.get("signal_bar_ts"), 0.0)
+    metadata = event.raw.get("metadata", {}) if isinstance(event.raw, dict) else {}
+    return {
+        "profile": event.profile,
+        "kind": event.kind,
+        "phase": str(event.raw.get("phase") or observation.get("phase") or ""),
+        "symbol": event.symbol,
+        "signal_ts": _iso_utc(event.ts),
+        "delivery_ts": _iso_utc(event.delivery_ts),
+        "signal_bar_ts": _iso_utc(signal_bar_ts) if signal_bar_ts > 0 else "",
+        "entry_ref": round(_safe_float(observation.get("entry"), event.entry_price or 0.0), 8),
+        "tp": event.tp or _extract_float(observation, "take_profit"),
+        "sl": event.sl or _extract_float(observation, "stop_loss"),
+        "first_reaction_10m": first_reaction,
+        "upside_15m_pct": round(up_15, 3),
+        "downside_15m_pct": round(down_15, 3),
+        "upside_60m_pct": round(up_60, 3),
+        "downside_60m_pct": round(down_60, 3),
+        "adverse_excursion_15m_pct": round(up_15, 3),
+        "favorable_excursion_15m_pct": round(down_15, 3),
+        "adverse_excursion_60m_pct": round(up_60, 3),
+        "favorable_excursion_60m_pct": round(down_60, 3),
+        "bars_to_first_down_035pct": bars_to_first_down,
+        "bars_to_first_up_035pct": bars_to_first_up,
+        "minutes_to_first_down_035pct": down_minutes,
+        "minutes_to_first_up_035pct": up_minutes,
+        "tp_hit_60m": tp_hit_60,
+        "sl_hit_60m": sl_hit_60,
+        "verdict": verdict,
+        "bar_horizons": bar_horizons,
+        "context": metadata if isinstance(metadata, dict) else {},
+        "status": "local_observation",
+        "delivered": bool(observation.get("delivered")),
+    }
+
+
+def _analyze_signal(
+    client: MarketDataClient,
+    event: SignalEvent,
+    *,
+    timeframe: str = "1",
+    local_observation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if isinstance(local_observation, dict):
+        local_result = _analyze_local_observation(
+            event,
+            local_observation,
+            timeframe=timeframe,
+        )
+        if local_result is not None:
+            return local_result
+
     df = _fetch_signal_window(client, event, timeframe)
     if df.empty:
         return {
@@ -807,6 +966,7 @@ def main() -> int:
     parser.add_argument("--early-db", default=str(RUNTIME_DIR / "v2_demo_runtime_early.db"))
     parser.add_argument("--log", default=str(_latest_live_log()))
     parser.add_argument("--signal-events", default=str(RUNTIME_DIR / "signal_events.jsonl"))
+    parser.add_argument("--observations", default=str(LOCAL_OBSERVATIONS_PATH))
     parser.add_argument("--main-limit", type=int, default=12)
     parser.add_argument("--early-limit", type=int, default=12)
     parser.add_argument("--dedupe-window-sec", type=int, default=900)
@@ -822,6 +982,7 @@ def main() -> int:
     )
     signal_event_main = [row for row in signal_event_rows if row.profile == "main"]
     signal_event_early = [row for row in signal_event_rows if row.profile == "early"]
+    local_observations = _load_completed_signal_observations(Path(args.observations))
 
     main_entries = signal_event_main[-int(args.main_limit):] or _select_recent_main_entries(main_rows, int(args.main_limit))
     early_entries = signal_event_early[-int(args.early_limit):] or _enrich_early_alerts_with_db_execution(
@@ -831,8 +992,28 @@ def main() -> int:
 
     client = MarketDataClient(timeout=12, max_retries=2)
     try:
-        main_analyzed = [_analyze_signal(client, row, timeframe=str(args.timeframe)) for row in main_entries]
-        early_analyzed = [_analyze_signal(client, row, timeframe=str(args.timeframe)) for row in early_entries]
+        main_analyzed = [
+            _analyze_signal(
+                client,
+                row,
+                timeframe=str(args.timeframe),
+                local_observation=local_observations.get(
+                    str(row.raw.get("signal_id") or row.order_link_id or "")
+                ),
+            )
+            for row in main_entries
+        ]
+        early_analyzed = [
+            _analyze_signal(
+                client,
+                row,
+                timeframe=str(args.timeframe),
+                local_observation=local_observations.get(
+                    str(row.raw.get("signal_id") or row.order_link_id or "")
+                ),
+            )
+            for row in early_entries
+        ]
     finally:
         client.close()
 

@@ -275,7 +275,11 @@ try {
         $tmpStdout = Join-Path $LogDir ("tmp_obs_stdout_{0}_{1}.log" -f $ts, $runs)
         $tmpStderr = Join-Path $LogDir ("tmp_obs_stderr_{0}_{1}.log" -f $ts, $runs)
 
-        $proc = Start-Process -FilePath $PythonPath -ArgumentList "-m", "app.main" -NoNewWindow -Wait -PassThru -RedirectStandardOutput $tmpStdout -RedirectStandardError $tmpStderr
+        # PowerShell 5 Start-Process can fail after a Windows migration when the
+        # inherited environment contains both Path and PATH keys. Direct
+        # invocation avoids that case-insensitive dictionary collision.
+        & $PythonPath "-m" "app.main" 1> $tmpStdout 2> $tmpStderr
+        $runExitCode = if ($null -eq $LASTEXITCODE) { 1 } else { [int]$LASTEXITCODE }
 
         if (Test-Path $tmpStdout) {
             Get-Content $tmpStdout | Add-Content -Path $combinedLog
@@ -286,9 +290,9 @@ try {
             Remove-Item -Force $tmpStderr -ErrorAction SilentlyContinue
         }
 
-        if ($proc.ExitCode -ne 0) {
+        if ($runExitCode -ne 0) {
             $runFailures += 1
-            Add-Content -Path $combinedLog -Value ("[collector] run={0} exit_code={1} ts={2}" -f $runs, $proc.ExitCode, (Get-Date).ToString("o"))
+            Add-Content -Path $combinedLog -Value ("[collector] run={0} exit_code={1} ts={2}" -f $runs, $runExitCode, (Get-Date).ToString("o"))
         }
 
         if ((Get-Date) -ge $stopAt) {
