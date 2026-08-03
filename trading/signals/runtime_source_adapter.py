@@ -294,10 +294,23 @@ def build_runtime_signal_inputs(
         oi_degraded_final = oi_signal_degraded
 
     market_quality: dict[str, Any] = {}
-    for key in ("turnover24h_usdt", "volume24h", "spread_bps", "bid1Price", "ask1Price"):
+    for key in (
+        "turnover24h_usdt",
+        "volume24h",
+        "spread_bps",
+        "bid1Price",
+        "ask1Price",
+        "taker_buy_ratio",
+        "trade_flow_delta",
+        "aggressor_exhaustion",
+        "trade_flow_samples",
+    ):
         value, _ = _first_payload_float(payload, [key])
         if value is not None:
             market_quality[key] = value
+    aggressor_source = _first_payload_text(payload, ["aggressor_exhaustion_source"])
+    if aggressor_source:
+        market_quality["aggressor_exhaustion_source"] = aggressor_source
 
     return {
         "sentiment_value": sentiment_value,

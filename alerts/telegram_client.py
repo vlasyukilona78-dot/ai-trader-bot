@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import socket
 from urllib.parse import urlparse
 
@@ -42,7 +43,10 @@ class TelegramClient:
             if self._proxy_reachable(proxy_url):
                 transports.append(("proxy", self._create_session(proxy_url)))
             else:
-                logger.warning("telegram proxy is not reachable at startup: %s", proxy_url)
+                logger.warning(
+                    "telegram proxy is not reachable at startup: %s",
+                    self._redact_log_text(proxy_url),
+                )
             if self._env_truthy("TELEGRAM_DIRECT_FALLBACK", True) or not transports:
                 transports.append(("direct", self._create_session()))
             return transports
@@ -134,6 +138,21 @@ class TelegramClient:
             return None
         return json.dumps(reply_markup, ensure_ascii=False, separators=(",", ":"))
 
+    def _redact_log_text(self, value) -> str:
+        text = str(value or "")
+        if self.token:
+            text = text.replace(self.token, "[REDACTED_TELEGRAM_TOKEN]")
+        text = re.sub(
+            r"(?<![A-Za-z0-9_-])[0-9]{8,12}:[A-Za-z0-9_-]{20,}",
+            "[REDACTED_TELEGRAM_TOKEN]",
+            text,
+        )
+        return re.sub(
+            r"(://)[^/@\s]+:[^/@\s]+@",
+            r"\1[REDACTED_PROXY_AUTH]@",
+            text,
+        )
+
     def _post_with_failover(
         self,
         url: str,
@@ -164,9 +183,18 @@ class TelegramClient:
         if not log_failure:
             return False, last_transport
         if last_status is not None:
-            logger.warning("telegram request HTTP %s via %s: %s", last_status, last_transport or "unknown", last_text)
+            logger.warning(
+                "telegram request HTTP %s via %s: %s",
+                last_status,
+                last_transport or "unknown",
+                self._redact_log_text(last_text),
+            )
         elif last_exc is not None:
-            logger.warning("telegram request failed via %s: %s", last_transport or "unknown", last_exc)
+            logger.warning(
+                "telegram request failed via %s: %s",
+                last_transport or "unknown",
+                self._redact_log_text(last_exc),
+            )
         return False, last_transport
 
     def send_text(self, text: str, reply_markup: dict | None = None) -> bool:

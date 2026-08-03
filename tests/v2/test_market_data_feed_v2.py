@@ -13,11 +13,14 @@ from trading.signals.runtime_source_adapter import build_runtime_signal_inputs
 class _FakeMarketDataClient:
     def __init__(self):
         self.derivative_calls = 0
+        self.ohlcv_intervals = []
+        self.ticker_calls = 0
 
     def close(self):
         pass
 
     def fetch_ohlcv(self, symbol: str, interval: str, limit: int) -> pd.DataFrame:
+        self.ohlcv_intervals.append(str(interval))
         index = pd.date_range("2026-01-01", periods=3, freq="1min", tz="UTC")
         return pd.DataFrame(
             {
@@ -31,6 +34,7 @@ class _FakeMarketDataClient:
         )
 
     def fetch_ticker_meta(self, symbol: str) -> dict[str, str]:
+        self.ticker_calls += 1
         return {
             "markPrice": "1.031",
             "fundingRate": "0.00042",
@@ -38,6 +42,16 @@ class _FakeMarketDataClient:
             "volume24h": "150000",
             "bid1Price": "1.030",
             "ask1Price": "1.032",
+        }
+
+    @staticmethod
+    def normalize_symbol(symbol: str) -> str:
+        return str(symbol).replace("/", "").upper().strip()
+
+    def fetch_tickers_meta(self, category: str = "linear") -> dict[str, dict[str, str]]:
+        return {
+            "TESTUSDT": self.fetch_ticker_meta("TESTUSDT"),
+            "OTHERUSDT": {"symbol": "OTHERUSDT", "markPrice": "2.0"},
         }
 
     def fetch_long_short_ratio(self, symbol: str) -> float:
@@ -55,6 +69,13 @@ class _FakeMarketDataClient:
             "open_interest_ratio": 1.42,
             "oi_signal": 1.42,
         }
+
+    def fetch_recent_public_trades(self, symbol: str, limit: int = 240) -> list[dict[str, str]]:
+        return [
+            {"side": "Buy", "size": "1.0"} for _ in range(8)
+        ] + [
+            {"side": "Sell", "size": "1.0"} for _ in range(12)
+        ]
 
 
 class MarketDataFeedV2Tests(unittest.TestCase):
@@ -77,6 +98,29 @@ class MarketDataFeedV2Tests(unittest.TestCase):
         self.assertAlmostEqual(float(payload.get("spread_bps")), 19.39864209505)
         self.assertNotIn("long_short_ratio", payload)
         self.assertEqual(client.derivative_calls, 0)
+
+    def test_fetch_frame_uses_bulk_ticker_without_per_symbol_ticker_request(self):
+        client = _FakeMarketDataClient()
+        supplied = {
+            "symbol": "TESTUSDT",
+            "markPrice": "1.125",
+            "fundingRate": "0.00051",
+            "turnover24h": "3000000",
+        }
+
+        frame = self._feed(client).fetch_frame("TESTUSDT", "1", 3, ticker_meta=supplied)
+
+        self.assertEqual(frame.mark_price, 1.125)
+        self.assertEqual((frame.runtime_payload or {}).get("funding_rate"), 0.00051)
+        self.assertEqual(client.ticker_calls, 0)
+
+    def test_fetch_tickers_snapshot_filters_exchange_snapshot_to_requested_market(self):
+        client = _FakeMarketDataClient()
+
+        snapshot = self._feed(client).fetch_tickers_snapshot(["TEST/USDT"])
+
+        self.assertEqual(set(snapshot), {"TESTUSDT"})
+        self.assertEqual(snapshot["TESTUSDT"]["markPrice"], "1.031")
 
     def test_fetch_frame_can_opt_into_live_derivative_context(self):
         client = _FakeMarketDataClient()
@@ -105,6 +149,10 @@ class MarketDataFeedV2Tests(unittest.TestCase):
         self.assertEqual(payload.get("long_short_ratio"), 1.37)
         self.assertEqual(payload.get("open_interest_abs"), 123456.0)
         self.assertEqual(client.derivative_calls, 2)
+        self.assertEqual(client.ohlcv_intervals, ["1", "15", "60"])
+        self.assertEqual(set(frame.ohlcv.attrs["native_mtf_frames"]), {"15m", "1h"})
+        self.assertAlmostEqual(float(payload.get("taker_buy_ratio")), 0.4)
+        self.assertAlmostEqual(float(payload.get("aggressor_exhaustion")), 0.6)
 
     def test_runtime_source_adapter_preserves_market_quality_payload_for_risk(self):
         client = _FakeMarketDataClient()
@@ -118,6 +166,8 @@ class MarketDataFeedV2Tests(unittest.TestCase):
         self.assertEqual(runtime_inputs.get("open_interest_ratio"), 1.42)
         self.assertEqual(runtime_inputs.get("oi_signal"), 1.42)
         self.assertAlmostEqual(float(runtime_inputs.get("spread_bps")), 19.39864209505)
+        self.assertAlmostEqual(float(runtime_inputs.get("aggressor_exhaustion")), 0.6)
+        self.assertEqual(runtime_inputs.get("aggressor_exhaustion_source"), "live:bybit:recent-trades")
 
     def test_explicit_live_overlay_without_append_never_adds_zero_volume_bucket(self):
         last_ts = pd.Timestamp.now("UTC").floor("1min") - pd.Timedelta(minutes=10)

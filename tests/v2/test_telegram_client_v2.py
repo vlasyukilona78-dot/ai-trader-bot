@@ -98,6 +98,31 @@ class TelegramClientV2Tests(unittest.TestCase):
             client = TelegramClient(token="t", chat_id="c")
         self.assertEqual([name for name, _ in client._transports], ["direct"])
 
+    def test_failure_log_redacts_telegram_token_and_proxy_credentials(self):
+        token = "1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghi"
+        proxy = "http://proxy-user:proxy-password@proxy.example:8080"
+        with patch.dict(os.environ, {"TELEGRAM_PROXY_URL": proxy}, clear=False), patch.object(
+            TelegramClient, "_proxy_reachable", return_value=True
+        ):
+            client = TelegramClient(token=token, chat_id="c")
+        client._transports = [
+            (
+                "proxy",
+                _FakeSession(
+                    RuntimeError(
+                        f"request failed /bot{token}/sendMessage through {proxy}"
+                    )
+                ),
+            ),
+        ]
+        with patch("alerts.telegram_client.logger.warning") as warning_mock:
+            self.assertFalse(client.send_text("hello"))
+        logged = str(warning_mock.call_args_list)
+        self.assertNotIn(token, logged)
+        self.assertNotIn("proxy-password", logged)
+        self.assertIn("[REDACTED_TELEGRAM_TOKEN]", logged)
+        self.assertIn("[REDACTED_PROXY_AUTH]", logged)
+
 
 if __name__ == "__main__":
     unittest.main()

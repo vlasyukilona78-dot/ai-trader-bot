@@ -120,6 +120,71 @@ class MarketDataFeed:
             payload["oi_degraded"] = False
         return payload
 
+    def _fetch_native_mtf_frames(self, symbol: str) -> dict[str, pd.DataFrame]:
+        """Fetch enough native HTF bars for RSI/EMA context on final pump candidates."""
+        if not self._env_truthy("MARKETDATA_FETCH_NATIVE_MTF", True):
+            return {}
+
+        try:
+            limit = int(float(os.getenv("MARKETDATA_NATIVE_MTF_CANDLES", "120")))
+        except (TypeError, ValueError):
+            limit = 120
+        limit = max(60, min(limit, 300))
+
+        frames: dict[str, pd.DataFrame] = {}
+        for interval, key in (("15", "15m"), ("60", "1h")):
+            try:
+                frame = self._client.fetch_ohlcv(symbol=symbol, interval=interval, limit=limit)
+            except Exception:
+                continue
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                continue
+            required = {"open", "high", "low", "close", "volume"}
+            if not required.issubset(frame.columns):
+                continue
+            frames[key] = frame[list(required)].copy()
+        return frames
+
+    def _fetch_trade_flow_payload(self, symbol: str) -> dict[str, object]:
+        fetcher = getattr(self._client, "fetch_recent_public_trades", None)
+        if not callable(fetcher):
+            return {}
+        try:
+            rows = fetcher(symbol, limit=240)
+        except Exception:
+            return {}
+        if not isinstance(rows, list) or not rows:
+            return {}
+
+        buy_volume = 0.0
+        sell_volume = 0.0
+        samples = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            size = self._safe_float(row.get("size"))
+            if size is None or size <= 0:
+                continue
+            side = str(row.get("side") or "").strip().lower()
+            if side == "buy":
+                buy_volume += size
+            elif side == "sell":
+                sell_volume += size
+            else:
+                continue
+            samples += 1
+        total = buy_volume + sell_volume
+        if total <= 0 or samples < 10:
+            return {}
+        buy_ratio = max(0.0, min(buy_volume / total, 1.0))
+        return {
+            "taker_buy_ratio": buy_ratio,
+            "trade_flow_delta": (buy_volume - sell_volume) / total,
+            "aggressor_exhaustion": 1.0 - buy_ratio,
+            "aggressor_exhaustion_source": "live:bybit:recent-trades",
+            "trade_flow_samples": samples,
+        }
+
     @classmethod
     def _overlay_live_price_to_ohlcv(
         cls,
@@ -186,18 +251,25 @@ class MarketDataFeed:
         timeframe: str,
         candles: int,
         *,
+        ticker_meta: dict[str, Any] | None = None,
         include_liquidations: bool = False,
         include_derivatives: bool | None = None,
         overlay_live_price: bool = False,
         append_live_bucket: bool | None = None,
     ) -> MarketFrame:
         ohlcv = self._client.fetch_ohlcv(symbol=symbol, interval=timeframe, limit=int(candles))
-        ticker = self._client.fetch_ticker_meta(symbol=symbol)
+        ticker = dict(ticker_meta) if isinstance(ticker_meta, dict) and ticker_meta else self._client.fetch_ticker_meta(symbol=symbol)
         runtime_payload = self._runtime_payload_from_ticker(ticker)
         force_derivatives = bool(include_derivatives)
         if include_derivatives is None:
             force_derivatives = False
+        derivative_context_requested = force_derivatives or self._env_truthy(
+            "MARKETDATA_FETCH_DERIVATIVE_CONTEXT",
+            False,
+        )
         runtime_payload.update(self._fetch_optional_derivative_payload(symbol, force=force_derivatives))
+        if derivative_context_requested:
+            runtime_payload.update(self._fetch_trade_flow_payload(symbol))
         mark_price = 0.0
         for key in ("markPrice", "lastPrice", "indexPrice"):
             try:
@@ -213,6 +285,11 @@ class MarketDataFeed:
                 timeframe=timeframe,
                 append_new_bucket=append_live_bucket,
             )
+        if derivative_context_requested:
+            native_mtf_frames = self._fetch_native_mtf_frames(symbol)
+            if native_mtf_frames:
+                ohlcv.attrs["native_mtf_frames"] = native_mtf_frames
+                ohlcv.attrs["native_mtf_source"] = "live:bybit:kline"
         liq_high = None
         liq_low = None
         if include_liquidations:
@@ -246,3 +323,24 @@ class MarketDataFeed:
             liquidation_cluster_low=liq_low,
             runtime_payload=runtime_payload,
         )
+
+    def fetch_tickers_snapshot(self, symbols: list[str]) -> dict[str, dict[str, Any]]:
+        """Return a single-cycle ticker snapshot for the requested linear market."""
+        requested = {
+            self._client.normalize_symbol(symbol)
+            for symbol in symbols
+            if str(symbol).strip()
+        }
+        if not requested:
+            return {}
+        fetcher = getattr(self._client, "fetch_tickers_meta", None)
+        if not callable(fetcher):
+            return {}
+        snapshot = fetcher(category="linear")
+        if not isinstance(snapshot, dict):
+            return {}
+        return {
+            symbol: dict(ticker)
+            for symbol, ticker in snapshot.items()
+            if symbol in requested and isinstance(ticker, dict)
+        }

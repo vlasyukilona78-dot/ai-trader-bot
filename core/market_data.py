@@ -199,6 +199,21 @@ class MarketDataClient:
             return {}
         return payload.get("result", {}) if isinstance(payload, dict) else {}
 
+    def fetch_recent_public_trades(self, symbol: str, limit: int = 240) -> list[dict[str, Any]]:
+        category = self._category_for_symbol(symbol)
+        payload = self._request_public(
+            "/v5/market/recent-trade",
+            params={
+                "category": category,
+                "symbol": self.normalize_symbol(symbol),
+                "limit": max(20, min(int(limit), 1000)),
+            },
+        )
+        if not payload:
+            return []
+        rows = payload.get("result", {}).get("list", [])
+        return [dict(row) for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
     def fetch_ticker_meta(self, symbol: str) -> dict[str, Any]:
         category = self._category_for_symbol(symbol)
         payload = self._request_public(
@@ -211,6 +226,32 @@ class MarketDataClient:
         if not items:
             return {}
         return items[0] if isinstance(items[0], dict) else {}
+
+    def fetch_tickers_meta(self, category: str = "linear") -> dict[str, dict[str, Any]]:
+        """Fetch one exchange-wide ticker snapshot instead of one request per symbol."""
+        normalized_category = str(category or "linear").strip().lower()
+        if normalized_category not in {"linear", "inverse", "spot"}:
+            normalized_category = "linear"
+        payload = self._request_public(
+            "/v5/market/tickers",
+            params={"category": normalized_category},
+        )
+        if not payload:
+            return {}
+        items = payload.get("result", {}).get("list", [])
+        if not isinstance(items, list):
+            return {}
+
+        snapshot: dict[str, dict[str, Any]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            symbol = self.normalize_symbol(str(item.get("symbol") or ""))
+            if not symbol:
+                continue
+            snapshot[symbol] = dict(item)
+            self._cache_symbol_category(symbol, normalized_category)
+        return snapshot
 
     def fetch_funding_rate(self, symbol: str) -> float | None:
         ticker = self.fetch_ticker_meta(symbol)
