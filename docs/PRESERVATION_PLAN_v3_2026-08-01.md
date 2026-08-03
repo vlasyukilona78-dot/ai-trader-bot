@@ -16,8 +16,8 @@
   `VERIFIED_OK.txt`, 2387 payload files, 2,840,300,975 bytes, manifest SHA-256
   `3f86780a487d2f6f02e3603d83e741e5665fb0f0cdc91cb6cadaa1f71274a075`;
 - receipt фиксирует pre-mutation heads `0c38863`/`9f71a86`, а не новые tips;
-- root functional anchor `e501e21` опубликован, тесты
-  `532 passed, 4 skipped, 3 warnings`;
+- root functional anchor `2f7e18f` опубликован, тесты
+  `533 passed, 4 skipped, 3 warnings`;
 - MEXC functional anchor `98217df` опубликован, тесты
   `340 passed, 4 skipped, 2 warnings`;
 - `.env` и runtime system logs удалены из текущих tips; история не очищена и

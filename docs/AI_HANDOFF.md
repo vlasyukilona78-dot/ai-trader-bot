@@ -15,8 +15,8 @@
 
 Current checkpoint: 2026-08-03, Europe/Moscow
 
-- Root functional anchor: `e501e21`, published; validation
-  `532 passed, 4 skipped, 3 warnings`.
+- Root functional anchor: `2f7e18f`, published; validation
+  `533 passed, 4 skipped, 3 warnings`.
 - MEXC functional anchor: `98217df`, published; validation
   `340 passed, 4 skipped, 2 warnings`.
 - MEXC is the selected target exchange. Its scanner is causal,

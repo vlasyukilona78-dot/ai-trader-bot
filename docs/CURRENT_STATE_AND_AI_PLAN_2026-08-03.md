@@ -43,7 +43,7 @@ Koteika Ultra — исследовательская система, котор�
 
 | Линия | Назначение | Functional anchor | Remote | Состояние |
 |---|---|---|---|---|
-| Root | сохранённый Bybit/runtime Phase 2, observation и operational tooling | `e501e21` | `origin/feat/phase2-layer1-pump-runtime-alignment` = `e501e21` | `532 passed, 4 skipped, 3 warnings` |
+| Root | сохранённый Bybit/runtime Phase 2, observation и operational tooling | `2f7e18f` | `origin/feat/phase2-layer1-pump-runtime-alignment` = `2f7e18f` | `533 passed, 4 skipped, 3 warnings` |
 | MEXC | целевая causal research/signals-only реализация | `98217df` | `origin/claude/codex-project-review-04581e` = `98217df` | `340 passed, 4 skipped, 2 warnings` |
 
 Docs-only коммиты после этих anchors могут изменить tip, но не меняют указанные
@@ -92,7 +92,7 @@ source MEXC HEAD: 9f71a866b413bba4f1ab3a21603219dfe61f16fd
 ```
 
 Эта копия зафиксировала состояние **до** новых commits и поэтому не заменяет Git
-для `e501e21`/`98217df`. Она не содержит `.env`, но была создана до ужесточения
+для `2f7e18f`/`98217df`. Она не содержит `.env`, но была создана до ужесточения
 исключения runtime logs и должна считаться чувствительной: не публиковать и не
 подключать к недоверенной машине.
 

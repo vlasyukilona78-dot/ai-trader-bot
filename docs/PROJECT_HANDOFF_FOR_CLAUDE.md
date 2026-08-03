@@ -17,8 +17,8 @@
 
 Актуальные functional anchors:
 
-- root/Bybit runtime: `e501e21`, опубликован в
-  `origin/feat/phase2-layer1-pump-runtime-alignment`; `532 passed, 4 skipped`;
+- root/Bybit runtime: `2f7e18f`, опубликован в
+  `origin/feat/phase2-layer1-pump-runtime-alignment`; `533 passed, 4 skipped`;
 - target MEXC research: `98217df`, опубликован в
   `origin/claude/codex-project-review-04581e`; `340 passed, 4 skipped`;
 - MEXC подтверждён как целевая площадка, scanner остаётся public-data,

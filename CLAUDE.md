@@ -23,8 +23,8 @@ strategy conclusion:
 ## Critical repository state
 
 - The root worktree is the preserved Bybit/runtime line:
-  `feat/phase2-layer1-pump-runtime-alignment`; functional anchor `e501e21` is
-  published to the same remote branch. Fresh validation: 532 passed, 4 skipped.
+  `feat/phase2-layer1-pump-runtime-alignment`; functional anchor `2f7e18f` is
+  published to the same remote branch. Fresh validation: 533 passed, 4 skipped.
 - `.claude/worktrees/codex-project-review-04581e` is a separate, unmerged
   MEXC/research line; functional anchor `98217df` is published to
   `origin/claude/codex-project-review-04581e`. Fresh validation: 340 passed,
