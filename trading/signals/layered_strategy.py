@@ -1,5 +1,8 @@
 ﻿from __future__ import annotations
 
+import threading
+from copy import deepcopy
+
 from core.market_regime import detect_market_regime
 from core.signal_generator import SignalConfig, SignalContext, SignalGenerator
 from core.volume_profile import compute_volume_profile
@@ -25,22 +28,29 @@ class LayeredPumpStrategy(StrategyInterface):
         )
         self._benchmark = None
         self._htf_cache = None
+        # SignalGenerator diagnostics/pending confirmation state and the
+        # cross-sectional volatility context are mutable. Scanner workers share
+        # one strategy instance, so those operations must form one atomic unit.
+        self._state_lock = threading.RLock()
 
     def set_benchmark(self, frame):
         """Market reference (BTC OHLCV), refreshed once per scan cycle."""
-        self._benchmark = frame
+        with self._state_lock:
+            self._benchmark = frame
 
     def begin_sweep(self):
         """Freeze the cross-sectional volatility floor for one scan pass."""
-        self._volatility.start_sweep()
+        with self._state_lock:
+            self._volatility.start_sweep()
 
     def set_htf_cache(self, cache):
         """Source of higher-timeframe bars per symbol, so indicators can be read
         on the timeframe where they carry signal rather than all on the entry one."""
-        self._htf_cache = cache
+        with self._state_lock:
+            self._htf_cache = cache
 
     def _trace_meta(self) -> dict:
-        trace = self._generator.last_diagnostics if isinstance(self._generator.last_diagnostics, dict) else {}
+        trace = deepcopy(self._generator.last_diagnostics) if isinstance(self._generator.last_diagnostics, dict) else {}
         failed_layer = str(trace.get("failed_layer") or "") if trace else ""
         return {
             "layer_trace": trace,
@@ -66,28 +76,40 @@ class LayeredPumpStrategy(StrategyInterface):
         regime = detect_market_regime(enriched)
         vp = compute_volume_profile(enriched)
 
+        # Cache/network access stays outside the mutable-state lock so symbols
+        # can still fetch higher-timeframe context in parallel.
+        with self._state_lock:
+            benchmark = self._benchmark
+            htf_cache = self._htf_cache
+        htf_frame = None
+        if htf_cache is not None:
+            if context.candle_cutoff_ts is None:
+                htf_frame = htf_cache.get(context.symbol)
+            else:
+                htf_frame = htf_cache.get(context.symbol, as_of=context.candle_cutoff_ts)
+
         last = enriched.iloc[-1]
         close = float(last.get("close") or 0.0)
         atr = float(last.get("atr") or 0.0)
-        if close > 0 and atr > 0:
-            self._volatility.observe(context.symbol, atr / close)
-
-        signal = self._generator.generate(
-            SignalContext(
-                symbol=context.symbol,
-                df=enriched,
-                volume_profile=vp,
-                regime=regime,
-                sentiment_index=context.sentiment_index,
-                sentiment_source=context.sentiment_source,
-                funding_rate=context.funding_rate,
-                long_short_ratio=context.long_short_ratio,
-                atr_floor=self._volatility.floor(),
-                benchmark=self._benchmark,
-                htf_frame=self._htf_cache.get(context.symbol) if self._htf_cache is not None else None,
+        with self._state_lock:
+            if close > 0 and atr > 0:
+                self._volatility.observe(context.symbol, atr / close)
+            signal = self._generator.generate(
+                SignalContext(
+                    symbol=context.symbol,
+                    df=enriched,
+                    volume_profile=vp,
+                    regime=regime,
+                    sentiment_index=context.sentiment_index,
+                    sentiment_source=context.sentiment_source,
+                    funding_rate=context.funding_rate,
+                    long_short_ratio=context.long_short_ratio,
+                    atr_floor=self._volatility.floor(),
+                    benchmark=benchmark,
+                    htf_frame=htf_frame,
+                )
             )
-        )
-        trace_meta = self._trace_meta()
+            trace_meta = self._trace_meta()
         if signal is None:
             failed_layer = trace_meta.get("layer_failed") or "unknown"
             return StrategyIntent(

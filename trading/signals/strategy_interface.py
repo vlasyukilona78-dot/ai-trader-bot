@@ -21,6 +21,7 @@ class StrategyContext:
     sentiment_source: str | None = None
     funding_rate: float | None = None
     long_short_ratio: float | None = None
+    candle_cutoff_ts: float | None = None
 
 
 class StrategyInterface(Protocol):
