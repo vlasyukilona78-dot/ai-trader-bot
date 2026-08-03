@@ -154,6 +154,30 @@ class PreservationBackupScriptV2Tests(unittest.TestCase):
             self.assertIn("inside a source worktree", result.stdout + result.stderr)
             self.assertFalse(inside_repository.exists())
 
+    def test_clean_repositories_allow_empty_untracked_file_sets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root, mexc = self._make_minimal_repositories(base)
+            backup_base = base / "checkpoint"
+
+            result = self._run_script(
+                root=root,
+                mexc=mexc,
+                backup_base=backup_base,
+                mode="LocalCheckpoint",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            runs = list(backup_base.glob("koteika_preservation_*"))
+            self.assertEqual(len(runs), 1)
+            backup_root = runs[0]
+            self.assertTrue((backup_root / "CHECKPOINT_VERIFIED.json").is_file())
+            for name in ("root_untracked", "mexc_untracked"):
+                source_manifest = backup_root / "manifests" / f"{name}_source_before.json"
+                destination_manifest = backup_root / "manifests" / f"{name}_destination.json"
+                self.assertEqual(json.loads(source_manifest.read_text(encoding="utf-8")), [])
+                self.assertEqual(json.loads(destination_manifest.read_text(encoding="utf-8")), [])
+
     def test_local_checkpoint_is_verified_without_copying_forbidden_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)

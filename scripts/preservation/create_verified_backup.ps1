@@ -669,10 +669,14 @@ function Copy-VerifiedFileSet {
     Assert-ManifestsEqual $before $after "$Name source changed during copy"
     Assert-ManifestsEqual $before $destinationRows "$Name destination"
 
+    [int64]$byteTotal = 0
+    if ($before.Count -gt 0) {
+        $byteTotal = [int64](($before | Measure-Object Length -Sum).Sum)
+    }
     return [pscustomobject]@{
         Name = $Name
         Files = $before.Count
-        Bytes = [int64](($before | Measure-Object Length -Sum).Sum)
+        Bytes = $byteTotal
     }
 }
 
