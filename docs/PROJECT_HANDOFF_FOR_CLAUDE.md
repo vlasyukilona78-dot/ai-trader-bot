@@ -23,6 +23,10 @@
   `origin/claude/codex-project-review-04581e`; `340 passed, 4 skipped`;
 - MEXC подтверждён как целевая площадка, scanner остаётся public-data,
   signals-only, бот остановлен;
+- проверенный same-disk checkpoint без USB:
+  `C:\koteika-checkpoints\koteika_preservation_20260803_154657_88710bc3`,
+  root `80e6f2b`, MEXC `1e91ce0`, manifest SHA-256
+  `237204c9b629e48a60b185accf3f3f05491c84a43ca5f11c26e5bc950a0aec89`;
 - no-edge verdict не изменён;
 - текущие tips не содержат `.env`, но credentials не ротированы и история не
   очищена: private API/Telegram/testnet/live запрещены;

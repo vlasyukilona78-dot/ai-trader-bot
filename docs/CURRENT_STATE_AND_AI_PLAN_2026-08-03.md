@@ -43,8 +43,8 @@ Koteika Ultra — исследовательская система, котор�
 
 | Линия | Назначение | Functional anchor | Remote | Состояние |
 |---|---|---|---|---|
-| Root | сохранённый Bybit/runtime Phase 2, observation и operational tooling | `2f7e18f` | `origin/feat/phase2-layer1-pump-runtime-alignment` = `2f7e18f` | `533 passed, 4 skipped, 3 warnings` |
-| MEXC | целевая causal research/signals-only реализация | `98217df` | `origin/claude/codex-project-review-04581e` = `98217df` | `340 passed, 4 skipped, 2 warnings` |
+| Root | сохранённый Bybit/runtime Phase 2, observation и operational tooling | `2f7e18f` | anchor опубликован в `origin/feat/phase2-layer1-pump-runtime-alignment` | `533 passed, 4 skipped, 3 warnings` |
+| MEXC | целевая causal research/signals-only реализация | `98217df` | anchor опубликован в `origin/claude/codex-project-review-04581e` | `340 passed, 4 skipped, 2 warnings` |
 
 Docs-only коммиты после этих anchors могут изменить tip, но не меняют указанные
 functional checkpoints. `main` и root/Bybit не следует смешивать с MEXC без
@@ -108,6 +108,26 @@ source MEXC HEAD: 9f71a866b413bba4f1ab3a21603219dfe61f16fd
 Локальный checkpoint защищает от ошибочного Git-действия и порчи worktree, но не
 от отказа SSD, кражи или шифровальщика. Он является нормальным ежедневным режимом,
 поэтому внешний диск больше не обязателен для продолжения разработки.
+
+Фактически создан и полностью проверен локальный checkpoint:
+
+```text
+C:\koteika-checkpoints\koteika_preservation_20260803_154657_88710bc3
+marker: CHECKPOINT_VERIFIED.json
+root HEAD: 80e6f2bf288bfe7ec0b6776a53a067797fa07ba5
+MEXC HEAD: 1e91ce0bf6059af2732c7fb567f27e2942f00650
+payload: 2571 files / 2,861,567,291 bytes
+SQLite Online Backup: 3 databases
+MANIFEST_SHA256.json:
+237204c9b629e48a60b185accf3f3f05491c84a43ca5f11c26e5bc950a0aec89
+```
+
+Предыдущая попытка
+`C:\koteika-checkpoints\koteika_preservation_20260803_154248_af3efbc8`
+остановилась на regression edge case пустого untracked set. У неё нет success
+marker, поэтому она не считается backup. Каталог (~24.6 MB) намеренно не удалён
+без отдельного указания пользователя; исправление зафиксировано в `2f7e18f` и
+покрыто отдельным тестом.
 
 Preflight без записи:
 

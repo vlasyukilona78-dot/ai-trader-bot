@@ -35,6 +35,10 @@ strategy conclusion:
   anchors. Local ignored datasets still require deliberate preservation.
 - `scripts/preservation/create_verified_backup.ps1` supports same-disk
   `LocalCheckpoint` without USB and separate-disk/UNC `DisasterResilient` mode.
+- The verified current same-disk receipt is
+  `C:\koteika-checkpoints\koteika_preservation_20260803_154657_88710bc3`
+  (`CHECKPOINT_VERIFIED.json`, root `80e6f2b`, MEXC `1e91ce0`). It is not a
+  substitute for separate-disk disaster recovery.
 - Do not run `reset`, `clean`, `checkout --`, bulk deletion, or repository-wide
   formatting. Do not assume recovery directories or relocated environments are
   disposable.

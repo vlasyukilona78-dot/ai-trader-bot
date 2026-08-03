@@ -25,6 +25,10 @@
 - `scripts/preservation/create_verified_backup.ps1` теперь различает
   `LocalCheckpoint` на C: (`CHECKPOINT_VERIFIED.json`) и настоящий
   `DisasterResilient` на другом диске/UNC (`VERIFIED_OK.json`).
+- текущий `LocalCheckpoint` успешно создан в
+  `C:\koteika-checkpoints\koteika_preservation_20260803_154657_88710bc3`:
+  root `80e6f2b`, MEXC `1e91ce0`, 2571 файлов / 2,861,567,291 bytes, manifest
+  `237204c9b629e48a60b185accf3f3f05491c84a43ca5f11c26e5bc950a0aec89`.
 
 Этот документ заменяет `docs/PRESERVATION_PLAN_2026-07-30.md`.
 
