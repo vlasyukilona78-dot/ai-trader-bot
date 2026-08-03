@@ -2,7 +2,16 @@
 
 Updated: 2026-08-03, Europe/Moscow
 
-## Current authoritative checkpoint — 2026-08-03
+> [!IMPORTANT]
+> Fresh-session entrypoint: read `CLAUDE.md` and
+> `docs/CLAUDE_REVIEW_PROMPT_2026-08-03.md`, then treat
+> `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` as the current MEXC plan. The
+> published AI foundation anchor is `f0b43d6`; verify the current local/remote
+> descendant HEAD. The `98217df`/`340 passed` checkpoint immediately below is a
+> preserved earlier causal-scanner snapshot, not the latest foundation state.
+> Latest code validation: `352 passed, 4 skipped, 2 known collection warnings`.
+
+## Earlier causal-scanner checkpoint — 2026-08-03
 
 This section supersedes the historical scanner-state statements below. The
 earlier audits are retained because their research findings and the reasons for
@@ -1235,10 +1244,14 @@ Publication state for this foundation:
 0b010e8 fix(backtest): prevent hindsight cohort substitution
 3ff8de0 feat(ai): add causal MEXC feature contract
 29536f1 docs: unify MEXC strategy and AI roadmap
+f0b43d6 docs: record AI foundation publication state
 remote: origin/claude/codex-project-review-04581e (fast-forward)
 ```
 
-Validation on the exact reviewed tree:
+### Historical 2026-07-28 independent-review validation
+
+The following smaller counts belong to the earlier reviewed tree, not to the
+current `f0b43d6` foundation:
 
 ```text
 focused changed-area tests: 87 passed
