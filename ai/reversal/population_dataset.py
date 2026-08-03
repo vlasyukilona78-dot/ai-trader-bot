@@ -16,11 +16,17 @@ import re
 from typing import Any, Iterator, Mapping
 
 from trading.market_data.bar_contract import interval_seconds
+from trading.metrics.cycle_envelope import CycleEnvelope, CycleEnvelopeError
+from trading.market_data.source_timing import SourceTiming, SourceTimingError
 from trading.metrics.population_journal import (
+    RECORD_TYPE_DECISION,
+    RECORD_TYPE_FOOTER,
+    RECORD_TYPE_HEADER,
     SCHEMA_VERSION,
     PopulationDecision,
     PopulationJournalError,
     make_cycle_id,
+    rows_checksum,
 )
 
 from .feature_contract import (
@@ -278,29 +284,101 @@ def _parse_feature_row(payload: Mapping[str, Any]) -> PopulationFeatureRow:
     )
 
 
-def iter_population_feature_rows(path: str | Path) -> Iterator[PopulationFeatureRow]:
-    """Yield only complete, ordered cycles from a canonical population JSONL."""
+def _rebuild_envelope(payload: Mapping[str, Any]) -> CycleEnvelope:
+    """Reconstruct the envelope from its own fields rather than trusting them.
+
+    Rebuilding re-runs every temporal invariant and re-derives actionable and
+    entry timing, so a hand-edited or drifted header cannot pass by simply
+    carrying self-consistent numbers.
+    """
+
+    try:
+        timings = tuple(
+            SourceTiming(
+                source=str(item.get("source")),
+                request_started_at=item.get("request_started_at"),
+                received_at=item.get("received_at"),
+                status=str(item.get("status")),
+                source_as_of=item.get("source_as_of"),
+                error_code=item.get("error_code"),
+            )
+            for item in payload.get("source_timings", ())
+        )
+    except (AttributeError, SourceTimingError, TypeError, ValueError) as exc:
+        raise PopulationDatasetError("invalid_cycle_source_timing") from exc
+    if not timings:
+        raise PopulationDatasetError("cycle_envelope_has_no_source_timings")
+
+    universe_name = str(_mapping(payload.get("universe_timing"), field="universe_timing").get("source"))
+    universe = next((timing for timing in timings if timing.source == universe_name), None)
+    if universe is None:
+        raise PopulationDatasetError("cycle_envelope_universe_timing_missing")
+
+    try:
+        rebuilt = CycleEnvelope.build(
+            cycle_id=str(payload.get("cycle_id") or ""),
+            timeframe=str(payload.get("timeframe") or ""),
+            cycle_started_at=payload.get("cycle_started_at"),
+            candle_cutoff_ts=payload.get("candle_cutoff_ts"),
+            universe_symbols=tuple(payload.get("universe_symbols", ())),
+            universe_timing=universe,
+            source_timings=timings,
+            strategy_config_hash=str(payload.get("strategy_config_hash") or ""),
+            universe_policy_hash=str(payload.get("universe_policy_hash") or ""),
+            ranking_ready_ts=payload.get("ranking_ready_ts"),
+            cycle_completed_ts=payload.get("cycle_completed_ts"),
+            status=str(payload.get("status") or ""),
+            error_code=payload.get("error_code"),
+        )
+    except (CycleEnvelopeError, TypeError, ValueError) as exc:
+        raise PopulationDatasetError("invalid_cycle_envelope") from exc
+
+    if rebuilt.as_dict() != dict(payload):
+        raise PopulationDatasetError("cycle_envelope_source_mismatch")
+    return rebuilt
+
+
+def _check_row_against_envelope(row: PopulationFeatureRow, envelope: CycleEnvelope) -> None:
+    """Every cycle-level fact on a row must be the envelope's, not its own."""
+
+    for row_field, envelope_field in (
+        ("cycle_id", "cycle_id"),
+        ("timeframe", "timeframe"),
+        ("bar_cutoff_ts", "candle_cutoff_ts"),
+        ("ranking_ready_ts", "ranking_ready_ts"),
+        ("cycle_completed_ts", "cycle_completed_ts"),
+        ("actionable_ts", "actionable_ts"),
+        ("entry_eligible_ts", "entry_eligible_ts"),
+        ("entry_bar_open_ts", "entry_bar_open_ts"),
+        ("strategy_config_hash", "strategy_config_hash"),
+        ("universe_policy_hash", "universe_policy_hash"),
+    ):
+        if getattr(row, row_field) != getattr(envelope, envelope_field):
+            raise PopulationDatasetError(f"row_disagrees_with_cycle_envelope:{row_field}")
+    if row.universe_received_at != envelope.universe_timing.received_at:
+        raise PopulationDatasetError("row_disagrees_with_cycle_envelope:universe_received_at")
+
+
+def iter_population_cycles(path: str | Path) -> Iterator[tuple[CycleEnvelope, list[PopulationFeatureRow]]]:
+    """Yield each complete, verified cycle as its envelope plus ordered rows."""
 
     source = Path(path)
     if not source.exists():
         raise PopulationDatasetError("population_journal_not_found")
-
-    active_cycle = ""
-    active_size = 0
-    next_ordinal = 0
-    cycle_symbols: set[str] = set()
-    cycle_snapshots: set[str] = set()
-    cycle_rows: list[PopulationFeatureRow] = []
-    completed_cycles: set[str] = set()
-    saw_row = False
     try:
         handle = source.open("r", encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise PopulationDatasetError("population_journal_unreadable") from exc
+
+    envelope: CycleEnvelope | None = None
+    declared_rows = 0
+    cycle_rows: list[PopulationFeatureRow] = []
+    completed_cycles: set[str] = set()
+    saw_any = False
+
     with handle:
         try:
-            lines = enumerate(handle, start=1)
-            for line_number, line in lines:
+            for line_number, line in enumerate(handle, start=1):
                 if not line.strip():
                     continue
                 if len(line) > _MAX_JOURNAL_LINE_CHARS:
@@ -313,76 +391,84 @@ def iter_population_feature_rows(path: str | Path) -> Iterator[PopulationFeature
                     )
                 except (json.JSONDecodeError, ValueError) as exc:
                     raise PopulationDatasetError(f"invalid_json_line:{line_number}") from exc
-                row = _parse_feature_row(_mapping(decoded, field="journal_row"))
-                saw_row = True
+                payload = _mapping(decoded, field="journal_row")
+                if payload.get("schema_version") != SCHEMA_VERSION:
+                    raise PopulationDatasetError(
+                        f"unsupported_population_schema_version:expected_{SCHEMA_VERSION}"
+                    )
+                record_type = payload.get("record_type")
 
-                if not active_cycle:
-                    if row.cycle_ordinal != 0 or row.cycle_size < 1:
-                        raise PopulationDatasetError("cycle_must_start_at_ordinal_zero")
-                    if row.cycle_id in completed_cycles:
+                if record_type == RECORD_TYPE_HEADER:
+                    if envelope is not None:
+                        raise PopulationDatasetError("new_cycle_before_previous_cycle_completed")
+                    envelope = _rebuild_envelope(
+                        _mapping(payload.get("envelope"), field="envelope")
+                    )
+                    if envelope.cycle_id != payload.get("cycle_id"):
+                        raise PopulationDatasetError("cycle_header_id_mismatch")
+                    if envelope.cycle_id in completed_cycles:
                         raise PopulationDatasetError("duplicate_cycle")
-                    active_cycle = row.cycle_id
-                    active_size = row.cycle_size
-                    next_ordinal = 0
-                    cycle_symbols.clear()
-                    cycle_snapshots.clear()
-                    cycle_rows.clear()
-                if row.cycle_id != active_cycle:
-                    raise PopulationDatasetError("new_cycle_before_previous_cycle_completed")
-                if row.cycle_size != active_size or row.cycle_ordinal != next_ordinal:
-                    raise PopulationDatasetError("incomplete_or_unordered_cycle")
-                if row.symbol in cycle_symbols or row.snapshot_id in cycle_snapshots:
-                    raise PopulationDatasetError("duplicate_symbol_or_snapshot_in_cycle")
-                cycle_symbols.add(row.symbol)
-                cycle_snapshots.add(row.snapshot_id)
-                cycle_rows.append(row)
-                next_ordinal += 1
+                    declared_rows = _integer(payload.get("row_count"), field="row_count")
+                    cycle_rows = []
+                    saw_any = True
+                    continue
 
-                if next_ordinal == active_size:
-                    first = cycle_rows[0]
-                    # Cycle-level facts must be identical on every row. The entry
-                    # timing in particular is a property of the cohort, not of
-                    # whichever worker happened to finish first.
-                    if any(
-                        item.schema_version != first.schema_version
-                        or item.timeframe != first.timeframe
-                        or item.bar_cutoff_ts != first.bar_cutoff_ts
-                        or item.universe_refreshed_at != first.universe_refreshed_at
-                        or item.universe_received_at != first.universe_received_at
-                        or item.ranking_ready_ts != first.ranking_ready_ts
-                        or item.cycle_completed_ts != first.cycle_completed_ts
-                        or item.actionable_ts != first.actionable_ts
-                        or item.entry_eligible_ts != first.entry_eligible_ts
-                        or item.entry_bar_open_ts != first.entry_bar_open_ts
-                        or item.strategy_config_hash != first.strategy_config_hash
-                        or item.universe_policy_hash != first.universe_policy_hash
-                        for item in cycle_rows
+                if envelope is None:
+                    raise PopulationDatasetError("journal_row_before_its_cycle_header")
+
+                if record_type == RECORD_TYPE_DECISION:
+                    row = _parse_feature_row(payload)
+                    if row.cycle_ordinal != len(cycle_rows) or row.cycle_size != declared_rows:
+                        raise PopulationDatasetError("incomplete_or_unordered_cycle")
+                    if any(item.symbol == row.symbol for item in cycle_rows):
+                        raise PopulationDatasetError("duplicate_symbol_or_snapshot_in_cycle")
+                    if any(item.snapshot_id == row.snapshot_id for item in cycle_rows):
+                        raise PopulationDatasetError("duplicate_symbol_or_snapshot_in_cycle")
+                    _check_row_against_envelope(row, envelope)
+                    cycle_rows.append(row)
+                    continue
+
+                if record_type == RECORD_TYPE_FOOTER:
+                    if payload.get("cycle_id") != envelope.cycle_id:
+                        raise PopulationDatasetError("cycle_footer_id_mismatch")
+                    if _integer(payload.get("row_count"), field="row_count") != len(cycle_rows):
+                        raise PopulationDatasetError("cycle_row_count_mismatch")
+                    if payload.get("rows_checksum") != rows_checksum(
+                        [item.snapshot_id for item in cycle_rows]
                     ):
-                        raise PopulationDatasetError("cycle_provenance_mismatch")
-                    try:
+                        raise PopulationDatasetError("cycle_rows_checksum_mismatch")
+                    if cycle_rows:
                         expected_cycle_id = make_cycle_id(
-                            timeframe=first.timeframe,
-                            candle_cutoff_ts=first.bar_cutoff_ts,
-                            universe_received_at=first.universe_received_at,
+                            timeframe=envelope.timeframe,
+                            candle_cutoff_ts=envelope.candle_cutoff_ts,
+                            universe_received_at=envelope.universe_timing.received_at,
                             universe_symbols=[item.symbol for item in cycle_rows],
-                            schema_version=first.schema_version,
+                            schema_version=SCHEMA_VERSION,
                         )
-                    except (PopulationJournalError, TypeError, ValueError) as exc:
-                        raise PopulationDatasetError("invalid_cycle_contract") from exc
-                    if expected_cycle_id != active_cycle:
-                        raise PopulationDatasetError("population_cycle_id_mismatch")
-                    completed_cycles.add(active_cycle)
-                    yield from cycle_rows
-                    active_cycle = ""
-                    active_size = 0
-                    next_ordinal = 0
+                        if expected_cycle_id != envelope.cycle_id:
+                            raise PopulationDatasetError("population_cycle_id_mismatch")
+                    completed_cycles.add(envelope.cycle_id)
+                    yield envelope, cycle_rows
+                    envelope = None
+                    declared_rows = 0
+                    cycle_rows = []
+                    continue
+
+                raise PopulationDatasetError(f"unknown_journal_record_type:{record_type!r}")
         except UnicodeError as exc:
             raise PopulationDatasetError("population_journal_invalid_encoding") from exc
 
-    if active_cycle:
+    if envelope is not None:
         raise PopulationDatasetError("journal_ends_with_incomplete_cycle")
-    if not saw_row:
+    if not saw_any:
         raise PopulationDatasetError("population_journal_is_empty")
+
+
+def iter_population_feature_rows(path: str | Path) -> Iterator[PopulationFeatureRow]:
+    """Yield only rows belonging to complete, envelope-verified cycles."""
+
+    for _envelope, rows in iter_population_cycles(path):
+        yield from rows
 
 
 def population_feature_records(path: str | Path) -> list[dict[str, Any]]:

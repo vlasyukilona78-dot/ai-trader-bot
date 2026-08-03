@@ -382,7 +382,9 @@ def _population_record(
     # One versioned extractor is shared by runtime capture and future dataset /
     # inference code.  Missing observations remain explicit nulls plus masks;
     # zero is never used as a silent substitute for an unavailable source.
-    metadata["cycle"] = envelope.as_dict()
+    # The envelope is written once per cycle as a header record. Copying it here
+    # made the journal quadratic in universe size and pushed the ordered symbol
+    # list past the bounds that keep arbitrary per-row metadata safe.
     metadata["feature_snapshot"] = build_runtime_feature_snapshot(
         metadata,
         bar_cutoff_ts=envelope.candle_cutoff_ts,
@@ -461,6 +463,17 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
             cycle_completed_ts=empty_completed_at,
             status="empty_universe",
         )
+        # Durable evidence, not just a log line: a gap in the journal cannot be
+        # told apart from a scan that never ran.
+        if population_journal is not None and getattr(population_journal, "enabled", True):
+            try:
+                population_journal.append_cycle((), envelope=empty_envelope)
+            except Exception as exc:
+                logger.warning(
+                    "empty_cycle_journal_failed=%s",
+                    safe_error_code(exc),
+                    extra={"event": "scan"},
+                )
         logger.warning(
             "empty_universe cycle=%s entry_bar_open_ts=%.0f",
             empty_envelope.cycle_id,
@@ -704,7 +717,7 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
     ]
     duplicate_cycle = False
     if population_journal is not None and getattr(population_journal, "enabled", True):
-        duplicate_cycle = population_journal.append_cycle(records) is False
+        duplicate_cycle = population_journal.append_cycle(records, envelope=envelope) is False
         if duplicate_cycle:
             logger.info(
                 "duplicate_population_cycle_suppressed=%s",

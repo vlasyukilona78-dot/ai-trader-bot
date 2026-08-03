@@ -28,6 +28,10 @@ CYCLE_ENVELOPE_SCHEMA_VERSION = 1
 
 CYCLE_STATUSES = frozenset({"completed", "empty_universe", "error"})
 
+# Matches the cycle-ID bound. The whole MEXC USDT board is ~1000 contracts, so
+# this is a sanity limit rather than an operating constraint.
+_MAX_UNIVERSE_SYMBOLS = 10_000
+
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _ERROR_CODE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.]{0,127}$")
 
@@ -133,11 +137,19 @@ class CycleEnvelope:
         if self.status == "empty_universe":
             if symbols:
                 raise CycleEnvelopeError("empty_universe_must_not_list_symbols")
+        elif self.status == "error":
+            # A failure before evaluation may legitimately have no universe yet.
+            if len(set(symbols)) != len(symbols):
+                raise CycleEnvelopeError("universe_symbols_must_be_unique")
         else:
             if not symbols:
                 raise CycleEnvelopeError("cycle_requires_at_least_one_symbol")
             if len(set(symbols)) != len(symbols):
                 raise CycleEnvelopeError("universe_symbols_must_be_unique")
+        # The envelope is written once per cycle, so a large universe is no longer
+        # a per-row cost. It is still bounded, just far above any real scan.
+        if len(symbols) > _MAX_UNIVERSE_SYMBOLS:
+            raise CycleEnvelopeError("universe_contains_too_many_symbols")
         object.__setattr__(self, "universe_symbols", symbols)
         object.__setattr__(self, "source_timings", tuple(self.source_timings))
 

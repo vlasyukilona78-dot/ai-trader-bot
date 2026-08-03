@@ -15,11 +15,18 @@ from typing import Any, Mapping, Sequence
 from trading.market_data.bar_contract import interval_seconds, is_bar_aligned
 
 
-# v2 adds explicit source-response and cycle-completion timing plus the first
-# executable entry bar. v1 rows carried `universe_refreshed_at` as though it were
-# the moment the data was known; it was read before the request. The two are not
-# interchangeable, so the version is bumped rather than the meaning reused.
-SCHEMA_VERSION = 2
+# v2 added explicit source-response and cycle-completion timing plus the first
+# executable entry bar, because v1 dated its universe data with a timestamp read
+# before the request. v3 changes the file layout: the cycle envelope is written
+# once as a header record with a closing footer instead of being copied into
+# every decision row, which made a 300-symbol scan quadratic and pushed the
+# ordered universe past the per-row metadata bounds. Two incompatible layouts
+# must not both be called v2, so the version moves again.
+SCHEMA_VERSION = 3
+
+RECORD_TYPE_HEADER = "cycle_header"
+RECORD_TYPE_DECISION = "decision"
+RECORD_TYPE_FOOTER = "cycle_footer"
 POPULATION_STATUSES = frozenset(
     {
         "evaluated",
@@ -409,6 +416,7 @@ class PopulationDecision:
 
     def as_dict(self) -> dict[str, object]:
         return {
+            "record_type": RECORD_TYPE_DECISION,
             "schema_version": int(self.schema_version),
             "cycle_id": self.cycle_id,
             "snapshot_id": self.snapshot_id,
@@ -440,68 +448,151 @@ class PopulationDecision:
         }
 
 
+def rows_checksum(snapshot_ids: Sequence[str]) -> str:
+    """Digest over the ordered snapshot IDs of one cycle.
+
+    Lets a reader detect a truncated or reordered body without re-deriving every
+    row, and lets the footer state what the header promised.
+    """
+
+    return _sha256_id({"snapshot_ids": [str(value) for value in snapshot_ids]})
+
+
 class PopulationJournal:
+    """Append-only cycle log: one header, its decision rows, then a footer.
+
+    The envelope is written once per cycle. Copying it onto every row made the
+    file quadratic in universe size and pushed the ordered symbol list past the
+    bounds that keep arbitrary per-row metadata safe.
+    """
+
     def __init__(self, path: str | Path, *, enabled: bool = True) -> None:
         self._path = Path(path)
         self._enabled = bool(enabled)
         self._lock = threading.Lock()
-        self._last_cycle_id = self._read_last_complete_cycle_id() if self._enabled else None
+        self._last_cycle_id = self._inspect_existing_file() if self._enabled else None
 
-    def _read_last_complete_cycle_id(self) -> str | None:
+    def _inspect_existing_file(self) -> str | None:
+        """Refuse to append to a file written by a different schema or left torn."""
+
         if not self._path.exists() or self._path.stat().st_size == 0:
             return None
         try:
             with self._path.open("rb") as handle:
+                first_line = handle.readline()
                 size = handle.seek(0, os.SEEK_END)
                 handle.seek(max(0, size - 1_048_576), os.SEEK_SET)
-                lines = [line for line in handle.read().splitlines() if line.strip()]
-            if not lines:
-                return None
-            row = json.loads(lines[-1].decode("utf-8"))
-            cycle_id = row.get("cycle_id")
-            ordinal = row.get("cycle_ordinal")
-            cycle_size = row.get("cycle_size")
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError) as exc:
+                tail = handle.read()
+        except OSError as exc:
+            raise PopulationJournalError("population journal is unreadable") from exc
+
+        # A previous process that died mid-write leaves a line without its
+        # newline. Appending would concatenate two JSON objects into one
+        # unparseable line, so stop and say how to recover.
+        if not tail.endswith(b"\n"):
+            raise PopulationJournalError(
+                "population journal ends without a newline; it was truncated mid-write. "
+                "Move the file aside and start a new one rather than appending to it."
+            )
+
+        try:
+            header = json.loads(first_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PopulationJournalError("population journal has an unreadable first record") from exc
+        if not isinstance(header, Mapping):
+            raise PopulationJournalError("population journal first record is not an object")
+        existing_version = header.get("schema_version")
+        if existing_version != SCHEMA_VERSION:
+            raise PopulationJournalError(
+                f"population journal was written by schema {existing_version!r}, "
+                f"this build writes {SCHEMA_VERSION}. Use a separate file per schema."
+            )
+        if header.get("record_type") != RECORD_TYPE_HEADER:
+            raise PopulationJournalError("population journal does not start with a cycle header")
+
+        lines = [line for line in tail.splitlines() if line.strip()]
+        if not lines:
+            return None
+        try:
+            footer = json.loads(lines[-1].decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise PopulationJournalError("population journal has an unreadable tail") from exc
+        if not isinstance(footer, Mapping) or footer.get("record_type") != RECORD_TYPE_FOOTER:
+            raise PopulationJournalError("population journal ends with an incomplete cycle")
+        cycle_id = footer.get("cycle_id")
         if not isinstance(cycle_id, str) or not re.fullmatch(r"[0-9a-f]{64}", cycle_id):
             raise PopulationJournalError("population journal tail has an invalid cycle ID")
-        if (
-            isinstance(ordinal, bool)
-            or isinstance(cycle_size, bool)
-            or not isinstance(ordinal, int)
-            or not isinstance(cycle_size, int)
-            or cycle_size < 1
-            or ordinal != cycle_size - 1
-        ):
-            raise PopulationJournalError("population journal ends with an incomplete cycle")
         return cycle_id
 
     @property
     def enabled(self) -> bool:
         return self._enabled
 
-    def append_cycle(self, records: Sequence[PopulationDecision]) -> bool:
-        if not self._enabled or not records:
+    def append_cycle(
+        self,
+        records: Sequence[PopulationDecision],
+        *,
+        envelope: object,
+    ) -> bool:
+        """Write one complete cycle: header, ordered rows, footer.
+
+        A cycle with no rows is still written. An empty universe or a failure
+        before evaluation is evidence, and a hole in the log cannot be told apart
+        from a scan that never ran.
+        """
+
+        if not self._enabled:
             return False
+        if envelope is None:
+            raise PopulationJournalError("a cycle requires its envelope")
+
+        envelope_payload = envelope.as_dict()
+        cycle_id = envelope_payload.get("cycle_id")
+        if not isinstance(cycle_id, str) or not re.fullmatch(r"[0-9a-f]{64}", cycle_id):
+            raise PopulationJournalError("cycle envelope has an invalid cycle ID")
+
         rows: list[bytes] = []
         for record in records:
             if not isinstance(record, PopulationDecision):
                 raise PopulationJournalError("records must contain PopulationDecision instances")
+            if record.schema_version != SCHEMA_VERSION:
+                raise PopulationJournalError("append batch mixes journal schema versions")
+            if record.cycle_id != cycle_id:
+                raise PopulationJournalError("decision row does not belong to the envelope cycle")
             rows.append(_canonical_bytes(record.as_dict()) + b"\n")
-        cycle_ids = {record.cycle_id for record in records}
-        if len(cycle_ids) != 1:
-            raise PopulationJournalError("one append batch must contain exactly one cycle")
-        cycle_id = records[0].cycle_id
+
         expected_size = len(records)
-        if any(record.cycle_size != expected_size for record in records):
-            raise PopulationJournalError("declared cycle size differs from append batch")
-        if [record.cycle_ordinal for record in records] != list(range(expected_size)):
-            raise PopulationJournalError("cycle records must be complete and ordered")
-        if len({record.symbol for record in records}) != expected_size:
-            raise PopulationJournalError("cycle contains duplicate symbols")
-        if len({record.snapshot_id for record in records}) != expected_size:
-            raise PopulationJournalError("cycle contains duplicate snapshots")
-        batch = b"".join(rows)
+        if expected_size:
+            if any(record.cycle_size != expected_size for record in records):
+                raise PopulationJournalError("declared cycle size differs from append batch")
+            if [record.cycle_ordinal for record in records] != list(range(expected_size)):
+                raise PopulationJournalError("cycle records must be complete and ordered")
+            if len({record.symbol for record in records}) != expected_size:
+                raise PopulationJournalError("cycle contains duplicate symbols")
+            if len({record.snapshot_id for record in records}) != expected_size:
+                raise PopulationJournalError("cycle contains duplicate snapshots")
+
+        snapshot_ids = [record.snapshot_id for record in records]
+        header = _canonical_bytes(
+            {
+                "record_type": RECORD_TYPE_HEADER,
+                "schema_version": SCHEMA_VERSION,
+                "cycle_id": cycle_id,
+                "row_count": expected_size,
+                "envelope": envelope_payload,
+            }
+        ) + b"\n"
+        footer = _canonical_bytes(
+            {
+                "record_type": RECORD_TYPE_FOOTER,
+                "schema_version": SCHEMA_VERSION,
+                "cycle_id": cycle_id,
+                "row_count": expected_size,
+                "rows_checksum": rows_checksum(snapshot_ids),
+            }
+        ) + b"\n"
+
+        batch = header + b"".join(rows) + footer
         with self._lock:
             if self._last_cycle_id == cycle_id:
                 return False

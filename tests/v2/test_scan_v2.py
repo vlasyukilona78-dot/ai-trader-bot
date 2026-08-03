@@ -166,16 +166,18 @@ class _FakeStrategy:
 class _CaptureJournal:
     def __init__(self):
         self.cycles = []
+        self.envelopes = []
 
-    def append_cycle(self, records):
+    def append_cycle(self, records, *, envelope):
         self.cycles.append(list(records))
+        self.envelopes.append(envelope)
 
 
 class _DuplicateJournal(_CaptureJournal):
     enabled = True
 
-    def append_cycle(self, records):
-        super().append_cycle(records)
+    def append_cycle(self, records, *, envelope):
+        super().append_cycle(records, envelope=envelope)
         return False
 
 
