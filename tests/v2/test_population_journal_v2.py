@@ -106,9 +106,12 @@ def test_exception_text_metadata_keys_are_rejected() -> None:
 
 def test_append_cycle_writes_one_canonical_json_row_per_record(tmp_path) -> None:
     path = tmp_path / "population.jsonl"
-    records = [_record(symbol="AAA_USDT"), _record(symbol="BBB_USDT")]
+    records = [
+        _record(symbol="AAA_USDT", cycle_ordinal=0, cycle_size=2),
+        _record(symbol="BBB_USDT", cycle_ordinal=1, cycle_size=2),
+    ]
 
-    PopulationJournal(path).append_cycle(records)
+    assert PopulationJournal(path).append_cycle(records) is True
 
     lines = path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 2
@@ -120,7 +123,7 @@ def test_append_cycle_writes_one_canonical_json_row_per_record(tmp_path) -> None
 def test_disabled_journal_does_not_create_a_file(tmp_path) -> None:
     path = tmp_path / "population.jsonl"
 
-    PopulationJournal(path, enabled=False).append_cycle([_record()])
+    assert PopulationJournal(path, enabled=False).append_cycle([_record()]) is False
 
     assert not path.exists()
 
@@ -140,3 +143,73 @@ def test_cycle_id_depends_on_ordered_point_in_time_universe() -> None:
     )
 
     assert first != second
+
+
+def test_equivalent_timeframe_names_have_the_same_causal_ids() -> None:
+    generic_cycle = make_cycle_id(
+        timeframe="60",
+        candle_cutoff_ts=1_700_002_800.0,
+        universe_refreshed_at=1_700_000_000.0,
+        universe_symbols=["AAA_USDT"],
+    )
+    mexc_cycle = make_cycle_id(
+        timeframe="Min60",
+        candle_cutoff_ts=1_700_002_800.0,
+        universe_refreshed_at=1_700_000_000.0,
+        universe_symbols=["AAA_USDT"],
+    )
+    generic = _record(
+        cycle_id=generic_cycle,
+        timeframe="60",
+        candle_cutoff_ts=1_700_002_800.0,
+        scan_observed_at=1_700_002_801.0,
+        decision_ts=1_700_002_802.0,
+        base_bar_open_ts=1_699_999_200.0,
+        base_bar_close_ts=1_700_002_800.0,
+    )
+    mexc = _record(
+        cycle_id=mexc_cycle,
+        timeframe="Min60",
+        candle_cutoff_ts=1_700_002_800.0,
+        scan_observed_at=1_700_002_801.0,
+        decision_ts=1_700_002_802.0,
+        base_bar_open_ts=1_699_999_200.0,
+        base_bar_close_ts=1_700_002_800.0,
+    )
+
+    assert generic_cycle == mexc_cycle
+    assert generic.input_hash == mexc.input_hash
+    assert generic.snapshot_id == mexc.snapshot_id
+
+
+def test_no_data_uses_absent_bar_timestamps_instead_of_a_sentinel() -> None:
+    record = _record(
+        status="no_data",
+        base_bar_open_ts=None,
+        base_bar_close_ts=None,
+        action="HOLD",
+        reason="no_data",
+        confidence=0.0,
+    )
+
+    assert record.base_bar_open_ts is None
+    assert record.base_bar_close_ts is None
+
+
+def test_append_cycle_deduplicates_the_latest_complete_cycle(tmp_path) -> None:
+    path = tmp_path / "population.jsonl"
+    record = _record()
+    journal = PopulationJournal(path)
+
+    assert journal.append_cycle([record]) is True
+    assert journal.append_cycle([record]) is False
+    assert PopulationJournal(path).append_cycle([record]) is False
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_append_cycle_requires_complete_ordered_batch(tmp_path) -> None:
+    path = tmp_path / "population.jsonl"
+    incomplete = _record(cycle_ordinal=0, cycle_size=2)
+
+    with pytest.raises(PopulationJournalError, match="cycle size"):
+        PopulationJournal(path).append_cycle([incomplete])

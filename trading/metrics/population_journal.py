@@ -12,6 +12,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
+from trading.market_data.bar_contract import interval_seconds
+
 
 SCHEMA_VERSION = 1
 POPULATION_STATUSES = frozenset(
@@ -20,6 +22,8 @@ POPULATION_STATUSES = frozenset(
         "no_data",
         "short_history",
         "invalid_bar_contract",
+        "data_error",
+        "data_quality_error",
         "strategy_error",
     }
 )
@@ -141,7 +145,9 @@ def make_cycle_id(
     return _sha256_id(
         {
             "schema_version": int(schema_version),
-            "timeframe": _bounded_string(timeframe, name="timeframe", max_length=32),
+            "timeframe_seconds": interval_seconds(
+                _bounded_string(timeframe, name="timeframe", max_length=32)
+            ),
             "candle_cutoff_ts": _finite_float(candle_cutoff_ts, name="candle_cutoff_ts"),
             "universe_refreshed_at": _finite_float(universe_refreshed_at, name="universe_refreshed_at"),
             "universe_symbols": clean_symbols,
@@ -171,12 +177,14 @@ class PopulationDecision:
     symbol: str
     timeframe: str
     status: str
-    base_bar_open_ts: float
-    base_bar_close_ts: float
+    base_bar_open_ts: float | None
+    base_bar_close_ts: float | None
     action: str
     reason: str
     confidence: float
     metadata: Mapping[str, object]
+    cycle_ordinal: int = 0
+    cycle_size: int = 1
     error_code: str | None = None
 
     def __post_init__(self) -> None:
@@ -191,15 +199,31 @@ class PopulationDecision:
             "scan_observed_at",
             "candle_cutoff_ts",
             "decision_ts",
-            "base_bar_open_ts",
-            "base_bar_close_ts",
             "confidence",
         ):
             object.__setattr__(self, field_name, _finite_float(getattr(self, field_name), name=field_name))
-        if self.base_bar_close_ts > self.candle_cutoff_ts:
-            raise PopulationJournalError("base bar closes after the causal cutoff")
-        if self.decision_ts < self.candle_cutoff_ts:
-            raise PopulationJournalError("decision_ts precedes the causal cutoff")
+        if self.universe_refreshed_at > self.scan_observed_at:
+            raise PopulationJournalError("universe refresh follows scan observation time")
+        if self.scan_observed_at < self.candle_cutoff_ts:
+            raise PopulationJournalError("scan observation precedes the causal cutoff")
+        if self.decision_ts < self.scan_observed_at:
+            raise PopulationJournalError("decision_ts precedes scan observation time")
+        if (self.base_bar_open_ts is None) != (self.base_bar_close_ts is None):
+            raise PopulationJournalError("base bar open and close must both be present or absent")
+        if self.base_bar_open_ts is not None:
+            base_open = _finite_float(self.base_bar_open_ts, name="base_bar_open_ts")
+            base_close = _finite_float(self.base_bar_close_ts, name="base_bar_close_ts")
+            if base_open >= base_close:
+                raise PopulationJournalError("base bar open must precede its close")
+            if base_close > self.candle_cutoff_ts:
+                raise PopulationJournalError("base bar closes after the causal cutoff")
+            expected_seconds = interval_seconds(self.timeframe)
+            if not math.isclose(base_close - base_open, expected_seconds, rel_tol=0.0, abs_tol=1e-6):
+                raise PopulationJournalError("base bar duration differs from timeframe")
+            object.__setattr__(self, "base_bar_open_ts", base_open)
+            object.__setattr__(self, "base_bar_close_ts", base_close)
+        elif self.status in {"evaluated", "short_history", "strategy_error"}:
+            raise PopulationJournalError(f"{self.status} requires real base bar timestamps")
         if not 0.0 <= self.confidence <= 1.0:
             raise PopulationJournalError("confidence must be between 0 and 1")
         object.__setattr__(self, "symbol", _bounded_string(self.symbol, name="symbol", max_length=64))
@@ -208,10 +232,26 @@ class PopulationDecision:
         object.__setattr__(self, "reason", _bounded_string(self.reason, name="reason", max_length=512))
         if self.status not in POPULATION_STATUSES:
             raise PopulationJournalError(f"unsupported population status: {self.status}")
+        if isinstance(self.cycle_ordinal, bool) or not isinstance(self.cycle_ordinal, Integral):
+            raise PopulationJournalError("cycle_ordinal must be an integer")
+        if isinstance(self.cycle_size, bool) or not isinstance(self.cycle_size, Integral):
+            raise PopulationJournalError("cycle_size must be an integer")
+        if self.cycle_size < 1 or not 0 <= self.cycle_ordinal < self.cycle_size:
+            raise PopulationJournalError("cycle ordinal is outside the declared cycle size")
+        object.__setattr__(self, "cycle_ordinal", int(self.cycle_ordinal))
+        object.__setattr__(self, "cycle_size", int(self.cycle_size))
         if self.error_code is not None and not _ERROR_CODE_RE.fullmatch(self.error_code):
             raise PopulationJournalError("error_code must be a safe exception class name")
-        if self.status == "strategy_error" and self.error_code is None:
-            raise PopulationJournalError("strategy_error requires error_code")
+        error_statuses = {
+            "invalid_bar_contract",
+            "data_error",
+            "data_quality_error",
+            "strategy_error",
+        }
+        if self.status in error_statuses and self.error_code is None:
+            raise PopulationJournalError(f"{self.status} requires error_code")
+        if self.status not in error_statuses and self.error_code is not None:
+            raise PopulationJournalError(f"{self.status} must not carry error_code")
         if not isinstance(self.metadata, Mapping):
             raise PopulationJournalError("metadata must be a mapping")
         frozen_metadata = _freeze_json_value(self.metadata, path="metadata")
@@ -232,12 +272,14 @@ class PopulationDecision:
         symbol: str,
         timeframe: str,
         status: str,
-        base_bar_open_ts: float,
-        base_bar_close_ts: float,
+        base_bar_open_ts: float | None,
+        base_bar_close_ts: float | None,
         action: str,
         reason: str,
         confidence: float,
         metadata: Mapping[str, object],
+        cycle_ordinal: int = 0,
+        cycle_size: int = 1,
         error_code: str | None = None,
         schema_version: int = SCHEMA_VERSION,
     ) -> "PopulationDecision":
@@ -248,11 +290,19 @@ class PopulationDecision:
             "schema_version": int(schema_version),
             "cycle_id": cycle_id,
             "symbol": symbol,
-            "timeframe": timeframe,
+            "timeframe_seconds": interval_seconds(timeframe),
             "status": status,
             "candle_cutoff_ts": _finite_float(candle_cutoff_ts, name="candle_cutoff_ts"),
-            "base_bar_open_ts": _finite_float(base_bar_open_ts, name="base_bar_open_ts"),
-            "base_bar_close_ts": _finite_float(base_bar_close_ts, name="base_bar_close_ts"),
+            "base_bar_open_ts": (
+                _finite_float(base_bar_open_ts, name="base_bar_open_ts")
+                if base_bar_open_ts is not None
+                else None
+            ),
+            "base_bar_close_ts": (
+                _finite_float(base_bar_close_ts, name="base_bar_close_ts")
+                if base_bar_close_ts is not None
+                else None
+            ),
             "action": action,
             "reason": reason,
             "confidence": _finite_float(confidence, name="confidence"),
@@ -286,6 +336,8 @@ class PopulationDecision:
             reason=reason,
             confidence=confidence,
             metadata=frozen_metadata,
+            cycle_ordinal=cycle_ordinal,
+            cycle_size=cycle_size,
             error_code=error_code,
         )
 
@@ -301,6 +353,7 @@ class PopulationDecision:
             "decision_ts": self.decision_ts,
             "symbol": self.symbol,
             "timeframe": self.timeframe,
+            "timeframe_seconds": interval_seconds(self.timeframe),
             "status": self.status,
             "base_bar_open_ts": self.base_bar_open_ts,
             "base_bar_close_ts": self.base_bar_close_ts,
@@ -308,6 +361,8 @@ class PopulationDecision:
             "reason": self.reason,
             "confidence": self.confidence,
             "metadata": _thaw_json_value(self.metadata),
+            "cycle_ordinal": self.cycle_ordinal,
+            "cycle_size": self.cycle_size,
             "error_code": self.error_code,
         }
 
@@ -317,23 +372,72 @@ class PopulationJournal:
         self._path = Path(path)
         self._enabled = bool(enabled)
         self._lock = threading.Lock()
+        self._last_cycle_id = self._read_last_complete_cycle_id() if self._enabled else None
+
+    def _read_last_complete_cycle_id(self) -> str | None:
+        if not self._path.exists() or self._path.stat().st_size == 0:
+            return None
+        try:
+            with self._path.open("rb") as handle:
+                size = handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, size - 1_048_576), os.SEEK_SET)
+                lines = [line for line in handle.read().splitlines() if line.strip()]
+            if not lines:
+                return None
+            row = json.loads(lines[-1].decode("utf-8"))
+            cycle_id = row.get("cycle_id")
+            ordinal = row.get("cycle_ordinal")
+            cycle_size = row.get("cycle_size")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError) as exc:
+            raise PopulationJournalError("population journal has an unreadable tail") from exc
+        if not isinstance(cycle_id, str) or not re.fullmatch(r"[0-9a-f]{64}", cycle_id):
+            raise PopulationJournalError("population journal tail has an invalid cycle ID")
+        if (
+            isinstance(ordinal, bool)
+            or isinstance(cycle_size, bool)
+            or not isinstance(ordinal, int)
+            or not isinstance(cycle_size, int)
+            or cycle_size < 1
+            or ordinal != cycle_size - 1
+        ):
+            raise PopulationJournalError("population journal ends with an incomplete cycle")
+        return cycle_id
 
     @property
     def enabled(self) -> bool:
         return self._enabled
 
-    def append_cycle(self, records: Sequence[PopulationDecision]) -> None:
+    def append_cycle(self, records: Sequence[PopulationDecision]) -> bool:
         if not self._enabled or not records:
-            return
+            return False
         rows: list[bytes] = []
         for record in records:
             if not isinstance(record, PopulationDecision):
                 raise PopulationJournalError("records must contain PopulationDecision instances")
             rows.append(_canonical_bytes(record.as_dict()) + b"\n")
+        cycle_ids = {record.cycle_id for record in records}
+        if len(cycle_ids) != 1:
+            raise PopulationJournalError("one append batch must contain exactly one cycle")
+        cycle_id = records[0].cycle_id
+        expected_size = len(records)
+        if any(record.cycle_size != expected_size for record in records):
+            raise PopulationJournalError("declared cycle size differs from append batch")
+        if [record.cycle_ordinal for record in records] != list(range(expected_size)):
+            raise PopulationJournalError("cycle records must be complete and ordered")
+        if len({record.symbol for record in records}) != expected_size:
+            raise PopulationJournalError("cycle contains duplicate symbols")
+        if len({record.snapshot_id for record in records}) != expected_size:
+            raise PopulationJournalError("cycle contains duplicate snapshots")
+        batch = b"".join(rows)
         with self._lock:
+            if self._last_cycle_id == cycle_id:
+                return False
             self._path.parent.mkdir(parents=True, exist_ok=True)
             with self._path.open("ab") as handle:
-                for row in rows:
-                    handle.write(row)
+                written = handle.write(batch)
+                if written != len(batch):
+                    raise OSError("population journal batch write was incomplete")
                 handle.flush()
                 os.fsync(handle.fileno())
+            self._last_cycle_id = cycle_id
+        return True
