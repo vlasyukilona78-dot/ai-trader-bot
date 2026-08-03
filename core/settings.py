@@ -42,6 +42,12 @@ class StrategySettings:
     vwap_tolerance_pct: float = 0.0025
     funding_tolerance: float = 0.0003
     long_short_ratio_tolerance: float = 0.10
+    fake_filter_structural_override_enabled: bool = True
+    fake_filter_structural_override_lsr_min: float = 1.35
+    fake_filter_structural_override_min_funding_rate: float = -0.003
+    fake_filter_structural_override_min_layer2_strength: float = 0.60
+    fake_filter_structural_override_min_layer3_strength: float = 0.95
+    fake_filter_structural_override_max_peak_distance_pct: float = 0.045
     msb_lookback: int = 14
     msb_recent_bars: int = 10
     msb_break_buffer_pct: float = 0.0002

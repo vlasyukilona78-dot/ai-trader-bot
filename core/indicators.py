@@ -8,6 +8,21 @@ def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
 
+def macd(
+    series: pd.Series,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Return the standard EMA MACD line, signal line and histogram."""
+    fast_line = ema(series, span=fast)
+    slow_line = ema(series, span=slow)
+    macd_line = fast_line - slow_line
+    signal_line = ema(macd_line, span=signal)
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gains = delta.clip(lower=0)
@@ -87,6 +102,12 @@ def compute_indicators(df: pd.DataFrame, keltner_mult: float = 1.5) -> pd.DataFr
     out["ema20"] = ema(out["close"], span=20)
     out["ema50"] = ema(out["close"], span=50)
     out["atr"] = atr(out, period=14)
+    macd_line, macd_signal, macd_hist = macd(out["close"])
+    out["macd"] = macd_line
+    out["macd_signal"] = macd_signal
+    out["hist"] = macd_hist
+    # Compatibility for older Ultra code which accepted either column name.
+    out["macd_hist"] = macd_hist
 
     bb_lower, bb_mid, bb_upper = bollinger_bands(out["close"], period=20, mult=2.0)
     out["bb_lower"] = bb_lower
@@ -103,6 +124,11 @@ def compute_indicators(df: pd.DataFrame, keltner_mult: float = 1.5) -> pd.DataFr
 
     out["obv"] = obv(out)
     out["cvd"] = cvd(out)
+    # This is a candle-direction volume proxy, not bid/ask trade delta.
+    # Keeping the marker prevents the strategy from treating it as independent
+    # order-flow confirmation.
+    out["cvd_is_proxy"] = 1.0
+    out.attrs["cvd_source"] = "candle_direction_proxy"
 
     out["volume_ma20"] = out["volume"].rolling(20).mean()
     out["volume_spike"] = out["volume"] / out["volume_ma20"].replace(0, np.nan)

@@ -113,6 +113,10 @@ def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
 
+    # attrs may contain native DataFrames. Pandas compares attrs while
+    # concatenating resample results, and DataFrame equality is not scalar.
+    source = df.copy()
+    source.attrs = {}
     agg = {
         "open": "first",
         "high": "max",
@@ -120,7 +124,7 @@ def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
         "close": "last",
         "volume": "sum",
     }
-    out = df.resample(rule).agg(agg).dropna(subset=["open", "high", "low", "close", "volume"])
+    out = source.resample(rule).agg(agg).dropna(subset=["open", "high", "low", "close", "volume"])
     return out
 
 
@@ -282,10 +286,32 @@ def compute_mtf_feature_snapshot(df: pd.DataFrame) -> dict[str, float]:
         "mtf_trend_5m": 0.0,
         "mtf_trend_15m": 0.0,
         "mtf_trend_1h": 0.0,
+        "mtf_ready_5m": 0.0,
+        "mtf_ready_15m": 0.0,
+        "mtf_ready_1h": 0.0,
+        "mtf_native_15m": 0.0,
+        "mtf_native_1h": 0.0,
     }
 
+    native_frames = df.attrs.get("native_mtf_frames", {})
+    if not isinstance(native_frames, dict):
+        native_frames = {}
+    base_ohlcv = df[["open", "high", "low", "close", "volume"]].copy()
+    base_ohlcv.attrs.clear()
+
     for rule, key_suffix in (("5min", "5m"), ("15min", "15m"), ("1h", "1h")):
-        mtf = _resample_ohlcv(df[["open", "high", "low", "close", "volume"]], rule=rule)
+        mtf = None
+        if key_suffix in {"15m", "1h"}:
+            native = native_frames.get(key_suffix)
+            if isinstance(native, pd.DataFrame) and not native.empty:
+                required = {"open", "high", "low", "close", "volume"}
+                if required.issubset(native.columns):
+                    mtf = native[list(required)].copy()
+                    mtf.attrs.clear()
+                    mtf = mtf[~mtf.index.duplicated(keep="last")].sort_index()
+                    values[f"mtf_native_{key_suffix}"] = 1.0
+        if mtf is None:
+            mtf = _resample_ohlcv(base_ohlcv, rule=rule)
         if len(mtf) < 30:
             continue
         mtf_ind = compute_indicators(mtf)
@@ -299,6 +325,7 @@ def compute_mtf_feature_snapshot(df: pd.DataFrame) -> dict[str, float]:
         values[f"mtf_trend_{key_suffix}"] = (
             _safe_float(last.get("ema20"), close) - _safe_float(last.get("ema50"), close)
         ) / close
+        values[f"mtf_ready_{key_suffix}"] = 1.0
 
     return values
 

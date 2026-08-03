@@ -27,21 +27,26 @@ class FeaturePipeline:
     def build(self, symbol: str, ohlcv: pd.DataFrame, *, as_of: pd.Timestamp, extras: dict | None = None) -> FeatureBundle:
         assert_monotonic_time(ohlcv)
         hist = ohlcv.loc[:as_of].copy()
+        source_attrs = dict(getattr(hist, "attrs", {}) or {})
+        # Pandas propagates attrs through Series operations. Nested DataFrames in
+        # native_mtf_frames then get compared during concat/finalize and raise
+        # "truth value of a DataFrame is ambiguous". Indicators do not need attrs.
+        hist.attrs.clear()
         assert_no_future_rows(hist, as_of)
         if len(hist) < 80:
             raise ValueError("insufficient_history")
 
         enriched = sanitize_feature_frame(compute_indicators(hist))
-        try:
-            enriched.attrs.update(getattr(hist, "attrs", {}) or {})
-        except Exception:
-            pass
         quality = assess_feature_frame_quality(enriched)
         if not bool(quality.get("usable", True)):
             reason = str(quality.get("reason") or "blocked")
             raise ValueError(f"feature_frame_quality:{reason}")
         vp = compute_volume_profile(enriched, window=self.profile_window, bins=self.profile_bins)
         regime = detect_market_regime(enriched)
+        try:
+            enriched.attrs.update(source_attrs)
+        except Exception:
+            pass
 
         row = build_feature_row(
             symbol=symbol,

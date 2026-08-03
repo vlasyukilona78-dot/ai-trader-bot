@@ -58,6 +58,12 @@ class SignalConfig:
     regime_mtf_rsi_5m_max_short: float = 70.0
     fake_filter_lsr_extreme_soft: float = 1.01
     fake_filter_oi_volume_spike_soft: float = 1.2
+    fake_filter_structural_override_enabled: bool = True
+    fake_filter_structural_override_lsr_min: float = 1.35
+    fake_filter_structural_override_min_funding_rate: float = -0.003
+    fake_filter_structural_override_min_layer2_strength: float = 0.60
+    fake_filter_structural_override_min_layer3_strength: float = 0.95
+    fake_filter_structural_override_max_peak_distance_pct: float = 0.045
     degraded_mode_requires_strong_structure: bool = True
     degraded_mode_min_layer2_strength: float = 0.74
     degraded_mode_min_layer3_strength: float = 0.74
@@ -570,6 +576,7 @@ class SignalGenerator:
                 "pump_context_strength": 0.0,
                 "clean_pump_pct": 0.0,
                 "clean_pump_min_pct_used": float(self.config.layer1_clean_pump_min_pct),
+                "early_watch_clean_pump_min_pct_used": float(self.config.early_watch_clean_pump_min_pct),
                 "clean_pump_ok": 0.0,
                 "soft_pass_candidate": 0.0,
                 "soft_pass_used": 0.0,
@@ -695,6 +702,7 @@ class SignalGenerator:
                 "pump_context_strength": float(pts / 3.0),
                 "clean_pump_pct": float(clean_pump_pct),
                 "clean_pump_min_pct_used": float(clean_pump_threshold),
+                "early_watch_clean_pump_min_pct_used": float(self.config.early_watch_clean_pump_min_pct),
                 "clean_pump_ok": 1.0 if clean_pump_ok else 0.0,
                 "near_clean_pump_ok": 1.0 if near_clean_pump_ok else 0.0,
                 "failed_reclaim": 1.0 if failed_reclaim_ctx else 0.0,
@@ -1059,7 +1067,12 @@ class SignalGenerator:
         price_ctx = price_up
 
         obv_div = self._safe(last.get("obv"), 0.0) < self._safe(ref.get("obv"), 0.0)
-        cvd_div = self._safe(last.get("cvd"), 0.0) < self._safe(ref.get("cvd"), 0.0)
+        cvd_div_raw = self._safe(last.get("cvd"), 0.0) < self._safe(ref.get("cvd"), 0.0)
+        cvd_is_proxy = self._safe(last.get("cvd_is_proxy"), 0.0) >= 0.5
+        # Candle-direction CVD shares most of its information with price/OBV.
+        # It may corroborate a divergence, but cannot act as an independent
+        # order-flow confirmation unless a real trade-delta series is supplied.
+        cvd_div = bool(cvd_div_raw and (not cvd_is_proxy or obv_div))
         rsi_last = self._safe(last.get("rsi"), 50.0)
         rsi_prev = self._safe(prev.get("rsi"), rsi_last)
         hist_last = self._safe(last.get("hist"), 0.0)
@@ -1180,6 +1193,8 @@ class SignalGenerator:
             "late_near_high_context": 1.0 if late_near_high_context else 0.0,
             "obv_bearish_divergence": 1.0 if obv_div else 0.0,
             "cvd_bearish_divergence": 1.0 if cvd_div else 0.0,
+            "cvd_bearish_divergence_raw": 1.0 if cvd_div_raw else 0.0,
+            "cvd_is_proxy": 1.0 if cvd_is_proxy else 0.0,
             "rsi_rollover": 1.0 if rsi_rollover else 0.0,
             "hist_rollover": 1.0 if hist_rollover else 0.0,
             "lower_close_after_peak": 1.0 if lower_close else 0.0,
@@ -1877,6 +1892,8 @@ class SignalGenerator:
         oi_signal: float | None = None,
         oi_source: str | None = None,
         oi_degraded: bool | None = None,
+        layer2: dict[str, Any] | None = None,
+        layer3: dict[str, Any] | None = None,
     ) -> tuple[bool, dict[str, Any]]:
         if df.empty or side != "SHORT":
             return False, {"passed": 0.0, "degraded_mode": 1.0, "failed_reason": "insufficient_history" if df.empty else "unsupported_side_not_short", "missing_conditions": "history" if df.empty else "short_context_required", "source_flags": {}}
@@ -1929,13 +1946,56 @@ class SignalGenerator:
         else:
             oi_ok = float(oi_metric) >= oi_soft
         oi_or_unavail = oi_ok or oi_quality == "unavailable"
-        passed = price_ok and sent_or_unavail and funding_or_unavail and lsr_or_unavail and oi_or_unavail
+        strict_passed = price_ok and sent_or_unavail and funding_or_unavail and lsr_or_unavail and oi_or_unavail
+        layer2_ctx = layer2 if isinstance(layer2, dict) else {}
+        layer3_ctx = layer3 if isinstance(layer3, dict) else {}
+        structural_override_lsr_min = max(
+            lsr_extreme_threshold,
+            float(self.config.fake_filter_structural_override_lsr_min),
+        )
+        structural_override_lsr_ok = bool(
+            lsr_quality == "live"
+            and long_short_ratio is not None
+            and float(long_short_ratio) >= structural_override_lsr_min
+        )
+        structural_override_funding_ok = bool(
+            funding_quality != "live"
+            or funding_rate is None
+            or float(funding_rate) >= float(self.config.fake_filter_structural_override_min_funding_rate)
+        )
+        hard_failed_reclaim = bool(
+            float(layer2_ctx.get("failed_reclaim", 0.0) or 0.0)
+            or float(layer2_ctx.get("retest_failed_breakout", 0.0) or 0.0)
+            or float(layer3_ctx.get("failed_reclaim", 0.0) or 0.0)
+            or float(layer3_ctx.get("retest_failed_breakout", 0.0) or 0.0)
+        )
+        structural_override = bool(
+            self.config.fake_filter_structural_override_enabled
+            and hard_failed_reclaim
+            and bool(float(layer3_ctx.get("sweep_reclaim_entry_ok", 0.0) or 0.0))
+            and bool(float(layer3_ctx.get("fresh_reaction_from_high", 0.0) or 0.0))
+            and bool(float(layer3_ctx.get("downside_displacement_confirmed", 0.0) or 0.0))
+            and bool(float(layer3_ctx.get("meaningfully_below_vah", 0.0) or 0.0))
+            and not bool(float(layer3_ctx.get("acceptance_above_swing_high", 0.0) or 0.0))
+            and not bool(float(layer3_ctx.get("continuation_above_fast_value", 0.0) or 0.0))
+            and not bool(float(layer3_ctx.get("high_mtf_continuation", 0.0) or 0.0))
+            and float(layer2_ctx.get("weakness_strength", 0.0) or 0.0)
+            >= float(self.config.fake_filter_structural_override_min_layer2_strength)
+            and float(layer3_ctx.get("entry_location_strength", 0.0) or 0.0)
+            >= float(self.config.fake_filter_structural_override_min_layer3_strength)
+            and float(layer3_ctx.get("distance_from_recent_high_pct", 1.0) or 1.0)
+            <= float(self.config.fake_filter_structural_override_max_peak_distance_pct)
+            and structural_override_lsr_ok
+            and structural_override_funding_ok
+        )
+        passed = strict_passed or structural_override
         missing = []
-        if not price_ok: missing.append("price_above_vwap")
-        if not sent_or_unavail: missing.append("sentiment_euphoric")
-        if not funding_or_unavail: missing.append("funding_supports_short")
-        if not lsr_or_unavail: missing.append("long_short_ratio_extreme")
-        if not oi_or_unavail: missing.append("oi_overheated")
+        if not passed:
+            if not price_ok: missing.append("price_above_vwap")
+            if not sent_or_unavail: missing.append("sentiment_euphoric")
+            if not funding_or_unavail: missing.append("funding_supports_short")
+            if not lsr_or_unavail: missing.append("long_short_ratio_extreme")
+            if not oi_or_unavail: missing.append("oi_overheated")
 
         blocker_price = not price_ok
         blocker_sent = not sent_or_unavail
@@ -1968,6 +2028,14 @@ class SignalGenerator:
         }
         return passed, {
             "passed": 1.0 if passed else 0.0,
+            "strict_passed": 1.0 if strict_passed else 0.0,
+            "structural_override_used": 1.0 if structural_override else 0.0,
+            "structural_override_lsr_ok": 1.0 if structural_override_lsr_ok else 0.0,
+            "structural_override_funding_ok": 1.0 if structural_override_funding_ok else 0.0,
+            "structural_override_lsr_min": float(structural_override_lsr_min),
+            "structural_override_min_funding_rate": float(
+                self.config.fake_filter_structural_override_min_funding_rate
+            ),
             "price_above_vwap": 1.0 if price_ok else 0.0,
             "sentiment_euphoric": 1.0 if sent_ok else 0.0,
             "sentiment_euphoric_threshold": float(sentiment_euphoric_threshold),
@@ -2442,7 +2510,7 @@ class SignalGenerator:
             self.last_diagnostics = trace
             return None
 
-        layer4_ok, layer4 = self._layer4_fake_filter(df=df, side=side, sentiment_index=context.sentiment_index, sentiment_source=context.sentiment_source, funding_rate=context.funding_rate, long_short_ratio=context.long_short_ratio, open_interest=context.open_interest, open_interest_source=context.open_interest_source, sentiment_value=context.sentiment_value, sentiment_degraded=context.sentiment_degraded, funding_source=context.funding_source, funding_degraded=context.funding_degraded, long_short_ratio_source=context.long_short_ratio_source, long_short_ratio_degraded=context.long_short_ratio_degraded, open_interest_ratio=context.open_interest_ratio, oi_signal=context.oi_signal, oi_source=context.oi_source, oi_degraded=context.oi_degraded)
+        layer4_ok, layer4 = self._layer4_fake_filter(df=df, side=side, sentiment_index=context.sentiment_index, sentiment_source=context.sentiment_source, funding_rate=context.funding_rate, long_short_ratio=context.long_short_ratio, open_interest=context.open_interest, open_interest_source=context.open_interest_source, sentiment_value=context.sentiment_value, sentiment_degraded=context.sentiment_degraded, funding_source=context.funding_source, funding_degraded=context.funding_degraded, long_short_ratio_source=context.long_short_ratio_source, long_short_ratio_degraded=context.long_short_ratio_degraded, open_interest_ratio=context.open_interest_ratio, oi_signal=context.oi_signal, oi_source=context.oi_source, oi_degraded=context.oi_degraded, layer2=layer2, layer3=layer3)
         trace["layers"]["layer4_fake_filter"] = {"passed": layer4_ok, "details": layer4}
         if not layer4_ok:
             trace["failed_layer"] = "layer4_fake_filter"

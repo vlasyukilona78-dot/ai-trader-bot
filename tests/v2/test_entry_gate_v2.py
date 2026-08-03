@@ -197,6 +197,75 @@ class EntryGateV2Tests(unittest.TestCase):
         self.assertGreater(decision.penalties["microstructure_soft_risk"], 0.0)
         self.assertIn("microstructure_context", decision.diagnostics)
 
+    def test_strong_degraded_candidate_can_reach_default_degraded_threshold(self):
+        details = {
+            "layer1": {"rsi": 74.0, "pump_bar_offset": 1},
+            "layer2": {
+                "weakness_strength": 1.0,
+                "price_rejection_near_high": 1.0,
+                "lower_close_after_peak": 1.0,
+                "lower_high_after_peak": 1.0,
+                "failed_reclaim": 1.0,
+            },
+            "layer3": {
+                "entry_location_strength": 1.0,
+                "fresh_reaction_from_high": 1.0,
+                "failed_reclaim": 1.0,
+            },
+            "layer4": {
+                "degraded_mode": 1.0,
+                "source_flags": {
+                    "sentiment_source": "unavailable",
+                    "sentiment_quality": "unavailable",
+                    "sentiment_unavailable": 1.0,
+                    "funding_source": "live:bybit:ticker",
+                    "funding_quality": "live",
+                    "funding_live_used": 1.0,
+                    "long_short_ratio_quality": "live",
+                    "open_interest_quality": "live",
+                    "vwap_quality": "live",
+                },
+            },
+            "layer5": {"tp_sl_strength": 1.0, "fallback_rr_used": 0.0},
+        }
+        gate = EntryGate(EntryGateConfig())
+
+        decision = gate.evaluate(
+            self._candidate(
+                confidence=0.70,
+                recent_high=100.6,
+                details=details,
+            )
+        )
+
+        self.assertTrue(decision.approved, msg=str(decision))
+        self.assertEqual(decision.reason, "approved")
+        self.assertEqual(decision.diagnostics["min_score_used"], 0.78)
+        self.assertGreaterEqual(decision.score, 0.78)
+        self.assertTrue(decision.flags["degraded_context"])
+
+    def test_context_quality_counts_quality_dimensions_not_service_flags(self):
+        details = {
+            "layer4": {
+                "degraded_mode": 1.0,
+                "source_flags": {
+                    "sentiment_source": "unavailable",
+                    "sentiment_quality": "unavailable",
+                    "sentiment_unavailable": 1.0,
+                    "funding_source": "live:bybit:ticker",
+                    "funding_quality": "live",
+                    "funding_live_used": 1.0,
+                    "long_short_ratio_quality": "live",
+                    "open_interest_quality": "live",
+                    "vwap_quality": "live",
+                },
+            }
+        }
+
+        quality = EntryGate._context_quality(details)
+
+        self.assertAlmostEqual(quality, 0.624, places=3)
+
     def test_signal_candidate_collects_microstructure_from_context(self):
         class Signal:
             signal_id = "sig-context"
@@ -236,6 +305,27 @@ class EntryGateV2Tests(unittest.TestCase):
         decision = gate.evaluate(self._candidate())
         self.assertFalse(decision.approved)
         self.assertEqual(decision.reason, "mtf_context_missing")
+
+    def test_readiness_flags_prevent_neutral_mtf_from_passing_as_live(self):
+        gate = EntryGate(EntryGateConfig(require_mtf_context=True))
+        decision = gate.evaluate(
+            self._candidate(
+                market_extras={
+                    "mtf_trend_1h": 0.0,
+                    "mtf_trend_15m": 0.0,
+                    "mtf_trend_5m": 0.0,
+                    "mtf_rsi_1h": 50.0,
+                    "mtf_rsi_15m": 50.0,
+                    "mtf_rsi_5m": 50.0,
+                    "mtf_ready_1h": 0.0,
+                    "mtf_ready_15m": 0.0,
+                    "mtf_ready_5m": 1.0,
+                }
+            )
+        )
+        self.assertFalse(decision.approved)
+        self.assertEqual(decision.reason, "mtf_context_missing")
+        self.assertFalse(decision.diagnostics["ready_1h"])
 
     def test_replay_admission_summary(self):
         class Row:

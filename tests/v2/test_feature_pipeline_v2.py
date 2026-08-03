@@ -18,6 +18,7 @@ if HAS_NUMPY_PANDAS:
         compute_mtf_feature_snapshot,
         sanitize_feature_frame,
     )
+    from core.indicators import compute_indicators
     from trading.features.pipeline import FeaturePipeline
     from trading.features.validators import FeatureValidationError, assert_no_future_rows
 else:
@@ -82,6 +83,69 @@ class FeaturePipelineV2Tests(unittest.TestCase):
         self.assertTrue(np.isfinite(float(snapshot["mtf_rsi_1h"])))
         self.assertTrue(np.isfinite(float(snapshot["mtf_atr_norm_1h"])))
         self.assertTrue(np.isfinite(float(snapshot["mtf_trend_1h"])))
+        self.assertEqual(snapshot["mtf_ready_1h"], 1.0)
+
+    def test_compute_indicators_produces_live_macd_histogram(self):
+        df = self._build_df(n=120)
+
+        enriched = compute_indicators(df)
+
+        for column in ("macd", "macd_signal", "hist", "macd_hist"):
+            self.assertIn(column, enriched.columns)
+            self.assertTrue(np.isfinite(float(enriched[column].iloc[-1])))
+        self.assertAlmostEqual(float(enriched["hist"].iloc[-1]), float(enriched["macd_hist"].iloc[-1]))
+        self.assertNotEqual(float(enriched["hist"].iloc[-1]), float(enriched["hist"].iloc[-8]))
+
+    def test_compute_mtf_uses_native_frames_for_short_base_window(self):
+        df = self._build_df(n=320)
+        native_15m = self._build_df(n=120)
+        native_15m.index = pd.date_range("2025-12-01", periods=120, freq="15min", tz="UTC")
+        native_1h = self._build_df(n=120)
+        native_1h.index = pd.date_range("2025-11-01", periods=120, freq="1h", tz="UTC")
+        df.attrs["native_mtf_frames"] = {
+            "15m": native_15m,
+            "1h": native_1h,
+        }
+
+        snapshot = compute_mtf_feature_snapshot(df)
+
+        self.assertEqual(snapshot["mtf_ready_5m"], 1.0)
+        self.assertEqual(snapshot["mtf_ready_15m"], 1.0)
+        self.assertEqual(snapshot["mtf_ready_1h"], 1.0)
+        self.assertEqual(snapshot["mtf_native_15m"], 1.0)
+        self.assertEqual(snapshot["mtf_native_1h"], 1.0)
+        self.assertNotEqual(snapshot["mtf_rsi_15m"], 50.0)
+        self.assertNotEqual(snapshot["mtf_rsi_1h"], 50.0)
+
+    def test_feature_pipeline_accepts_native_mtf_dataframes_in_attrs(self):
+        df = self._build_df(n=320)
+        native_15m = self._build_df(n=120)
+        native_15m.index = pd.date_range("2025-12-01", periods=120, freq="15min", tz="UTC")
+        native_1h = self._build_df(n=120)
+        native_1h.index = pd.date_range("2025-11-01", periods=120, freq="1h", tz="UTC")
+        df.attrs["native_mtf_frames"] = {
+            "15m": native_15m,
+            "1h": native_1h,
+        }
+
+        bundle = FeaturePipeline().build(
+            symbol="BTCUSDT",
+            ohlcv=df,
+            as_of=df.index[-1],
+        )
+
+        self.assertEqual(bundle.row.values["mtf_native_15m"], 1.0)
+        self.assertEqual(bundle.row.values["mtf_native_1h"], 1.0)
+        self.assertEqual(bundle.row.values["mtf_ready_15m"], 1.0)
+        self.assertEqual(bundle.row.values["mtf_ready_1h"], 1.0)
+        self.assertIn("native_mtf_frames", bundle.enriched.attrs)
+
+    def test_compute_mtf_marks_unavailable_higher_timeframes(self):
+        snapshot = compute_mtf_feature_snapshot(self._build_df(n=320))
+
+        self.assertEqual(snapshot["mtf_ready_5m"], 1.0)
+        self.assertEqual(snapshot["mtf_ready_15m"], 0.0)
+        self.assertEqual(snapshot["mtf_ready_1h"], 0.0)
 
     def test_sanitize_feature_frame_repairs_inf_and_duplicate_rows(self):
         df = self._build_df(n=16)

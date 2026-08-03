@@ -156,7 +156,9 @@ class LayeredPumpStrategy(StrategyInterface):
         if getattr(enriched, "empty", True) or not set(required).issubset(set(getattr(enriched, "columns", []))):
             return enriched
         try:
-            snapshot = compute_mtf_feature_snapshot(enriched[list(required)])
+            mtf_input = enriched[list(required)].copy()
+            mtf_input.attrs.update(getattr(enriched, "attrs", {}) or {})
+            snapshot = compute_mtf_feature_snapshot(mtf_input)
             latest_idx = enriched.index[-1]
             for key, value in snapshot.items():
                 numeric_value = float(value)
@@ -600,6 +602,12 @@ class LayeredPumpStrategy(StrategyInterface):
             best_low = max(best_wick_low, best_close_low - atr * 0.20)
         else:
             best_low = best_close_low
+        tracked_best_price = self._safe_float(
+            getattr(enriched, "attrs", {}).get("tracked_best_price"),
+            0.0,
+        )
+        if tracked_best_price > 0.0:
+            best_low = min(best_low, tracked_best_price)
 
         vp_poc = self._safe_float(getattr(volume_profile, "poc", 0.0), 0.0) if volume_profile is not None else 0.0
         vp_val = self._safe_float(getattr(volume_profile, "val", 0.0), 0.0) if volume_profile is not None else 0.0
@@ -991,16 +999,16 @@ class LayeredPumpStrategy(StrategyInterface):
                     "confidence_raw": float(ultra_decision.score),
                 }
                 if not ultra_gate_decision.approved:
-                    return StrategyIntent(
-                        symbol=context.symbol,
-                        action=IntentAction.HOLD,
-                        reason=f"entry_gate_{ultra_gate_decision.reason}",
-                        confidence=float(ultra_gate_decision.score),
-                        metadata=ultra_meta,
-                    )
-                ultra_intent.metadata = ultra_meta
-                ultra_intent.confidence = min(float(ultra_decision.score), float(ultra_gate_decision.score))
-                return ultra_intent
+                    # Ultra is only a fast path. A rejected Ultra candidate must
+                    # not hide a valid, more conservative layered setup.
+                    trace_meta = {
+                        **trace_meta,
+                        "ultra_admission": ultra_meta,
+                    }
+                else:
+                    ultra_intent.metadata = ultra_meta
+                    ultra_intent.confidence = min(float(ultra_decision.score), float(ultra_gate_decision.score))
+                    return ultra_intent
 
         if signal is None:
             if managed_short_exit is not None:

@@ -38,7 +38,10 @@ def _env_int(name: str, default: int) -> int:
 class EntryGateConfig:
     enabled: bool = True
     min_score: float = 0.76
-    min_score_degraded: float = 0.86
+    # Generator confidence is capped at 0.70 for degraded inputs and this gate
+    # also applies a 0.10 degraded penalty. At 0.86 the weighted score was
+    # mathematically unreachable even with perfect structural evidence.
+    min_score_degraded: float = 0.78
     min_rr: float = 1.35
     min_context_quality: float = 0.55
     min_stop_atr: float = 0.35
@@ -94,7 +97,9 @@ class EntryGateConfig:
             ),
             reentry_cooldown_bars=_env_int("ENTRY_GATE_REENTRY_COOLDOWN_BARS", cls.reentry_cooldown_bars),
             mtf_guard_enabled=_env_bool("ENTRY_GATE_MTF_GUARD_ENABLED", cls.mtf_guard_enabled),
-            require_mtf_context=_env_bool("ENTRY_GATE_REQUIRE_MTF_CONTEXT", cls.require_mtf_context),
+            # Production defaults to a complete MTF context. The dataclass keeps
+            # False for explicit replay/test configurations created in code.
+            require_mtf_context=_env_bool("ENTRY_GATE_REQUIRE_MTF_CONTEXT", True),
             mtf_trend_1h_max_short=_env_float("ENTRY_GATE_MTF_TREND_1H_MAX_SHORT", cls.mtf_trend_1h_max_short),
             mtf_trend_15m_max_short=_env_float("ENTRY_GATE_MTF_TREND_15M_MAX_SHORT", cls.mtf_trend_15m_max_short),
             mtf_trend_5m_max_short=_env_float("ENTRY_GATE_MTF_TREND_5M_MAX_SHORT", cls.mtf_trend_5m_max_short),
@@ -497,7 +502,16 @@ class EntryGate:
         source_flags = mapping_get(layer4, "source_flags")
         if not isinstance(source_flags, Mapping) or not source_flags:
             return 0.62
-        values = [str(value).lower() for value in source_flags.values()]
+        quality_values = [
+            str(value).lower()
+            for key, value in source_flags.items()
+            if str(key).lower().endswith("_quality")
+        ]
+        values = quality_values or [
+            str(value).lower()
+            for value in source_flags.values()
+            if str(value).lower() in {"live", "fallback", "unavailable"}
+        ]
         live = values.count("live")
         fallback = values.count("fallback")
         unavailable = values.count("unavailable")
@@ -892,7 +906,14 @@ class EntryGate:
             "mtf_rsi_15m",
             "mtf_rsi_5m",
         }
-        missing = not any(key in extras for key in observed_keys)
+        ready_keys = ("mtf_ready_5m", "mtf_ready_15m", "mtf_ready_1h")
+        if any(key in extras for key in ready_keys):
+            ready = {key: boolish(extras.get(key)) for key in ready_keys}
+            missing = not all(ready.values())
+        else:
+            # Compatibility for replay fixtures recorded before readiness flags existed.
+            ready = {key: key.replace("ready_", "rsi_") in extras for key in ready_keys}
+            missing = not any(key in extras for key in observed_keys)
         hard_1h = trend_1h >= self.config.mtf_trend_1h_max_short and rsi_1h >= self.config.mtf_rsi_1h_max_short
         hard_15m = trend_15m >= self.config.mtf_trend_15m_max_short and rsi_15m >= self.config.mtf_rsi_15m_max_short
         hard_5m = trend_5m >= self.config.mtf_trend_5m_max_short and rsi_5m >= self.config.mtf_rsi_5m_max_short
@@ -912,6 +933,9 @@ class EntryGate:
             "mtf_rsi_1h": float(rsi_1h),
             "mtf_rsi_15m": float(rsi_15m),
             "mtf_rsi_5m": float(rsi_5m),
+            "ready_5m": bool(ready["mtf_ready_5m"]),
+            "ready_15m": bool(ready["mtf_ready_15m"]),
+            "ready_1h": bool(ready["mtf_ready_1h"]),
             "mtf_guard_enabled": bool(self.config.mtf_guard_enabled),
             "require_mtf_context": bool(self.config.require_mtf_context),
         }

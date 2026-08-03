@@ -26,6 +26,12 @@ strategy:
   vwap_tolerance_pct: 0.0025
   funding_tolerance: 0.0003
   long_short_ratio_tolerance: 0.1
+  fake_filter_structural_override_enabled: true
+  fake_filter_structural_override_lsr_min: 1.35
+  fake_filter_structural_override_min_funding_rate: -0.003
+  fake_filter_structural_override_min_layer2_strength: 0.60
+  fake_filter_structural_override_min_layer3_strength: 0.95
+  fake_filter_structural_override_max_peak_distance_pct: 0.045
   msb_lookback: 14
   msb_recent_bars: 10
   msb_break_buffer_pct: 0.0002
