@@ -71,6 +71,28 @@ def closed_boundary_ts(as_of, interval: str) -> float:
     return float(pd.Timestamp(boundary_ns, tz="UTC").timestamp())
 
 
+def next_bar_open_ts(as_of, interval: str) -> float:
+    """Return the first bar open strictly after the explicit decision time.
+
+    A decision known at a bar's open cannot be filled at that open: the price was
+    already printing while the decision was still being computed. Flooring to the
+    boundary and adding one interval keeps the result strictly greater even when
+    ``as_of`` lands exactly on a boundary, which is the case that would otherwise
+    buy a bar the decision did not precede.
+    """
+
+    seconds = interval_seconds(interval)
+    return closed_boundary_ts(as_of, interval) + float(seconds)
+
+
+def is_bar_aligned(timestamp, interval: str) -> bool:
+    """Whether a timestamp sits exactly on a bar boundary for this interval."""
+
+    seconds = interval_seconds(interval)
+    value = _as_utc_timestamp(timestamp).value
+    return value % (seconds * 1_000_000_000) == 0
+
+
 def last_bar_times(frame: pd.DataFrame, *, interval: str) -> tuple[float, float]:
     """Return UTC epoch seconds for the final bar's open and contractual close."""
 

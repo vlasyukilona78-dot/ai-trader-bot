@@ -63,7 +63,12 @@ class UniverseEntry:
 class UniverseSnapshot:
     entries: list[UniverseEntry] = field(default_factory=list)
     total_contracts: int = 0
+    # When this snapshot became the current one. It anchors the refresh TTL and
+    # is taken before the request, so it must never be used as the instant the
+    # data was known - see request_started_at/received_at for that.
     refreshed_at: float = 0.0
+    request_started_at: float = 0.0
+    received_at: float = 0.0
 
     @property
     def symbols(self) -> list[str]:
@@ -102,7 +107,11 @@ class SymbolUniverse:
         if self._snapshot.entries and age < self.config.refresh_sec and not force:
             return self._snapshot
 
+        request_started_at = time.time()
         tickers = self.client.fetch_all_tickers(force=force)
+        # The response instant, not `now`. `now` was read before the request and
+        # would date this data earlier than the process could possibly have held it.
+        received_at = time.time()
         if not tickers:
             # Keep serving the previous snapshot rather than emptying the scan list.
             return self._snapshot
@@ -171,6 +180,8 @@ class SymbolUniverse:
             entries=entries,
             total_contracts=len(tickers),
             refreshed_at=now,
+            request_started_at=request_started_at,
+            received_at=received_at,
         )
         return self._snapshot
 
