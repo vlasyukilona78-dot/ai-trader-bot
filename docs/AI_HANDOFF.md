@@ -1263,3 +1263,100 @@ cross-thread trace isolation, multi-bar confirmation gaps, actual Telegram
 success, single-instance dedup, or reproduction of the published statistics.
 Keep the scanner and trading bot stopped until those blockers are resolved and
 fresh closed-data observation is repeated.
+
+## Phase 1 slice 1 — causal time and cycle/cohort identity — 2026-08-03
+
+Branch `claude/codex-project-review-04581e`, descending from the AI foundation
+anchor `f0b43d6`. Scanner, external APIs and Telegram were not started; `.env`
+was not read; no private, testnet or live path was touched.
+
+### What was wrong
+
+The independent re-entry audit confirmed two defects that block executable
+labels regardless of any strategy question:
+
+- `backtesting/single_position.py` grouped candidates by equality of a float
+  `decision_ts`, so worker latency decided which candidates competed. The replay
+  additionally required the first bar to open exactly at that per-symbol wall
+  clock, which is unreachable in practice.
+- `trading/market_data/universe.py` set `refreshed_at` before its own request and
+  that value fed `cycle_id`, dating every ticker value earlier than the process
+  could have held it.
+
+### New temporal schema
+
+```text
+cycle_started_at            start of the scan pass
+candle_cutoff_ts            last closed bar boundary at or before it
+<source>.request_started_at when the request went out
+<source>.received_at        when the response arrived   (never refreshed_at)
+<source>.source_as_of       the causal cutoff of the data itself
+ranking_ready_ts   = max(last per-symbol decision, last market response)
+cycle_completed_ts = max(now, ranking_ready_ts)
+actionable_ts      = max(all source received_at, ranking_ready_ts)
+entry_eligible_ts  = max(actionable_ts, cycle_completed_ts)
+entry_bar_open_ts  = first aligned bar strictly after entry_eligible_ts
+```
+
+All fail closed: a response before its own request, closed market data claiming a
+moment after the answer, a cycle sealed before it was ranked, an unaligned entry
+bar, an entry bar that does not follow the decision, or one that skips a bar the
+decision could have reached.
+
+### Changed identities
+
+| Identity | Before | Now |
+|---|---|---|
+| `cycle_id` | bound `universe_refreshed_at` (pre-request) | binds `universe_received_at` |
+| cohort | float `decision_ts` equality | explicit `cohort_id` on `EntryPlan` |
+| entry reference | `plan.decision_ts` | `plan.entry_bar_open_ts` |
+| `entry_ts` | decision instant | fill instant (the entry bar's open) |
+| population journal | schema 1 | schema 2, reader fail-closed on 1 |
+| single-position contract | schema 1 | schema 2 |
+
+Wall-clock instants remain outside `input_hash`, so identical market inputs still
+hash identically however slowly the scan ran.
+
+### Commits
+
+```text
+a21a729 feat(time): measure when each market-data source actually answered
+ce01c06 feat(journal): add the cycle envelope and causal timing schema v2
+20d4b73 fix(backtest): group cohorts by explicit identity, not float decision_ts
+bab837b test: prove cycle identity, entry timing and schema fail-closed
+```
+
+### Tests
+
+```text
+388 passed, 4 skipped, 2 known collection warnings
+```
+
+Baseline before the slice was `352 passed, 4 skipped`; the 36 new tests are the
+nine required guarantees. Three consecutive full runs were identical, so the
+parallel cases are not scheduling-flaky.
+
+Two real defects were found by the new tests rather than by reading:
+`ranking_ready_ts` could precede the last market response depending on thread
+scheduling, and `entry_ts` was dated at the decision, which credited funding to a
+position that was not yet open. Both are fixed.
+
+### Not changed in this slice
+
+Benchmark fail-open semantics, thresholds, strategy defaults, feature parity,
+model training, the label builder and external dependencies are untouched.
+
+### Still open
+
+- P0 benchmark gate fails open at `core/signal_generator.py:358-362` while the
+  higher-timeframe gate beside it fails closed. Fixing it changes signal counts,
+  so it needs an explicit user decision and its own slice.
+- P0 layer trace still stops at the first failed gate, so late features are
+  structurally missing and the missingness mask correlates with the rule outcome.
+- P1 base OHLCV and HTF share one `market_data` timing spanning the parallel
+  pass; per-symbol and per-timeframe split is the next timing refinement.
+- P1 raw contract ledger, instrument specs, cross-process journal lock, and the
+  journal's refusal to reopen after a crashed tail all remain as recorded.
+
+No edge is claimed or implied by this slice. It makes selection reproducible and
+the entry reachable; it does not make the strategy profitable.

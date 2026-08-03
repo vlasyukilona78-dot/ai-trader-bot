@@ -342,22 +342,47 @@ Acceptance: schema стабильна, HOLD не теряются, старый 
 
 ### Phase 1 — P0 time/spec contract
 
+Slice 1 (выполнено, `a21a729`, `ce01c06`, `20d4b73`, `bab837b`) закрыл пункты
+4 (частично), 5 и 8:
+
+- [x] `SourceTiming` фиксирует `request_started_at` / `received_at` /
+  `source_as_of` / status для universe, benchmark и рыночных данных; отказавший
+  источник тоже записывает время ожидания.
+- [x] `universe.refreshed_at` больше не выдаётся за момент получения данных: он
+  остаётся якорем TTL, а `received_at` замеряется после ответа API.
+- [x] `CycleEnvelope` вводит `ranking_ready_ts`, `cycle_completed_ts`,
+  `actionable_ts`, `entry_eligible_ts`, `entry_bar_open_ts` и выводит их сам.
+- [x] `entry_bar_open_ts` — первая выровненная свеча строго после
+  `entry_eligible_ts`; вход на открытии свечи, известной в момент её открытия,
+  запрещён.
+- [x] Selection группируется по `cohort_id`, а не по равенству float
+  `decision_ts`. `EntryPlan` несёт когорту, то есть она известна до replay.
+- [x] `replay_single_short` требует первую свечу на `entry_bar_open_ts`;
+  `entry_ts` следует за исполнением, а не за решением.
+- [x] Schema bump: population journal v2, single-position contract v2; reader
+  fail-closed на прежней версии.
+- [x] Пустая вселенная оставляет envelope вместо молчаливого возврата.
+- [x] Регрессия: `388 passed, 4 skipped, 2 known collection warnings`.
+
+Осталось в Phase 1:
+
 1. Ввести `StrategySpecV2` и один canonical config hash; YAML и scanner должны
    использовать один объект.
 2. Закрепить feature/base/execution/15m/1h/4h intervals отдельно.
 3. Выразить окна в секундах либо именованных timeframe bars.
-4. Разделить armed, confirmed, cycle-complete, actionable и executable entry.
-5. Группировать selection по cycle/cohort, а не float compute timestamp.
+4. Разделить armed и confirmed как отдельные typed состояния (cycle-complete,
+   actionable и executable entry уже разделены).
 6. Добавить canonical serialization/hash single-position contract.
 7. Разделить identity `MarketFeatureSnapshot`, `RuleEvaluation`, proposal и
    prediction.
-8. Фиксировать source request/received/exchange time; `universe.refreshed_at`
-   сейчас ставится до завершения fetch и недостаточен.
+8a. Разделить per-symbol base OHLCV и HTF timing: сейчас они покрыты одним
+   `market_data` интервалом, ограничивающим весь параллельный проход.
 9. Получать point-in-time instrument specs: contract size, quantity step,
    minimum quantity/notional, leverage, timestamp и hash.
 
-Acceptance: worker count/order не меняет snapshot, ranking, entry или outcome;
-первый execution bar действительно доступен после `actionable_ts`.
+Acceptance: worker count/order не меняет snapshot, ranking, entry или outcome
+(**выполнено и покрыто тестом**); первый execution bar действительно доступен
+после `actionable_ts` (**выполнено**).
 
 ### Phase 2 — unconditional causal feature parity
 
@@ -479,7 +504,10 @@ capital caps и emergency stop. Текущее разрешение менять
 - Старые CSV и tracked ML artifacts — legacy/discovery-only.
 - Реализованный feature contract улучшает воспроизводимость, но **не доказывает
   edge** и пока не разрешает model fit.
-- Следующая задача: **Phase 1 time/spec contract**, затем unconditional parity.
+- Phase 1 slice 1 (causal time + cycle/cohort identity) выполнен. Он делает отбор
+  воспроизводимым и вход достижимым, но **edge по-прежнему не установлен**.
+- Следующая задача: остаток Phase 1 (`StrategySpecV2`, интервалы, arm/confirm
+  lifecycle, instrument specs), затем unconditional parity.
 
 ## 12. Первичные источники для выбора технологий
 
