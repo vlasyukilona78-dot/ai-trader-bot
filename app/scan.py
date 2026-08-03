@@ -33,8 +33,10 @@ from trading.market_data.bar_contract import (
 )
 from trading.market_data.feed import MarketDataFeed
 from trading.market_data.mexc_client import MexcContractClient
+from trading.market_data.source_timing import SourceTiming
 from trading.market_data.timeframe_cache import HigherTimeframeCache
 from trading.market_data.universe import SymbolUniverse, UniverseConfig
+from trading.metrics.cycle_envelope import CycleEnvelope
 from trading.metrics.logging import setup_logging
 from trading.metrics.population_journal import (
     PopulationDecision,
@@ -269,6 +271,53 @@ def _safe_journal_value(value, *, depth: int = 0):
     return _UNSAFE_JOURNAL_VALUE
 
 
+def _universe_timing(snapshot, *, fallback: float) -> SourceTiming:
+    """Timing of the universe response, never its pre-request TTL anchor.
+
+    ``refreshed_at`` is read before the request is sent, so treating it as the
+    moment the data was known would date every ticker value earlier than the
+    process could possibly have held it. A snapshot without real response timing
+    (an injected stub, or one predating this contract) is dated at the scan
+    itself: when the true instant is unknown the safe assumption is later, not
+    earlier.
+    """
+
+    started = _optional_finite(getattr(snapshot, "request_started_at", None))
+    received = _optional_finite(getattr(snapshot, "received_at", None))
+    if started is None or received is None or received <= 0.0 or started <= 0.0:
+        started = received = fallback
+    return SourceTiming(
+        source="universe",
+        request_started_at=min(started, received),
+        received_at=received,
+    )
+
+
+def _timed_source(
+    source: str,
+    *,
+    request_started_at: float,
+    received_at: float,
+    source_as_of: float | None,
+    error: BaseException | None = None,
+) -> SourceTiming:
+    if error is None:
+        return SourceTiming(
+            source=source,
+            request_started_at=request_started_at,
+            received_at=received_at,
+            source_as_of=source_as_of,
+        )
+    return SourceTiming(
+        source=source,
+        request_started_at=request_started_at,
+        received_at=received_at,
+        status="error",
+        source_as_of=source_as_of,
+        error_code=safe_error_code(error),
+    )
+
+
 def _universe_metadata(snapshot) -> dict[str, dict[str, object]]:
     metadata: dict[str, dict[str, object]] = {}
     for entry in getattr(snapshot, "entries", ()):
@@ -291,15 +340,11 @@ def _universe_metadata(snapshot) -> dict[str, dict[str, object]]:
 def _population_record(
     *,
     result: _ScanEvaluation,
-    cycle_id: str,
+    envelope: CycleEnvelope,
     universe_refreshed_at: float,
     scan_observed_at: float,
-    candle_cutoff_ts: float,
-    timeframe: str,
     universe_meta: Mapping[str, object],
     benchmark_status: str,
-    strategy_config_hash: str,
-    universe_policy_hash: str,
     cycle_ordinal: int,
     cycle_size: int,
 ) -> PopulationDecision:
@@ -311,8 +356,8 @@ def _population_record(
         },
         "benchmark_status": benchmark_status,
         "provenance": {
-            "strategy_config_hash": strategy_config_hash,
-            "universe_policy_hash": universe_policy_hash,
+            "strategy_config_hash": envelope.strategy_config_hash,
+            "universe_policy_hash": envelope.universe_policy_hash,
         },
     }
     if result.stage:
@@ -337,20 +382,28 @@ def _population_record(
     # One versioned extractor is shared by runtime capture and future dataset /
     # inference code.  Missing observations remain explicit nulls plus masks;
     # zero is never used as a silent substitute for an unavailable source.
+    metadata["cycle"] = envelope.as_dict()
     metadata["feature_snapshot"] = build_runtime_feature_snapshot(
         metadata,
-        bar_cutoff_ts=candle_cutoff_ts,
+        bar_cutoff_ts=envelope.candle_cutoff_ts,
         universe_refreshed_at=universe_refreshed_at,
     )
 
     return PopulationDecision.create(
-        cycle_id=cycle_id,
+        cycle_id=envelope.cycle_id,
         universe_refreshed_at=universe_refreshed_at,
+        universe_request_started_at=envelope.universe_timing.request_started_at,
+        universe_received_at=envelope.universe_timing.received_at,
         scan_observed_at=scan_observed_at,
-        candle_cutoff_ts=candle_cutoff_ts,
+        candle_cutoff_ts=envelope.candle_cutoff_ts,
         decision_ts=result.decision_ts,
+        ranking_ready_ts=envelope.ranking_ready_ts,
+        cycle_completed_ts=envelope.cycle_completed_ts,
+        actionable_ts=envelope.actionable_ts,
+        entry_eligible_ts=envelope.entry_eligible_ts,
+        entry_bar_open_ts=envelope.entry_bar_open_ts,
         symbol=result.symbol,
-        timeframe=timeframe,
+        timeframe=envelope.timeframe,
         status=result.status,
         base_bar_open_ts=result.base_bar_open_ts,
         base_bar_close_ts=result.base_bar_close_ts,
@@ -366,21 +419,59 @@ def _population_record(
 
 def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
               tracker=None, alerters=(), population_journal=None) -> list:
+    cycle_started_at = time.time()
     snapshot = universe.refresh()
+    scan_observed_at = time.time()
     symbols = list(snapshot.symbols)
+    universe_timing = _universe_timing(snapshot, fallback=scan_observed_at)
+    candle_cutoff_ts = closed_boundary_ts(scan_observed_at, timeframe)
+
     if not symbols:
-        logger.warning("empty_universe", extra={"event": "scan"})
+        # An empty cycle is still a cycle. Returning silently would leave a hole
+        # that no later completeness check could distinguish from a scan that
+        # never ran.
+        empty_completed_at = time.time()
+        empty_envelope = CycleEnvelope.build(
+            cycle_id=make_cycle_id(
+                timeframe=timeframe,
+                candle_cutoff_ts=candle_cutoff_ts,
+                universe_received_at=universe_timing.received_at,
+                universe_symbols=(),
+            ),
+            timeframe=timeframe,
+            cycle_started_at=cycle_started_at,
+            candle_cutoff_ts=candle_cutoff_ts,
+            universe_symbols=(),
+            universe_timing=universe_timing,
+            source_timings=(universe_timing,),
+            strategy_config_hash=configuration_hash(
+                strategy.configuration_snapshot()
+                if hasattr(strategy, "configuration_snapshot")
+                else getattr(strategy, "config", None),
+                component="mexc_signal_strategy",
+            ),
+            universe_policy_hash=configuration_hash(
+                getattr(universe, "config", None), component="mexc_universe_policy"
+            ),
+            ranking_ready_ts=scan_observed_at,
+            cycle_completed_ts=empty_completed_at,
+            status="empty_universe",
+        )
+        logger.warning(
+            "empty_universe cycle=%s entry_bar_open_ts=%.0f",
+            empty_envelope.cycle_id,
+            empty_envelope.entry_bar_open_ts,
+            extra={"event": "scan"},
+        )
         return []
 
-    scan_observed_at = time.time()
-    candle_cutoff_ts = closed_boundary_ts(scan_observed_at, timeframe)
     universe_refreshed_at = _finite_number(
         getattr(snapshot, "refreshed_at", None), field="universe_refreshed_at"
     )
     cycle_id = make_cycle_id(
         timeframe=timeframe,
         candle_cutoff_ts=candle_cutoff_ts,
-        universe_refreshed_at=universe_refreshed_at,
+        universe_received_at=universe_timing.received_at,
         universe_symbols=symbols,
     )
     universe_metadata = _universe_metadata(snapshot)
@@ -403,6 +494,7 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
     if hasattr(strategy, "begin_sweep"):
         strategy.begin_sweep()
 
+    benchmark_started_at = time.time()
     try:
         btc, _, _, _ = _fetch_closed_frame(
             feed=feed,
@@ -413,9 +505,23 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
         )
         strategy.set_benchmark(btc if not btc.empty else None)
         benchmark_status = "available" if not btc.empty else "no_data"
+        benchmark_timing = _timed_source(
+            "benchmark",
+            request_started_at=benchmark_started_at,
+            received_at=time.time(),
+            source_as_of=candle_cutoff_ts,
+        )
     except Exception as exc:
         strategy.set_benchmark(None)
         benchmark_status = f"error:{safe_error_code(exc)}"
+        # A source that failed still consumed time the cycle waited for.
+        benchmark_timing = _timed_source(
+            "benchmark",
+            request_started_at=benchmark_started_at,
+            received_at=time.time(),
+            source_as_of=candle_cutoff_ts,
+            error=exc,
+        )
         logger.warning(
             "benchmark_unavailable=%s",
             safe_error_code(exc),
@@ -544,20 +650,49 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
     started = time.time()
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         results = list(pool.map(evaluate, symbols))
+    # Base OHLCV and the higher-timeframe cache are both read inside `evaluate`,
+    # so this span bounds every per-symbol market request in the cycle.
+    market_data_timing = _timed_source(
+        "market_data",
+        request_started_at=started,
+        received_at=time.time(),
+        source_as_of=candle_cutoff_ts,
+    )
+
+    # The cycle becomes comparable only once its last symbol has been decided,
+    # and reachable only once that decision set is sealed. Neither depends on
+    # which worker finished first.
+    # Bounded below by the last per-symbol decision and by the moment the last
+    # market request answered: a cohort is not comparable while either is still
+    # outstanding, and which of the two lands later depends on scheduling.
+    ranking_ready_ts = max(
+        max(result.decision_ts for result in results),
+        market_data_timing.received_at,
+    )
+    cycle_completed_ts = max(time.time(), ranking_ready_ts)
+    envelope = CycleEnvelope.build(
+        cycle_id=cycle_id,
+        timeframe=timeframe,
+        cycle_started_at=cycle_started_at,
+        candle_cutoff_ts=candle_cutoff_ts,
+        universe_symbols=symbols,
+        universe_timing=universe_timing,
+        source_timings=(universe_timing, benchmark_timing, market_data_timing),
+        strategy_config_hash=strategy_config_hash,
+        universe_policy_hash=universe_policy_hash,
+        ranking_ready_ts=ranking_ready_ts,
+        cycle_completed_ts=cycle_completed_ts,
+    )
 
     cycle_size = len(results)
     records = [
         _population_record(
             result=result,
-            cycle_id=cycle_id,
+            envelope=envelope,
             universe_refreshed_at=universe_refreshed_at,
             scan_observed_at=scan_observed_at,
-            candle_cutoff_ts=candle_cutoff_ts,
-            timeframe=timeframe,
             universe_meta=universe_metadata.get(result.symbol, {}),
             benchmark_status=benchmark_status,
-            strategy_config_hash=strategy_config_hash,
-            universe_policy_hash=universe_policy_hash,
             cycle_ordinal=ordinal,
             cycle_size=cycle_size,
         )
@@ -581,8 +716,11 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
         record = records_by_symbol[result.symbol]
         result.intent.metadata["population_tracking"] = {
             "snapshot_id": record.snapshot_id,
+            "cohort_id": record.cycle_id,
             "decision_ts": record.decision_ts,
             "base_bar_open_ts": record.base_bar_open_ts,
+            "actionable_ts": record.actionable_ts,
+            "entry_bar_open_ts": record.entry_bar_open_ts,
         }
 
     signals = [

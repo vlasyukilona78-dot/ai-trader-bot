@@ -43,18 +43,27 @@ def _records() -> list[PopulationDecision]:
     cycle_id = make_cycle_id(
         timeframe="60",
         candle_cutoff_ts=1_700_002_800.0,
-        universe_refreshed_at=1_700_000_000.0,
+        universe_received_at=1_700_000_001.0,
         universe_symbols=["AAAUSDT", "BBBUSDT"],
     )
     out = []
+    # Per-symbol decision clocks differ inside one cycle; the cycle-level timing
+    # below is identical on every row, which is what makes them one cohort.
     for ordinal, (symbol, funding) in enumerate((("AAAUSDT", 0.0), ("BBBUSDT", None))):
         out.append(
             PopulationDecision.create(
                 cycle_id=cycle_id,
                 universe_refreshed_at=1_700_000_000.0,
+                universe_request_started_at=1_700_000_000.0,
+                universe_received_at=1_700_000_001.0,
                 scan_observed_at=1_700_002_801.0,
                 candle_cutoff_ts=1_700_002_800.0,
                 decision_ts=1_700_002_802.0 + ordinal,
+                ranking_ready_ts=1_700_002_804.0,
+                cycle_completed_ts=1_700_002_805.0,
+                actionable_ts=1_700_002_804.0,
+                entry_eligible_ts=1_700_002_805.0,
+                entry_bar_open_ts=1_700_006_400.0,
                 symbol=symbol,
                 timeframe="60",
                 status="evaluated",

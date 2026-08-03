@@ -17,7 +17,7 @@ def _cycle_id() -> str:
     return make_cycle_id(
         timeframe="Min5",
         candle_cutoff_ts=1_700_000_100.0,
-        universe_refreshed_at=1_700_000_000.0,
+        universe_received_at=1_700_000_000.0,
         universe_symbols=["AAA_USDT", "BBB_USDT"],
     )
 
@@ -25,10 +25,18 @@ def _cycle_id() -> str:
 def _record(**overrides: object) -> PopulationDecision:
     values: dict[str, object] = {
         "cycle_id": _cycle_id(),
-        "universe_refreshed_at": 1_700_000_000.0,
+        "universe_refreshed_at": 1_699_999_999.0,
+        "universe_request_started_at": 1_699_999_999.5,
+        "universe_received_at": 1_700_000_000.0,
         "scan_observed_at": 1_700_000_101.0,
         "candle_cutoff_ts": 1_700_000_100.0,
         "decision_ts": 1_700_000_102.0,
+        "ranking_ready_ts": 1_700_000_103.0,
+        "cycle_completed_ts": 1_700_000_104.0,
+        "actionable_ts": 1_700_000_103.0,
+        "entry_eligible_ts": 1_700_000_104.0,
+        # first Min5 boundary strictly after entry_eligible_ts
+        "entry_bar_open_ts": 1_700_000_400.0,
         "symbol": "AAA_USDT",
         "timeframe": "Min5",
         "status": "evaluated",
@@ -60,8 +68,19 @@ def test_causal_change_changes_input_and_snapshot_ids() -> None:
 
 
 def test_wall_clock_decision_time_does_not_change_causal_ids() -> None:
+    """Neither the per-symbol decision clock nor the cycle's own timing may enter
+    causal identity: the same market inputs must hash the same however slowly the
+    scan happened to run."""
     first = _record(decision_ts=1_700_000_102.0)
-    later = _record(decision_ts=1_700_000_999.0, scan_observed_at=1_700_000_998.0)
+    later = _record(
+        decision_ts=1_700_000_999.0,
+        scan_observed_at=1_700_000_998.0,
+        ranking_ready_ts=1_700_001_000.0,
+        cycle_completed_ts=1_700_001_001.0,
+        actionable_ts=1_700_001_000.0,
+        entry_eligible_ts=1_700_001_001.0,
+        entry_bar_open_ts=1_700_001_300.0,
+    )
 
     assert first.input_hash == later.input_hash
     assert first.snapshot_id == later.snapshot_id
@@ -132,13 +151,13 @@ def test_cycle_id_depends_on_ordered_point_in_time_universe() -> None:
     first = make_cycle_id(
         timeframe="Min5",
         candle_cutoff_ts=1_700_000_100.0,
-        universe_refreshed_at=1_700_000_000.0,
+        universe_received_at=1_700_000_000.0,
         universe_symbols=["AAA_USDT", "BBB_USDT"],
     )
     second = make_cycle_id(
         timeframe="Min5",
         candle_cutoff_ts=1_700_000_100.0,
-        universe_refreshed_at=1_700_000_000.0,
+        universe_received_at=1_700_000_000.0,
         universe_symbols=["BBB_USDT", "AAA_USDT"],
     )
 
@@ -149,13 +168,13 @@ def test_equivalent_timeframe_names_have_the_same_causal_ids() -> None:
     generic_cycle = make_cycle_id(
         timeframe="60",
         candle_cutoff_ts=1_700_002_800.0,
-        universe_refreshed_at=1_700_000_000.0,
+        universe_received_at=1_700_000_000.0,
         universe_symbols=["AAA_USDT"],
     )
     mexc_cycle = make_cycle_id(
         timeframe="Min60",
         candle_cutoff_ts=1_700_002_800.0,
-        universe_refreshed_at=1_700_000_000.0,
+        universe_received_at=1_700_000_000.0,
         universe_symbols=["AAA_USDT"],
     )
     generic = _record(
@@ -164,6 +183,11 @@ def test_equivalent_timeframe_names_have_the_same_causal_ids() -> None:
         candle_cutoff_ts=1_700_002_800.0,
         scan_observed_at=1_700_002_801.0,
         decision_ts=1_700_002_802.0,
+        ranking_ready_ts=1_700_002_803.0,
+        cycle_completed_ts=1_700_002_804.0,
+        actionable_ts=1_700_002_803.0,
+        entry_eligible_ts=1_700_002_804.0,
+        entry_bar_open_ts=1_700_006_400.0,
         base_bar_open_ts=1_699_999_200.0,
         base_bar_close_ts=1_700_002_800.0,
     )
@@ -173,6 +197,11 @@ def test_equivalent_timeframe_names_have_the_same_causal_ids() -> None:
         candle_cutoff_ts=1_700_002_800.0,
         scan_observed_at=1_700_002_801.0,
         decision_ts=1_700_002_802.0,
+        ranking_ready_ts=1_700_002_803.0,
+        cycle_completed_ts=1_700_002_804.0,
+        actionable_ts=1_700_002_803.0,
+        entry_eligible_ts=1_700_002_804.0,
+        entry_bar_open_ts=1_700_006_400.0,
         base_bar_open_ts=1_699_999_200.0,
         base_bar_close_ts=1_700_002_800.0,
     )

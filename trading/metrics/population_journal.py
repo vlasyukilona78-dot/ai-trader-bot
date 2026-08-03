@@ -12,10 +12,14 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
-from trading.market_data.bar_contract import interval_seconds
+from trading.market_data.bar_contract import interval_seconds, is_bar_aligned
 
 
-SCHEMA_VERSION = 1
+# v2 adds explicit source-response and cycle-completion timing plus the first
+# executable entry bar. v1 rows carried `universe_refreshed_at` as though it were
+# the moment the data was known; it was read before the request. The two are not
+# interchangeable, so the version is bumped rather than the meaning reused.
+SCHEMA_VERSION = 2
 POPULATION_STATUSES = frozenset(
     {
         "evaluated",
@@ -129,11 +133,17 @@ def make_cycle_id(
     *,
     timeframe: str,
     candle_cutoff_ts: float,
-    universe_refreshed_at: float,
+    universe_received_at: float,
     universe_symbols: Sequence[str],
     schema_version: int = SCHEMA_VERSION,
 ) -> str:
-    """Return a stable ID for one point-in-time universe evaluation cycle."""
+    """Return a stable ID for one point-in-time universe evaluation cycle.
+
+    Built only from the cycle's causal inputs - the bar cutoff, the instant the
+    universe response arrived, and the ordered symbol set. Nothing here depends on
+    how quickly individual workers finished, so the identity of a cycle cannot
+    change with thread scheduling.
+    """
 
     if isinstance(schema_version, bool) or not isinstance(schema_version, Integral) or schema_version < 1:
         raise PopulationJournalError("schema_version must be a positive integer")
@@ -149,7 +159,7 @@ def make_cycle_id(
                 _bounded_string(timeframe, name="timeframe", max_length=32)
             ),
             "candle_cutoff_ts": _finite_float(candle_cutoff_ts, name="candle_cutoff_ts"),
-            "universe_refreshed_at": _finite_float(universe_refreshed_at, name="universe_refreshed_at"),
+            "universe_received_at": _finite_float(universe_received_at, name="universe_received_at"),
             "universe_symbols": clean_symbols,
         }
     )
@@ -171,9 +181,16 @@ class PopulationDecision:
     snapshot_id: str
     input_hash: str
     universe_refreshed_at: float
+    universe_request_started_at: float
+    universe_received_at: float
     scan_observed_at: float
     candle_cutoff_ts: float
     decision_ts: float
+    ranking_ready_ts: float
+    cycle_completed_ts: float
+    actionable_ts: float
+    entry_eligible_ts: float
+    entry_bar_open_ts: float
     symbol: str
     timeframe: str
     status: str
@@ -196,18 +213,53 @@ class PopulationDecision:
                 raise PopulationJournalError(f"{field_name} must be a lowercase SHA-256 hex digest")
         for field_name in (
             "universe_refreshed_at",
+            "universe_request_started_at",
+            "universe_received_at",
             "scan_observed_at",
             "candle_cutoff_ts",
             "decision_ts",
+            "ranking_ready_ts",
+            "cycle_completed_ts",
+            "actionable_ts",
+            "entry_eligible_ts",
+            "entry_bar_open_ts",
             "confidence",
         ):
             object.__setattr__(self, field_name, _finite_float(getattr(self, field_name), name=field_name))
         if self.universe_refreshed_at > self.scan_observed_at:
             raise PopulationJournalError("universe refresh follows scan observation time")
+        if self.universe_received_at < self.universe_request_started_at:
+            raise PopulationJournalError("universe response precedes its own request")
+        if self.universe_received_at > self.scan_observed_at:
+            raise PopulationJournalError("universe response follows scan observation time")
         if self.scan_observed_at < self.candle_cutoff_ts:
             raise PopulationJournalError("scan observation precedes the causal cutoff")
         if self.decision_ts < self.scan_observed_at:
             raise PopulationJournalError("decision_ts precedes scan observation time")
+
+        # The cycle is comparable only once every one of its symbols has been
+        # decided, and reachable only once it is also sealed.
+        if self.ranking_ready_ts < self.decision_ts:
+            raise PopulationJournalError("ranking_ready_ts precedes this decision")
+        if self.cycle_completed_ts < self.ranking_ready_ts:
+            raise PopulationJournalError("cycle_completed_ts precedes ranking_ready_ts")
+        if self.actionable_ts < self.ranking_ready_ts:
+            raise PopulationJournalError("actionable_ts precedes ranking_ready_ts")
+        if self.actionable_ts < self.universe_received_at:
+            raise PopulationJournalError("actionable_ts precedes the universe response")
+        if self.entry_eligible_ts < self.actionable_ts:
+            raise PopulationJournalError("entry_eligible_ts precedes actionable_ts")
+        if self.entry_eligible_ts < self.cycle_completed_ts:
+            raise PopulationJournalError("entry_eligible_ts precedes cycle completion")
+        # A decision known at a bar's open cannot be filled at that open.
+        if self.entry_bar_open_ts <= self.actionable_ts:
+            raise PopulationJournalError("entry bar does not open after actionable_ts")
+        if self.entry_bar_open_ts <= self.entry_eligible_ts:
+            raise PopulationJournalError("entry bar does not open after entry_eligible_ts")
+        if not is_bar_aligned(self.entry_bar_open_ts, self.timeframe):
+            raise PopulationJournalError("entry bar open is not aligned to the timeframe")
+        if self.entry_bar_open_ts - self.entry_eligible_ts > interval_seconds(self.timeframe):
+            raise PopulationJournalError("entry bar skips a reachable bar")
         if (self.base_bar_open_ts is None) != (self.base_bar_close_ts is None):
             raise PopulationJournalError("base bar open and close must both be present or absent")
         if self.base_bar_open_ts is not None:
@@ -266,9 +318,16 @@ class PopulationDecision:
         *,
         cycle_id: str,
         universe_refreshed_at: float,
+        universe_request_started_at: float,
+        universe_received_at: float,
         scan_observed_at: float,
         candle_cutoff_ts: float,
         decision_ts: float,
+        ranking_ready_ts: float,
+        cycle_completed_ts: float,
+        actionable_ts: float,
+        entry_eligible_ts: float,
+        entry_bar_open_ts: float,
         symbol: str,
         timeframe: str,
         status: str,
@@ -324,9 +383,16 @@ class PopulationDecision:
             snapshot_id=snapshot_id,
             input_hash=input_hash,
             universe_refreshed_at=universe_refreshed_at,
+            universe_request_started_at=universe_request_started_at,
+            universe_received_at=universe_received_at,
             scan_observed_at=scan_observed_at,
             candle_cutoff_ts=candle_cutoff_ts,
             decision_ts=decision_ts,
+            ranking_ready_ts=ranking_ready_ts,
+            cycle_completed_ts=cycle_completed_ts,
+            actionable_ts=actionable_ts,
+            entry_eligible_ts=entry_eligible_ts,
+            entry_bar_open_ts=entry_bar_open_ts,
             symbol=symbol,
             timeframe=timeframe,
             status=status,
@@ -348,9 +414,16 @@ class PopulationDecision:
             "snapshot_id": self.snapshot_id,
             "input_hash": self.input_hash,
             "universe_refreshed_at": self.universe_refreshed_at,
+            "universe_request_started_at": self.universe_request_started_at,
+            "universe_received_at": self.universe_received_at,
             "scan_observed_at": self.scan_observed_at,
             "candle_cutoff_ts": self.candle_cutoff_ts,
             "decision_ts": self.decision_ts,
+            "ranking_ready_ts": self.ranking_ready_ts,
+            "cycle_completed_ts": self.cycle_completed_ts,
+            "actionable_ts": self.actionable_ts,
+            "entry_eligible_ts": self.entry_eligible_ts,
+            "entry_bar_open_ts": self.entry_bar_open_ts,
             "symbol": self.symbol,
             "timeframe": self.timeframe,
             "timeframe_seconds": interval_seconds(self.timeframe),

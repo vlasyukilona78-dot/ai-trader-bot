@@ -17,6 +17,7 @@ from typing import Any, Iterator, Mapping
 
 from trading.market_data.bar_contract import interval_seconds
 from trading.metrics.population_journal import (
+    SCHEMA_VERSION,
     PopulationDecision,
     PopulationJournalError,
     make_cycle_id,
@@ -65,6 +66,12 @@ class PopulationFeatureRow:
     bar_cutoff_ts: float
     decision_completed_ts: float
     universe_refreshed_at: float
+    universe_received_at: float
+    ranking_ready_ts: float
+    cycle_completed_ts: float
+    actionable_ts: float
+    entry_eligible_ts: float
+    entry_bar_open_ts: float
     strategy_config_hash: str
     universe_policy_hash: str
     feature_contract_version: str
@@ -100,6 +107,13 @@ def _mapping(value: Any, *, field: str) -> Mapping[str, Any]:
 
 def _parse_feature_row(payload: Mapping[str, Any]) -> PopulationFeatureRow:
     metadata = _mapping(payload.get("metadata"), field="metadata")
+    # Fail closed rather than reinterpret. A v1 row dated its universe data with a
+    # timestamp taken before the request, and it carries no entry timing at all;
+    # silently reading it as v2 would invent both.
+    if payload.get("schema_version") != SCHEMA_VERSION:
+        raise PopulationDatasetError(
+            f"unsupported_population_schema_version:expected_{SCHEMA_VERSION}"
+        )
     try:
         record = PopulationDecision(
             schema_version=payload.get("schema_version"),
@@ -107,9 +121,16 @@ def _parse_feature_row(payload: Mapping[str, Any]) -> PopulationFeatureRow:
             snapshot_id=payload.get("snapshot_id"),
             input_hash=payload.get("input_hash"),
             universe_refreshed_at=payload.get("universe_refreshed_at"),
+            universe_request_started_at=payload.get("universe_request_started_at"),
+            universe_received_at=payload.get("universe_received_at"),
             scan_observed_at=payload.get("scan_observed_at"),
             candle_cutoff_ts=payload.get("candle_cutoff_ts"),
             decision_ts=payload.get("decision_ts"),
+            ranking_ready_ts=payload.get("ranking_ready_ts"),
+            cycle_completed_ts=payload.get("cycle_completed_ts"),
+            actionable_ts=payload.get("actionable_ts"),
+            entry_eligible_ts=payload.get("entry_eligible_ts"),
+            entry_bar_open_ts=payload.get("entry_bar_open_ts"),
             symbol=payload.get("symbol"),
             timeframe=payload.get("timeframe"),
             status=payload.get("status"),
@@ -241,6 +262,12 @@ def _parse_feature_row(payload: Mapping[str, Any]) -> PopulationFeatureRow:
         bar_cutoff_ts=record.candle_cutoff_ts,
         decision_completed_ts=record.decision_ts,
         universe_refreshed_at=record.universe_refreshed_at,
+        universe_received_at=record.universe_received_at,
+        ranking_ready_ts=record.ranking_ready_ts,
+        cycle_completed_ts=record.cycle_completed_ts,
+        actionable_ts=record.actionable_ts,
+        entry_eligible_ts=record.entry_eligible_ts,
+        entry_bar_open_ts=record.entry_bar_open_ts,
         strategy_config_hash=strategy_config_hash,
         universe_policy_hash=universe_policy_hash,
         feature_contract_version=contract_version,
@@ -313,11 +340,20 @@ def iter_population_feature_rows(path: str | Path) -> Iterator[PopulationFeature
 
                 if next_ordinal == active_size:
                     first = cycle_rows[0]
+                    # Cycle-level facts must be identical on every row. The entry
+                    # timing in particular is a property of the cohort, not of
+                    # whichever worker happened to finish first.
                     if any(
                         item.schema_version != first.schema_version
                         or item.timeframe != first.timeframe
                         or item.bar_cutoff_ts != first.bar_cutoff_ts
                         or item.universe_refreshed_at != first.universe_refreshed_at
+                        or item.universe_received_at != first.universe_received_at
+                        or item.ranking_ready_ts != first.ranking_ready_ts
+                        or item.cycle_completed_ts != first.cycle_completed_ts
+                        or item.actionable_ts != first.actionable_ts
+                        or item.entry_eligible_ts != first.entry_eligible_ts
+                        or item.entry_bar_open_ts != first.entry_bar_open_ts
                         or item.strategy_config_hash != first.strategy_config_hash
                         or item.universe_policy_hash != first.universe_policy_hash
                         for item in cycle_rows
@@ -327,7 +363,7 @@ def iter_population_feature_rows(path: str | Path) -> Iterator[PopulationFeature
                         expected_cycle_id = make_cycle_id(
                             timeframe=first.timeframe,
                             candle_cutoff_ts=first.bar_cutoff_ts,
-                            universe_refreshed_at=first.universe_refreshed_at,
+                            universe_received_at=first.universe_received_at,
                             universe_symbols=[item.symbol for item in cycle_rows],
                             schema_version=first.schema_version,
                         )
@@ -367,6 +403,12 @@ def population_feature_records(path: str | Path) -> list[dict[str, Any]]:
             "bar_cutoff_ts": row.bar_cutoff_ts,
             "decision_completed_ts": row.decision_completed_ts,
             "universe_refreshed_at": row.universe_refreshed_at,
+            "universe_received_at": row.universe_received_at,
+            "ranking_ready_ts": row.ranking_ready_ts,
+            "cycle_completed_ts": row.cycle_completed_ts,
+            "actionable_ts": row.actionable_ts,
+            "entry_eligible_ts": row.entry_eligible_ts,
+            "entry_bar_open_ts": row.entry_bar_open_ts,
             "strategy_config_hash": row.strategy_config_hash,
             "universe_policy_hash": row.universe_policy_hash,
             "feature_contract_version": row.feature_contract_version,
