@@ -45,7 +45,8 @@ def _contract(*, costs: ExecutionCosts = FREE, horizon_bars: int = 2) -> SingleP
 
 _DECISION_TS = 900.0
 _ACTIONABLE_TS = 950.0
-# the first 300s boundary strictly after the decision became actionable
+_ELIGIBLE_TS = 960.0
+# the first 300s boundary strictly after the decision became eligible
 _ENTRY_BAR_OPEN_TS = 1200.0
 _COHORT = "cycle-1"
 
@@ -56,6 +57,7 @@ def _plan(
     cohort_id: str = _COHORT,
     decision_ts: float = _DECISION_TS,
     actionable_ts: float = _ACTIONABLE_TS,
+    entry_eligible_ts: float = _ELIGIBLE_TS,
     entry_bar_open_ts: float = _ENTRY_BAR_OPEN_TS,
 ) -> EntryPlan:
     return EntryPlan(
@@ -63,6 +65,7 @@ def _plan(
         cohort_id=cohort_id,
         decision_ts=decision_ts,
         actionable_ts=actionable_ts,
+        entry_eligible_ts=entry_eligible_ts,
         entry_bar_open_ts=entry_bar_open_ts,
         decision_price=100.0,
         stop_price=105.0,
@@ -213,6 +216,7 @@ class SinglePositionSelectionV2Tests(unittest.TestCase):
             cohort_id=cohort_id,
             decision_ts=decision_ts,
             actionable_ts=entry_bar_open_ts - 250.0,
+            entry_eligible_ts=entry_bar_open_ts - 240.0,
             entry_bar_open_ts=entry_bar_open_ts,
         )
         result = replay_single_short(

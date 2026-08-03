@@ -41,6 +41,12 @@ class VolatilityContext:
         # came first and admitted after a run of calm symbols had dragged the
         # percentile down.
         self._frozen: list[float] = []
+        # Whether a sweep is active, tracked separately from the frozen list. On a
+        # cold start that list is legitimately empty, and testing it for emptiness
+        # made the floor fall through to the live observations of the sweep in
+        # progress - reintroducing exactly the scan-order dependence freezing
+        # exists to remove.
+        self._sweep_active = False
 
     def observe(self, symbol: str, atr_pct: float, *, now: float | None = None):
         if atr_pct is None or atr_pct != atr_pct or atr_pct <= 0:
@@ -59,14 +65,18 @@ class VolatilityContext:
         """Freeze the distribution that this sweep will be judged against.
 
         Called once per scan, before any symbol is evaluated, so every candidate
-        in the sweep faces the same floor regardless of ordering.
+        in the sweep faces the same floor regardless of ordering. An empty freeze
+        is still a freeze: the first sweep of a fresh process holds the fallback
+        floor for all of its symbols instead of watching the distribution build up
+        underneath it.
         """
         self._frozen = self._fresh_values(now)
+        self._sweep_active = True
 
     def floor(self, *, now: float | None = None) -> float:
         """ATR cutoff for the current sweep. Falls back to the fixed floor until
         enough symbols have been seen, so a cold start cannot admit everything."""
-        values = self._frozen if self._frozen else self._fresh_values(now)
+        values = self._frozen if self._sweep_active else self._fresh_values(now)
         if len(values) < self.config.min_observations:
             return self.config.fallback_floor
 

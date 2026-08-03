@@ -26,7 +26,7 @@ from trading.metrics.cycle_envelope import CycleEnvelope, CycleEnvelopeError
 from trading.metrics.population_journal import PopulationJournalError, make_cycle_id
 
 from v2.test_scan_v2 import _CaptureJournal, _FakeFeed, _FakeStrategy, _FakeUniverse, _Logger, _ohlcv
-from v2.test_single_position_contract_v2 import _bars, _contract, _plan
+from v2.test_single_position_contract_v2 import _ENTRY_BAR_OPEN_TS, _bars, _contract, _plan
 
 from app.scan import scan_once
 
@@ -119,14 +119,16 @@ def test_cycle_id_ignores_everything_a_worker_could_influence() -> None:
 
 
 def _candidate(score: float, symbol: str, *, cohort_id: str, entry_bar_open_ts: float,
-               decision_ts: float, exit_ts: float) -> ScoredCandidate:
+               decision_ts: float, exit_ts: float,
+               actionable_ts: float | None = None) -> ScoredCandidate:
     from backtesting.single_position import replay_single_short
 
     plan = _plan(
         symbol=symbol,
         cohort_id=cohort_id,
         decision_ts=decision_ts,
-        actionable_ts=entry_bar_open_ts - 250.0,
+        actionable_ts=entry_bar_open_ts - 250.0 if actionable_ts is None else actionable_ts,
+        entry_eligible_ts=entry_bar_open_ts - 240.0,
         entry_bar_open_ts=entry_bar_open_ts,
     )
     result = replay_single_short(
@@ -351,3 +353,178 @@ def test_journal_rejects_a_universe_response_before_its_own_request() -> None:
 
     with pytest.raises(PopulationJournalError, match="precedes its own request"):
         _record(universe_request_started_at=1_700_000_050.0)
+
+
+# --------------------------------------------------------------------------
+# Slice A: defects an adversarial review found in the first Phase 1 attempt.
+# --------------------------------------------------------------------------
+
+
+def test_a_refresh_that_crosses_a_bar_boundary_does_not_move_the_cutoff() -> None:
+    """The cutoff is frozen before the universe request.
+
+    Deriving it afterwards let a slow refresh produce a cutoff later than the
+    cycle's own start, which both claims data the cycle could not have had and
+    trips the envelope invariant.
+    """
+    symbols = ["AAAUSDT"]
+    feed = _FakeFeed({symbol: _ohlcv() for symbol in symbols + ["BTCUSDT"]})
+    journal = _CaptureJournal()
+    journal.enabled = True
+
+    boundary = 1_700_006_400.0
+    clock = iter([boundary - 0.1, boundary + 0.1, boundary + 0.2, boundary + 0.3])
+    real_time = time.time
+
+    def fake_time():
+        try:
+            return next(clock)
+        except StopIteration:
+            return boundary + 0.4
+
+    import app.scan as scan_module
+
+    original = scan_module.time.time
+    scan_module.time.time = fake_time
+    try:
+        scan_once(
+            universe=_FakeUniverse(symbols),
+            feed=feed,
+            strategy=_FakeStrategy(),
+            logger=_Logger(),
+            timeframe="60",
+            candles=120,
+            workers=1,
+            population_journal=journal,
+        )
+    finally:
+        scan_module.time.time = original
+        assert scan_module.time.time is real_time
+
+    record = journal.cycles[0][0]
+    assert record.candle_cutoff_ts <= boundary - 0.1
+    assert record.candle_cutoff_ts == boundary - 3600.0
+
+
+def test_entry_bar_must_be_the_first_reachable_one() -> None:
+    """A later aligned bar is a delay, and a delayed entry measures a different
+    trade than the one the signal proposed."""
+    from backtesting.single_position import replay_single_short
+
+    delayed = _plan(entry_bar_open_ts=_ENTRY_BAR_OPEN_TS + 300.0)
+    with pytest.raises(SinglePositionContractError, match="first_reachable_bar"):
+        replay_single_short(
+            _bars(
+                [(100.0, 101.0, 99.0, 100.0), (100.0, 101.0, 99.0, 100.0)],
+                start_ts=_ENTRY_BAR_OPEN_TS + 300.0,
+            ),
+            plan=delayed,
+            contract=_contract(),
+        )
+
+
+def test_plan_requires_eligibility_not_only_actionability() -> None:
+    with pytest.raises(SinglePositionContractError, match="entry_eligible_ts_precedes"):
+        _plan(actionable_ts=960.0, entry_eligible_ts=950.0)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("decision_ts", 901.0), ("entry_bar_open_ts", 1500.0)],
+)
+def test_candidate_rejects_a_result_from_a_different_plan(field, value) -> None:
+    candidate = _candidate(0.9, "AUSDT", cohort_id="cycle-1", entry_bar_open_ts=1200.0,
+                           decision_ts=900.0, exit_ts=2000.0)
+    mismatched = candidate.result.__class__(**{**candidate.result.__dict__, field: value})
+
+    with pytest.raises(SinglePositionContractError, match=f"result_{field}_differ"):
+        ScoredCandidate(0.9, candidate.plan, mismatched)
+
+
+def test_candidate_rejects_a_fill_that_did_not_happen_on_the_planned_bar() -> None:
+    candidate = _candidate(0.9, "AUSDT", cohort_id="cycle-1", entry_bar_open_ts=1200.0,
+                           decision_ts=900.0, exit_ts=2000.0)
+    assert candidate.result.filled
+    moved = candidate.result.__class__(**{**candidate.result.__dict__, "entry_ts": 1500.0})
+
+    with pytest.raises(SinglePositionContractError, match="filled_entry_ts_differs"):
+        ScoredCandidate(0.9, candidate.plan, moved)
+
+
+def test_same_entry_bar_is_reserved_by_the_earliest_actionable_cohort() -> None:
+    """Two cycles can target one bar. The earlier decision keeps it; ordering by
+    cohort_id would decide it by SHA order, which means nothing causally."""
+    early = _candidate(0.5, "EARLYUSDT", cohort_id="zzz-late-hash", entry_bar_open_ts=1200.0,
+                       decision_ts=900.0, exit_ts=2000.0, actionable_ts=940.0)
+    late = _candidate(0.9, "LATEUSDT", cohort_id="aaa-early-hash", entry_bar_open_ts=1200.0,
+                      decision_ts=900.0, exit_ts=2000.0, actionable_ts=950.0)
+
+    selection = select_single_position([late, early], minimum_score=0.1)
+
+    # The higher score does not win across cohorts: the slot was already taken.
+    assert [item.result.symbol for item in selection.selected] == ["EARLYUSDT"]
+
+
+def test_an_unfilled_earlier_cohort_does_not_hand_the_bar_to_a_later_one() -> None:
+    from backtesting.single_position import replay_single_short
+
+    invalid_plan = _plan(symbol="EARLYUSDT", cohort_id="cycle-early")
+    invalid = replay_single_short(
+        _bars([(106.0, 107.0, 105.5, 106.0), (106.0, 107.0, 105.0, 106.0)]),
+        plan=invalid_plan,
+        contract=_contract(),
+    )
+    later = _candidate(0.9, "LATEUSDT", cohort_id="cycle-late", entry_bar_open_ts=1200.0,
+                       decision_ts=900.0, exit_ts=2000.0, actionable_ts=955.0)
+
+    selection = select_single_position(
+        [ScoredCandidate(0.95, invalid_plan, invalid), later], minimum_score=0.1
+    )
+
+    # The earlier cohort's entry simply did not happen; that is not permission for
+    # a later cohort to take the same bar using the knowledge that it failed.
+    assert selection.selected == ()
+    assert selection.skipped_unfilled == 1
+
+
+def test_cold_start_volatility_floor_is_invariant_to_worker_order() -> None:
+    """The first sweep of a fresh process must hold the fallback floor for every
+    symbol. Testing the frozen list for emptiness let it fall through to the live
+    observations being written by the sweep itself."""
+    from core.signal_generator import SignalConfig
+    from trading.signals.layered_strategy import LayeredPumpStrategy
+
+    symbols = [f"S{index:03d}USDT" for index in range(28)]
+    floors: list[list[float]] = []
+
+    for order in (symbols, list(reversed(symbols))):
+        strategy = LayeredPumpStrategy(SignalConfig())
+        strategy.begin_sweep()
+        seen = []
+        for index, symbol in enumerate(order):
+            # A spread of volatilities, so a leaking floor would visibly move.
+            strategy._volatility.observe(symbol, 0.001 + index * 0.004)
+            seen.append(strategy._volatility.floor())
+        floors.append(seen)
+
+    fallback = SignalConfig().min_atr_pct
+    assert all(value == fallback for run in floors for value in run)
+    assert floors[0] == floors[1]
+
+
+def test_a_completed_sweep_freezes_the_next_one_at_its_own_distribution() -> None:
+    from trading.signals.volatility_context import VolatilityContext, VolatilityContextConfig
+
+    context = VolatilityContext(VolatilityContextConfig(min_observations=5, fallback_floor=0.5))
+    context.begin = None  # guard against accidental API drift
+    context.start_sweep()
+    for index in range(10):
+        context.observe(f"S{index}", 0.01 + index * 0.01)
+    # Still the first sweep: the floor may not react to its own observations.
+    assert context.floor() == 0.5
+
+    context.start_sweep()
+    frozen = context.floor()
+    assert frozen != 0.5
+    context.observe("LATE", 99.0)
+    assert context.floor() == frozen

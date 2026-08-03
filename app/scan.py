@@ -420,11 +420,15 @@ def _population_record(
 def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
               tracker=None, alerters=(), population_journal=None) -> list:
     cycle_started_at = time.time()
+    # Freeze the causal cutoff before the universe request. Deriving it afterwards
+    # let a refresh that happened to cross a bar boundary produce a cutoff later
+    # than the cycle's own start, which is both a false provenance claim and an
+    # envelope-invariant crash.
+    candle_cutoff_ts = closed_boundary_ts(cycle_started_at, timeframe)
     snapshot = universe.refresh()
-    scan_observed_at = time.time()
+    scan_observed_at = max(time.time(), cycle_started_at)
     symbols = list(snapshot.symbols)
     universe_timing = _universe_timing(snapshot, fallback=scan_observed_at)
-    candle_cutoff_ts = closed_boundary_ts(scan_observed_at, timeframe)
 
     if not symbols:
         # An empty cycle is still a cycle. Returning silently would leave a hole

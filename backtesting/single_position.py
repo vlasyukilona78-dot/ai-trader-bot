@@ -130,6 +130,7 @@ class EntryPlan:
     cohort_id: str
     decision_ts: float
     actionable_ts: float
+    entry_eligible_ts: float
     entry_bar_open_ts: float
     decision_price: float
     stop_price: float
@@ -142,14 +143,18 @@ class EntryPlan:
             raise SinglePositionContractError("cohort_id_required")
         if len(self.cohort_id) > 128:
             raise SinglePositionContractError("cohort_id_too_long")
-        for name in ("decision_ts", "actionable_ts", "entry_bar_open_ts"):
+        for name in ("decision_ts", "actionable_ts", "entry_eligible_ts", "entry_bar_open_ts"):
             if not _finite(getattr(self, name)):
                 raise SinglePositionContractError(f"{name}_must_be_finite")
         if self.actionable_ts < self.decision_ts:
             raise SinglePositionContractError("actionable_ts_precedes_decision_ts")
+        # Eligibility can only be later than actionability: it additionally waits
+        # for the cycle to be sealed.
+        if self.entry_eligible_ts < self.actionable_ts:
+            raise SinglePositionContractError("entry_eligible_ts_precedes_actionable_ts")
         # A decision known at a bar's open cannot be filled at that open.
-        if self.entry_bar_open_ts <= self.actionable_ts:
-            raise SinglePositionContractError("entry_bar_must_open_after_actionable_ts")
+        if self.entry_bar_open_ts <= self.entry_eligible_ts:
+            raise SinglePositionContractError("entry_bar_must_open_after_entry_eligible_ts")
         _require_finite_positive("decision_price", self.decision_price)
         _require_finite_positive("stop_price", self.stop_price)
         _require_finite_positive("take_profit_price", self.take_profit_price)
@@ -217,10 +222,16 @@ class ScoredCandidate:
             raise SinglePositionContractError("candidate_score_must_be_finite")
         if not isinstance(self.plan, EntryPlan):
             raise SinglePositionContractError("candidate_requires_its_entry_plan")
-        if self.plan.symbol != self.result.symbol:
-            raise SinglePositionContractError("candidate_plan_and_result_symbol_differ")
-        if self.plan.cohort_id != self.result.cohort_id:
-            raise SinglePositionContractError("candidate_plan_and_result_cohort_differ")
+        # A result produced from a different plan describes a different trade. Only
+        # comparing the symbol would let a replay of another cohort, decision or
+        # entry bar be scored as if it were this one.
+        for field_name in ("symbol", "cohort_id", "decision_ts", "entry_bar_open_ts"):
+            if getattr(self.plan, field_name) != getattr(self.result, field_name):
+                raise SinglePositionContractError(
+                    f"candidate_plan_and_result_{field_name}_differ"
+                )
+        if self.result.filled and self.result.entry_ts != self.plan.entry_bar_open_ts:
+            raise SinglePositionContractError("filled_entry_ts_differs_from_the_plan")
 
 
 @dataclass(frozen=True)
@@ -260,6 +271,18 @@ def _empty_result(plan: EntryPlan, contract: SinglePositionContract, reason: str
         funding_events_applied=0,
         contract_schema_version=contract.schema_version,
     )
+
+
+def first_reachable_bar_open(entry_eligible_ts: float, bar_interval_seconds: int) -> float:
+    """The only bar a market entry may use: the first one opening after eligibility.
+
+    Anything later is a deliberate delay, and a delayed entry quietly changes the
+    trade being measured - it skips the move the signal was about and reports the
+    result as if the plan had been followed.
+    """
+
+    interval = float(bar_interval_seconds)
+    return (math.floor(float(entry_eligible_ts) / interval) + 1.0) * interval
 
 
 def _normalise_bars(
@@ -368,6 +391,12 @@ def replay_single_short(
     Positive funding rates mean longs pay shorts, so they add to SHORT PnL.
     Only payments with ``entry_ts < timestamp <= exit_ts`` are applied.
     """
+
+    expected_entry_bar = first_reachable_bar_open(
+        plan.entry_eligible_ts, contract.bar_interval_seconds
+    )
+    if abs(plan.entry_bar_open_ts - expected_entry_bar) > _EPS:
+        raise SinglePositionContractError("entry_bar_must_be_the_first_reachable_bar")
 
     frame = _normalise_bars(
         bars, entry_bar_open_ts=plan.entry_bar_open_ts, contract=contract
@@ -500,17 +529,27 @@ def select_single_position(
     # A cohort is one cycle, so its entry timing is a single fact. If two rows
     # disagree the grouping is not trustworthy and the run must stop rather than
     # silently split or merge cohorts.
-    cohort_timing: dict[str, tuple[float, float]] = {}
+    cohort_timing: dict[str, tuple[float, float, float]] = {}
     for candidate in candidates:
-        timing = (candidate.plan.actionable_ts, candidate.plan.entry_bar_open_ts)
+        timing = (
+            candidate.plan.actionable_ts,
+            candidate.plan.entry_eligible_ts,
+            candidate.plan.entry_bar_open_ts,
+        )
         existing = cohort_timing.setdefault(candidate.plan.cohort_id, timing)
         if existing != timing:
             raise SinglePositionContractError("cohort_timing_conflict")
 
+    # Two cohorts can target the same entry bar. The one that became actionable
+    # first reserves the slot: it was decided while the other did not yet exist,
+    # so letting the later one take the bar would be a retroactive substitution.
+    # Ordering by cohort_id instead would decide it by SHA order, which carries no
+    # causal meaning at all. Ties fall back to the identifier only to stay stable.
     ordered = sorted(
         candidates,
         key=lambda candidate: (
             candidate.plan.entry_bar_open_ts,
+            candidate.plan.actionable_ts,
             candidate.plan.cohort_id,
             -candidate.score,
             candidate.result.symbol,
@@ -521,6 +560,12 @@ def select_single_position(
     skipped_unfilled = 0
     skipped_busy = 0
     active_until = -math.inf
+    # An entry bar is consumed by the attempt, not by the fill. Whether the
+    # leader's entry filled is only known once that bar has printed, and by then a
+    # competing cohort's entry on the same bar is equally in the past. Letting the
+    # runner-up cohort take it would be the same hindsight substitution the
+    # within-cohort rule already forbids.
+    attempted_entry_bars: set[float] = set()
     index = 0
     while index < len(ordered):
         cohort_id = ordered[index].plan.cohort_id
@@ -538,11 +583,12 @@ def select_single_position(
                 eligible.append(candidate)
         if not eligible:
             continue
-        if entry_bar_open_ts < active_until:
+        if entry_bar_open_ts in attempted_entry_bars or entry_bar_open_ts < active_until:
             skipped_busy += len(eligible)
             continue
 
         chosen = eligible[0]
+        attempted_entry_bars.add(entry_bar_open_ts)
         skipped_busy += len(eligible) - 1
         if not chosen.result.filled or chosen.result.exit_ts is None:
             skipped_unfilled += 1
