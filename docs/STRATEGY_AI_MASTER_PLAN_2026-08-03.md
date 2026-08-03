@@ -324,7 +324,7 @@ market snapshot hash. Это позволяет честно сравниват�
 
 ## 9. Новый план реализации
 
-### Phase 0 — foundation (частично выполнено сейчас)
+### Phase 0 — foundation (выполнено)
 
 - [x] MEXC signals-only, closed-bar full-population journal.
 - [x] Single-position mechanics v1.
@@ -334,7 +334,8 @@ market snapshot hash. Это позволяет честно сравниват�
 - [x] Strategy/universe config fingerprints and model-role whitelist.
 - [x] Unfilled-leader same-cohort look-ahead removed.
 - [x] Full regression: `352 passed, 4 skipped, 2 known collection warnings`.
-- [ ] Commit/push текущего этапа.
+- [x] Изменения разделены на reviewable commits и опубликованы fast-forward:
+  `0b010e8`, `3ff8de0`, `29536f1`.
 
 Acceptance: schema стабильна, HOLD не теряются, старый CSV не может случайно
 попасть в новый builder.

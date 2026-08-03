@@ -1229,6 +1229,15 @@ Validation of this foundation on the full MEXC tree:
 352 passed, 4 skipped, 2 known pytest collection warnings
 ```
 
+Publication state for this foundation:
+
+```text
+0b010e8 fix(backtest): prevent hindsight cohort substitution
+3ff8de0 feat(ai): add causal MEXC feature contract
+29536f1 docs: unify MEXC strategy and AI roadmap
+remote: origin/claude/codex-project-review-04581e (fast-forward)
+```
+
 Validation on the exact reviewed tree:
 
 ```text
