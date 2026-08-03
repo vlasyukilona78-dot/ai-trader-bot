@@ -84,7 +84,6 @@ def _metadata(*, funding: float | None) -> dict:
     metadata["feature_snapshot"] = build_runtime_feature_snapshot(
         metadata,
         bar_cutoff_ts=1_700_002_800.0,
-        universe_refreshed_at=1_700_000_000.0,
     )
     return metadata
 

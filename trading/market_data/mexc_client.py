@@ -140,28 +140,70 @@ class MexcContractClient:
                 delay *= 2
         return None
 
+    def fetch_all_tickers_with_provenance(
+        self, force: bool = False
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Tickers plus how they were obtained.
+
+        A cache hit and a fresh response are not interchangeable. Returning only
+        the rows let a caller stamp cached data with the current instant and treat
+        it as though the exchange had just answered, which is exactly the kind of
+        provenance inflation the timing contract exists to prevent.
+
+        ``source_ts`` is when the returned rows were actually received from the
+        exchange, whether that was now or several minutes ago.
+        """
+
+        started = time.time()
+        with self._lock:
+            cached = list(self._tickers_cache)
+            cached_ts = self._tickers_cache_ts
+        fresh = (started - cached_ts) < self.tickers_cache_ttl_sec
+        if cached and fresh and not force:
+            return cached, {
+                "request_started_at": started,
+                "received_at": time.time(),
+                "source_ts": cached_ts,
+                "cache_hit": True,
+                "cache_age_sec": max(0.0, started - cached_ts),
+                "status": "ok",
+            }
+
+        payload = self._request_public("/api/v1/contract/ticker")
+        received = time.time()
+        items = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            # The request failed. The previous rows may still be usable, but they
+            # must keep their own age rather than inherit this attempt's clock.
+            return cached, {
+                "request_started_at": started,
+                "received_at": received,
+                "source_ts": cached_ts,
+                "cache_hit": bool(cached),
+                "cache_age_sec": max(0.0, started - cached_ts) if cached else None,
+                "status": "stale_cache" if cached else "error",
+            }
+
+        with self._lock:
+            self._tickers_cache = items
+            self._tickers_cache_ts = received
+        return list(items), {
+            "request_started_at": started,
+            "received_at": received,
+            "source_ts": received,
+            "cache_hit": False,
+            "cache_age_sec": 0.0,
+            "status": "ok",
+        }
+
     def fetch_all_tickers(self, force: bool = False) -> list[dict[str, Any]]:
         """All contract tickers in one call (~1000 symbols), short-TTL cached.
 
         One call serves both universe filtering and per-symbol ticker lookups,
         which avoids issuing a separate request per scanned symbol.
         """
-        now = time.time()
-        with self._lock:
-            fresh = (now - self._tickers_cache_ts) < self.tickers_cache_ttl_sec
-            if self._tickers_cache and fresh and not force:
-                return list(self._tickers_cache)
-
-        payload = self._request_public("/api/v1/contract/ticker")
-        items = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(items, list):
-            with self._lock:
-                return list(self._tickers_cache)
-
-        with self._lock:
-            self._tickers_cache = items
-            self._tickers_cache_ts = now
-            return list(items)
+        items, _ = self.fetch_all_tickers_with_provenance(force=force)
+        return items
 
     def fetch_contract_details(self, force: bool = False) -> dict[str, dict[str, Any]]:
         """Contract specs for every symbol, keyed by MEXC symbol, cached for the session.

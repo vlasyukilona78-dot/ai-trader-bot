@@ -32,6 +32,31 @@ class HigherTimeframeCache:
         self._fetched_at: dict[str, float] = {}
         self._boundary_at: dict[str, float] = {}
         self._lock = threading.Lock()
+        # Per-call spans so a cycle can report higher-timeframe timing as its own
+        # source instead of hiding it inside the base-OHLCV span.
+        self._timings: list[dict[str, object]] = []
+
+    def drain_timings(self) -> list[dict[str, object]]:
+        """Take and clear the spans recorded since the last drain."""
+
+        with self._lock:
+            drained = list(self._timings)
+            self._timings.clear()
+        return drained
+
+    def _record_timing(self, *, started: float, received: float, boundary: float,
+                       status: str, cache_hit: bool) -> None:
+        with self._lock:
+            if len(self._timings) < 5_000:
+                self._timings.append(
+                    {
+                        "request_started_at": started,
+                        "received_at": received,
+                        "source_as_of": boundary,
+                        "status": status,
+                        "cache_hit": cache_hit,
+                    }
+                )
 
     @staticmethod
     def _copy(frame: pd.DataFrame) -> pd.DataFrame:
@@ -46,6 +71,7 @@ class HigherTimeframeCache:
         as_of=None,
         now: float | None = None,
     ) -> pd.DataFrame | None:
+        started_at = time.time()
         cache_now = float(now if now is not None else time.time())
         # ``now`` as the decision clock is retained only for legacy callers;
         # causal callers should always provide their own explicit ``as_of``.
@@ -60,7 +86,17 @@ class HigherTimeframeCache:
                 and cached_boundary == boundary
                 and 0.0 <= age < self.config.ttl_sec
             ):
-                return self._copy(cached)
+                hit = self._copy(cached)
+                self._timings.append(
+                    {
+                        "request_started_at": started_at,
+                        "received_at": time.time(),
+                        "source_as_of": boundary,
+                        "status": "ok",
+                        "cache_hit": True,
+                    }
+                )
+                return hit
 
         try:
             fetch_closed = getattr(self.feed, "fetch_closed_frame", None)
@@ -84,11 +120,20 @@ class HigherTimeframeCache:
             ).tail(self.config.candles)
             frame = self._copy(frame)
         except Exception:
+            self._record_timing(
+                started=started_at, received=time.time(), boundary=boundary,
+                status="error", cache_hit=False,
+            )
             with self._lock:
                 cached = self._frames.get(symbol)
                 if cached is not None and self._boundary_at.get(symbol) == boundary:
                     return self._copy(cached)
                 return None
+
+        self._record_timing(
+            started=started_at, received=time.time(), boundary=boundary,
+            status="ok", cache_hit=False,
+        )
 
         with self._lock:
             existing_boundary = self._boundary_at.get(symbol)

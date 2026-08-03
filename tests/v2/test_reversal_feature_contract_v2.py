@@ -62,8 +62,8 @@ def _metadata() -> dict:
 def test_registry_is_unique_versioned_and_causal() -> None:
     names = [spec.name for spec in FEATURE_SPECS]
     assert len(names) == len(set(names))
-    assert FEATURE_CONTRACT_VERSION == "mexc_reversal_features_v1"
-    assert feature_contract_hash() == "bad45062961cac9638102a6e7a378fd64a93c4b6e025a135e3991698dab8b3d9"
+    assert FEATURE_CONTRACT_VERSION == "mexc_reversal_features_v2"
+    assert feature_contract_hash() == "20f9f61d4e2d787c5ad05f54ee3ccd8b7f8ea3a99fe09bc38bbefe09872c496c"
     assert re.fullmatch(r"[0-9a-f]{64}", feature_registry_hash())
     assert feature_contract_hash() != feature_registry_hash()
     assert {spec.timing for spec in FEATURE_SPECS}.issubset(
@@ -99,7 +99,6 @@ def test_snapshot_keeps_real_zero_distinct_from_missing() -> None:
     snapshot = build_runtime_feature_snapshot(
         _metadata(),
         bar_cutoff_ts=1_700_002_800.0,
-        universe_refreshed_at=1_700_000_000.0,
     )
 
     assert snapshot["contract_version"] == FEATURE_CONTRACT_VERSION
@@ -128,7 +127,6 @@ def test_partial_gate_trace_has_fixed_schema_and_explicit_missingness() -> None:
     snapshot = build_runtime_feature_snapshot(
         _metadata(),
         bar_cutoff_ts=1_700_002_800.0,
-        universe_refreshed_at=1_700_000_000.0,
     )
     expected_names = [spec.name for spec in captured_feature_specs()]
 

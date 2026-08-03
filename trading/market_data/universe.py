@@ -69,6 +69,17 @@ class UniverseSnapshot:
     refreshed_at: float = 0.0
     request_started_at: float = 0.0
     received_at: float = 0.0
+    # When the exchange actually produced these rows. On a cache hit this stays
+    # at the original response instant, so cached data cannot be presented as a
+    # fresh answer.
+    source_ts: float = 0.0
+    cache_hit: bool = False
+    cache_age_sec: float | None = None
+    source_status: str = "ok"
+    # Contract details are a separate optional request; it has its own timing.
+    details_request_started_at: float | None = None
+    details_received_at: float | None = None
+    details_status: str | None = None
 
     @property
     def symbols(self) -> list[str]:
@@ -107,11 +118,27 @@ class SymbolUniverse:
         if self._snapshot.entries and age < self.config.refresh_sec and not force:
             return self._snapshot
 
-        request_started_at = time.time()
-        tickers = self.client.fetch_all_tickers(force=force)
         # The response instant, not `now`. `now` was read before the request and
-        # would date this data earlier than the process could possibly have held it.
-        received_at = time.time()
+        # would date this data earlier than the process could possibly have held
+        # it. Cache hits keep their own source instant so they are not laundered
+        # into fresh responses.
+        with_provenance = getattr(self.client, "fetch_all_tickers_with_provenance", None)
+        if callable(with_provenance):
+            tickers, provenance = with_provenance(force=force)
+        else:
+            started = time.time()
+            tickers = self.client.fetch_all_tickers(force=force)
+            answered = time.time()
+            provenance = {
+                "request_started_at": started,
+                "received_at": answered,
+                "source_ts": answered,
+                "cache_hit": False,
+                "cache_age_sec": 0.0,
+                "status": "ok",
+            }
+        request_started_at = float(provenance["request_started_at"])
+        received_at = float(provenance["received_at"])
         if not tickers:
             # Keep serving the previous snapshot rather than emptying the scan list.
             return self._snapshot
@@ -122,11 +149,20 @@ class SymbolUniverse:
         entries: list[UniverseEntry] = []
 
         details: dict[str, dict] = {}
+        details_started: float | None = None
+        details_received: float | None = None
+        details_status: str | None = None
         if cfg.max_min_notional_usdt > 0:
+            # A second, independent request: it gets its own timing rather than
+            # sharing the ticker's.
+            details_started = time.time()
             try:
                 details = self.client.fetch_contract_details()
+                details_status = "ok"
             except Exception:
                 details = {}  # missing specs must not empty the scan list
+                details_status = "error"
+            details_received = time.time()
 
         for item in tickers:
             if not isinstance(item, dict):
@@ -182,6 +218,13 @@ class SymbolUniverse:
             refreshed_at=now,
             request_started_at=request_started_at,
             received_at=received_at,
+            source_ts=float(provenance.get("source_ts") or received_at),
+            cache_hit=bool(provenance.get("cache_hit")),
+            cache_age_sec=provenance.get("cache_age_sec"),
+            source_status=str(provenance.get("status") or "ok"),
+            details_request_started_at=details_started,
+            details_received_at=details_received,
+            details_status=details_status,
         )
         return self._snapshot
 

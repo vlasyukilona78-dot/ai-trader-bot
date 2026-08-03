@@ -25,6 +25,7 @@ from trading.metrics.population_journal import (
     SCHEMA_VERSION,
     PopulationDecision,
     PopulationJournalError,
+    _causal_metadata,
     make_cycle_id,
     rows_checksum,
 )
@@ -179,7 +180,6 @@ def _parse_feature_row(payload: Mapping[str, Any]) -> PopulationFeatureRow:
     rebuilt_snapshot = build_runtime_feature_snapshot(
         metadata,
         bar_cutoff_ts=record.candle_cutoff_ts,
-        universe_refreshed_at=record.universe_refreshed_at,
     )
     if snapshot != rebuilt_snapshot:
         raise PopulationDatasetError("feature_snapshot_source_mismatch")
@@ -225,7 +225,7 @@ def _parse_feature_row(payload: Mapping[str, Any]) -> PopulationFeatureRow:
         "action": record.action,
         "reason": record.reason,
         "confidence": record.confidence,
-        "metadata": metadata,
+        "metadata": _causal_metadata(metadata),
         "error_code": record.error_code,
     }
     encoded = json.dumps(

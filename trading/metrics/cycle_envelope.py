@@ -12,6 +12,8 @@ cannot claim to have been actionable earlier than its own inputs allow.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 import math
 import re
 from typing import Sequence
@@ -24,7 +26,18 @@ from trading.market_data.bar_contract import (
 from trading.market_data.source_timing import SourceTiming, latest_received_at
 
 
-CYCLE_ENVELOPE_SCHEMA_VERSION = 1
+CYCLE_ENVELOPE_SCHEMA_VERSION = 2
+
+# What `entry_bar_open_ts` is allowed to claim.
+#
+# It proves that a research replay may compare this cohort and enter on that bar:
+# every input had answered and every candidate was decided before it opened. It
+# does NOT prove a live signals-only pipeline could have reached it. Between
+# `cycle_completed_ts` and an actual alert there is still record construction, an
+# fsync, the return path and channel delivery, none of which are measured here
+# and any of which can cross the boundary. Calling this execution-ready would be
+# a claim the code cannot support.
+TIMING_BASIS_RESEARCH_RANKING = "research_ranking_ready"
 
 CYCLE_STATUSES = frozenset({"completed", "empty_universe", "error"})
 
@@ -70,10 +83,13 @@ class CycleEnvelope:
     entry_bar_open_ts: float
     status: str
     error_code: str | None = None
+    timing_basis: str = TIMING_BASIS_RESEARCH_RANKING
 
     def __post_init__(self) -> None:
         if self.schema_version != CYCLE_ENVELOPE_SCHEMA_VERSION:
             raise CycleEnvelopeError("unsupported_cycle_envelope_schema_version")
+        if self.timing_basis != TIMING_BASIS_RESEARCH_RANKING:
+            raise CycleEnvelopeError("unsupported_timing_basis")
         if not isinstance(self.cycle_id, str) or not _HASH_RE.fullmatch(self.cycle_id):
             raise CycleEnvelopeError("cycle_id_must_be_a_sha256_digest")
         for name in ("strategy_config_hash", "universe_policy_hash"):
@@ -219,4 +235,17 @@ class CycleEnvelope:
             "entry_bar_open_ts": self.entry_bar_open_ts,
             "status": self.status,
             "error_code": self.error_code,
+            "timing_basis": self.timing_basis,
         }
+
+    def envelope_hash(self) -> str:
+        """Identity of this cycle's executable timing, kept apart from the market.
+
+        Rows carry it so a snapshot can be tied to the timing it was ranked under
+        without that timing entering the market-feature hash.
+        """
+
+        encoded = json.dumps(
+            self.as_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

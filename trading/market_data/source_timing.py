@@ -48,6 +48,12 @@ class SourceTiming:
     status: str = _STATUS_OK
     source_as_of: float | None = None
     error_code: str | None = None
+    # A cache hit is not a fresh answer. `received_at` is when this process got
+    # the rows; `source_ts` is when the exchange produced them, which for a hit is
+    # the earlier original response.
+    cache_hit: bool = False
+    cache_age_sec: float | None = None
+    source_ts: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.source, str) or not _SOURCE_RE.fullmatch(self.source):
@@ -70,6 +76,19 @@ class SourceTiming:
                 raise SourceTimingError("source_as_of_follows_received_at")
             object.__setattr__(self, "source_as_of", as_of)
 
+        if self.cache_age_sec is not None:
+            age = _finite(self.cache_age_sec, field="cache_age_sec")
+            if age < 0:
+                raise SourceTimingError("cache_age_sec_must_not_be_negative")
+            object.__setattr__(self, "cache_age_sec", age)
+        if self.source_ts is not None:
+            produced = _finite(self.source_ts, field="source_ts")
+            if produced > received:
+                raise SourceTimingError("source_ts_follows_received_at")
+            object.__setattr__(self, "source_ts", produced)
+        if self.cache_hit and self.source_ts is None:
+            raise SourceTimingError("cache_hit_requires_source_ts")
+
         if self.status == _STATUS_OK:
             if self.error_code is not None:
                 raise SourceTimingError("ok_status_must_not_carry_error_code")
@@ -90,6 +109,9 @@ class SourceTiming:
             "status": self.status,
             "source_as_of": self.source_as_of,
             "error_code": self.error_code,
+            "cache_hit": bool(self.cache_hit),
+            "cache_age_sec": self.cache_age_sec,
+            "source_ts": self.source_ts,
         }
 
 

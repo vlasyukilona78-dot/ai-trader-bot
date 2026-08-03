@@ -118,6 +118,20 @@ def _thaw_json_value(value: object) -> object:
     return value
 
 
+# Recorded, but never part of market identity: these are wall clocks and cycle
+# bookkeeping, and the same bars must hash the same however slowly they were
+# fetched.
+_NON_CAUSAL_METADATA_KEYS = frozenset({"feature_provenance"})
+
+
+def _causal_metadata(metadata: Mapping[str, object]) -> dict[str, object]:
+    return {
+        key: value
+        for key, value in metadata.items()
+        if key not in _NON_CAUSAL_METADATA_KEYS
+    }
+
+
 def _canonical_bytes(payload: Mapping[str, object]) -> bytes:
     try:
         encoded = json.dumps(
@@ -372,7 +386,7 @@ class PopulationDecision:
             "action": action,
             "reason": reason,
             "confidence": _finite_float(confidence, name="confidence"),
-            "metadata": _thaw_json_value(frozen_metadata),
+            "metadata": _causal_metadata(_thaw_json_value(frozen_metadata)),
             "error_code": error_code,
         }
         input_hash = _sha256_id(causal_payload)

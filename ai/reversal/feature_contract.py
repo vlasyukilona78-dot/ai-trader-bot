@@ -24,9 +24,14 @@ import math
 from typing import Any, Mapping
 
 
-FEATURE_CONTRACT_VERSION = "mexc_reversal_features_v1"
+# v2 stops dating the snapshot with `universe_refreshed_at`, which was read
+# before the universe request and therefore claimed the data earlier than the
+# process held it. The response instant is recorded instead - and as provenance
+# beside the snapshot rather than inside its hashed identity, so a slower scan
+# does not produce a different "market".
+FEATURE_CONTRACT_VERSION = "mexc_reversal_features_v2"
 _PINNED_CONTRACT_HASHES = {
-    "mexc_reversal_features_v1": "bad45062961cac9638102a6e7a378fd64a93c4b6e025a135e3991698dab8b3d9",
+    "mexc_reversal_features_v2": "20f9f61d4e2d787c5ad05f54ee3ccd8b7f8ea3a99fe09bc38bbefe09872c496c",
 }
 
 
@@ -213,8 +218,12 @@ def feature_contract_hash() -> str:
         )
     payload = {
         "snapshot_schema": {
-            "version": 1,
-            "source_times": ("bar_cutoff_ts", "universe_refreshed_at"),
+            "version": 2,
+            # Only the causal, bar-aligned cutoff belongs to market identity. The
+            # universe response instant is real provenance but it is a wall clock,
+            # and wall clocks must not make the same market hash differently.
+            "source_times": ("bar_cutoff_ts",),
+            "provenance_times": ("universe_received_at",),
             "missing_representation": "nullable_value_plus_observed_bit_and_reason",
         },
         "features": features,
@@ -281,9 +290,14 @@ def build_runtime_feature_snapshot(
     metadata: Mapping[str, Any],
     *,
     bar_cutoff_ts: float,
-    universe_refreshed_at: float,
 ) -> dict[str, Any]:
-    """Extract the current causal values without inventing missing observations."""
+    """Extract the current causal values without inventing missing observations.
+
+    The result is the market's identity and nothing else. Wall-clock provenance -
+    when the universe answered, when the cycle finished - lives in the cycle
+    envelope, so re-running the same bars on a slower machine cannot produce a
+    different snapshot.
+    """
 
     values: dict[str, float | None] = {}
     observed: dict[str, int] = {}
@@ -321,7 +335,6 @@ def build_runtime_feature_snapshot(
         "contract_hash": feature_contract_hash(),
         "source_times": {
             "bar_cutoff_ts": _numeric(bar_cutoff_ts),
-            "universe_refreshed_at": _numeric(universe_refreshed_at),
         },
         "values": values,
         "observed": observed,

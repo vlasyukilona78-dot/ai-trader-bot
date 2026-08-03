@@ -286,10 +286,37 @@ def _universe_timing(snapshot, *, fallback: float) -> SourceTiming:
     received = _optional_finite(getattr(snapshot, "received_at", None))
     if started is None or received is None or received <= 0.0 or started <= 0.0:
         started = received = fallback
+    # No min(): a response recorded before its own request is a broken clock or a
+    # broken caller, and clamping it would hide exactly the defect this contract
+    # exists to surface. SourceTiming raises.
     return SourceTiming(
-        source="universe",
-        request_started_at=min(started, received),
+        source="universe_ticker",
+        request_started_at=started,
         received_at=received,
+        status=str(getattr(snapshot, "source_status", "ok") or "ok"),
+        error_code="StaleTickerCache"
+        if str(getattr(snapshot, "source_status", "ok")) not in ("ok",)
+        else None,
+        cache_hit=bool(getattr(snapshot, "cache_hit", False)),
+        cache_age_sec=getattr(snapshot, "cache_age_sec", None),
+        source_ts=_optional_finite(getattr(snapshot, "source_ts", None)) or received,
+    )
+
+
+def _details_timing(snapshot) -> SourceTiming | None:
+    """Contract details are an independent optional request with its own clock."""
+
+    started = _optional_finite(getattr(snapshot, "details_request_started_at", None))
+    received = _optional_finite(getattr(snapshot, "details_received_at", None))
+    if started is None or received is None:
+        return None
+    status = str(getattr(snapshot, "details_status", "ok") or "ok")
+    return SourceTiming(
+        source="contract_details",
+        request_started_at=started,
+        received_at=received,
+        status=status,
+        error_code="ContractDetailsUnavailable" if status != "ok" else None,
     )
 
 
@@ -388,8 +415,15 @@ def _population_record(
     metadata["feature_snapshot"] = build_runtime_feature_snapshot(
         metadata,
         bar_cutoff_ts=envelope.candle_cutoff_ts,
-        universe_refreshed_at=universe_refreshed_at,
     )
+    # Provenance sits outside the hashed snapshot: it is real and recorded, but a
+    # slower scan must not produce a different "market".
+    metadata["feature_provenance"] = {
+        "universe_received_at": envelope.universe_timing.received_at,
+        "universe_source_ts": envelope.universe_timing.source_ts,
+        "universe_cache_hit": bool(envelope.universe_timing.cache_hit),
+        "envelope_hash": envelope.envelope_hash(),
+    }
 
     return PopulationDecision.create(
         cycle_id=envelope.cycle_id,
@@ -550,7 +584,10 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
         # already-observed causal cutoff.
         return max(time.time(), scan_observed_at, candle_cutoff_ts)
 
+    base_spans: list[tuple[float, float]] = []
+
     def evaluate(symbol: str) -> _ScanEvaluation:
+        fetch_started_at = time.time()
         try:
             raw, bar_open_ts, bar_close_ts, mark_price = _fetch_closed_frame(
                 feed=feed,
@@ -559,7 +596,9 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
                 candles=candles,
                 cutoff=candle_cutoff_ts,
             )
+            base_spans.append((fetch_started_at, time.time()))
         except MarketDataQualityError as exc:
+            base_spans.append((fetch_started_at, time.time()))
             return _ScanEvaluation(
                 symbol=symbol,
                 status="data_quality_error",
@@ -570,6 +609,7 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
                 error_code=safe_error_code(exc),
             )
         except BarContractError as exc:
+            base_spans.append((fetch_started_at, time.time()))
             return _ScanEvaluation(
                 symbol=symbol,
                 status="invalid_bar_contract",
@@ -580,6 +620,7 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
                 error_code=safe_error_code(exc),
             )
         except Exception as exc:
+            base_spans.append((fetch_started_at, time.time()))
             return _ScanEvaluation(
                 symbol=symbol,
                 status="data_error",
@@ -667,14 +708,40 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
     started = time.time()
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         results = list(pool.map(evaluate, symbols))
-    # Base OHLCV and the higher-timeframe cache are both read inside `evaluate`,
-    # so this span bounds every per-symbol market request in the cycle.
+    pass_finished_at = time.time()
+    # Base OHLCV and the higher-timeframe cache are separate sources with separate
+    # clocks; reporting one span for both hid which of them a cycle waited on.
+    base_started = min((span[0] for span in base_spans), default=started)
+    base_received = max((span[1] for span in base_spans), default=pass_finished_at)
     market_data_timing = _timed_source(
-        "market_data",
-        request_started_at=started,
-        received_at=time.time(),
+        "base_ohlcv",
+        request_started_at=base_started,
+        received_at=base_received,
         source_as_of=candle_cutoff_ts,
     )
+    source_timings = [universe_timing, benchmark_timing, market_data_timing]
+    details_timing = _details_timing(snapshot)
+    if details_timing is not None:
+        source_timings.append(details_timing)
+
+    htf_cache = getattr(strategy, "_htf_cache", None)
+    htf_spans = htf_cache.drain_timings() if hasattr(htf_cache, "drain_timings") else []
+    if htf_spans:
+        source_timings.append(
+            SourceTiming(
+                source="higher_timeframe",
+                request_started_at=min(float(span["request_started_at"]) for span in htf_spans),
+                received_at=max(float(span["received_at"]) for span in htf_spans),
+                source_as_of=max(float(span["source_as_of"]) for span in htf_spans),
+                status="ok" if all(span["status"] == "ok" for span in htf_spans) else "error",
+                error_code=None if all(span["status"] == "ok" for span in htf_spans)
+                else "HigherTimeframeUnavailable",
+                cache_hit=all(bool(span["cache_hit"]) for span in htf_spans),
+                cache_age_sec=0.0 if all(bool(span["cache_hit"]) for span in htf_spans) else None,
+                source_ts=max(float(span["source_as_of"]) for span in htf_spans)
+                if all(bool(span["cache_hit"]) for span in htf_spans) else None,
+            )
+        )
 
     # The cycle becomes comparable only once its last symbol has been decided,
     # and reachable only once that decision set is sealed. Neither depends on
@@ -694,7 +761,7 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
         candle_cutoff_ts=candle_cutoff_ts,
         universe_symbols=symbols,
         universe_timing=universe_timing,
-        source_timings=(universe_timing, benchmark_timing, market_data_timing),
+        source_timings=tuple(source_timings),
         strategy_config_hash=strategy_config_hash,
         universe_policy_hash=universe_policy_hash,
         ranking_ready_ts=ranking_ready_ts,

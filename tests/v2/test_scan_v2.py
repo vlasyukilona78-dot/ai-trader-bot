@@ -323,10 +323,17 @@ class ScanOnceV2Tests(unittest.TestCase):
             feature_snapshot["source_times"]["bar_cutoff_ts"],
             journal.cycles[0][0].candle_cutoff_ts,
         )
+        # The snapshot is the market's identity and carries no wall clock. When
+        # the universe answered is real provenance, but it lives beside the
+        # snapshot so a slower scan cannot produce a different "market".
+        self.assertNotIn("universe_refreshed_at", feature_snapshot["source_times"])
+        self.assertNotIn("universe_received_at", feature_snapshot["source_times"])
+        feature_provenance = journal.cycles[0][0].metadata["feature_provenance"]
         self.assertEqual(
-            feature_snapshot["source_times"]["universe_refreshed_at"],
-            journal.cycles[0][0].universe_refreshed_at,
+            feature_provenance["universe_received_at"],
+            journal.cycles[0][0].universe_received_at,
         )
+        self.assertRegex(feature_provenance["envelope_hash"], r"^[0-9a-f]{64}$")
         provenance = journal.cycles[0][0].metadata["provenance"]
         self.assertRegex(provenance["strategy_config_hash"], r"^[0-9a-f]{64}$")
         self.assertRegex(provenance["universe_policy_hash"], r"^[0-9a-f]{64}$")
