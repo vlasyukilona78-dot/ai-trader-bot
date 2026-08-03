@@ -1186,6 +1186,49 @@ offline `+1h` decision alignment, HTF absence failing closed, next-bar wick
 invalidation, interleaved DCA stop/add ordering, public-only scanner wiring, and
 basic request pacing. They are incomplete in the edge cases above.
 
+## Unified strategy/AI contract foundation — 2026-08-03
+
+The current authoritative implementation plan is
+`docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md`. It reconciles the five-layer
+strategy, intended causal features, model roles and the single-position
+contract after a fresh code/data-path audit.
+
+Implemented in the working change associated with that plan:
+
+- `ai/reversal/feature_contract.py` is the first versioned machine-readable
+  registry (`mexc_reversal_features_v1`) with a stable SHA-256 contract hash,
+  explicit feature roles/runtime statuses and null + observed-bit missingness;
+- every MEXC population record now contains a fixed-schema causal
+  `feature_snapshot`, including HOLD/error rows;
+- point-in-time funding from the frozen universe snapshot is actually passed
+  into the strategy instead of only being journalled;
+- Layer 4 records funding/long-short source availability separately from numeric
+  zero;
+- fallback sentiment, missing volume-profile levels, missing overhead levels and
+  turnover proxy values now carry explicit availability instead of becoming
+  observed zeroes;
+- the scanner fingerprints strategy config and universe policy, and the feature
+  contract separates executable-schema and roadmap hashes;
+- `ai/reversal/population_dataset.py` is the first strict consumer of the
+  population journal. It rejects incomplete cycles and feature
+  version/hash/schema drift, recomputes snapshots from source metadata, checks
+  PopulationDecision timing/bar/status/IDs, exposes a role-whitelisted model
+  input API and does not accept legacy event-conditioned CSV;
+- `select_single_position()` no longer substitutes a filled runner-up after a
+  top-score candidate is found unfilled using future price information.
+
+This is foundation only. The trace is still stage-conditioned, scanner timing
+is not yet executable-label timing, and the single-position replay is not yet
+wired to the journal. No model may be trained or enabled from this partial
+snapshot. Next priority is the Phase 1 time/spec contract described in the
+master plan.
+
+Validation of this foundation on the full MEXC tree:
+
+```text
+352 passed, 4 skipped, 2 known pytest collection warnings
+```
+
 Validation on the exact reviewed tree:
 
 ```text
