@@ -110,8 +110,10 @@ class _FakeFeed:
 
 
 class _FakeUniverse:
-    def __init__(self, symbols):
+    def __init__(self, symbols, *, funding_rate=None, open_interest=None):
         self._symbols = symbols
+        self._funding_rate = funding_rate
+        self._open_interest = open_interest
 
     def refresh(self):
         return UniverseSnapshot(
@@ -121,6 +123,8 @@ class _FakeUniverse:
                     mexc_symbol=symbol.replace("USDT", "_USDT"),
                     turnover_24h_usdt=1_000_000.0 + index,
                     change_24h=0.1 + index / 100.0,
+                    funding_rate=self._funding_rate,
+                    open_interest=self._open_interest,
                 )
                 for index, symbol in enumerate(self._symbols)
             ],
@@ -287,6 +291,43 @@ class ScanOnceV2Tests(unittest.TestCase):
         self.assertTrue(all(record.action == "HOLD" for record in records))
         self.assertEqual([record.cycle_ordinal for record in records], [0, 1])
         self.assertTrue(all(record.cycle_size == 2 for record in records))
+
+    def test_frozen_universe_funding_reaches_strategy_and_feature_snapshot(self):
+        frames = {s: _ohlcv() for s in ["BTCUSDT", "AUSDT"]}
+        strategy = _FakeStrategy(IntentAction.HOLD)
+        journal = _CaptureJournal()
+
+        scan_once(
+            universe=_FakeUniverse(
+                ["AUSDT"],
+                funding_rate=0.00125,
+                open_interest=987_654.0,
+            ),
+            feed=_FakeFeed(frames),
+            strategy=strategy,
+            logger=_Logger(),
+            timeframe="60",
+            candles=320,
+            workers=1,
+            population_journal=journal,
+        )
+
+        self.assertEqual(strategy.contexts[0].funding_rate, 0.00125)
+        feature_snapshot = journal.cycles[0][0].metadata["feature_snapshot"]
+        self.assertEqual(feature_snapshot["values"]["funding_rate"], 0.00125)
+        self.assertEqual(feature_snapshot["observed"]["funding_rate"], 1)
+        self.assertEqual(feature_snapshot["values"]["open_interest"], 987_654.0)
+        self.assertEqual(
+            feature_snapshot["source_times"]["bar_cutoff_ts"],
+            journal.cycles[0][0].candle_cutoff_ts,
+        )
+        self.assertEqual(
+            feature_snapshot["source_times"]["universe_refreshed_at"],
+            journal.cycles[0][0].universe_refreshed_at,
+        )
+        provenance = journal.cycles[0][0].metadata["provenance"]
+        self.assertRegex(provenance["strategy_config_hash"], r"^[0-9a-f]{64}$")
+        self.assertRegex(provenance["universe_policy_hash"], r"^[0-9a-f]{64}$")
 
     def test_population_journal_covers_every_symbol_and_safe_failure_status(self):
         symbols = ["ENTRYUSDT", "HOLDUSDT", "EMPTYUSDT", "SHORTUSDT",

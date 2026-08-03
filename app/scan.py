@@ -23,6 +23,7 @@ from typing import Literal, Mapping
 
 import pandas as pd
 
+from ai.reversal.feature_contract import build_runtime_feature_snapshot, configuration_hash
 from core.indicators import compute_indicators
 from trading.market_data.bar_contract import (
     BarContractError,
@@ -297,6 +298,8 @@ def _population_record(
     timeframe: str,
     universe_meta: Mapping[str, object],
     benchmark_status: str,
+    strategy_config_hash: str,
+    universe_policy_hash: str,
     cycle_ordinal: int,
     cycle_size: int,
 ) -> PopulationDecision:
@@ -307,6 +310,10 @@ def _population_record(
             "mark_price": result.mark_price if result.mark_price > 0 else None,
         },
         "benchmark_status": benchmark_status,
+        "provenance": {
+            "strategy_config_hash": strategy_config_hash,
+            "universe_policy_hash": universe_policy_hash,
+        },
     }
     if result.stage:
         metadata["stage"] = result.stage
@@ -326,6 +333,15 @@ def _population_record(
         action = IntentAction.HOLD.value
         reason = result.status
         confidence = 0.0
+
+    # One versioned extractor is shared by runtime capture and future dataset /
+    # inference code.  Missing observations remain explicit nulls plus masks;
+    # zero is never used as a silent substitute for an unavailable source.
+    metadata["feature_snapshot"] = build_runtime_feature_snapshot(
+        metadata,
+        bar_cutoff_ts=candle_cutoff_ts,
+        universe_refreshed_at=universe_refreshed_at,
+    )
 
     return PopulationDecision.create(
         cycle_id=cycle_id,
@@ -368,6 +384,19 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
         universe_symbols=symbols,
     )
     universe_metadata = _universe_metadata(snapshot)
+    strategy_config = (
+        strategy.configuration_snapshot()
+        if hasattr(strategy, "configuration_snapshot")
+        else getattr(strategy, "config", None)
+    )
+    strategy_config_hash = configuration_hash(
+        strategy_config,
+        component="mexc_signal_strategy",
+    )
+    universe_policy_hash = configuration_hash(
+        getattr(universe, "config", None),
+        component="mexc_universe_policy",
+    )
 
     # Freeze the volatility distribution before evaluating anyone, so a
     # candidate's fate does not depend on its position in the scan order.
@@ -462,6 +491,8 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
 
         try:
             enriched = compute_indicators(raw)
+            symbol_universe_meta = universe_metadata.get(symbol, {})
+            funding_rate = _optional_finite(symbol_universe_meta.get("funding_rate"))
             intent = _validate_intent(
                 strategy.generate(
                     StrategyContext(
@@ -475,6 +506,9 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
                         synced_state=TradeState.FLAT,
                         sentiment_index=50.0,
                         sentiment_source="fallback_neutral_50",
+                        # This is the same frozen point-in-time snapshot already
+                        # journalled for the cycle, not a later per-symbol fetch.
+                        funding_rate=funding_rate,
                         candle_cutoff_ts=candle_cutoff_ts,
                     )
                 ),
@@ -522,6 +556,8 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
             timeframe=timeframe,
             universe_meta=universe_metadata.get(result.symbol, {}),
             benchmark_status=benchmark_status,
+            strategy_config_hash=strategy_config_hash,
+            universe_policy_hash=universe_policy_hash,
             cycle_ordinal=ordinal,
             cycle_size=cycle_size,
         )

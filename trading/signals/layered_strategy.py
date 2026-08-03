@@ -2,6 +2,7 @@
 
 import threading
 from copy import deepcopy
+from dataclasses import asdict
 
 from core.market_regime import detect_market_regime
 from core.signal_generator import SignalConfig, SignalContext, SignalGenerator
@@ -37,6 +38,15 @@ class LayeredPumpStrategy(StrategyInterface):
         """Market reference (BTC OHLCV), refreshed once per scan cycle."""
         with self._state_lock:
             self._benchmark = frame
+
+    def configuration_snapshot(self) -> dict:
+        """Return only immutable strategy semantics, never mutable scan state."""
+
+        with self._state_lock:
+            return {
+                "signal": asdict(self._generator.config),
+                "volatility": asdict(self._volatility.config),
+            }
 
     def begin_sweep(self):
         """Freeze the cross-sectional volatility floor for one scan pass."""

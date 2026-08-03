@@ -35,6 +35,7 @@ class TurnoverUnitsV2Tests(unittest.TestCase):
         # 12 bars x 20_000 turnover = 240k, comfortably over the floor
         ok, d = gen._layer1b_quality_gate(_frame(close=1.0, volume=1.0, turnover=20_000.0))
         self.assertTrue(ok)
+        self.assertEqual(d["exact_turnover_available"], 1.0)
         self.assertAlmostEqual(d["usd_volume_recent"], 240_000.0)
 
     def test_contract_count_no_longer_inflates_a_thin_symbol(self):
@@ -59,6 +60,7 @@ class TurnoverUnitsV2Tests(unittest.TestCase):
     def test_falls_back_to_price_times_volume_when_turnover_is_absent(self):
         gen = self._gen()
         _, d = gen._layer1b_quality_gate(_frame(close=10.0, volume=2_000.0, turnover=None))
+        self.assertEqual(d["exact_turnover_available"], 0.0)
         self.assertAlmostEqual(d["usd_volume_recent"], 10.0 * 2_000.0 * 12)
 
 

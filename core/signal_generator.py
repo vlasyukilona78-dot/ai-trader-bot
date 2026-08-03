@@ -403,6 +403,7 @@ class SignalGenerator:
             dist = (overhead.price - close) / close if (overhead and close > 0) else float("nan")
             level_ok = bool(overhead is not None and dist >= cfg.min_level_dist_pct)
             details["level_dist"] = float(dist) if dist == dist else 0.0
+            details["level_available"] = 1.0 if overhead is not None else 0.0
             details["level_ok"] = 1.0 if level_ok else 0.0
 
         return bool(rs_ok and htf_ok and chase_ok and level_ok), details
@@ -428,12 +429,14 @@ class SignalGenerator:
         # ships exact quote turnover alongside it; prefer that whenever present.
         if "turnover" in tail.columns:
             usd_volume = float(pd.to_numeric(tail["turnover"], errors="coerce").fillna(0.0).sum())
+            exact_turnover_available = True
         else:
             usd_volume = float(
                 (pd.to_numeric(tail["close"], errors="coerce") * pd.to_numeric(tail["volume"], errors="coerce"))
                 .fillna(0.0)
                 .sum()
             )
+            exact_turnover_available = False
 
         effective_floor = cfg.min_atr_pct if atr_floor is None else atr_floor
         atr_ok = atr_pct >= effective_floor if effective_floor > 0 else True
@@ -445,6 +448,7 @@ class SignalGenerator:
             "atr_floor_adaptive": 1.0 if atr_floor is not None else 0.0,
             "atr_ok": 1.0 if atr_ok else 0.0,
             "usd_volume_recent": usd_volume,
+            "exact_turnover_available": 1.0 if exact_turnover_available else 0.0,
             "min_hourly_usd_volume": float(cfg.min_hourly_usd_volume),
             "liquidity_ok": 1.0 if liq_ok else 0.0,
         }
@@ -699,12 +703,15 @@ class SignalGenerator:
             "crowd_not_against": 1.0 if crowd_not_against else 0.0,
             "crowd_extreme": 1.0 if crowd_extreme else 0.0,
             "funding_rate": float(funding_rate) if funding_rate is not None else 0.0,
+            "funding_available": 1.0 if funding_rate is not None else 0.0,
             "long_short_ratio": float(long_short_ratio) if long_short_ratio is not None else 0.0,
+            "long_short_ratio_available": 1.0 if long_short_ratio is not None else 0.0,
             "vwap_tolerance_pct": vwap_tol,
             "funding_tolerance": funding_tol,
             "ratio_tolerance": ratio_tol,
             "sentiment_fallback_used": fallback_used,
             "sentiment_source_unavailable": source_unavailable,
+            "sentiment_available": 0.0 if (fallback_used or source_unavailable) else 1.0,
             "degraded_mode": 1.0 if (fallback_used or source_unavailable) else 0.0,
             "sentiment_source": source,
         }

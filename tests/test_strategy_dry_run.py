@@ -109,6 +109,9 @@ class SignalGeneratorTests(unittest.TestCase):
         self.assertEqual(layer4.get("sentiment_source"), "unavailable")
         self.assertEqual(layer4.get("degraded_mode"), 1.0)
         self.assertEqual(layer4.get("sentiment_fallback_used"), 1.0)
+        self.assertEqual(layer4.get("sentiment_available"), 0.0)
+        self.assertEqual(layer4.get("funding_available"), 0.0)
+        self.assertEqual(layer4.get("long_short_ratio_available"), 0.0)
 
 
 if __name__ == "__main__":
