@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import math
 from typing import Any
 
 import numpy as np
@@ -77,6 +78,10 @@ class SignalConfig:
     # engineered pump, and fading it is a different trade.
     min_relative_strength: float = 0.05
     relative_strength_lookback: int = 24
+    # Missing BTC context disables the relative-strength protection. Fail closed
+    # by default, just like the higher-timeframe gate; research can opt into the
+    # legacy behavior explicitly for an ablation.
+    require_benchmark: bool = True
     # Optional and off by default: an overhead level cuts the tail further still
     # (0.77 legs) but more than halves the number of signals.
     require_level_overhead: bool = False
@@ -355,11 +360,19 @@ class SignalGenerator:
         details.update({k: float(v) for k, v in rs.items()})
 
         value = rs.get("relative_strength")
-        if cfg.min_relative_strength > 0 and benchmark is not None and value is not None and value == value:
-            rs_ok = value >= cfg.min_relative_strength
-        else:
-            # No benchmark available: do not silently block every signal.
+        benchmark_usable = (
+            benchmark is not None
+            and not benchmark.empty
+            and value is not None
+            and math.isfinite(float(value))
+        )
+        details["benchmark_available"] = 1.0 if benchmark_usable else 0.0
+        if cfg.min_relative_strength <= 0:
             rs_ok = True
+        elif benchmark_usable:
+            rs_ok = float(value) >= cfg.min_relative_strength
+        else:
+            rs_ok = not cfg.require_benchmark
         details["relative_strength_ok"] = 1.0 if rs_ok else 0.0
         details["min_relative_strength"] = float(cfg.min_relative_strength)
 

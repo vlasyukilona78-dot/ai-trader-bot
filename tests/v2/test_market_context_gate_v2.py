@@ -49,9 +49,16 @@ class MarketContextGateV2Tests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(d["relative_strength_ok"], 0.0)
 
-    def test_missing_benchmark_does_not_block_everything(self):
+    def test_missing_benchmark_blocks_by_default(self):
         coin = _frame(list(np.linspace(100, 130, 40)))
         ok, d = self._gen()._layer1c_market_context(coin, None)
+        self.assertFalse(ok)
+        self.assertEqual(d["benchmark_available"], 0.0)
+        self.assertEqual(d["relative_strength_ok"], 0.0)
+
+    def test_missing_benchmark_can_be_allowed_explicitly(self):
+        coin = _frame(list(np.linspace(100, 130, 40)))
+        ok, d = self._gen(require_benchmark=False)._layer1c_market_context(coin, None)
         self.assertTrue(ok)
         self.assertEqual(d["relative_strength_ok"], 1.0)
 
@@ -80,6 +87,9 @@ class WeaknessLayerDefaultV2Tests(unittest.TestCase):
 
     def test_relative_strength_default_matches_the_measured_threshold(self):
         self.assertEqual(SignalConfig().min_relative_strength, 0.05)
+
+    def test_benchmark_is_required_by_default(self):
+        self.assertTrue(SignalConfig().require_benchmark)
 
 
 if __name__ == "__main__":
