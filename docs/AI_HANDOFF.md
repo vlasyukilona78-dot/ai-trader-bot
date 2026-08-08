@@ -1,15 +1,19 @@
 # AI collaboration handoff
 
-Updated: 2026-08-03, Europe/Moscow
+Updated: 2026-08-08, Europe/Moscow
 
 > [!IMPORTANT]
 > Fresh-session entrypoint: read `CLAUDE.md` and
 > `docs/CLAUDE_REVIEW_PROMPT_2026-08-03.md`, then treat
 > `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` as the current MEXC plan. The
-> published AI foundation anchor is `f0b43d6`; verify the current local/remote
-> descendant HEAD. The `98217df`/`340 passed` checkpoint immediately below is a
+> published AI foundation anchor is `f0b43d6`; the Phase 1 hardening code tip is
+> `e0e4cb4` and was verified equal to its remote after push. Discover the later
+> documentation-only descendant with `git log`. The `98217df`/`340 passed`
+> checkpoint immediately below is a
 > preserved earlier causal-scanner snapshot, not the latest foundation state.
-> Latest code validation: `352 passed, 4 skipped, 2 known collection warnings`.
+> Latest code validation: `529 passed, 4 skipped, 2 known collection warnings`
+> (`13.85s`). Current journal path:
+> `data/runtime/mexc_population_decisions_v4.jsonl`.
 
 ## Earlier causal-scanner checkpoint — 2026-08-03
 
@@ -1458,3 +1462,150 @@ Baseline before this rework was 388. Three consecutive full runs were identical.
 
 No edge is claimed. This rework makes selection reproducible and the research
 entry reachable; it does not make the strategy profitable.
+
+## Phase 1 evidence hardening — 2026-08-08
+
+This is the latest operational checkpoint. It supersedes only the open-state
+verdict at the end of the 2026-08-03 rework; the historical findings above stay
+as an audit trail. Work was performed only in the selected MEXC worktree on
+`claude/codex-project-review-04581e`, starting from `59bb59c`. The three code
+commits were pushed fast-forward and local/remote both reached `e0e4cb4` before
+this documentation update:
+
+```text
+32e8fbe fix(journal): harden causal population evidence
+0c32047 fix(backtest): bind replay outcomes to schema-v3 evidence
+e0e4cb4 fix(strategy): fail closed without benchmark context
+```
+
+### Current version and identity matrix
+
+| Boundary | Current version / identity |
+|---|---|
+| population journal | schema v4; default `data/runtime/mexc_population_decisions_v4.jsonl` |
+| cycle envelope | schema v2 + canonical `envelope_hash` |
+| reversal features | `mexc_reversal_features_v2`; pinned executable hash |
+| market snapshot | `market_feature_hash(symbol, timeframe, snapshot)` |
+| single-position | schema v3; plan/contract/replay-input/result SHA-256 |
+
+`market_feature_hash` is the market-only identity. `PopulationDecision.input_hash`
+and `snapshot_id` still bind the cycle and rule output (`action`, `reason`,
+`confidence`), so separate persisted `MarketFeatureSnapshot`, `RuleEvaluation`
+and `TradeProposal` entities are not yet complete. Wall clock is outside the
+feature snapshot but still enters population identity through `cycle_id`; do not
+claim that every row hash is timing-independent.
+
+### Journal v4 and strict dataset boundary
+
+- Header and footer both bind the exact `CycleEnvelope`; each feature-bearing
+  row carries the same envelope hash.
+- Completed cycles must contain exactly `envelope.universe_symbols` in order.
+  `empty_universe` and `error` cycles must contain zero decision rows.
+- Footer checksum covers every canonical field of every ordered decision row,
+  rather than only snapshot IDs.
+- Writer and restart audit reconstruct every `PopulationDecision`, re-derive
+  `input_hash`/`snapshot_id`, rebuild the feature snapshot from source metadata,
+  and verify symbol/timeframe-bound `market_feature_hash`.
+- The reader validates the entire immutable file once before yielding its first
+  cycle, then parses the same fingerprint again. A corrupt later cycle cannot
+  leak an accepted prefix into an exporter/trainer.
+- Duplicate cycles are rejected even in an A-B-A layout.
+- A process-local path lock plus Windows `msvcrt` / POSIX `flock` sidecar lock
+  protects `refresh -> dedup -> append -> fsync` across objects and processes.
+- An incomplete/torn tail still blocks reopen. Recovery is intentionally manual:
+  move the damaged file aside and start a new schema-v4 journal. Automatic repair
+  is not implemented.
+- If terminal-cycle persistence fails while journalling is enabled, scanner code
+  raises instead of converting the attempt into an invisible gap.
+
+### Source provenance and closed-frame semantics
+
+- Universe ticker and optional contract details distinguish fresh response,
+  TTL cache hit, stale fallback and first-request failure.
+- `request_started_at`, `received_at`, `source_ts`, `cache_hit`, cache age,
+  status and safe error code survive an exact envelope round-trip.
+- A successful universe refresh uses its response instant as `refreshed_at`;
+  stale fallback retains the prior successful TTL anchor so the next cycle can
+  retry. Reused contract details are relabelled as cache data.
+- `source_as_of` is absent when a failed source returned no data. Partial base or
+  HTF availability is represented conservatively instead of claiming a wholly
+  fresh cohort.
+- Mixed fresh/cache higher-timeframe reads remain visibly cache-backed.
+- `source_ts` for fresh ticker/details is currently the local response instant,
+  not an exchange-supplied server timestamp.
+- A closed OHLCV frame no longer makes an extra live ticker request. Its mark
+  reference is the last closed close, matching the scanner's causal input.
+- Base OHLCV and higher timeframe now have separate cycle timings, but still need
+  per-symbol/per-timeframe provenance before executable label admission.
+- The volatility sweep shares one frozen timestamp and cold-start distribution,
+  removing scan-order drift from its floor.
+
+### Single-position schema v3
+
+The previous result object could be made internally plausible while changing
+costs, sizing, exit timing or an opaque replay-input hash. The accepted contract
+now requires:
+
+- one SHORT entry, one stop, one TP and global concurrency exactly one;
+- explicit fee, spread, slippage, equity/risk fraction, notional/leverage caps,
+  quantity step/minimums, bar interval and maximum horizon;
+- `plan_hash`, `contract_hash`, `replay_input_hash` and `result_hash` over
+  canonical payloads;
+- immutable `ReplayEvidence` containing the normalized gap-free horizon bars and
+  strictly increasing, non-duplicated funding events;
+- `ScoredCandidate(plan, contract, evidence, result)` with no legacy/default
+  bypass;
+- a fresh deterministic replay at the candidate boundary and again when the
+  selector revalidates candidates. A random/rehashed input digest or a valid hash
+  from different bars is rejected;
+- exact entry/exit bar arithmetic, sizing, risk budget, fees and fill friction.
+
+This is executable mechanics, not the finished label pipeline. Durable evidence
+serialization/reader, forward-data manifests, point-in-time instrument rules and
+the journal→proposal→label bridge remain Phase 1/3 work.
+
+### Benchmark failure policy
+
+The old BTC relative-strength gate failed open: missing benchmark data could
+increase signals. `require_benchmark=True` is now the default. When relative
+strength is active, missing, empty or non-finite benchmark context blocks L1c;
+the previous behavior exists only behind explicit
+`require_benchmark=False` for controlled ablation. `benchmark_available` is
+recorded in the trace.
+
+This deliberately changes eligibility/signal count. It is a correctness and
+failure-semantics decision, not evidence that returns improved.
+
+### Validation receipt
+
+```text
+529 passed, 4 skipped, 2 known PytestCollectionWarning (13.85s)
+```
+
+Focused adversarial coverage includes full-row/provenance tampering, restart
+revalidation, A-B-A duplicates, concurrent spawned writers, fresh/cache/stale
+scanner→journal→reader round trips, cost/sizing/timing forgeries with recomputed
+result hashes, false replay-input hashes, evidence from different bars, reversed
+funding and duplicate funding timestamps.
+
+### Operational boundary and remaining order
+
+- MEXC remains the target; the bot/scanner stayed stopped.
+- No exchange API, Telegram, model training, testnet, private or live path was
+  run. `.env` was not read. Historical credentials remain unrotated, so every
+  private/live action is still forbidden.
+- Root/Bybit was not changed; its three user-owned `.idea/*` modifications were
+  preserved.
+- Generic pump-fade still has no demonstrated stable edge after costs. No model
+  has been fitted, promoted or enabled.
+
+Next implementation order:
+
+1. Finish `StrategySpecV2`: canonical configuration plus explicit
+   feature/base/execution/15m/1h/4h intervals and physical windows.
+2. Add per-symbol base/HTF provenance, point-in-time instrument rules and typed
+   arm/confirm lifecycle.
+3. Phase 2: compute gate-independent causal features and raw-contract ledger.
+4. Only then build durable TradeProposal/OutcomeLabel and forward-data manifests.
+5. Accumulate prospective population before logistic/rules/random baselines and
+   the LightGBM + separate EV candidate. Repeat no-edge is an accepted result.

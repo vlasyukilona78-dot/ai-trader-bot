@@ -1,6 +1,6 @@
 # Koteika Ultra — единая стратегия, AI-архитектура и новый план
 
-Актуально: **2026-08-03, Europe/Moscow**. Целевая площадка: **MEXC futures**.
+Актуально: **2026-08-08, Europe/Moscow**. Целевая площадка: **MEXC futures**.
 
 Этот документ заменяет идею «добавить одну умную нейросеть, которая почувствует
 разворот» на проверяемую систему. Он объединяет исполняемую стратегию, causal
@@ -69,22 +69,22 @@ manual promotion и отсутствие private/live доступа до рот
   часов, `confirmation_max_wait_bars=3` — до трёх часов, `msb_recent_bars=6` —
   шесть часов. Комментарии описывают быстрый intraday pump, то есть физический
   смысл и исполняемая конфигурация расходятся.
-- Каждый symbol получает собственный wall-clock `decision_ts` после вычисления.
-  Single-position replay требует первую execution candle ровно с этим timestamp,
-  что практически невозможно.
-- Одновременные candidates сейчас группируются по равенству float timestamp, а
-  не по `cycle_id`, поэтому worker latency может менять concurrency-one результат.
-- Нужны отдельные `bar_cutoff_ts`, source-specific `request_started_at` /
-  `received_at`, `decision_completed_ts`, `cycle_completed_ts`, `actionable_ts`
-  и `entry_eligible_ts >= max(all source received_at, cycle completion)`.
-- Look-ahead с заменой unfilled top-score на runner-up того же момента уже
-  устранён: сначала выбирается лидер по causal score, затем моделируется только
-  его fill. Grouping по cycle/cohort всё ещё требует Phase 1.
+- Research timing теперь разделяет cutoff, source responses, ranking completion,
+  `actionable_ts`, `entry_eligible_ts` и первый достижимый execution bar.
+  Cohorts группируются по `cycle_id`, а не по float wall-clock; unfilled leader
+  не заменяется runner-up по будущему outcome.
+- Single-position v3 связывает план, полный execution contract, нормализованные
+  бары, строго упорядоченный funding и результат. Selector повторяет replay по
+  обязательному `ReplayEvidence`, поэтому одного самозаявленного hash недостаточно.
+- Остаются P0 для model-ready labels: физические интервалы и окна в едином
+  `StrategySpec`, arm/confirm lifecycle, point-in-time instrument rules и
+  journal→proposal→label bridge. Research timing не является доказательством
+  своевременной Telegram/live-доставки.
 
 ### P0 — dataset / labels / model
 
-- Population journal писал полный цикл, но до текущей реализации ни один dataset
-  builder его не читал.
+- Population journal v4 и строгий reader теперь образуют проверяемый ordered
+  runtime-population источник, но label builder ещё не связан с ним.
 - Старые builders создают event-conditioned LONG/DCA labels; новый
   `replay_single_short()` ими не вызывается.
 - Старый trainer использует `target_win/target_horizon`, row-wise split, выбирает
@@ -94,8 +94,8 @@ manual promotion и отсутствие private/live доступа до рот
 
 ### P0 — feature parity
 
-- Funding и OI уже находились в universe metadata, но funding не передавался в
-  strategy context; OI не употреблялся.
+- Funding из frozen universe snapshot уже передаётся в strategy context; raw OI
+  по-прежнему не нормализован по contract size и остаётся diagnostic/unconsumed.
 - `min_rsi_1h` и `require_confluence` объявлены, но не исполняются.
 - Fibonacci, confluence, divergence и estimated liquidation доступны offline,
   но не в runtime decision.
@@ -118,8 +118,11 @@ manual promotion и отсутствие private/live доступа до рот
   quantity step, minimum quantity, contract size и надёжный max leverage.
 - Estimated liquidation map — OHLCV/leverage proxy. Его запрещено называть
   биржевым liquidation feed и смешивать с liquidation price нашей позиции.
-- Empty-universe и ошибки до `append_cycle()` пока не имеют отдельного attempt /
-  universe-envelope journal.
+- Empty-universe и pre-scan errors теперь получают durable zero-row envelope;
+  ошибка записи при включённом journal останавливает цикл fail-closed.
+- Base/HTF timing разделён по источникам, но остаётся cycle aggregate, а не
+  per-symbol/per-timeframe evidence. Оборванный tail намеренно блокирует reopen
+  и пока требует ручного переноса файла вместо автоматического repair.
 - Комментарии `measured best`, `validated` и исторические численные thresholds
   считаются только frozen legacy hypotheses: финальный no-edge отменил статус
   доказанного преимущества.
@@ -128,7 +131,7 @@ manual promotion и отсутствие private/live доступа до рот
 
 Добавлен `ai/reversal/feature_contract.py`:
 
-- version `mexc_reversal_features_v1`;
+- version `mexc_reversal_features_v2`;
 - stable registry и SHA-256 contract hash;
 - роли `model_candidate`, `proposal_conditioning`, `deterministic_policy`,
   `context_candidate`, `diagnostic_only`;
@@ -162,8 +165,9 @@ Scanner теперь:
 - имеет отдельный nested `model_input_records()` только по role whitelist, без
   action/status/rule columns.
 
-Это ещё не model-ready dataset: поздние layer features пока structural-missing,
-labels и executable entry timing не построены.
+Это ещё не model-ready dataset: research entry timing уже построен, но поздние
+layer features пока structural-missing, point-in-time instrument contract и
+proposal/label bridge отсутствуют, а новая prospective population не накоплена.
 
 ## 5. Единая таблица стратегии
 
@@ -373,8 +377,9 @@ runtime- и schema-блокеры. Дефекты устранены тремя 
   `decision_ts`. `EntryPlan` несёт когорту, то есть она известна до replay.
 - [x] `replay_single_short` требует первую свечу на `entry_bar_open_ts`;
   `entry_ts` следует за исполнением, а не за решением.
-- [x] Schema bump: population journal v2, single-position contract v2; reader
-  fail-closed на прежней версии.
+- [x] Актуальная version matrix: population journal v4, `CycleEnvelope` v2,
+  `mexc_reversal_features_v2`, single-position contract v3. Несовместимые старые
+  schemas fail-closed.
 - [x] Пустой и ошибочный цикл пишутся в журнал как header+footer и читаются
   после рестарта.
 - [x] Envelope пишется один раз на цикл (header/rows/footer, row count и
@@ -388,12 +393,35 @@ runtime- и schema-блокеры. Дефекты устранены тремя 
   base OHLCV, higher timeframe; кэш тикеров не выдаётся за свежий ответ.
 - [x] Холодный старт волатильности инвариантен к порядку воркеров (проверено на
   реальной `LayeredPumpStrategy`, 28 символов, оба порядка).
-- [x] Регрессия: `423 passed, 4 skipped, 2 known collection warnings`.
+- [x] Регрессия после hardening: `529 passed, 4 skipped, 2 known collection
+  warnings` (`13.85s`).
 
 Что timing **не** доказывает: `entry_bar_open_ts` помечен
 `timing_basis="research_ranking_ready"`. Он обосновывает сравнимость когорты в
 research-replay и не утверждает, что живая signals-only доставка успела бы к
 этому бару — построение записи, fsync, возврат и канал доставки не измерены.
+
+Hardening 2026-08-08 опубликован тремя отдельными code commits:
+
+- `32e8fbe` — journal v4: envelope hash в header/body/footer, checksum полных
+  canonical decision rows, exact ordered population, zero-row terminal cycles,
+  полный restart audit, two-pass reader до первого yield и Windows/POSIX
+  inter-process append lock;
+- `0c32047` — single-position v3: `plan_hash`, `contract_hash`,
+  `replay_input_hash`, `result_hash`, обязательный immutable `ReplayEvidence`,
+  повторный replay в selector и strict-increasing funding timestamps;
+- `e0e4cb4` — benchmark fail-closed по умолчанию; legacy fail-open оставлен
+  только как явная ablation `require_benchmark=False`. Это меняет eligibility и
+  signal count, но само по себе не является доказательством edge.
+
+Дополнительно fresh/TTL-cache/stale-cache/first-failure сохраняют разные
+provenance; contract details имеют отдельный clock; mixed HTF cache не выдаётся
+за полностью fresh; закрытый frame больше не делает скрытый live-ticker запрос.
+`source_ts` свежего ticker/details — локальный response instant, а не
+exchange-supplied server timestamp. `market_feature_hash` связывает symbol,
+timeframe и market-only snapshot. При этом `PopulationDecision.input_hash` и
+`snapshot_id` намеренно продолжают включать cycle/rule identity, поэтому это не
+замена отдельным persisted `MarketFeatureSnapshot` и `RuleEvaluation`.
 
 Осталось в Phase 1:
 
@@ -403,12 +431,13 @@ research-replay и не утверждает, что живая signals-only д�
 3. Выразить окна в секундах либо именованных timeframe bars.
 4. Разделить armed и confirmed как отдельные typed состояния (cycle-complete,
    actionable и executable entry уже разделены).
-6. Добавить canonical serialization/hash single-position contract.
-7. Разделить identity `MarketFeatureSnapshot`, `RuleEvaluation`, proposal и
+5. Добавить durable public serialization/reader для single-position v3 и
+   forward-data manifest; canonical hashes уже реализованы.
+6. Разделить persisted identity `MarketFeatureSnapshot`, `RuleEvaluation`, proposal и
    prediction.
-8a. Разделить per-symbol base OHLCV и HTF timing: сейчас они покрыты одним
-   `market_data` интервалом, ограничивающим весь параллельный проход.
-9. Получать point-in-time instrument specs: contract size, quantity step,
+7. Разделить per-symbol base OHLCV и per-symbol/per-timeframe HTF timing: сейчас
+   два источника различаются, но каждый остаётся aggregate всего цикла.
+8. Получать point-in-time instrument specs: contract size, quantity step,
    minimum quantity/notional, leverage, timestamp и hash.
 
 Acceptance: worker count/order не меняет snapshot, ranking, entry или outcome —
@@ -537,10 +566,12 @@ capital caps и emergency stop. Текущее разрешение менять
 - Старые CSV и tracked ML artifacts — legacy/discovery-only.
 - Реализованный feature contract улучшает воспроизводимость, но **не доказывает
   edge** и пока не разрешает model fit.
-- Phase 1 slice 1 (causal time + cycle/cohort identity) выполнен. Он делает отбор
-  воспроизводимым и вход достижимым, но **edge по-прежнему не установлен**.
-- Следующая задача: остаток Phase 1 (`StrategySpecV2`, интервалы, arm/confirm
-  lifecycle, instrument specs), затем unconditional parity.
+- Phase 1 timing/journal/replay hardening выполнен: journal v4 и single-position
+  v3 закрывают подтверждённые подмены provenance/result, а benchmark теперь
+  fail-closed. Это делает evidence строже, но **edge по-прежнему не установлен**.
+- Следующая задача: остаток Phase 1 (`StrategySpecV2`, физические интервалы,
+  arm/confirm lifecycle, point-in-time instrument specs и per-symbol timings),
+  затем Phase 2 unconditional parity и только после неё proposal/label bridge.
 
 ## 12. Первичные источники для выбора технологий
 

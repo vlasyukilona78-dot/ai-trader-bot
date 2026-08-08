@@ -16,6 +16,7 @@ Selected MEXC causal research line:
 C:\Users\vlasy\PycharmProjects\koteika_Ultra\.claude\worktrees\codex-project-review-04581e
 branch: claude/codex-project-review-04581e
 AI foundation anchor: f0b43d6
+Phase 1 hardening code tip: e0e4cb4
 remote: origin/claude/codex-project-review-04581e
 ```
 
@@ -45,12 +46,13 @@ git -C $MEXC log -8 --oneline --decorate
 git -C $MEXC diff --stat 1e91ce0..HEAD
 git -C $MEXC diff --check 1e91ce0..HEAD
 git -C $MEXC merge-base --is-ancestor f0b43d6 HEAD
+git -C $MEXC merge-base --is-ancestor e0e4cb4 HEAD
 git -C $MEXC ls-files -- .env
 ```
 
 Expected facts at the recorded checkpoint:
 
-- MEXC local and remote tips match, `f0b43d6` is their ancestor, and the
+- MEXC local and remote tips match, `f0b43d6` and `e0e4cb4` are ancestors, and the
   worktree is clean;
 - current `.env` is not tracked; old history still contained credentials;
 - root may contain user-owned `.idea/*` changes — preserve and ignore them;
@@ -67,6 +69,7 @@ Read every listed file in full unless the item explicitly names a section:
 2. MEXC `CLAUDE.md`.
 3. MEXC `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` — authoritative plan.
 4. MEXC `docs/AI_HANDOFF.md`:
+   - `Phase 1 evidence hardening — 2026-08-08`;
    - `Current authoritative checkpoint — 2026-08-03`;
    - `Claude no-edge finding — 2026-07-26`;
    - `Codex independent review of Claude's nine follow-up commits`;
@@ -84,6 +87,9 @@ Read every listed file in full unless the item explicitly names a section:
 3ff8de0 feat(ai): add causal MEXC feature contract
 29536f1 docs: unify MEXC strategy and AI roadmap
 f0b43d6 docs: record AI foundation publication state
+32e8fbe fix(journal): harden causal population evidence
+0c32047 fix(backtest): bind replay outcomes to schema-v3 evidence
+e0e4cb4 fix(strategy): fail closed without benchmark context
 ```
 
 The Claude re-entry files are a later documentation-only change. Discover their
@@ -108,11 +114,17 @@ correct.
 - `trading/market_data/mexc_client.py`
 - `trading/market_data/timeframe_cache.py`
 - `trading/metrics/population_journal.py`
+- `trading/metrics/cycle_envelope.py`
 - `trading/alerts/telegram.py`
 - `ai/train.py` only to understand why it is legacy and must not be reused
 - `tests/v2/test_reversal_feature_contract_v2.py`
 - `tests/v2/test_population_feature_dataset_v2.py`
 - `tests/v2/test_single_position_contract_v2.py`
+- `tests/v2/test_single_position_schema_v3.py`
+- `tests/v2/test_single_position_result_invariants_v2.py`
+- `tests/v2/test_journal_cycle_records_v2.py`
+- `tests/v2/test_scan_journal_reader_e2e_v2.py`
+- `tests/v2/test_scan_source_provenance_v2.py`
 - `tests/v2/test_scan_v2.py`
 - `tests/v2/test_closed_bar_contract_v2.py`
 - `tests/v2/test_population_journal_v2.py`
@@ -125,7 +137,8 @@ correct.
 Confirm from code and tests, not only prose, that:
 
 1. The single-position selector chooses the top causal candidate before looking
-   at future fills and does not substitute a filled runner-up retrospectively.
+   at future fills, does not substitute a filled runner-up retrospectively, and
+   rejects a rehashed outcome that differs from mandatory ReplayEvidence.
 2. The feature contract is versioned, has a pinned executable schema hash,
    separates MODEL/PROPOSAL/POLICY/CONTEXT/DIAGNOSTIC roles, and distinguishes
    observed zero from missing/unavailable.
@@ -142,10 +155,12 @@ Confirm from code and tests, not only prose, that:
 Explicitly verify or challenge these still-open items. They are planned work,
 not completed claims:
 
-1. Source-specific `observed_at` and `entry_eligible_ts`; candle cutoff must not
-   pretend ticker/funding/OI were known earlier than the API response.
-2. Exact timeframe semantics, warm-up, bar duration and next executable entry
-   bar. Current scanner Min60/decision timing is not yet label-ready.
+1. Per-symbol base and per-symbol/per-timeframe HTF timing. Cycle-level source
+   provenance and research `entry_eligible_ts` are implemented, but delivery
+   timing is not.
+2. Exact StrategySpec timeframe semantics, warm-up and physical windows. The
+   first research execution bar is reachable; the current Min60 defaults still
+   do not express the intended fast-pump horizons.
 3. Ledger of all point-in-time MEXC USDT contracts, with inclusion/exclusion
    reasons, rather than only the filtered scan universe.
 4. Gate-independent eager feature computation for every valid symbol. Current
@@ -221,7 +236,7 @@ After the read-only audit, the allowed local verification command is:
 Run it from the MEXC worktree. The recorded result is:
 
 ```text
-352 passed, 4 skipped, 2 known PytestCollectionWarning
+529 passed, 4 skipped, 2 known PytestCollectionWarning (13.85s)
 ```
 
 Do not run the scanner or any test that requires private credentials/network

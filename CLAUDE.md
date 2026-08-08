@@ -13,27 +13,33 @@ API, or giving a strategy verdict:
    read-only orientation/review sequence.
 2. Read `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` in full. It is the
    authoritative MEXC strategy, data, model and implementation plan.
-3. Read the current checkpoint and the final 2026-08-03 section of
+3. Read the current checkpoint and the final 2026-08-08 section of
    `docs/AI_HANDOFF.md`. Earlier sections are an audit history and contain
    superseded findings.
 4. Verify the worktree, branch, local HEAD and remote HEAD yourself. The
    published AI foundation anchor is `f0b43d6` on
-   `claude/codex-project-review-04581e`; current HEAD may contain later
-   documentation-only handoff commits and must descend from that anchor.
+   `claude/codex-project-review-04581e`; the 2026-08-08 hardening code tip is
+   `e0e4cb4`, and current HEAD must descend from both anchors.
 
 ## Current product truth
 
 - Target exchange: MEXC futures.
 - Scope: public-data, signals-only causal research. There is no production MEXC
   private execution adapter in this line.
-- Latest tested tree at the recorded checkpoint: `352 passed, 4 skipped`, with
-  two known pytest collection warnings.
+- Latest tested tree at the recorded checkpoint: `529 passed, 4 skipped`, with
+  two known pytest collection warnings (`13.85s`).
 - Generic pump-fade has not demonstrated stable positive edge after costs. The
   earlier DCA/positive-expectancy claims are retracted hypotheses, not evidence.
-- Phase 0 of the new AI/data foundation is complete. The next implementation
-  task is Phase 1 `time/spec contract`, then unconditional feature parity.
-- Do not train or enable a model from the current partial snapshots. The current
-  trace is still gate-conditioned and exact entry/source timing is unfinished.
+- Phase 0 and the Phase 1 timing/journal/replay hardening are complete. Journal
+  schema v4 and single-position schema v3 are current; benchmark context now
+  fails closed by default.
+- The current runtime-population path is
+  `data/runtime/mexc_population_decisions_v4.jsonl`; older journal schemas and
+  legacy event-conditioned CSV are not accepted by the strict reader.
+- Do not train or enable a model from the current partial snapshots. The trace
+  is still gate-conditioned; StrategySpec/physical intervals, per-symbol
+  base/HTF provenance, arm/confirm lifecycle, point-in-time instrument specs and
+  the journal→proposal→label bridge remain unfinished.
 
 ## AI boundary
 
