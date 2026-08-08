@@ -529,7 +529,7 @@ class ScanCliV2Tests(unittest.TestCase):
             defaults = parse_args()
         self.assertEqual(
             defaults.population_journal,
-            "data/runtime/mexc_population_decisions_v4.jsonl",
+            "data/runtime/mexc_population_decisions_v5.jsonl",
         )
         self.assertFalse(defaults.disable_population_journal)
 

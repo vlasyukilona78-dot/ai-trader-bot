@@ -14,6 +14,11 @@ import time
 import pytest
 
 from ai.reversal.population_dataset import PopulationDatasetError, population_feature_records
+from core.mexc_strategy_spec import (
+    MEXC_STRATEGY_SPEC_VERSION,
+    load_mexc_strategy_spec,
+    strategy_spec_contract_hash,
+)
 from backtesting.single_position import (
     ScoredCandidate,
     SinglePositionContractError,
@@ -30,6 +35,9 @@ from v2.test_scan_v2 import _CaptureJournal, _FakeFeed, _FakeStrategy, _FakeUniv
 from v2.test_single_position_contract_v2 import _ENTRY_BAR_OPEN_TS, _bars, _contract, _plan
 
 from app.scan import scan_once
+
+
+_STRATEGY_SPEC = load_mexc_strategy_spec()
 
 
 # --------------------------------------------------------------------------
@@ -256,7 +264,10 @@ def _envelope(**overrides):
         universe_symbols=("AAAUSDT",),
         universe_timing=universe,
         source_timings=(universe,),
-        strategy_config_hash="b" * 64,
+        strategy_spec_version=MEXC_STRATEGY_SPEC_VERSION,
+        strategy_spec_contract_hash=strategy_spec_contract_hash(),
+        strategy_spec_instance_hash=_STRATEGY_SPEC.instance_hash,
+        strategy_spec_payload=_STRATEGY_SPEC.to_mapping(),
         universe_policy_hash="c" * 64,
         ranking_ready_ts=1_700_002_950.0,
         cycle_completed_ts=1_700_002_960.0,

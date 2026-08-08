@@ -4,6 +4,12 @@ import json
 
 import pytest
 
+from core.mexc_strategy_spec import (
+    MEXC_STRATEGY_SPEC_VERSION,
+    MexcStrategySpec,
+    load_mexc_strategy_spec,
+    strategy_spec_contract_hash,
+)
 from trading.market_data.source_timing import SourceTiming
 from trading.metrics.cycle_envelope import CycleEnvelope
 from trading.metrics.population_journal import (
@@ -20,6 +26,9 @@ _UNIVERSE_TIMING = SourceTiming(
     request_started_at=1_699_999_999.5,
     received_at=1_700_000_000.0,
 )
+_STRATEGY_SPEC_PAYLOAD = load_mexc_strategy_spec().to_mapping()
+_STRATEGY_SPEC_PAYLOAD["market_data"]["base_interval"] = "Min5"
+_STRATEGY_SPEC = MexcStrategySpec.from_mapping(_STRATEGY_SPEC_PAYLOAD)
 
 
 def _envelope(**overrides) -> CycleEnvelope:
@@ -31,7 +40,10 @@ def _envelope(**overrides) -> CycleEnvelope:
         universe_symbols=("AAA_USDT", "BBB_USDT"),
         universe_timing=_UNIVERSE_TIMING,
         source_timings=(_UNIVERSE_TIMING,),
-        strategy_config_hash="a" * 64,
+        strategy_spec_version=MEXC_STRATEGY_SPEC_VERSION,
+        strategy_spec_contract_hash=strategy_spec_contract_hash(),
+        strategy_spec_instance_hash=_STRATEGY_SPEC.instance_hash,
+        strategy_spec_payload=_STRATEGY_SPEC.to_mapping(),
         universe_policy_hash="b" * 64,
         ranking_ready_ts=1_700_000_103.0,
         cycle_completed_ts=1_700_000_104.0,

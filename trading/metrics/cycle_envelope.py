@@ -16,8 +16,15 @@ import hashlib
 import json
 import math
 import re
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
+from core.mexc_strategy_spec import (
+    MEXC_STRATEGY_SPEC_VERSION,
+    MexcStrategySpec,
+    MexcStrategySpecError,
+    strategy_spec_contract_hash,
+)
 from trading.market_data.bar_contract import (
     interval_seconds,
     is_bar_aligned,
@@ -30,7 +37,7 @@ from trading.market_data.source_timing import (
 )
 
 
-CYCLE_ENVELOPE_SCHEMA_VERSION = 2
+CYCLE_ENVELOPE_SCHEMA_VERSION = 3
 
 # What `entry_bar_open_ts` is allowed to claim.
 #
@@ -66,6 +73,22 @@ def _finite(value: object, *, field: str) -> float:
     return number
 
 
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({str(key): _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _thaw_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw_json(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True)
 class CycleEnvelope:
     """One scan cycle's identity, provenance and executable timing."""
@@ -78,7 +101,10 @@ class CycleEnvelope:
     universe_symbols: tuple[str, ...]
     universe_timing: SourceTiming
     source_timings: tuple[SourceTiming, ...]
-    strategy_config_hash: str
+    strategy_spec_version: str
+    strategy_spec_contract_hash: str
+    strategy_spec_instance_hash: str
+    strategy_spec_payload: Mapping[str, Any]
     universe_policy_hash: str
     ranking_ready_ts: float
     cycle_completed_ts: float
@@ -96,10 +122,37 @@ class CycleEnvelope:
             raise CycleEnvelopeError("unsupported_timing_basis")
         if not isinstance(self.cycle_id, str) or not _HASH_RE.fullmatch(self.cycle_id):
             raise CycleEnvelopeError("cycle_id_must_be_a_sha256_digest")
-        for name in ("strategy_config_hash", "universe_policy_hash"):
+        if self.strategy_spec_version != MEXC_STRATEGY_SPEC_VERSION:
+            raise CycleEnvelopeError("unsupported_strategy_spec_version")
+        for name in (
+            "strategy_spec_contract_hash",
+            "strategy_spec_instance_hash",
+            "universe_policy_hash",
+        ):
             value = getattr(self, name)
             if not isinstance(value, str) or not _HASH_RE.fullmatch(value):
                 raise CycleEnvelopeError(f"{name}_must_be_a_sha256_digest")
+        if not isinstance(self.strategy_spec_payload, Mapping):
+            raise CycleEnvelopeError("strategy_spec_payload_must_be_a_mapping")
+        try:
+            rebuilt_spec = MexcStrategySpec.from_mapping(self.strategy_spec_payload)
+        except (MexcStrategySpecError, RuntimeError, TypeError, ValueError) as exc:
+            raise CycleEnvelopeError("invalid_strategy_spec_payload") from exc
+        canonical_spec_payload = rebuilt_spec.to_mapping()
+        if _thaw_json(self.strategy_spec_payload) != canonical_spec_payload:
+            raise CycleEnvelopeError("strategy_spec_payload_must_be_canonical")
+        try:
+            expected_contract_hash = strategy_spec_contract_hash()
+            expected_instance_hash = rebuilt_spec.instance_hash
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise CycleEnvelopeError("invalid_strategy_spec_identity") from exc
+        if self.strategy_spec_contract_hash != expected_contract_hash:
+            raise CycleEnvelopeError("strategy_spec_contract_hash_mismatch")
+        if self.strategy_spec_instance_hash != expected_instance_hash:
+            raise CycleEnvelopeError("strategy_spec_instance_hash_mismatch")
+        if interval_seconds(self.timeframe) != rebuilt_spec.base_interval_seconds:
+            raise CycleEnvelopeError("timeframe_disagrees_with_strategy_spec")
+        object.__setattr__(self, "strategy_spec_payload", _freeze_json(canonical_spec_payload))
         if self.status not in CYCLE_STATUSES:
             raise CycleEnvelopeError("unsupported_cycle_status")
         if self.status == "error":
@@ -184,7 +237,10 @@ class CycleEnvelope:
         universe_symbols: Sequence[str],
         universe_timing: SourceTiming,
         source_timings: Sequence[SourceTiming],
-        strategy_config_hash: str,
+        strategy_spec_version: str,
+        strategy_spec_contract_hash: str,
+        strategy_spec_instance_hash: str,
+        strategy_spec_payload: Mapping[str, Any],
         universe_policy_hash: str,
         ranking_ready_ts: float,
         cycle_completed_ts: float,
@@ -208,7 +264,10 @@ class CycleEnvelope:
             universe_symbols=tuple(universe_symbols),
             universe_timing=universe_timing,
             source_timings=timings,
-            strategy_config_hash=strategy_config_hash,
+            strategy_spec_version=strategy_spec_version,
+            strategy_spec_contract_hash=strategy_spec_contract_hash,
+            strategy_spec_instance_hash=strategy_spec_instance_hash,
+            strategy_spec_payload=strategy_spec_payload,
             universe_policy_hash=universe_policy_hash,
             ranking_ready_ts=ranking_ready_ts,
             cycle_completed_ts=cycle_completed_ts,
@@ -274,7 +333,10 @@ class CycleEnvelope:
                 universe_symbols=payload.get("universe_symbols"),
                 universe_timing=universe,
                 source_timings=timings,
-                strategy_config_hash=payload.get("strategy_config_hash"),
+                strategy_spec_version=payload.get("strategy_spec_version"),
+                strategy_spec_contract_hash=payload.get("strategy_spec_contract_hash"),
+                strategy_spec_instance_hash=payload.get("strategy_spec_instance_hash"),
+                strategy_spec_payload=payload.get("strategy_spec_payload"),
                 universe_policy_hash=payload.get("universe_policy_hash"),
                 ranking_ready_ts=payload.get("ranking_ready_ts"),
                 cycle_completed_ts=payload.get("cycle_completed_ts"),
@@ -301,7 +363,10 @@ class CycleEnvelope:
             "universe_symbols": list(self.universe_symbols),
             "universe_timing": self.universe_timing.as_dict(),
             "source_timings": [timing.as_dict() for timing in self.source_timings],
-            "strategy_config_hash": self.strategy_config_hash,
+            "strategy_spec_version": self.strategy_spec_version,
+            "strategy_spec_contract_hash": self.strategy_spec_contract_hash,
+            "strategy_spec_instance_hash": self.strategy_spec_instance_hash,
+            "strategy_spec_payload": _thaw_json(self.strategy_spec_payload),
             "universe_policy_hash": self.universe_policy_hash,
             "ranking_ready_ts": self.ranking_ready_ts,
             "cycle_completed_ts": self.cycle_completed_ts,
@@ -312,6 +377,18 @@ class CycleEnvelope:
             "error_code": self.error_code,
             "timing_basis": self.timing_basis,
         }
+
+    @property
+    def strategy_config_hash(self) -> str:
+        """Compatibility alias for schema-v4 row provenance.
+
+        Journal-v5 headers carry the complete StrategySpec identity and payload.
+        Decision rows retain their existing field name until the feature-row
+        contract is versioned independently; its value is now the validated
+        StrategySpec instance hash, never an independently computed digest.
+        """
+
+        return self.strategy_spec_instance_hash
 
     def envelope_hash(self) -> str:
         """Identity of this cycle's executable timing, kept apart from the market.

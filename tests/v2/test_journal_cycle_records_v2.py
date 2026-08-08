@@ -23,6 +23,8 @@ from trading.metrics.population_journal import (
     SCHEMA_VERSION,
     PopulationJournal,
     PopulationJournalError,
+    compute_cycle_commit,
+    genesis_cycle_commit,
     rows_checksum,
 )
 
@@ -78,24 +80,37 @@ def test_reader_rejects_a_serialized_completed_cycle_with_no_rows(tmp_path) -> N
     path = tmp_path / "population.jsonl"
     envelope = _envelope()
     envelope_hash = envelope.envelope_hash()
+    journal_id = "c" * 64
+    prev_cycle_commit = genesis_cycle_commit(journal_id)
+    header = {
+        "record_type": "cycle_header",
+        "schema_version": SCHEMA_VERSION,
+        "journal_id": journal_id,
+        "sequence_no": 0,
+        "prev_cycle_commit": prev_cycle_commit,
+        "cycle_id": envelope.cycle_id,
+        "row_count": 0,
+        "envelope_hash": envelope_hash,
+        "envelope": envelope.as_dict(),
+    }
+    footer_core = {
+        "record_type": "cycle_footer",
+        "schema_version": SCHEMA_VERSION,
+        "journal_id": journal_id,
+        "sequence_no": 0,
+        "prev_cycle_commit": prev_cycle_commit,
+        "cycle_id": envelope.cycle_id,
+        "row_count": 0,
+        "envelope_hash": envelope_hash,
+        "rows_checksum": rows_checksum(()),
+    }
     _rewrite(
         path,
         [
+            header,
             {
-                "record_type": "cycle_header",
-                "schema_version": SCHEMA_VERSION,
-                "cycle_id": envelope.cycle_id,
-                "row_count": 0,
-                "envelope_hash": envelope_hash,
-                "envelope": envelope.as_dict(),
-            },
-            {
-                "record_type": "cycle_footer",
-                "schema_version": SCHEMA_VERSION,
-                "cycle_id": envelope.cycle_id,
-                "row_count": 0,
-                "envelope_hash": envelope_hash,
-                "rows_checksum": rows_checksum(()),
+                **footer_core,
+                "cycle_commit": compute_cycle_commit(header, (), footer_core),
             },
         ],
     )

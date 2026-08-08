@@ -13,6 +13,7 @@ Nothing here can place, modify or cancel an order.
 from __future__ import annotations
 
 import argparse
+from functools import lru_cache
 import math
 import os
 import time
@@ -30,6 +31,12 @@ from ai.reversal.feature_contract import (
     market_feature_hash,
 )
 from core.indicators import compute_indicators
+from core.mexc_strategy_spec import (
+    DEFAULT_MEXC_STRATEGY_SPEC_PATH,
+    MexcStrategySpec,
+    load_mexc_strategy_spec,
+    strategy_spec_contract_hash,
+)
 from trading.market_data.bar_contract import (
     BarContractError,
     closed_boundary_ts,
@@ -56,7 +63,6 @@ from trading.state.models import TradeState
 from trading.state.signal_observation_tracker import SignalObservationTracker
 
 
-_MIN_HISTORY_BARS = 80
 _REQUIRED_OHLCV_COLUMNS = frozenset({"open", "high", "low", "close", "volume"})
 _PopulationStatus = Literal[
     "evaluated",
@@ -94,8 +100,22 @@ class _ScanEvaluation:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="MEXC signal scanner (no execution)")
-    p.add_argument("--timeframe", default="60", help="Bar size for the entry frame")
-    p.add_argument("--candles", type=int, default=320)
+    p.add_argument(
+        "--strategy-spec",
+        default=str(DEFAULT_MEXC_STRATEGY_SPEC_PATH),
+        help="Strict MEXC strategy YAML used by strategy, market data and evidence",
+    )
+    p.add_argument(
+        "--timeframe",
+        default=None,
+        help="Compatibility assertion only; must equal strategy-spec base_interval",
+    )
+    p.add_argument(
+        "--candles",
+        type=int,
+        default=None,
+        help="Compatibility assertion only; must equal strategy-spec base_candles",
+    )
     p.add_argument("--min-turnover", type=float, default=400_000.0)
     p.add_argument("--max-turnover", type=float, default=100_000_000.0)
     p.add_argument("--max-symbols", type=int, default=0, help="0 = whole filtered universe")
@@ -111,7 +131,7 @@ def parse_args() -> argparse.Namespace:
                    help="How long each signal is followed after delivery")
     p.add_argument(
         "--population-journal",
-        default="data/runtime/mexc_population_decisions_v4.jsonl",
+        default="data/runtime/mexc_population_decisions_v5.jsonl",
         help="Append one causal decision row for every point-in-time universe symbol",
     )
     p.add_argument(
@@ -120,6 +140,54 @@ def parse_args() -> argparse.Namespace:
         help="Disable the runtime-population JSONL journal",
     )
     return p.parse_args()
+
+
+@lru_cache(maxsize=1)
+def _default_strategy_spec() -> MexcStrategySpec:
+    """Load the repository default once for compatibility/test callers.
+
+    Production ``main`` loads the operator-selected path itself and supplies the
+    resulting object explicitly.  The cached fallback keeps the lower-level
+    ``scan_once`` API deterministic without reparsing YAML on every loop.
+    """
+
+    return load_mexc_strategy_spec(DEFAULT_MEXC_STRATEGY_SPEC_PATH)
+
+
+def _resolve_scan_spec(
+    *,
+    strategy: object,
+    strategy_spec: MexcStrategySpec | None,
+    timeframe: str | None,
+    candles: int | None,
+) -> MexcStrategySpec:
+    bound_spec = getattr(strategy, "strategy_spec", None)
+    if bound_spec is not None and not isinstance(bound_spec, MexcStrategySpec):
+        raise TypeError("strategy_spec_binding_must_be_mexc_strategy_spec")
+    if strategy_spec is None and bound_spec is None:
+        # Compatibility for lower-level offline/test callers that predate the
+        # explicit spec argument.  Production main always supplies the loaded
+        # YAML object, where the legacy flags below are assertions only.
+        compatibility_payload = _default_strategy_spec().to_mapping()
+        if timeframe is not None:
+            compatibility_payload["market_data"]["base_interval"] = timeframe
+        if candles is not None:
+            compatibility_payload["market_data"]["base_candles"] = candles
+        resolved = MexcStrategySpec.from_mapping(compatibility_payload)
+    else:
+        resolved = strategy_spec or bound_spec
+    if not isinstance(resolved, MexcStrategySpec):
+        raise TypeError("strategy_spec_must_be_mexc_strategy_spec")
+    if bound_spec is not None and bound_spec.instance_hash != resolved.instance_hash:
+        raise ValueError("strategy_and_scanner_specs_do_not_match")
+    assert_consistent = getattr(strategy, "assert_strategy_spec_consistency", None)
+    if callable(assert_consistent):
+        assert_consistent(resolved)
+    if timeframe is not None and interval_seconds(timeframe) != resolved.base_interval_seconds:
+        raise ValueError("cli_timeframe_does_not_match_strategy_spec")
+    if candles is not None and candles != resolved.market_data.base_candles:
+        raise ValueError("cli_candles_do_not_match_strategy_spec")
+    return resolved
 
 
 def _finite_number(value, *, field: str) -> float:
@@ -468,7 +536,9 @@ def _population_record(
         },
         "benchmark_status": benchmark_status,
         "provenance": {
-            "strategy_config_hash": envelope.strategy_config_hash,
+            # Kept under the v4 row-field name until the feature-row schema is
+            # bumped; the v5 envelope contains and validates the complete spec.
+            "strategy_config_hash": envelope.strategy_spec_instance_hash,
             "universe_policy_hash": envelope.universe_policy_hash,
         },
     }
@@ -543,23 +613,38 @@ def _population_record(
     )
 
 
-def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
-              tracker=None, alerters=(), population_journal=None) -> list:
+def scan_once(
+    *,
+    universe,
+    feed,
+    strategy,
+    logger,
+    timeframe: str | None = None,
+    candles: int | None = None,
+    workers: int = 8,
+    tracker=None,
+    alerters=(),
+    population_journal=None,
+    strategy_spec: MexcStrategySpec | None = None,
+) -> list:
+    resolved_spec = _resolve_scan_spec(
+        strategy=strategy,
+        strategy_spec=strategy_spec,
+        timeframe=timeframe,
+        candles=candles,
+    )
+    timeframe = resolved_spec.market_data.base_interval
+    candles = resolved_spec.market_data.base_candles
     cycle_started_at = time.time()
     # Freeze the causal cutoff before the universe request. Deriving it afterwards
     # let a refresh that happened to cross a bar boundary produce a cutoff later
     # than the cycle's own start, which is both a false provenance claim and an
     # envelope-invariant crash.
     candle_cutoff_ts = closed_boundary_ts(cycle_started_at, timeframe)
-    strategy_config = (
-        strategy.configuration_snapshot()
-        if hasattr(strategy, "configuration_snapshot")
-        else getattr(strategy, "config", None)
-    )
-    strategy_config_hash = configuration_hash(
-        strategy_config,
-        component="mexc_signal_strategy",
-    )
+    strategy_spec_version = resolved_spec.spec_version
+    strategy_contract_hash = strategy_spec_contract_hash()
+    strategy_instance_hash = resolved_spec.instance_hash
+    strategy_spec_payload = resolved_spec.to_mapping()
     universe_policy_hash = configuration_hash(
         getattr(universe, "config", None),
         component="mexc_universe_policy",
@@ -593,7 +678,10 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
             universe_symbols=(),
             universe_timing=universe_timing,
             source_timings=(universe_timing,),
-            strategy_config_hash=strategy_config_hash,
+            strategy_spec_version=strategy_spec_version,
+            strategy_spec_contract_hash=strategy_contract_hash,
+            strategy_spec_instance_hash=strategy_instance_hash,
+            strategy_spec_payload=strategy_spec_payload,
             universe_policy_hash=universe_policy_hash,
             ranking_ready_ts=universe_received,
             cycle_completed_ts=cycle_completed_at,
@@ -648,7 +736,10 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
             universe_symbols=(),
             universe_timing=universe_timing,
             source_timings=tuple(terminal_source_timings),
-            strategy_config_hash=strategy_config_hash,
+            strategy_spec_version=strategy_spec_version,
+            strategy_spec_contract_hash=strategy_contract_hash,
+            strategy_spec_instance_hash=strategy_instance_hash,
+            strategy_spec_payload=strategy_spec_payload,
             universe_policy_hash=universe_policy_hash,
             ranking_ready_ts=scan_observed_at,
             cycle_completed_ts=empty_completed_at,
@@ -705,7 +796,7 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
         btc, _, _, _ = _fetch_closed_frame(
             feed=feed,
             symbol="BTCUSDT",
-            timeframe=timeframe,
+            timeframe=resolved_spec.resolved_benchmark_interval,
             candles=candles,
             cutoff=candle_cutoff_ts,
         )
@@ -821,7 +912,7 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
                 base_bar_close_ts=bar_close_ts,
                 stage="market_data",
             )
-        if len(raw) < _MIN_HISTORY_BARS:
+        if len(raw) < resolved_spec.runtime_semantics.layered_min_history_bars:
             return _ScanEvaluation(
                 symbol=symbol,
                 status="short_history",
@@ -835,7 +926,7 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
             )
 
         try:
-            enriched = compute_indicators(raw)
+            enriched = compute_indicators(raw, **resolved_spec.compute_indicators_kwargs())
             symbol_universe_meta = universe_metadata.get(symbol, {})
             funding_rate = _optional_finite(symbol_universe_meta.get("funding_rate"))
             intent = _validate_intent(
@@ -946,7 +1037,10 @@ def scan_once(*, universe, feed, strategy, logger, timeframe, candles, workers,
         universe_symbols=symbols,
         universe_timing=universe_timing,
         source_timings=tuple(source_timings),
-        strategy_config_hash=strategy_config_hash,
+        strategy_spec_version=strategy_spec_version,
+        strategy_spec_contract_hash=strategy_contract_hash,
+        strategy_spec_instance_hash=strategy_instance_hash,
+        strategy_spec_payload=strategy_spec_payload,
         universe_policy_hash=universe_policy_hash,
         ranking_ready_ts=ranking_ready_ts,
         cycle_completed_ts=cycle_completed_ts,
@@ -1142,6 +1236,15 @@ def main() -> int:
     args = parse_args()
     load_env()
     logger = setup_logging("INFO")
+    strategy_spec = load_mexc_strategy_spec(args.strategy_spec)
+    # The legacy flags are assertions, not overrides: allowing them to mutate
+    # the resolved YAML after it was hashed would create two sources of truth.
+    _resolve_scan_spec(
+        strategy=object(),
+        strategy_spec=strategy_spec,
+        timeframe=args.timeframe,
+        candles=args.candles,
+    )
 
     client = MexcContractClient()
     universe = SymbolUniverse(
@@ -1155,8 +1258,10 @@ def main() -> int:
         ),
     )
     feed = MarketDataFeed(client=client)
-    strategy = LayeredPumpStrategy()
-    strategy.set_htf_cache(HigherTimeframeCache(feed))
+    strategy = LayeredPumpStrategy(strategy_spec=strategy_spec)
+    strategy.set_htf_cache(
+        HigherTimeframeCache(feed, strategy_spec.to_timeframe_cache_config())
+    )
 
     alerters = build_alerters()
     tracker = SignalObservationTracker(args.observations, horizon_minutes=args.observe_minutes)
@@ -1167,12 +1272,15 @@ def main() -> int:
 
     logger.info(
         "scanner_start venue=mexc execution=disabled timeframe=%s alerts=%d "
-        "observations=%s population_journal=%s population_journal_enabled=%s",
-        args.timeframe,
+        "observations=%s population_journal=%s population_journal_enabled=%s "
+        "strategy_spec_version=%s strategy_spec_hash=%s",
+        strategy_spec.market_data.base_interval,
         len(alerters),
         args.observations,
         args.population_journal,
         population_journal.enabled,
+        strategy_spec.spec_version,
+        strategy_spec.instance_hash,
         extra={"event": "startup"},
     )
     if not alerters:
@@ -1187,9 +1295,9 @@ def main() -> int:
     try:
         while True:
             signals = scan_once(universe=universe, feed=feed, strategy=strategy, logger=logger,
-                                timeframe=args.timeframe, candles=args.candles,
                                 workers=args.workers, tracker=tracker, alerters=alerters,
-                                population_journal=population_journal)
+                                population_journal=population_journal,
+                                strategy_spec=strategy_spec)
             for symbol, intent, frame in signals:
                 text = describe(symbol, intent)
                 logger.info("%s", text, extra={"event": "signal"})

@@ -4,6 +4,11 @@ import json
 
 import pytest
 
+from core.mexc_strategy_spec import (
+    MEXC_STRATEGY_SPEC_VERSION,
+    load_mexc_strategy_spec,
+    strategy_spec_contract_hash,
+)
 from ai.reversal.feature_contract import build_runtime_feature_snapshot, market_feature_hash
 from ai.reversal.population_dataset import (
     PopulationDatasetError,
@@ -26,6 +31,7 @@ _UNIVERSE_TIMING = SourceTiming(
     cache_age_sec=11.0,
     source_ts=1_699_999_990.0,
 )
+_STRATEGY_SPEC = load_mexc_strategy_spec()
 
 
 def _envelope(**overrides) -> CycleEnvelope:
@@ -37,7 +43,10 @@ def _envelope(**overrides) -> CycleEnvelope:
         universe_symbols=("AAAUSDT", "BBBUSDT"),
         universe_timing=_UNIVERSE_TIMING,
         source_timings=(_UNIVERSE_TIMING,),
-        strategy_config_hash="a" * 64,
+        strategy_spec_version=MEXC_STRATEGY_SPEC_VERSION,
+        strategy_spec_contract_hash=strategy_spec_contract_hash(),
+        strategy_spec_instance_hash=_STRATEGY_SPEC.instance_hash,
+        strategy_spec_payload=_STRATEGY_SPEC.to_mapping(),
         universe_policy_hash="b" * 64,
         ranking_ready_ts=1_700_002_804.0,
         cycle_completed_ts=1_700_002_805.0,
@@ -89,7 +98,7 @@ def _metadata(*, funding: float | None, symbol: str = "AAAUSDT") -> dict:
         "base": {"bar_count": 320, "mark_price": 1.0},
         "benchmark_status": "available",
         "provenance": {
-            "strategy_config_hash": "a" * 64,
+            "strategy_config_hash": _STRATEGY_SPEC.instance_hash,
             "universe_policy_hash": "b" * 64,
         },
     }
@@ -165,7 +174,7 @@ def test_reader_preserves_complete_population_and_real_missingness(tmp_path) -> 
     assert flat[0]["envelope_hash"] == rows[0].envelope_hash
     assert flat[0]["market_feature_hash"] == rows[0].market_feature_hash
 
-    model_rows = model_input_records(path)
+    model_rows = model_input_records(path, allow_unanchored=True)
     assert "action" not in model_rows[0]
     assert "status" not in model_rows[0]
     assert "open_interest" not in model_rows[0]["features"]

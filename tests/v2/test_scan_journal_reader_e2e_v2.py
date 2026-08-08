@@ -107,8 +107,8 @@ def _scan(universe: SymbolUniverse, journal: PopulationJournal) -> None:
 def test_scan_journal_reader_round_trip_preserves_fresh_stale_and_error_cycles(
     tmp_path,
 ) -> None:
-    assert SCHEMA_VERSION == 4
-    journal_path = tmp_path / "population-v4.jsonl"
+    assert SCHEMA_VERSION == 5
+    journal_path = tmp_path / "population-v5.jsonl"
     journal = PopulationJournal(journal_path)
 
     reused_universe = _universe(_TickerSequence(["fresh", "stale_cache"]))
@@ -121,7 +121,7 @@ def test_scan_journal_reader_round_trip_preserves_fresh_stale_and_error_cycles(
 
     raw_records = [json.loads(line) for line in journal_path.read_text().splitlines()]
     assert raw_records
-    assert {record["schema_version"] for record in raw_records} == {4}
+    assert {record["schema_version"] for record in raw_records} == {5}
 
     cycles = list(iter_population_cycles(journal_path))
     assert len(cycles) == 3

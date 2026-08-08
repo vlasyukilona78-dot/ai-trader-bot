@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -28,11 +29,15 @@ from trading.metrics.cycle_envelope import CycleEnvelope, CycleEnvelopeError
 # must not both be called v2, so the version moves again. v4 binds that envelope
 # (whose own schema and captured feature contract changed after v3 shipped) to
 # both the body and footer, and refuses mixed or incomplete population cycles.
-SCHEMA_VERSION = 4
+# v5 adds an ordered, domain-separated cycle commitment.  The chain does not
+# authenticate itself (a trusted checkpoint is still required for that), but it
+# makes every later cycle depend on the exact canonical bytes of its prefix.
+SCHEMA_VERSION = 5
 
 RECORD_TYPE_HEADER = "cycle_header"
 RECORD_TYPE_DECISION = "decision"
 RECORD_TYPE_FOOTER = "cycle_footer"
+RECORD_TYPE_CHECKPOINT = "population_journal_checkpoint"
 POPULATION_STATUSES = frozenset(
     {
         "evaluated",
@@ -65,6 +70,38 @@ FEATURE_PROVENANCE_KEYS = frozenset(
 )
 _LOCK_ACQUIRE_TIMEOUT_SEC = 60.0
 _LOCK_RETRY_INTERVAL_SEC = 0.05
+_JOURNAL_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+_GENESIS_DOMAIN = b"KOTEIKA_POPULATION_GENESIS_V5\x00"
+_CYCLE_COMMIT_DOMAIN = b"KOTEIKA_POPULATION_CYCLE_V5\x00"
+CHECKPOINT_RECEIPT_SCHEMA_VERSION = 1
+
+HEADER_KEYS = frozenset(
+    {
+        "record_type",
+        "schema_version",
+        "journal_id",
+        "sequence_no",
+        "prev_cycle_commit",
+        "cycle_id",
+        "row_count",
+        "envelope_hash",
+        "envelope",
+    }
+)
+FOOTER_CORE_KEYS = frozenset(
+    {
+        "record_type",
+        "schema_version",
+        "journal_id",
+        "sequence_no",
+        "prev_cycle_commit",
+        "cycle_id",
+        "row_count",
+        "envelope_hash",
+        "rows_checksum",
+    }
+)
+FOOTER_KEYS = FOOTER_CORE_KEYS | {"cycle_commit"}
 
 
 # File locks alone do not provide portable thread exclusion: POSIX and Windows
@@ -306,8 +343,58 @@ def _canonical_bytes(payload: Mapping[str, object]) -> bytes:
     return encoded
 
 
+def _framed_payload(payload: Mapping[str, object]) -> bytes:
+    encoded = _canonical_bytes(payload)
+    return len(encoded).to_bytes(8, byteorder="big", signed=False) + encoded
+
+
 def _sha256_id(payload: Mapping[str, object]) -> str:
     return hashlib.sha256(_canonical_bytes(payload)).hexdigest()
+
+
+def genesis_cycle_commit(journal_id: str) -> str:
+    """Return the domain-separated predecessor for the first cycle."""
+
+    if not isinstance(journal_id, str) or not _JOURNAL_ID_RE.fullmatch(journal_id):
+        raise PopulationJournalError("journal_id must be a lowercase SHA-256 hex digest")
+    digest = hashlib.sha256()
+    digest.update(_GENESIS_DOMAIN)
+    digest.update(
+        _framed_payload(
+            {
+                "journal_id": journal_id,
+                "schema_version": SCHEMA_VERSION,
+            }
+        )
+    )
+    return digest.hexdigest()
+
+
+def compute_cycle_commit(
+    header: Mapping[str, object],
+    rows: Sequence[Mapping[str, object]],
+    footer_core: Mapping[str, object],
+) -> str:
+    """Commit to one exact canonical cycle without trusting serialized hashes.
+
+    Length-prefixing every component makes the byte stream unambiguous.  The
+    footer passed here deliberately excludes ``cycle_commit`` to avoid a
+    self-reference; exact key sets make that omission explicit and fail closed.
+    """
+
+    if set(header) != HEADER_KEYS:
+        raise PopulationJournalError("cycle commitment header schema mismatch")
+    if set(footer_core) != FOOTER_CORE_KEYS:
+        raise PopulationJournalError("cycle commitment footer schema mismatch")
+    digest = hashlib.sha256()
+    digest.update(_CYCLE_COMMIT_DOMAIN)
+    digest.update(_framed_payload(header))
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise PopulationJournalError("cycle commitment requires decision objects")
+        digest.update(_framed_payload(row))
+    digest.update(_framed_payload(footer_core))
+    return digest.hexdigest()
 
 
 def make_cycle_id(
@@ -640,9 +727,7 @@ def update_rows_checksum(digest: Any, payload: Mapping[str, object]) -> None:
 
     if not isinstance(payload, Mapping):
         raise PopulationJournalError("row checksum requires decision objects")
-    encoded = _canonical_bytes(payload)
-    digest.update(len(encoded).to_bytes(8, byteorder="big", signed=False))
-    digest.update(encoded)
+    digest.update(_framed_payload(payload))
 
 
 def rows_checksum(rows: Sequence[Mapping[str, object]]) -> str:
@@ -850,6 +935,105 @@ def _validated_decision_record(payload: Mapping[str, Any]) -> PopulationDecision
     return record
 
 
+@dataclass(frozen=True)
+class JournalCheckpointReceipt:
+    """Detached description of one trusted journal prefix.
+
+    The receipt is intentionally unsigned.  It becomes trusted only when a
+    caller obtains it from an independently protected location (or authenticates
+    its canonical payload out of band) and passes it explicitly to the reader.
+    Keeping a copy beside the writable journal provides no additional trust.
+    """
+
+    receipt_schema_version: int
+    journal_schema_version: int
+    journal_id: str
+    sequence_no: int
+    cycle_id: str
+    cycle_commit: str
+    prefix_length_bytes: int
+    prefix_sha256: str
+    record_type: str = RECORD_TYPE_CHECKPOINT
+
+    def __post_init__(self) -> None:
+        if self.record_type != RECORD_TYPE_CHECKPOINT:
+            raise PopulationJournalError("unsupported checkpoint receipt record type")
+        if self.receipt_schema_version != CHECKPOINT_RECEIPT_SCHEMA_VERSION:
+            raise PopulationJournalError("unsupported checkpoint receipt schema")
+        if self.journal_schema_version != SCHEMA_VERSION:
+            raise PopulationJournalError("checkpoint targets another journal schema")
+        for name in ("journal_id", "cycle_id", "cycle_commit", "prefix_sha256"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not _JOURNAL_ID_RE.fullmatch(value):
+                raise PopulationJournalError(f"checkpoint {name} must be a SHA-256 digest")
+        if isinstance(self.sequence_no, bool) or not isinstance(self.sequence_no, Integral):
+            raise PopulationJournalError("checkpoint sequence_no must be an integer")
+        if self.sequence_no < 0:
+            raise PopulationJournalError("checkpoint sequence_no must not be negative")
+        if isinstance(self.prefix_length_bytes, bool) or not isinstance(
+            self.prefix_length_bytes, Integral
+        ):
+            raise PopulationJournalError("checkpoint prefix length must be an integer")
+        if self.prefix_length_bytes <= 0:
+            raise PopulationJournalError("checkpoint prefix length must be positive")
+        object.__setattr__(self, "sequence_no", int(self.sequence_no))
+        object.__setattr__(self, "prefix_length_bytes", int(self.prefix_length_bytes))
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "JournalCheckpointReceipt":
+        expected = {
+            "record_type",
+            "receipt_schema_version",
+            "journal_schema_version",
+            "journal_id",
+            "sequence_no",
+            "cycle_id",
+            "cycle_commit",
+            "prefix_length_bytes",
+            "prefix_sha256",
+        }
+        if not isinstance(payload, Mapping) or set(payload) != expected:
+            raise PopulationJournalError("checkpoint receipt schema mismatch")
+        return cls(
+            record_type=payload.get("record_type"),  # type: ignore[arg-type]
+            receipt_schema_version=payload.get("receipt_schema_version"),  # type: ignore[arg-type]
+            journal_schema_version=payload.get("journal_schema_version"),  # type: ignore[arg-type]
+            journal_id=payload.get("journal_id"),  # type: ignore[arg-type]
+            sequence_no=payload.get("sequence_no"),  # type: ignore[arg-type]
+            cycle_id=payload.get("cycle_id"),  # type: ignore[arg-type]
+            cycle_commit=payload.get("cycle_commit"),  # type: ignore[arg-type]
+            prefix_length_bytes=payload.get("prefix_length_bytes"),  # type: ignore[arg-type]
+            prefix_sha256=payload.get("prefix_sha256"),  # type: ignore[arg-type]
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "record_type": self.record_type,
+            "receipt_schema_version": self.receipt_schema_version,
+            "journal_schema_version": self.journal_schema_version,
+            "journal_id": self.journal_id,
+            "sequence_no": self.sequence_no,
+            "cycle_id": self.cycle_id,
+            "cycle_commit": self.cycle_commit,
+            "prefix_length_bytes": self.prefix_length_bytes,
+            "prefix_sha256": self.prefix_sha256,
+        }
+
+
+@dataclass(frozen=True)
+class _JournalInspection:
+    journal_id: str | None
+    cycle_ids: tuple[str, ...]
+    cycle_commits: tuple[str, ...]
+    prefix_lengths: tuple[int, ...]
+    prefix_sha256s: tuple[str, ...]
+    tail_digest: Any
+
+    @property
+    def last_cycle_id(self) -> str | None:
+        return self.cycle_ids[-1] if self.cycle_ids else None
+
+
 class PopulationJournal:
     """Append-only cycle log: one header, its decision rows, then a footer.
 
@@ -871,16 +1055,32 @@ class PopulationJournal:
             # batch while another instance is between header and footer.
             with self._path_lock, _InterProcessPathLock(self._lock_path):
                 observed_state = _journal_file_state(self._path)
-                self._last_cycle_id, existing_ids = self._inspect_existing_file()
-                self._cycle_ids = set(existing_ids)
+                inspection = self._inspect_existing_file()
+                self._adopt_inspection(inspection)
                 self._file_state = _journal_file_state(self._path)
                 if self._file_state != observed_state:
                     raise PopulationJournalError(
                         "population journal changed while it was being validated"
                     )
         else:
+            self._journal_id = None
             self._last_cycle_id = None
             self._cycle_ids: set[str] = set()
+            self._cycle_ids_ordered: tuple[str, ...] = ()
+            self._cycle_commits: tuple[str, ...] = ()
+            self._prefix_lengths: tuple[int, ...] = ()
+            self._prefix_sha256s: tuple[str, ...] = ()
+            self._tail_digest = hashlib.sha256()
+
+    def _adopt_inspection(self, inspection: _JournalInspection) -> None:
+        self._journal_id = inspection.journal_id
+        self._last_cycle_id = inspection.last_cycle_id
+        self._cycle_ids = set(inspection.cycle_ids)
+        self._cycle_ids_ordered = inspection.cycle_ids
+        self._cycle_commits = inspection.cycle_commits
+        self._prefix_lengths = inspection.prefix_lengths
+        self._prefix_sha256s = inspection.prefix_sha256s
+        self._tail_digest = inspection.tail_digest.copy()
 
     def _refresh_if_changed(self) -> None:
         """Adopt cycles written by another instance while holding both locks."""
@@ -888,7 +1088,7 @@ class PopulationJournal:
         observed_state = _journal_file_state(self._path)
         if observed_state == self._file_state:
             return
-        last_cycle_id, existing_ids = self._inspect_existing_file()
+        inspection = self._inspect_existing_file()
         validated_state = _journal_file_state(self._path)
         if validated_state != observed_state:
             # A writer that ignores our sidecar lock changed the evidence while
@@ -896,11 +1096,22 @@ class PopulationJournal:
             raise PopulationJournalError(
                 "population journal changed while it was being validated"
             )
-        self._last_cycle_id = last_cycle_id
-        self._cycle_ids = set(existing_ids)
+        old_count = len(self._cycle_commits)
+        if old_count:
+            if inspection.journal_id != self._journal_id:
+                raise PopulationJournalError("population journal identity was replaced")
+            if len(inspection.cycle_commits) < old_count:
+                raise PopulationJournalError("population journal history was rolled back")
+            if inspection.cycle_commits[:old_count] != self._cycle_commits:
+                raise PopulationJournalError("population journal history was rewritten")
+            if inspection.prefix_lengths[:old_count] != self._prefix_lengths or (
+                inspection.prefix_sha256s[:old_count] != self._prefix_sha256s
+            ):
+                raise PopulationJournalError("population journal prefix bytes were rewritten")
+        self._adopt_inspection(inspection)
         self._file_state = validated_state
 
-    def _inspect_existing_file(self) -> tuple[str | None, frozenset[str]]:
+    def _inspect_existing_file(self) -> _JournalInspection:
         """Validate every existing cycle before permitting another append.
 
         Looking only at the first header and final footer allowed an incompatible
@@ -911,7 +1122,7 @@ class PopulationJournal:
         """
 
         if not self._path.exists() or self._path.stat().st_size == 0:
-            return None, frozenset()
+            return _JournalInspection(None, (), (), (), (), hashlib.sha256())
         try:
             with self._path.open("rb") as handle:
                 handle.seek(-1, os.SEEK_END)
@@ -929,15 +1140,26 @@ class PopulationJournal:
             )
 
         current_envelope: CycleEnvelope | None = None
+        current_header: Mapping[str, object] | None = None
         current_cycle_id: str | None = None
         current_envelope_hash: str | None = None
+        current_journal_id: str | None = None
+        current_sequence_no: int | None = None
+        current_prev_commit: str | None = None
         declared_rows = 0
         row_symbols: list[str] = []
+        row_payloads: list[Mapping[str, object]] = []
         rows_digest = hashlib.sha256()
         seen_symbols: set[str] = set()
         seen_snapshots: set[str] = set()
         completed_ids: set[str] = set()
-        last_cycle_id: str | None = None
+        completed_cycle_ids: list[str] = []
+        completed_commits: list[str] = []
+        prefix_lengths: list[int] = []
+        prefix_sha256s: list[str] = []
+        journal_id: str | None = None
+        file_digest = hashlib.sha256()
+        prefix_length = 0
 
         try:
             handle = self._path.open("rb")
@@ -945,8 +1167,10 @@ class PopulationJournal:
             raise PopulationJournalError("population journal is unreadable") from exc
         with handle:
             for line_number, raw in enumerate(handle, start=1):
+                file_digest.update(raw)
+                prefix_length += len(raw)
                 if not raw.strip():
-                    continue
+                    raise PopulationJournalError("population journal contains a blank line")
                 payload = _decode_journal_record(raw, line_number=line_number)
                 existing_version = payload.get("schema_version")
                 if existing_version != SCHEMA_VERSION:
@@ -957,16 +1181,43 @@ class PopulationJournal:
                 record_type = payload.get("record_type")
 
                 if record_type == RECORD_TYPE_HEADER:
+                    if set(payload) != HEADER_KEYS:
+                        raise PopulationJournalError("cycle header schema mismatch")
                     if current_envelope is not None:
                         raise PopulationJournalError(
                             "population journal starts a new cycle before closing the previous one"
                         )
                     current_envelope = _validated_envelope(payload.get("envelope"))
+                    current_header = payload
                     current_cycle_id = current_envelope.cycle_id
                     if payload.get("cycle_id") != current_cycle_id:
                         raise PopulationJournalError("cycle header ID differs from its envelope")
                     if current_cycle_id in completed_ids:
                         raise PopulationJournalError("population journal contains a duplicate cycle")
+                    raw_journal_id = payload.get("journal_id")
+                    if not isinstance(raw_journal_id, str) or not _JOURNAL_ID_RE.fullmatch(
+                        raw_journal_id
+                    ):
+                        raise PopulationJournalError("cycle header has an invalid journal ID")
+                    if journal_id is None:
+                        journal_id = raw_journal_id
+                    elif raw_journal_id != journal_id:
+                        raise PopulationJournalError("population journal mixes journal IDs")
+                    current_journal_id = raw_journal_id
+                    raw_sequence = payload.get("sequence_no")
+                    if isinstance(raw_sequence, bool) or not isinstance(raw_sequence, Integral):
+                        raise PopulationJournalError("cycle sequence number must be an integer")
+                    current_sequence_no = int(raw_sequence)
+                    if current_sequence_no != len(completed_commits):
+                        raise PopulationJournalError("population journal sequence is not contiguous")
+                    expected_prev = (
+                        genesis_cycle_commit(raw_journal_id)
+                        if not completed_commits
+                        else completed_commits[-1]
+                    )
+                    current_prev_commit = payload.get("prev_cycle_commit")  # type: ignore[assignment]
+                    if current_prev_commit != expected_prev:
+                        raise PopulationJournalError("population journal chain predecessor mismatch")
                     raw_count = payload.get("row_count")
                     if isinstance(raw_count, bool) or not isinstance(raw_count, Integral):
                         raise PopulationJournalError("cycle header row count must be an integer")
@@ -977,6 +1228,7 @@ class PopulationJournal:
                     if payload.get("envelope_hash") != current_envelope_hash:
                         raise PopulationJournalError("cycle header envelope hash mismatch")
                     row_symbols = []
+                    row_payloads = []
                     rows_digest = hashlib.sha256()
                     seen_symbols = set()
                     seen_snapshots = set()
@@ -1007,10 +1259,13 @@ class PopulationJournal:
                     seen_symbols.add(symbol)
                     seen_snapshots.add(snapshot_id)
                     row_symbols.append(symbol)
+                    row_payloads.append(payload)
                     update_rows_checksum(rows_digest, payload)
                     continue
 
                 if record_type == RECORD_TYPE_FOOTER:
+                    if set(payload) != FOOTER_KEYS:
+                        raise PopulationJournalError("cycle footer schema mismatch")
                     if payload.get("cycle_id") != current_cycle_id:
                         raise PopulationJournalError("cycle footer ID mismatch")
                     footer_count = payload.get("row_count")
@@ -1022,18 +1277,49 @@ class PopulationJournal:
                         raise PopulationJournalError("cycle footer envelope hash mismatch")
                     if payload.get("rows_checksum") != rows_digest.hexdigest():
                         raise PopulationJournalError("cycle footer rows checksum mismatch")
+                    if payload.get("journal_id") != current_journal_id:
+                        raise PopulationJournalError("cycle footer journal ID mismatch")
+                    if payload.get("sequence_no") != current_sequence_no:
+                        raise PopulationJournalError("cycle footer sequence mismatch")
+                    if payload.get("prev_cycle_commit") != current_prev_commit:
+                        raise PopulationJournalError("cycle footer predecessor mismatch")
+                    if current_header is None:
+                        raise PopulationJournalError("cycle header payload is absent")
+                    footer_core = {
+                        key: value for key, value in payload.items() if key != "cycle_commit"
+                    }
+                    expected_commit = compute_cycle_commit(
+                        current_header,
+                        row_payloads,
+                        footer_core,
+                    )
+                    recorded_commit = payload.get("cycle_commit")
+                    if (
+                        not isinstance(recorded_commit, str)
+                        or not _JOURNAL_ID_RE.fullmatch(recorded_commit)
+                        or recorded_commit != expected_commit
+                    ):
+                        raise PopulationJournalError("cycle commitment mismatch")
                     _validate_cycle_body(
                         current_envelope,
                         declared_rows=declared_rows,
                         row_symbols=row_symbols,
                     )
                     completed_ids.add(current_cycle_id)
-                    last_cycle_id = current_cycle_id
+                    completed_cycle_ids.append(current_cycle_id)
+                    completed_commits.append(expected_commit)
+                    prefix_lengths.append(prefix_length)
+                    prefix_sha256s.append(file_digest.hexdigest())
                     current_envelope = None
+                    current_header = None
                     current_cycle_id = None
                     current_envelope_hash = None
+                    current_journal_id = None
+                    current_sequence_no = None
+                    current_prev_commit = None
                     declared_rows = 0
                     row_symbols = []
+                    row_payloads = []
                     rows_digest = hashlib.sha256()
                     continue
 
@@ -1045,11 +1331,47 @@ class PopulationJournal:
             raise PopulationJournalError("population journal ends with an incomplete cycle")
         if not completed_ids:
             raise PopulationJournalError("population journal contains no complete cycles")
-        return last_cycle_id, frozenset(completed_ids)
+        return _JournalInspection(
+            journal_id=journal_id,
+            cycle_ids=tuple(completed_cycle_ids),
+            cycle_commits=tuple(completed_commits),
+            prefix_lengths=tuple(prefix_lengths),
+            prefix_sha256s=tuple(prefix_sha256s),
+            tail_digest=file_digest,
+        )
 
     @property
     def enabled(self) -> bool:
         return self._enabled
+
+    def checkpoint_receipt(self) -> JournalCheckpointReceipt:
+        """Describe the latest fsynced prefix for external anchoring.
+
+        Returning this object does not make it trusted.  The caller must move or
+        authenticate it outside the journal writer's trust domain and later pass
+        it explicitly to the dataset verification API.
+        """
+
+        if not self._enabled:
+            raise PopulationJournalError("disabled journal has no checkpoint")
+        with self._lock, self._path_lock, _InterProcessPathLock(self._lock_path):
+            self._refresh_if_changed()
+            if (
+                self._journal_id is None
+                or not self._cycle_commits
+                or not self._cycle_ids_ordered
+            ):
+                raise PopulationJournalError("empty journal has no checkpoint")
+            return JournalCheckpointReceipt(
+                receipt_schema_version=CHECKPOINT_RECEIPT_SCHEMA_VERSION,
+                journal_schema_version=SCHEMA_VERSION,
+                journal_id=self._journal_id,
+                sequence_no=len(self._cycle_commits) - 1,
+                cycle_id=self._cycle_ids_ordered[-1],
+                cycle_commit=self._cycle_commits[-1],
+                prefix_length_bytes=self._prefix_lengths[-1],
+                prefix_sha256=self._prefix_sha256s[-1],
+            )
 
     def append_cycle(
         self,
@@ -1109,28 +1431,6 @@ class PopulationJournal:
             row_symbols=[record.symbol for record in records],
         )
 
-        header = _canonical_bytes(
-            {
-                "record_type": RECORD_TYPE_HEADER,
-                "schema_version": SCHEMA_VERSION,
-                "cycle_id": cycle_id,
-                "row_count": expected_size,
-                "envelope_hash": envelope_hash,
-                "envelope": envelope_payload,
-            }
-        ) + b"\n"
-        footer = _canonical_bytes(
-            {
-                "record_type": RECORD_TYPE_FOOTER,
-                "schema_version": SCHEMA_VERSION,
-                "cycle_id": cycle_id,
-                "row_count": expected_size,
-                "envelope_hash": envelope_hash,
-                "rows_checksum": rows_checksum(row_payloads),
-            }
-        ) + b"\n"
-
-        batch = header + b"".join(rows) + footer
         with self._lock, self._path_lock, _InterProcessPathLock(self._lock_path):
             # Another object/process may have appended since this instance was
             # constructed.  A cheap file fingerprint makes unchanged appends
@@ -1138,6 +1438,44 @@ class PopulationJournal:
             self._refresh_if_changed()
             if cycle_id in self._cycle_ids:
                 return False
+            journal_id = self._journal_id or secrets.token_hex(32)
+            sequence_no = len(self._cycle_commits)
+            prev_cycle_commit = (
+                self._cycle_commits[-1]
+                if self._cycle_commits
+                else genesis_cycle_commit(journal_id)
+            )
+            header_payload: dict[str, object] = {
+                "record_type": RECORD_TYPE_HEADER,
+                "schema_version": SCHEMA_VERSION,
+                "journal_id": journal_id,
+                "sequence_no": sequence_no,
+                "prev_cycle_commit": prev_cycle_commit,
+                "cycle_id": cycle_id,
+                "row_count": expected_size,
+                "envelope_hash": envelope_hash,
+                "envelope": envelope_payload,
+            }
+            footer_core: dict[str, object] = {
+                "record_type": RECORD_TYPE_FOOTER,
+                "schema_version": SCHEMA_VERSION,
+                "journal_id": journal_id,
+                "sequence_no": sequence_no,
+                "prev_cycle_commit": prev_cycle_commit,
+                "cycle_id": cycle_id,
+                "row_count": expected_size,
+                "envelope_hash": envelope_hash,
+                "rows_checksum": rows_checksum(row_payloads),
+            }
+            cycle_commit = compute_cycle_commit(
+                header_payload,
+                row_payloads,
+                footer_core,
+            )
+            footer_payload = {**footer_core, "cycle_commit": cycle_commit}
+            header = _canonical_bytes(header_payload) + b"\n"
+            footer = _canonical_bytes(footer_payload) + b"\n"
+            batch = header + b"".join(rows) + footer
             self._path.parent.mkdir(parents=True, exist_ok=True)
             with self._path.open("ab") as handle:
                 written = handle.write(batch)
@@ -1145,7 +1483,17 @@ class PopulationJournal:
                     raise OSError("population journal batch write was incomplete")
                 handle.flush()
                 os.fsync(handle.fileno())
+            next_digest = self._tail_digest.copy()
+            next_digest.update(batch)
+            previous_length = self._prefix_lengths[-1] if self._prefix_lengths else 0
+            next_length = previous_length + len(batch)
+            self._journal_id = journal_id
             self._last_cycle_id = cycle_id
             self._cycle_ids.add(cycle_id)
+            self._cycle_ids_ordered = (*self._cycle_ids_ordered, cycle_id)
+            self._cycle_commits = (*self._cycle_commits, cycle_commit)
+            self._prefix_lengths = (*self._prefix_lengths, next_length)
+            self._prefix_sha256s = (*self._prefix_sha256s, next_digest.hexdigest())
+            self._tail_digest = next_digest
             self._file_state = _journal_file_state(self._path)
         return True
