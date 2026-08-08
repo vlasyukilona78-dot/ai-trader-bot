@@ -7,6 +7,70 @@
 feature contract, single-position PnL, роли моделей, research-инструменты и
 правила допуска в shadow. До доказанного edge система остаётся signals-only.
 
+## 0. Исполняемый checkpoint 2026-08-08
+
+Текущее состояние кода, которое заменяет более ранние промежуточные статусы ниже:
+
+- реализован строгий `MexcStrategySpec` version `mexc_strategy_v2` с отдельным
+  `config/mexc_strategy_v2.yaml`; production scanner, `LayeredPumpStrategy`, base
+  indicators, HTF indicators, volume profile и evidence используют один resolved
+  объект, один contract hash и один instance hash;
+- legacy `--timeframe` / `--candles` больше не являются вторым источником
+  конфигурации: это только fail-closed assertions против YAML;
+- все численные indicator/VP/min-history параметры из spec реально доходят до
+  исполнения. Объявленные, но ещё не реализованные `min_rsi_1h` и
+  `require_confluence` при ненулевом значении отвергаются, а не молча игнорируются;
+- актуальная version matrix: population journal **v5**, `CycleEnvelope` **v3**,
+  `mexc_reversal_features_v2`, single-position contract **v3**;
+- `CycleEnvelope v3` хранит canonical StrategySpec payload, version, contract hash
+  и instance hash; его timeframe обязан совпадать со spec по физической длине бара;
+- journal v5 образует непрерывную цепочку `journal_id` / `sequence_no` /
+  `prev_cycle_commit` / `cycle_commit`, проверяемую при reopen и строгом чтении;
+- полный локальный regression checkpoint: **576 passed, 4 skipped, 2 known
+  collection warnings**. Это проверка инвариантов, а не доказательство edge.
+
+### Граница доверия journal v5
+
+Внутренняя hash-chain обнаруживает изменение раннего цикла, если последующий хвост
+не был согласованно переписан, и не позволяет stale writer продолжить изменённую
+историю. Но публичная hash-chain сама по себе **не аутентифицирует полностью
+переписанный файл**: скоординированный writer может пересчитать всю цепочку.
+
+Tamper-evidence появляется только при явной передаче `JournalCheckpointReceipt`,
+полученного ранее и сохранённого **вне той же границы перезаписи**. Receipt якорит
+точный prefix (`journal_id`, sequence, chain tip, byte length и prefix SHA-256).
+Файл рядом с journal не становится trusted автоматически; auto-discovery receipt
+намеренно отсутствует. Model-input reader требует внешний checkpoint либо явный
+unsafe override и по умолчанию выдаёт только заякоренный prefix.
+
+### Текущие физические длительности fixed-bar стратегии
+
+`window_semantics=fixed_bar_counts`: смена base interval меняет физическую длину
+окна; код не делает скрытого пересчёта в секунды. При текущих `Min60` base и
+`Hour4` HTF исполняются именно такие длительности:
+
+| Параметр | Bars × source timeframe | Физическая длительность сейчас |
+|---|---:|---:|
+| `pump_window_bars` | 45 × Min60 | 45 часов |
+| `confirmation_max_wait_bars` | 3 × Min60 | до 3 часов |
+| `msb_recent_bars` / `msb_lookback` | 6 / 20 × Min60 | 6 / 20 часов |
+| `weakness_lookback` | 4 × Min60 | 4 часа |
+| `liquidity_lookback_bars` | 12 × Min60 | 12 часов |
+| `relative_strength_lookback` | 24 × Min60 | 24 часа |
+| base RSI / ATR configured period | 14 × Min60 | 14 часовых баров |
+| base ADX configured period | 14 × Min60, применён в двух rolling stages | около 27 баров warm-up; не простой 14-hour window |
+| base EMA spans | 20 / 50 × Min60 | span 20 / 50 часовых баров; EMA не имеет конечного окна |
+| base BB / Keltner / volume MA periods | 20 / 20 / 20 × Min60 | 20 часовых баров; Keltner содержит EMA |
+| VWAP / OBV / candle-CVD | cumulative input frame | до 320 часовых баров текущего frame |
+| volume profile | 120 × Min60 | 120 часов |
+| HTF RSI configured period | 14 × Hour4 | 14 четырёхчасовых баров (56 часов) |
+| `structural_anchor_htf_bars` | 12 × Hour4 | 48 часов |
+
+Теперь эти значения доказуемо соответствуют исполняемому spec. Остаётся отдельное
+исследовательское решение: являются ли именно такие физические горизонты
+задуманной стратегией. Менять их вместе с threshold calibration запрещено: сначала
+выбирается временной контракт, затем он проверяется как новая frozen hypothesis.
+
 ## 1. Итоговое решение
 
 Ядро первой AI-версии — **не Kimi K3 и не другая LLM**. Первым numeric champion
@@ -63,12 +127,18 @@ manual promotion и отсутствие private/live доступа до рот
 
 ## 3. Подтверждённые разрывы текущего кода
 
+Раздел сохраняет исторический audit trail. Пункты, закрытые checkpoint 2026-08-08,
+не удаляются, а явно помечаются **superseded**; непомеченная часть остаётся
+действующим разрывом.
+
 ### P0 — время и исполнимость
 
-- Scanner по умолчанию использует `Min60`. Поэтому `pump_window_bars=45` — это 45
+- **Историческая находка, уточнена (частично superseded):** scanner действительно
+  использует `Min60`, поэтому `pump_window_bars=45` — это 45
   часов, `confirmation_max_wait_bars=3` — до трёх часов, `msb_recent_bars=6` —
-  шесть часов. Комментарии описывают быстрый intraday pump, то есть физический
-  смысл и исполняемая конфигурация расходятся.
+  шесть часов. Теперь это явно закреплено `StrategySpecV2` как fixed-bar semantics,
+  а не скрытый config drift. Нерешённым остаётся выбор: соответствуют ли эти
+  физические горизонты задуманному быстрому intraday pump.
 - Research timing теперь разделяет cutoff, source responses, ranking completion,
   `actionable_ts`, `entry_eligible_ts` и первый достижимый execution bar.
   Cohorts группируются по `cycle_id`, а не по float wall-clock; unfilled leader
@@ -76,14 +146,16 @@ manual promotion и отсутствие private/live доступа до рот
 - Single-position v3 связывает план, полный execution contract, нормализованные
   бары, строго упорядоченный funding и результат. Selector повторяет replay по
   обязательному `ReplayEvidence`, поэтому одного самозаявленного hash недостаточно.
-- Остаются P0 для model-ready labels: физические интервалы и окна в едином
-  `StrategySpec`, arm/confirm lifecycle, point-in-time instrument rules и
+- **Частично superseded:** единый `StrategySpecV2` и явные source-bar windows уже
+  реализованы. Для model-ready labels остаются выбор intended physical horizons,
+  arm/confirm lifecycle, point-in-time instrument rules и
   journal→proposal→label bridge. Research timing не является доказательством
   своевременной Telegram/live-доставки.
 
 ### P0 — dataset / labels / model
 
-- Population journal v4 и строгий reader теперь образуют проверяемый ordered
+- **Superseded по версии:** промежуточный population journal v4 заменён journal v5
+  с chain/checkpoint semantics. Строгий reader образует проверяемый ordered
   runtime-population источник, но label builder ещё не связан с ним.
 - Старые builders создают event-conditioned LONG/DCA labels; новый
   `replay_single_short()` ими не вызывается.
@@ -96,7 +168,9 @@ manual promotion и отсутствие private/live доступа до рот
 
 - Funding из frozen universe snapshot уже передаётся в strategy context; raw OI
   по-прежнему не нормализован по contract size и остаётся diagnostic/unconsumed.
-- `min_rsi_1h` и `require_confluence` объявлены, но не исполняются.
+- **Superseded как silent-ignore дефект:** `min_rsi_1h` и `require_confluence` всё
+  ещё не реализованы в decision path, но StrategySpec теперь fail-closed отвергает
+  их ненулевые значения.
 - Fibonacci, confluence, divergence и estimated liquidation доступны offline,
   но не в runtime decision.
 - Weakness layer реализован, но выключен; candle-signed CVD является proxy, а не
@@ -111,8 +185,9 @@ manual promotion и отсутствие private/live доступа до рот
 
 ### P1 — конфигурация и provenance
 
-- `config/config.yaml` не задаёт фактические defaults signals-only scanner:
-  scanner создаёт `LayeredPumpStrategy()` напрямую.
+- **Superseded:** legacy `config/config.yaml` по-прежнему не является источником
+  MEXC defaults, но теперь это намеренно: scanner загружает отдельный строгий
+  `config/mexc_strategy_v2.yaml` и передаёт один resolved spec в strategy/data/evidence.
 - MEXC OI `holdVol` ещё не имеет закреплённых units, history/delta и age.
 - Contract details по умолчанию не загружаются, поэтому отсутствуют точные
   quantity step, minimum quantity, contract size и надёжный max leverage.
@@ -148,7 +223,8 @@ Scanner теперь:
 - пишет `feature_snapshot` каждому population record, включая HOLD/error rows;
 - различает настоящий `funding_rate=0` и отсутствие источника;
 - пишет provenance bits Layer 4 для sentiment/funding/long-short ratio и VP;
-- фиксирует strategy-config и universe-policy hashes;
+- фиксирует полный StrategySpec version/contract/instance identity и
+  universe-policy hash;
 - больше не позволяет подменить unfilled leader runner-up того же cohort с
   использованием будущего результата.
 
@@ -163,7 +239,24 @@ Scanner теперь:
 - нормализует любое `observed=0` в `None`, даже если legacy trace содержит
   placeholder `0.0`.
 - имеет отдельный nested `model_input_records()` только по role whitelist, без
-  action/status/rule columns.
+  action/status/rule columns; model inputs требуют explicit trusted checkpoint
+  либо явно названный unsafe unanchored режим.
+
+Добавлен `core/mexc_strategy_spec.py` и dedicated YAML:
+
+- strict exact-key/type/range parsing и запрет duplicate YAML keys;
+- canonical interval aliases, frozen payload, pinned contract hash и instance hash;
+- один executable adapter для `SignalConfig`, volatility, base/HTF indicators,
+  volume profile, history bounds и HTF cache;
+- runtime-consistency check не позволяет explicit spec описывать другую unbound
+  strategy configuration;
+- `CycleEnvelope v3` повторно строит spec из payload и связывает его с физическим
+  timeframe цикла.
+
+Population journal v5 добавляет domain-separated cycle commitments, непрерывную
+цепочку, restart audit и detached `JournalCheckpointReceipt`. Это обеспечивает
+внутреннюю целостность и external-prefix anchoring в заявленной выше границе, но
+не превращает незаякоренный файл в криптографически аутентифицированный источник.
 
 Это ещё не model-ready dataset: research entry timing уже построен, но поздние
 layer features пока structural-missing, point-in-time instrument contract и
@@ -174,10 +267,10 @@ proposal/label bridge отсутствуют, а новая prospective populati
 | Блок | Текущий runtime | Contract | Что исправить до model fit |
 |---|---|---|---|
 | Universe | весь **уже отфильтрованный** turnover-band cycle journalled | conditional population boundary | ledger всех USDT contracts: included/exclusion reason, received-at, policy hash, instrument rules |
-| Input | один closed cutoff, Min60/320 | hard causal invariant | физические timeframe/окна, hashes base/HTF/BTC |
-| L1 pump | recent band event + RSI/volume + move/retrace | candidate features + frozen rule baseline | unconditional values; окна в секундах |
+| Input | один closed cutoff, Min60/320 | `mexc_strategy_v2`, CycleEnvelope v3 | выбрать intended physical horizons; текущие fixed-bar durations уже записаны и hashed |
+| L1 pump | recent band event + RSI/volume + move/retrace | candidate features + frozen rule baseline | unconditional values; отдельно проверить frozen 45-hour hypothesis либо ввести новую spec version |
 | L1b quality | ATR floor + exact quote turnover; legacy fallback существует | features; data quality отдельно | fallback `close×contract volume` помечать missing, interval-normalized turnover, no early truncation |
-| L1c market | BTC RS, 4h RSI, optional overhead/chase | numeric context | explicit missing, fixed 1h/4h sources, fib/confluence ablation |
+| L1c market | BTC RS, 4h RSI, optional overhead/chase; unsupported 1h/confluence nonzero fail-closed | numeric context | explicit missing, fixed 1h/4h sources, fib/confluence ablation |
 | L2 weakness | OBV/CVD proxy, default off | challenger features | always measure; tag proxy; collect trades before true flow claim |
 | L3 location | extreme distance, MSB, VP | numeric location | unconditional snapshot; armed vs confirmed timestamps |
 | L4 crowd | neutral sentiment, VWAP, funding optional | context features | real funding wired; LSR missing; provenance/age required |
@@ -337,7 +430,8 @@ market snapshot hash. Это позволяет честно сравниват�
 - [x] Strict population journal reader.
 - [x] Strategy/universe config fingerprints and model-role whitelist.
 - [x] Unfilled-leader same-cohort look-ahead removed.
-- [x] Full regression: `352 passed, 4 skipped, 2 known collection warnings`.
+- [x] **Исторический regression checkpoint, superseded:** `352 passed, 4 skipped,
+  2 known collection warnings`; актуальный результат приведён в §0.
 - [x] Изменения разделены на reviewable commits и опубликованы fast-forward:
   `0b010e8`, `3ff8de0`, `29536f1`.
 
@@ -377,9 +471,9 @@ runtime- и schema-блокеры. Дефекты устранены тремя 
   `decision_ts`. `EntryPlan` несёт когорту, то есть она известна до replay.
 - [x] `replay_single_short` требует первую свечу на `entry_bar_open_ts`;
   `entry_ts` следует за исполнением, а не за решением.
-- [x] Актуальная version matrix: population journal v4, `CycleEnvelope` v2,
-  `mexc_reversal_features_v2`, single-position contract v3. Несовместимые старые
-  schemas fail-closed.
+- [x] **Историческая matrix, superseded:** population journal v4,
+  `CycleEnvelope` v2, `mexc_reversal_features_v2`, single-position contract v3.
+  Актуальная matrix приведена в checkpoint §0; несовместимые schemas fail-closed.
 - [x] Пустой и ошибочный цикл пишутся в журнал как header+footer и читаются
   после рестарта.
 - [x] Envelope пишется один раз на цикл (header/rows/footer, row count и
@@ -393,8 +487,9 @@ runtime- и schema-блокеры. Дефекты устранены тремя 
   base OHLCV, higher timeframe; кэш тикеров не выдаётся за свежий ответ.
 - [x] Холодный старт волатильности инвариантен к порядку воркеров (проверено на
   реальной `LayeredPumpStrategy`, 28 символов, оба порядка).
-- [x] Регрессия после hardening: `529 passed, 4 skipped, 2 known collection
-  warnings` (`13.85s`).
+- [x] **Исторический regression checkpoint, superseded:** `529 passed, 4 skipped,
+  2 known collection warnings` (`13.85s`). Актуальный результат: `576 passed,
+  4 skipped, 2 known collection warnings`.
 
 Что timing **не** доказывает: `entry_bar_open_ts` помечен
 `timing_basis="research_ranking_ready"`. Он обосновывает сравнимость когорты в
@@ -414,6 +509,17 @@ Hardening 2026-08-08 опубликован тремя отдельными code
   только как явная ablation `require_benchmark=False`. Это меняет eligibility и
   signal count, но само по себе не является доказательством edge.
 
+Следующий checkpoint того же дня, зафиксированный коммитами `bebfd0d` и
+`2d0efcb`, заменяет промежуточный journal v4:
+
+- journal v5: contiguous hash-chain, restart/stale-writer validation, explicit
+  detached checkpoint и anchored-only model-input boundary;
+- `CycleEnvelope v3`: полный canonical StrategySpec payload и обязательное
+  совпадение физического timeframe;
+- `mexc_strategy_v2`: dedicated YAML, единые runtime adapters и fail-closed
+  проверка spec/runtime drift;
+- полный regression: `576 passed, 4 skipped, 2 known collection warnings`.
+
 Дополнительно fresh/TTL-cache/stale-cache/first-failure сохраняют разные
 provenance; contract details имеют отдельный clock; mixed HTF cache не выдаётся
 за полностью fresh; закрытый frame больше не делает скрытый live-ticker запрос.
@@ -423,22 +529,32 @@ timeframe и market-only snapshot. При этом `PopulationDecision.input_has
 `snapshot_id` намеренно продолжают включать cycle/rule identity, поэтому это не
 замена отдельным persisted `MarketFeatureSnapshot` и `RuleEvaluation`.
 
-Осталось в Phase 1:
+Новый remaining order после checkpoint:
 
-1. Ввести `StrategySpecV2` и один canonical config hash; YAML и scanner должны
-   использовать один объект.
-2. Закрепить feature/base/execution/15m/1h/4h intervals отдельно.
-3. Выразить окна в секундах либо именованных timeframe bars.
-4. Разделить armed и confirmed как отдельные typed состояния (cycle-complete,
-   actionable и executable entry уже разделены).
-5. Добавить durable public serialization/reader для single-position v3 и
-   forward-data manifest; canonical hashes уже реализованы.
-6. Разделить persisted identity `MarketFeatureSnapshot`, `RuleEvaluation`, proposal и
-   prediction.
-7. Разделить per-symbol base OHLCV и per-symbol/per-timeframe HTF timing: сейчас
-   два источника различаются, но каждый остаётся aggregate всего цикла.
-8. Получать point-in-time instrument specs: contract size, quantity step,
+1. **[x] Superseded/выполнено:** ввести `StrategySpecV2`, dedicated YAML, один
+   canonical instance hash и именованные source-timeframe bars. Текущие durations
+   приведены в §0; скрытого пересчёта в секунды нет.
+2. **Сначала выбрать intended time contract без калибровки thresholds:** оставить
+   frozen `Min60`/45-hour hypothesis либо создать новую spec version с отдельными
+   feature/base/execution и Min15/Min60/Hour4 ролями. Не менять смысл окон
+   молча внутри текущего instance hash.
+3. Разделить armed и confirmed как typed states и заранее закрепить scoring
+   instant; cycle-complete, research-actionable и eligible entry уже разделены.
+4. Разделить persisted identity `MarketFeatureSnapshot`, `RuleEvaluation`,
+   `TradeProposal` и prediction; одновременно сделать per-symbol base и
+   per-symbol/per-timeframe HTF timing, а не только cycle aggregate.
+5. Получать point-in-time instrument specs: contract size, quantity step,
    minimum quantity/notional, leverage, timestamp и hash.
+6. Завершить unconditional feature parity и raw-contract inclusion ledger до
+   построения labels: ранний gate не должен определять missingness.
+7. Добавить durable public serialization/reader для single-position v3,
+   forward-data manifest и journal→proposal→label bridge.
+8. Только после новой schema и external checkpoint procedure начинать
+   prospective collection/maturation; затем chronological evaluation и первый fit.
+
+Для каждого фактически используемого journal v5 prefix оператор должен вынести
+`JournalCheckpointReceipt` за пределы той же перезаписываемой runtime-директории.
+Без этого chain остаётся `internally_consistent_unanchored`, а не trusted evidence.
 
 Acceptance: worker count/order не меняет snapshot, ranking, entry или outcome —
 **выполнено для cycle/cohort identity, entry timing и холодного старта
@@ -557,6 +673,10 @@ capital caps и emergency stop. Текущее разрешение менять
 13. Ingestion context с `first_seen_at > decision_completed_ts` отбрасывается;
     LLM не задаёт timestamps.
 14. LLM schema технически запрещает private/action/risk поля.
+15. Journal chain различает internal consistency и externally anchored prefix;
+    coordinated rewrite проходит только без trusted receipt и обнаруживается с ним.
+16. Cycle timeframe физически совпадает со StrategySpec; custom indicator/VP/HTF
+    параметры меняют реальное исполнение, а не только instance hash.
 
 ## 11. Текущий operational verdict
 
@@ -566,12 +686,14 @@ capital caps и emergency stop. Текущее разрешение менять
 - Старые CSV и tracked ML artifacts — legacy/discovery-only.
 - Реализованный feature contract улучшает воспроизводимость, но **не доказывает
   edge** и пока не разрешает model fit.
-- Phase 1 timing/journal/replay hardening выполнен: journal v4 и single-position
-  v3 закрывают подтверждённые подмены provenance/result, а benchmark теперь
-  fail-closed. Это делает evidence строже, но **edge по-прежнему не установлен**.
-- Следующая задача: остаток Phase 1 (`StrategySpecV2`, физические интервалы,
-  arm/confirm lifecycle, point-in-time instrument specs и per-symbol timings),
-  затем Phase 2 unconditional parity и только после неё proposal/label bridge.
+- Phase 1 timing/journal/replay foundation теперь включает journal v5,
+  `CycleEnvelope v3`, `mexc_strategy_v2` и single-position v3; benchmark
+  fail-closed. Hash-chain без вынесенного receipt остаётся unanchored. Это делает
+  evidence строже, но **edge по-прежнему не установлен**.
+- Следующий порядок: выбрать intended physical time contract → typed arm/confirm
+  lifecycle → persisted snapshot/rule identity и per-symbol timings → point-in-time
+  instrument specs → unconditional parity/raw ledger → proposal/label bridge →
+  externally checkpointed prospective collection. Model fit до этого запрещён.
 
 ## 12. Первичные источники для выбора технологий
 

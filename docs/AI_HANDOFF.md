@@ -6,14 +6,14 @@ Updated: 2026-08-08, Europe/Moscow
 > Fresh-session entrypoint: read `CLAUDE.md` and
 > `docs/CLAUDE_REVIEW_PROMPT_2026-08-03.md`, then treat
 > `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` as the current MEXC plan. The
-> published AI foundation anchor is `f0b43d6`; the Phase 1 hardening code tip is
-> `e0e4cb4` and was verified equal to its remote after push. Discover the later
-> documentation-only descendant with `git log`. The `98217df`/`340 passed`
+> published AI foundation anchor is `f0b43d6`; the latest StrategySpec/journal-v5
+> code tip is `2d0efcb`. Discover the later documentation-only descendant with
+> `git log`. The `98217df`/`340 passed`
 > checkpoint immediately below is a
 > preserved earlier causal-scanner snapshot, not the latest foundation state.
-> Latest code validation: `529 passed, 4 skipped, 2 known collection warnings`
-> (`13.85s`). Current journal path:
-> `data/runtime/mexc_population_decisions_v4.jsonl`.
+> Latest code validation: `576 passed, 4 skipped, 2 known collection warnings`
+> (`15.12s`). Current journal path:
+> `data/runtime/mexc_population_decisions_v5.jsonl`.
 
 ## Earlier causal-scanner checkpoint — 2026-08-03
 
@@ -1582,7 +1582,8 @@ failure-semantics decision, not evidence that returns improved.
 529 passed, 4 skipped, 2 known PytestCollectionWarning (13.85s)
 ```
 
-Focused adversarial coverage includes full-row/provenance tampering, restart
+Focused adversarial coverage includes full-row/provenance partial edits and
+corruption, restart
 revalidation, A-B-A duplicates, concurrent spawned writers, fresh/cache/stale
 scanner→journal→reader round trips, cost/sizing/timing forgeries with recomputed
 result hashes, false replay-input hashes, evidence from different bars, reversed
@@ -1609,3 +1610,121 @@ Next implementation order:
 4. Only then build durable TradeProposal/OutcomeLabel and forward-data manifests.
 5. Accumulate prospective population before logistic/rules/random baselines and
    the LightGBM + separate EV candidate. Repeat no-edge is an accepted result.
+
+## Canonical StrategySpec and anchored journal v5 — 2026-08-08
+
+This is the latest executable checkpoint and supersedes the remaining-order
+statement immediately above. Work stayed inside the selected MEXC worktree.
+The scanner, exchange APIs, Telegram, `.env`, model training, testnet and live
+execution were not run.
+
+```text
+bebfd0d feat(strategy): define canonical MEXC strategy spec
+2d0efcb feat(journal): chain schema-v5 population evidence
+```
+
+### Version and identity matrix
+
+| Boundary | Current version / identity |
+|---|---|
+| MEXC StrategySpec | `mexc_strategy_v2`; dedicated `config/mexc_strategy_v2.yaml` |
+| StrategySpec contract hash | `9c62b88b7804e9663bae6f0eb429c58c541680b61d307c4f16032cb0b62fe3dd` |
+| committed default instance hash | `9f0b2d7035c2a82ab1b6d8595245b8c3a7a8b9faad17bea8c57f6fcacb189466` |
+| population journal | schema v5; `data/runtime/mexc_population_decisions_v5.jsonl` |
+| cycle envelope | schema v3; full canonical StrategySpec payload and identities |
+| reversal features | `mexc_reversal_features_v2` |
+| single-position replay | schema v3 |
+
+The legacy root `config/config.yaml` is not a MEXC source of truth: it contains
+different thresholds and Bybit-era settings. Production `app/scan.py` loads the
+dedicated MEXC YAML once. Legacy CLI timeframe/candle arguments are assertions,
+not post-hash overrides. Strategy, volatility context, base/benchmark requests,
+HTF cache, indicators, volume profile and both history gates are constructed
+from the same resolved object. `CycleEnvelope.from_dict()` rebuilds that object
+from the persisted canonical payload and independently re-derives both hashes.
+
+All numeric indicator fields now execute on both base and HTF calculations;
+volume-profile minimum history/sample fields and the generator history gate are
+also live inputs. The declared but still unwired `min_rsi_1h` and
+`require_confluence` switches reject non-zero values instead of being silently
+hashed and ignored. Defaults were preserved exactly: this is a configuration
+and evidence migration, not a threshold calibration.
+
+### Timeframe semantics
+
+The current executable spec is explicit rather than aspirational:
+
+- base and BTC benchmark: Min60, 320 closed bars;
+- higher timeframe: Hour4, 120 closed bars, 30-minute request TTL;
+- windows retain fixed counts of their source bars.
+
+Consequently the current 45-bar pump window is 45 hours, confirmation wait is
+3 hours, recent-MSB window is 6 hours, relative-strength lookback is 24 hours,
+and the 12-bar structural HTF anchor is 48 hours. These durations preserve the
+previous scanner exactly. They do **not** prove that 45 hours is the intended
+fast-pump horizon. Changing to a faster physical window must be a separately
+versioned strategy/research decision with a new instance hash and evaluation.
+No 15-minute or execution-timeframe feed was invented in this refactor.
+
+### Journal v5 trust contract
+
+Each new file receives a random 256-bit `journal_id`. Cycles have contiguous
+`sequence_no`, a domain-separated genesis, `prev_cycle_commit`, and a footer
+`cycle_commit` over the exact canonical header, every full ordered decision row
+and the footer core. Restart validates the complete chain present in the file.
+A stale writer may adopt only an exact extension of the prefix it previously
+observed; rollback, fork and rewrite relative to that cached prefix fail closed.
+
+`PopulationJournal.checkpoint_receipt()` returns a detached receipt containing
+the journal ID, sequence, cycle ID/commit and SHA-256/length of the exact raw
+prefix. Returning or storing that unsigned receipt beside the journal does not
+make it trusted. A caller must preserve it in an independently protected domain
+(for example a pushed Git checkpoint or an authenticated immutable store) and
+pass it explicitly to `verify_population_journal()`/the dataset reader.
+
+The boundary is deliberate:
+
+- v5 detects corruption, torn or incomplete writes, partial edits, splicing and
+  a changed earlier cycle whose successor was not rebuilt;
+- a fresh unanchored reader accepts a clean shorter valid prefix, so suffix
+  deletion/rollback is detected only relative to a stale writer's cached state
+  or an explicitly supplied trusted receipt covering the removed prefix;
+- an actor able to coherently rebuild an entire **unanchored** file can still
+  produce another internally consistent chain;
+- an earlier trusted external receipt detects a rewrite of its covered prefix;
+- data after that receipt is validated but remains unanchored and is excluded
+  by checkpointed readers unless the caller asks for the tail explicitly;
+- `model_input_records()` requires a trusted receipt by default. The only
+  bypass is the explicit `allow_unanchored=True` research override.
+
+The reader validates the whole file before export, then checks each second-pass
+cycle ID/commit against the first pass before yielding. This closes the
+same-size/same-mtime replacement race found during adversarial review. File
+identity also includes device, inode, size, mtime and ctime.
+
+### Validation and operational verdict
+
+```text
+full pytest: 576 passed, 4 skipped, 2 known PytestCollectionWarning (15.12s)
+focused StrategySpec/runtime review: no remaining P0/P1
+focused journal/checkpoint red-team: no remaining P0/P1/P2
+git diff --check: clean
+```
+
+No trading edge was established and no model was fitted. The unkeyed chain is
+not a substitute for an external anchor, and its contract hash is a pinned
+declarative/version discipline rather than a hash of Python implementation
+bytes. Exact default runtime parity is enforced by regression tests.
+
+Next implementation order:
+
+1. Choose and version the intended physical fast-pump windows; do not retune
+   them inside a mechanical refactor.
+2. Add typed arm/confirm lifecycle, per-symbol base/HTF provenance and
+   point-in-time instrument rules.
+3. Phase 2: compute gate-independent causal features and the raw-contract
+   inclusion/exclusion ledger.
+4. Build durable TradeProposal/OutcomeLabel plus forward-data manifests and
+   connect them to single-position v3.
+5. Only after prospective maturation run logistic/rules/random/no-trade
+   baselines and then the LightGBM + separate EV shadow candidate.

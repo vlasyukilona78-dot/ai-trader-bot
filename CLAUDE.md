@@ -18,28 +18,42 @@ API, or giving a strategy verdict:
    superseded findings.
 4. Verify the worktree, branch, local HEAD and remote HEAD yourself. The
    published AI foundation anchor is `f0b43d6` on
-   `claude/codex-project-review-04581e`; the 2026-08-08 hardening code tip is
-   `e0e4cb4`, and current HEAD must descend from both anchors.
+   `claude/codex-project-review-04581e`; the 2026-08-08 StrategySpec/journal-v5
+   code tip is `2d0efcb`, and current HEAD must descend from both anchors.
 
 ## Current product truth
 
 - Target exchange: MEXC futures.
 - Scope: public-data, signals-only causal research. There is no production MEXC
   private execution adapter in this line.
-- Latest tested tree at the recorded checkpoint: `529 passed, 4 skipped`, with
-  two known pytest collection warnings (`13.85s`).
+- Latest tested tree at the recorded checkpoint: `576 passed, 4 skipped`, with
+  two known pytest collection warnings (`15.12s`).
 - Generic pump-fade has not demonstrated stable positive edge after costs. The
   earlier DCA/positive-expectancy claims are retracted hypotheses, not evidence.
-- Phase 0 and the Phase 1 timing/journal/replay hardening are complete. Journal
-  schema v4 and single-position schema v3 are current; benchmark context now
-  fails closed by default.
+- Phase 0 plus the Phase 1 timing, replay, canonical StrategySpec and evidence
+  hardening are complete. Population journal schema v5, CycleEnvelope v3 and
+  single-position schema v3 are current; benchmark context fails closed.
+- The MEXC runtime loads one strict strategy-spec YAML; its canonical committed
+  default is `config/mexc_strategy_v2.yaml`, while `--strategy-spec` may select
+  another fully validated file. The pinned contract hash is `9c62b88b...e3dd`;
+  the committed default instance hash is `9f0b2d70...9466`. Base/benchmark are
+  Min60 and HTF is Hour4. Existing windows deliberately retain fixed-bar
+  semantics, so the current 45-bar pump window means 45 hours; choosing a faster
+  physical horizon is a later strategy change.
 - The current runtime-population path is
-  `data/runtime/mexc_population_decisions_v4.jsonl`; older journal schemas and
+  `data/runtime/mexc_population_decisions_v5.jsonl`; older journal schemas and
   legacy event-conditioned CSV are not accepted by the strict reader.
+- Journal v5 is internally chained and rejects corruption, partial edits,
+  incomplete writes and stale-writer rewrites relative to the prefix that writer
+  already observed. A fresh reader cannot distinguish a clean shorter prefix or
+  a coherent rewrite of a wholly unanchored file: only an explicitly supplied
+  receipt kept outside the writer's trust domain anchors a prefix and detects
+  rollback within it. Model-input export requires that receipt unless an unsafe
+  unanchored override is stated explicitly.
 - Do not train or enable a model from the current partial snapshots. The trace
-  is still gate-conditioned; StrategySpec/physical intervals, per-symbol
-  base/HTF provenance, arm/confirm lifecycle, point-in-time instrument specs and
-  the journal→proposal→label bridge remain unfinished.
+  is still gate-conditioned; intended fast physical windows, per-symbol base/HTF
+  provenance, arm/confirm lifecycle, point-in-time instrument specs and the
+  journal→proposal→label bridge remain unfinished.
 
 ## AI boundary
 
