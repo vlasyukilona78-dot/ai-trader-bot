@@ -18,11 +18,14 @@ def compute_volume_profile(
     window: int = 120,
     bins: int = 48,
     value_area: float = 0.70,
+    *,
+    minimum_history_bars: int = 20,
+    minimum_sample_bars: int = 24,
 ) -> VolumeProfileLevels | None:
-    if df.empty or len(df) < 20:
+    if df.empty or len(df) < minimum_history_bars:
         return None
 
-    sample = df.tail(max(window, 24)).copy()
+    sample = df.tail(max(window, minimum_sample_bars)).copy()
     typical = ((sample["high"] + sample["low"] + sample["close"]) / 3.0).to_numpy(dtype=float)
     volume = sample["volume"].to_numpy(dtype=float)
 

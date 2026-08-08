@@ -78,22 +78,42 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return dx.rolling(period).mean()
 
 
-def compute_indicators(df: pd.DataFrame, keltner_mult: float = 1.5) -> pd.DataFrame:
+def compute_indicators(
+    df: pd.DataFrame,
+    keltner_mult: float = 1.5,
+    *,
+    rsi_period: int = 14,
+    ema_fast_span: int = 20,
+    ema_slow_span: int = 50,
+    atr_period: int = 14,
+    bollinger_period: int = 20,
+    bollinger_mult: float = 2.0,
+    keltner_period: int = 20,
+    volume_ma_period: int = 20,
+    adx_period: int = 14,
+) -> pd.DataFrame:
     if df.empty:
         return df.copy()
 
     out = df.copy()
-    out["rsi"] = rsi(out["close"], period=14)
-    out["ema20"] = ema(out["close"], span=20)
-    out["ema50"] = ema(out["close"], span=50)
-    out["atr"] = atr(out, period=14)
+    out["rsi"] = rsi(out["close"], period=rsi_period)
+    # Column names stay stable for downstream feature compatibility.  The
+    # executable periods are recorded by StrategySpec rather than inferred from
+    # these historical names.
+    out["ema20"] = ema(out["close"], span=ema_fast_span)
+    out["ema50"] = ema(out["close"], span=ema_slow_span)
+    out["atr"] = atr(out, period=atr_period)
 
-    bb_lower, bb_mid, bb_upper = bollinger_bands(out["close"], period=20, mult=2.0)
+    bb_lower, bb_mid, bb_upper = bollinger_bands(
+        out["close"], period=bollinger_period, mult=bollinger_mult
+    )
     out["bb_lower"] = bb_lower
     out["bb_mid"] = bb_mid
     out["bb_upper"] = bb_upper
 
-    kc_lower, kc_mid, kc_upper = keltner_channels(out, period=20, mult=keltner_mult)
+    kc_lower, kc_mid, kc_upper = keltner_channels(
+        out, period=keltner_period, mult=keltner_mult
+    )
     out["kc_lower"] = kc_lower
     out["kc_mid"] = kc_mid
     out["kc_upper"] = kc_upper
@@ -104,10 +124,10 @@ def compute_indicators(df: pd.DataFrame, keltner_mult: float = 1.5) -> pd.DataFr
     out["obv"] = obv(out)
     out["cvd"] = cvd(out)
 
-    out["volume_ma20"] = out["volume"].rolling(20).mean()
+    out["volume_ma20"] = out["volume"].rolling(volume_ma_period).mean()
     out["volume_spike"] = out["volume"] / out["volume_ma20"].replace(0, np.nan)
 
     out["bb_position"] = (out["close"] - out["bb_lower"]) / (out["bb_upper"] - out["bb_lower"]).replace(0, np.nan)
-    out["adx"] = adx(out, period=14)
+    out["adx"] = adx(out, period=adx_period)
 
     return out

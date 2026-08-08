@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import math
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
@@ -168,8 +168,20 @@ class PendingCandidate:
 
 
 class SignalGenerator:
-    def __init__(self, config: SignalConfig | None = None):
+    def __init__(
+        self,
+        config: SignalConfig | None = None,
+        *,
+        min_history_bars: int = 40,
+        indicator_kwargs: Mapping[str, Any] | None = None,
+    ):
+        if isinstance(min_history_bars, bool) or not isinstance(min_history_bars, int):
+            raise TypeError("min_history_bars must be an integer")
+        if min_history_bars < 1:
+            raise ValueError("min_history_bars must be positive")
         self.config = config or SignalConfig()
+        self.min_history_bars = min_history_bars
+        self.indicator_kwargs = dict(indicator_kwargs or {})
         self.last_diagnostics: dict[str, Any] = {}
         self._pending: dict[str, PendingCandidate] = {}
 
@@ -393,7 +405,11 @@ class SignalGenerator:
             else:
                 from core.indicators import compute_indicators
 
-                rsi_htf = float(compute_indicators(htf_frame.tail(200)).iloc[-1].get("rsi", float("nan")))
+                rsi_htf = float(
+                    compute_indicators(
+                        htf_frame.tail(200), **self.indicator_kwargs
+                    ).iloc[-1].get("rsi", float("nan"))
+                )
                 details["rsi_htf"] = rsi_htf
                 htf_ok = rsi_htf >= cfg.min_rsi_4h if rsi_htf == rsi_htf else not cfg.require_htf
             details["rsi_htf_ok"] = 1.0 if htf_ok else 0.0
@@ -972,7 +988,7 @@ class SignalGenerator:
             "layers": {},
         }
 
-        if df.empty or len(df) < 40:
+        if df.empty or len(df) < self.min_history_bars:
             trace["failed_layer"] = "layer0_input"
             trace["layers"]["layer0_input"] = {"passed": False, "details": {"insufficient_history": 1.0}}
             self.last_diagnostics = trace
