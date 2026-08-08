@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass
 from numbers import Integral, Real
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
+from weakref import WeakValueDictionary
 
 from trading.market_data.bar_contract import interval_seconds, is_bar_aligned
+from trading.metrics.cycle_envelope import CycleEnvelope, CycleEnvelopeError
 
 
 # v2 added explicit source-response and cycle-completion timing plus the first
@@ -21,8 +25,10 @@ from trading.market_data.bar_contract import interval_seconds, is_bar_aligned
 # once as a header record with a closing footer instead of being copied into
 # every decision row, which made a 300-symbol scan quadratic and pushed the
 # ordered universe past the per-row metadata bounds. Two incompatible layouts
-# must not both be called v2, so the version moves again.
-SCHEMA_VERSION = 3
+# must not both be called v2, so the version moves again. v4 binds that envelope
+# (whose own schema and captured feature contract changed after v3 shipped) to
+# both the body and footer, and refuses mixed or incomplete population cycles.
+SCHEMA_VERSION = 4
 
 RECORD_TYPE_HEADER = "cycle_header"
 RECORD_TYPE_DECISION = "decision"
@@ -47,6 +53,160 @@ _ERROR_CODE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.]{0,127}$")
 _FORBIDDEN_METADATA_KEYS = frozenset(
     {"exception", "exception_message", "traceback", "stacktrace", "error_message"}
 )
+_MAX_JOURNAL_LINE_BYTES = 2_000_000
+FEATURE_PROVENANCE_KEYS = frozenset(
+    {
+        "universe_received_at",
+        "universe_source_ts",
+        "universe_cache_hit",
+        "envelope_hash",
+        "market_feature_hash",
+    }
+)
+_LOCK_ACQUIRE_TIMEOUT_SEC = 60.0
+_LOCK_RETRY_INTERVAL_SEC = 0.05
+
+
+# File locks alone do not provide portable thread exclusion: POSIX and Windows
+# differ in whether two descriptors owned by one process contend with each
+# other.  Every spelling of the same resolved journal path therefore shares a
+# process-local lock as well as the OS-level sidecar lock below.
+_PATH_LOCKS_GUARD = threading.Lock()
+_PATH_LOCKS: WeakValueDictionary[str, threading.RLock] = WeakValueDictionary()
+
+
+def _canonical_path(path: Path) -> Path:
+    return Path(os.path.normcase(str(path.expanduser().resolve(strict=False))))
+
+
+def _process_path_lock(path: Path) -> threading.RLock:
+    key = str(_canonical_path(path))
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PATH_LOCKS[key] = lock
+        return lock
+
+
+class _InterProcessPathLock:
+    """Exclusive advisory lock backed only by the Python standard library.
+
+    A stable sidecar is used instead of locking the journal itself: the journal
+    may not exist at first use, and opening it merely to lock would turn the
+    distinction between an absent and an empty journal into a race.  OS locks
+    are released automatically when a process dies; the harmless sidecar may
+    remain on disk.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._handle: Any | None = None
+        self._locked = False
+
+    def __enter__(self) -> "_InterProcessPathLock":
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            # Unbuffered mode keeps the Windows lock byte and file position in
+            # sync with the descriptor used by msvcrt.locking().
+            handle = self._path.open("a+b", buffering=0)
+        except OSError as exc:
+            raise PopulationJournalError("population journal lock is unavailable") from exc
+        self._handle = handle
+        try:
+            self._ensure_windows_lock_byte()
+            self._acquire()
+        except BaseException:
+            handle.close()
+            self._handle = None
+            raise
+        return self
+
+    def _ensure_windows_lock_byte(self) -> None:
+        if os.name != "nt":
+            return
+        assert self._handle is not None
+        self._handle.seek(0, os.SEEK_END)
+        if self._handle.tell() == 0:
+            # Concurrent creators may both append a byte.  That is harmless:
+            # every participant still locks the first byte only.
+            self._handle.write(b"\x00")
+            self._handle.flush()
+
+    def _acquire(self) -> None:
+        assert self._handle is not None
+        deadline = time.monotonic() + _LOCK_ACQUIRE_TIMEOUT_SEC
+        while True:
+            try:
+                self._handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(
+                        self._handle.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                self._locked = True
+                return
+            except (BlockingIOError, OSError) as exc:
+                if not _is_lock_contention(exc):
+                    raise PopulationJournalError(
+                        "population journal lock could not be acquired"
+                    ) from exc
+                if time.monotonic() >= deadline:
+                    raise PopulationJournalError(
+                        "timed out waiting for the population journal lock"
+                    ) from exc
+                time.sleep(_LOCK_RETRY_INTERVAL_SEC)
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        handle = self._handle
+        try:
+            if handle is not None and self._locked:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._locked = False
+            self._handle = None
+            if handle is not None:
+                handle.close()
+
+
+def _is_lock_contention(exc: OSError) -> bool:
+    return (
+        isinstance(exc, BlockingIOError)
+        or exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
+        or getattr(exc, "winerror", None) in {33, 36}
+    )
+
+
+def _journal_file_state(path: Path) -> tuple[int, int, int, int, int] | None:
+    """Cheap identity used to avoid rescanning an unchanged append-only file."""
+
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise PopulationJournalError("population journal is unreadable") from exc
+    return (
+        int(stat.st_dev),
+        int(stat.st_ino),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        int(stat.st_ctime_ns),
+    )
 
 
 class PopulationJournalError(ValueError):
@@ -255,6 +415,8 @@ class PopulationDecision:
             raise PopulationJournalError("universe response follows scan observation time")
         if self.scan_observed_at < self.candle_cutoff_ts:
             raise PopulationJournalError("scan observation precedes the causal cutoff")
+        if not is_bar_aligned(self.candle_cutoff_ts, self.timeframe):
+            raise PopulationJournalError("candle cutoff is not aligned to the timeframe")
         if self.decision_ts < self.scan_observed_at:
             raise PopulationJournalError("decision_ts precedes scan observation time")
 
@@ -291,8 +453,19 @@ class PopulationDecision:
             if base_close > self.candle_cutoff_ts:
                 raise PopulationJournalError("base bar closes after the causal cutoff")
             expected_seconds = interval_seconds(self.timeframe)
+            if not is_bar_aligned(base_open, self.timeframe) or not is_bar_aligned(
+                base_close, self.timeframe
+            ):
+                raise PopulationJournalError("base bar is not aligned to the timeframe")
             if not math.isclose(base_close - base_open, expected_seconds, rel_tol=0.0, abs_tol=1e-6):
                 raise PopulationJournalError("base bar duration differs from timeframe")
+            if not math.isclose(
+                base_close,
+                self.candle_cutoff_ts,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            ):
+                raise PopulationJournalError("base bar does not close at the causal cutoff")
             object.__setattr__(self, "base_bar_open_ts", base_open)
             object.__setattr__(self, "base_bar_close_ts", base_close)
         elif self.status in {"evaluated", "short_history", "strategy_error"}:
@@ -462,14 +635,219 @@ class PopulationDecision:
         }
 
 
-def rows_checksum(snapshot_ids: Sequence[str]) -> str:
-    """Digest over the ordered snapshot IDs of one cycle.
+def update_rows_checksum(digest: Any, payload: Mapping[str, object]) -> None:
+    """Add one canonical full decision record to an ordered cycle digest."""
 
-    Lets a reader detect a truncated or reordered body without re-deriving every
-    row, and lets the footer state what the header promised.
+    if not isinstance(payload, Mapping):
+        raise PopulationJournalError("row checksum requires decision objects")
+    encoded = _canonical_bytes(payload)
+    digest.update(len(encoded).to_bytes(8, byteorder="big", signed=False))
+    digest.update(encoded)
+
+
+def rows_checksum(rows: Sequence[Mapping[str, object]]) -> str:
+    """Digest over every canonical field of the ordered decision rows.
+
+    Snapshot IDs deliberately exclude wall-clock/provenance fields. Hashing only
+    those IDs allowed a valid-looking timestamp or provenance substitution to
+    leave the footer unchanged. Length-prefixing the canonical full rows binds
+    both membership and all serialized evidence without concatenation ambiguity.
     """
 
-    return _sha256_id({"snapshot_ids": [str(value) for value in snapshot_ids]})
+    digest = hashlib.sha256()
+    for payload in rows:
+        update_rows_checksum(digest, payload)
+    return digest.hexdigest()
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"nonstandard JSON number: {value}")
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _decode_journal_record(raw: bytes, *, line_number: int) -> Mapping[str, Any]:
+    if len(raw) > _MAX_JOURNAL_LINE_BYTES:
+        raise PopulationJournalError(f"population journal line {line_number} is too large")
+    try:
+        decoded = json.loads(
+            raw.decode("utf-8"),
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_unique_json_object,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise PopulationJournalError(
+            f"population journal has invalid JSON at line {line_number}"
+        ) from exc
+    if not isinstance(decoded, Mapping):
+        raise PopulationJournalError(
+            f"population journal record at line {line_number} is not an object"
+        )
+    return decoded
+
+
+def _validated_envelope(payload: object) -> CycleEnvelope:
+    if not isinstance(payload, Mapping):
+        raise PopulationJournalError("cycle header envelope is not an object")
+    try:
+        envelope = CycleEnvelope.from_dict(payload)
+    except CycleEnvelopeError as exc:
+        raise PopulationJournalError("cycle header contains an invalid envelope") from exc
+    expected_cycle_id = make_cycle_id(
+        timeframe=envelope.timeframe,
+        candle_cutoff_ts=envelope.candle_cutoff_ts,
+        universe_received_at=envelope.universe_timing.received_at,
+        universe_symbols=envelope.universe_symbols,
+        schema_version=SCHEMA_VERSION,
+    )
+    if envelope.cycle_id != expected_cycle_id:
+        raise PopulationJournalError("cycle envelope ID does not match its ordered universe")
+    return envelope
+
+
+def _validate_cycle_body(
+    envelope: CycleEnvelope,
+    *,
+    declared_rows: int,
+    row_symbols: Sequence[str],
+) -> None:
+    """Bind status, ordered universe and declared/actual decision population."""
+
+    if declared_rows < 0:
+        raise PopulationJournalError("cycle row count must not be negative")
+    symbols = tuple(row_symbols)
+    if envelope.status == "completed":
+        if not symbols:
+            raise PopulationJournalError("completed cycle must contain decision rows")
+        if symbols != envelope.universe_symbols:
+            raise PopulationJournalError(
+                "completed cycle rows do not match the envelope universe order"
+            )
+    elif symbols:
+        raise PopulationJournalError(
+            f"{envelope.status} cycle must not contain decision rows"
+        )
+    if declared_rows != len(symbols):
+        raise PopulationJournalError("declared cycle row count differs from its body")
+
+
+def _validate_feature_provenance(
+    record: PopulationDecision,
+    *,
+    envelope: CycleEnvelope,
+) -> None:
+    """Fail early when a feature-bearing row is not bound to its market/envelope.
+
+    ``PopulationJournal`` remains usable for generic diagnostic rows that carry
+    neither object. Once either the canonical feature snapshot or provenance is
+    present, however, schema v4 requires both and validates the same SHA-256
+    links that the strict reader later rebuilds independently.
+    """
+
+    metadata = _thaw_json_value(record.metadata)
+    if not isinstance(metadata, Mapping):  # guarded by PopulationDecision
+        raise PopulationJournalError("record metadata is not a mapping")
+    snapshot = metadata.get("feature_snapshot")
+    provenance = metadata.get("feature_provenance")
+    if snapshot is None and provenance is None:
+        return
+    if not isinstance(snapshot, Mapping) or not isinstance(provenance, Mapping):
+        raise PopulationJournalError(
+            "feature snapshot and feature provenance must be present together"
+        )
+    if set(provenance) != FEATURE_PROVENANCE_KEYS:
+        raise PopulationJournalError("feature provenance schema mismatch")
+    if provenance.get("envelope_hash") != envelope.envelope_hash():
+        raise PopulationJournalError("feature provenance envelope hash mismatch")
+    if provenance.get("universe_received_at") != envelope.universe_timing.received_at:
+        raise PopulationJournalError("feature provenance universe response mismatch")
+    if provenance.get("universe_source_ts") != envelope.universe_timing.source_ts:
+        raise PopulationJournalError("feature provenance universe source mismatch")
+    if type(provenance.get("universe_cache_hit")) is not bool:
+        raise PopulationJournalError("feature provenance cache flag must be boolean")
+    if provenance.get("universe_cache_hit") is not envelope.universe_timing.cache_hit:
+        raise PopulationJournalError("feature provenance universe cache mismatch")
+    # Imported lazily so this low-level journal remains importable while
+    # ai.reversal.population_dataset imports PopulationDecision. append_cycle()
+    # is only called after module initialization, so the dependency is safe at
+    # runtime without turning module import into a cycle.
+    from ai.reversal.feature_contract import (
+        build_runtime_feature_snapshot,
+        market_feature_hash,
+    )
+
+    try:
+        rebuilt_snapshot = build_runtime_feature_snapshot(
+            metadata,
+            bar_cutoff_ts=record.candle_cutoff_ts,
+        )
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise PopulationJournalError("feature snapshot cannot be rebuilt") from exc
+    if _canonical_bytes(snapshot) != _canonical_bytes(rebuilt_snapshot):
+        raise PopulationJournalError("feature snapshot does not match its source metadata")
+    recorded_market_hash = provenance.get("market_feature_hash")
+    if (
+        not isinstance(recorded_market_hash, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", recorded_market_hash)
+        or recorded_market_hash
+        != market_feature_hash(
+            rebuilt_snapshot,
+            symbol=record.symbol,
+            timeframe_seconds=interval_seconds(record.timeframe),
+        )
+    ):
+        raise PopulationJournalError("feature provenance market feature hash mismatch")
+
+
+def _validated_decision_record(payload: Mapping[str, Any]) -> PopulationDecision:
+    """Rebuild one serialized row and re-derive both of its causal digests."""
+
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise PopulationJournalError("cycle decision row metadata is not an object")
+    try:
+        record = PopulationDecision.create(
+            schema_version=payload.get("schema_version"),
+            cycle_id=payload.get("cycle_id"),
+            universe_refreshed_at=payload.get("universe_refreshed_at"),
+            universe_request_started_at=payload.get("universe_request_started_at"),
+            universe_received_at=payload.get("universe_received_at"),
+            scan_observed_at=payload.get("scan_observed_at"),
+            candle_cutoff_ts=payload.get("candle_cutoff_ts"),
+            decision_ts=payload.get("decision_ts"),
+            ranking_ready_ts=payload.get("ranking_ready_ts"),
+            cycle_completed_ts=payload.get("cycle_completed_ts"),
+            actionable_ts=payload.get("actionable_ts"),
+            entry_eligible_ts=payload.get("entry_eligible_ts"),
+            entry_bar_open_ts=payload.get("entry_bar_open_ts"),
+            symbol=payload.get("symbol"),
+            timeframe=payload.get("timeframe"),
+            status=payload.get("status"),
+            base_bar_open_ts=payload.get("base_bar_open_ts"),
+            base_bar_close_ts=payload.get("base_bar_close_ts"),
+            action=payload.get("action"),
+            reason=payload.get("reason"),
+            confidence=payload.get("confidence"),
+            metadata=metadata,
+            cycle_ordinal=payload.get("cycle_ordinal"),
+            cycle_size=payload.get("cycle_size"),
+            error_code=payload.get("error_code"),
+        )
+    except (PopulationJournalError, TypeError, ValueError) as exc:
+        raise PopulationJournalError("population journal contains an invalid decision row") from exc
+    # Canonical byte equality catches unknown/missing fields and JSON type drift
+    # (for example 1 versus 1.0), while create() above re-derived input_hash and
+    # snapshot_id rather than trusting either serialized digest.
+    if _canonical_bytes(record.as_dict()) != _canonical_bytes(payload):
+        raise PopulationJournalError("population journal decision row does not rebuild exactly")
+    return record
 
 
 class PopulationJournal:
@@ -481,62 +859,193 @@ class PopulationJournal:
     """
 
     def __init__(self, path: str | Path, *, enabled: bool = True) -> None:
-        self._path = Path(path)
+        self._path = _canonical_path(Path(path))
         self._enabled = bool(enabled)
         self._lock = threading.Lock()
-        self._last_cycle_id = self._inspect_existing_file() if self._enabled else None
+        self._path_lock = _process_path_lock(self._path)
+        self._lock_path = self._path.with_name(f".{self._path.name}.lock")
+        self._file_state: tuple[int, int, int, int, int] | None = None
+        if self._enabled:
+            # Initialization participates in the same critical section as an
+            # append.  Otherwise one instance could inspect a half-written
+            # batch while another instance is between header and footer.
+            with self._path_lock, _InterProcessPathLock(self._lock_path):
+                observed_state = _journal_file_state(self._path)
+                self._last_cycle_id, existing_ids = self._inspect_existing_file()
+                self._cycle_ids = set(existing_ids)
+                self._file_state = _journal_file_state(self._path)
+                if self._file_state != observed_state:
+                    raise PopulationJournalError(
+                        "population journal changed while it was being validated"
+                    )
+        else:
+            self._last_cycle_id = None
+            self._cycle_ids: set[str] = set()
 
-    def _inspect_existing_file(self) -> str | None:
-        """Refuse to append to a file written by a different schema or left torn."""
+    def _refresh_if_changed(self) -> None:
+        """Adopt cycles written by another instance while holding both locks."""
+
+        observed_state = _journal_file_state(self._path)
+        if observed_state == self._file_state:
+            return
+        last_cycle_id, existing_ids = self._inspect_existing_file()
+        validated_state = _journal_file_state(self._path)
+        if validated_state != observed_state:
+            # A writer that ignores our sidecar lock changed the evidence while
+            # it was being validated.  Never append on top of that ambiguity.
+            raise PopulationJournalError(
+                "population journal changed while it was being validated"
+            )
+        self._last_cycle_id = last_cycle_id
+        self._cycle_ids = set(existing_ids)
+        self._file_state = validated_state
+
+    def _inspect_existing_file(self) -> tuple[str | None, frozenset[str]]:
+        """Validate every existing cycle before permitting another append.
+
+        Looking only at the first header and final footer allowed an incompatible
+        or corrupt cycle in the middle of a file to survive a restart.  This
+        state machine validates the complete outer journal, including ordered
+        population membership and A-B-A duplicate cycles, without importing the
+        feature reader (which would create a dependency cycle).
+        """
 
         if not self._path.exists() or self._path.stat().st_size == 0:
-            return None
+            return None, frozenset()
         try:
             with self._path.open("rb") as handle:
-                first_line = handle.readline()
-                size = handle.seek(0, os.SEEK_END)
-                handle.seek(max(0, size - 1_048_576), os.SEEK_SET)
-                tail = handle.read()
+                handle.seek(-1, os.SEEK_END)
+                ends_with_newline = handle.read(1) == b"\n"
         except OSError as exc:
             raise PopulationJournalError("population journal is unreadable") from exc
 
         # A previous process that died mid-write leaves a line without its
         # newline. Appending would concatenate two JSON objects into one
         # unparseable line, so stop and say how to recover.
-        if not tail.endswith(b"\n"):
+        if not ends_with_newline:
             raise PopulationJournalError(
                 "population journal ends without a newline; it was truncated mid-write. "
                 "Move the file aside and start a new one rather than appending to it."
             )
 
-        try:
-            header = json.loads(first_line.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise PopulationJournalError("population journal has an unreadable first record") from exc
-        if not isinstance(header, Mapping):
-            raise PopulationJournalError("population journal first record is not an object")
-        existing_version = header.get("schema_version")
-        if existing_version != SCHEMA_VERSION:
-            raise PopulationJournalError(
-                f"population journal was written by schema {existing_version!r}, "
-                f"this build writes {SCHEMA_VERSION}. Use a separate file per schema."
-            )
-        if header.get("record_type") != RECORD_TYPE_HEADER:
-            raise PopulationJournalError("population journal does not start with a cycle header")
+        current_envelope: CycleEnvelope | None = None
+        current_cycle_id: str | None = None
+        current_envelope_hash: str | None = None
+        declared_rows = 0
+        row_symbols: list[str] = []
+        rows_digest = hashlib.sha256()
+        seen_symbols: set[str] = set()
+        seen_snapshots: set[str] = set()
+        completed_ids: set[str] = set()
+        last_cycle_id: str | None = None
 
-        lines = [line for line in tail.splitlines() if line.strip()]
-        if not lines:
-            return None
         try:
-            footer = json.loads(lines[-1].decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise PopulationJournalError("population journal has an unreadable tail") from exc
-        if not isinstance(footer, Mapping) or footer.get("record_type") != RECORD_TYPE_FOOTER:
+            handle = self._path.open("rb")
+        except OSError as exc:
+            raise PopulationJournalError("population journal is unreadable") from exc
+        with handle:
+            for line_number, raw in enumerate(handle, start=1):
+                if not raw.strip():
+                    continue
+                payload = _decode_journal_record(raw, line_number=line_number)
+                existing_version = payload.get("schema_version")
+                if existing_version != SCHEMA_VERSION:
+                    raise PopulationJournalError(
+                        f"population journal was written by schema {existing_version!r}, "
+                        f"this build writes {SCHEMA_VERSION}. Use a separate file per schema."
+                    )
+                record_type = payload.get("record_type")
+
+                if record_type == RECORD_TYPE_HEADER:
+                    if current_envelope is not None:
+                        raise PopulationJournalError(
+                            "population journal starts a new cycle before closing the previous one"
+                        )
+                    current_envelope = _validated_envelope(payload.get("envelope"))
+                    current_cycle_id = current_envelope.cycle_id
+                    if payload.get("cycle_id") != current_cycle_id:
+                        raise PopulationJournalError("cycle header ID differs from its envelope")
+                    if current_cycle_id in completed_ids:
+                        raise PopulationJournalError("population journal contains a duplicate cycle")
+                    raw_count = payload.get("row_count")
+                    if isinstance(raw_count, bool) or not isinstance(raw_count, Integral):
+                        raise PopulationJournalError("cycle header row count must be an integer")
+                    declared_rows = int(raw_count)
+                    if declared_rows < 0:
+                        raise PopulationJournalError("cycle row count must not be negative")
+                    current_envelope_hash = current_envelope.envelope_hash()
+                    if payload.get("envelope_hash") != current_envelope_hash:
+                        raise PopulationJournalError("cycle header envelope hash mismatch")
+                    row_symbols = []
+                    rows_digest = hashlib.sha256()
+                    seen_symbols = set()
+                    seen_snapshots = set()
+                    continue
+
+                if current_envelope is None or current_cycle_id is None:
+                    raise PopulationJournalError("population journal row precedes its cycle header")
+
+                if record_type == RECORD_TYPE_DECISION:
+                    record = _validated_decision_record(payload)
+                    if record.cycle_id != current_cycle_id:
+                        raise PopulationJournalError("decision row belongs to another cycle")
+                    if (
+                        record.cycle_ordinal != len(row_symbols)
+                        or record.cycle_size != declared_rows
+                    ):
+                        raise PopulationJournalError("cycle decision rows are incomplete or unordered")
+                    if current_envelope_hash is None:  # guarded by the header state
+                        raise PopulationJournalError("cycle header envelope hash is absent")
+                    _validate_feature_provenance(
+                        record,
+                        envelope=current_envelope,
+                    )
+                    symbol = record.symbol
+                    snapshot_id = record.snapshot_id
+                    if symbol in seen_symbols or snapshot_id in seen_snapshots:
+                        raise PopulationJournalError("cycle contains duplicate symbols or snapshots")
+                    seen_symbols.add(symbol)
+                    seen_snapshots.add(snapshot_id)
+                    row_symbols.append(symbol)
+                    update_rows_checksum(rows_digest, payload)
+                    continue
+
+                if record_type == RECORD_TYPE_FOOTER:
+                    if payload.get("cycle_id") != current_cycle_id:
+                        raise PopulationJournalError("cycle footer ID mismatch")
+                    footer_count = payload.get("row_count")
+                    if isinstance(footer_count, bool) or not isinstance(footer_count, Integral):
+                        raise PopulationJournalError("cycle footer row count must be an integer")
+                    if int(footer_count) != declared_rows or declared_rows != len(row_symbols):
+                        raise PopulationJournalError("cycle header/footer/body row counts disagree")
+                    if payload.get("envelope_hash") != current_envelope_hash:
+                        raise PopulationJournalError("cycle footer envelope hash mismatch")
+                    if payload.get("rows_checksum") != rows_digest.hexdigest():
+                        raise PopulationJournalError("cycle footer rows checksum mismatch")
+                    _validate_cycle_body(
+                        current_envelope,
+                        declared_rows=declared_rows,
+                        row_symbols=row_symbols,
+                    )
+                    completed_ids.add(current_cycle_id)
+                    last_cycle_id = current_cycle_id
+                    current_envelope = None
+                    current_cycle_id = None
+                    current_envelope_hash = None
+                    declared_rows = 0
+                    row_symbols = []
+                    rows_digest = hashlib.sha256()
+                    continue
+
+                raise PopulationJournalError(
+                    f"unknown population journal record type: {record_type!r}"
+                )
+
+        if current_envelope is not None:
             raise PopulationJournalError("population journal ends with an incomplete cycle")
-        cycle_id = footer.get("cycle_id")
-        if not isinstance(cycle_id, str) or not re.fullmatch(r"[0-9a-f]{64}", cycle_id):
-            raise PopulationJournalError("population journal tail has an invalid cycle ID")
-        return cycle_id
+        if not completed_ids:
+            raise PopulationJournalError("population journal contains no complete cycles")
+        return last_cycle_id, frozenset(completed_ids)
 
     @property
     def enabled(self) -> bool:
@@ -560,12 +1069,18 @@ class PopulationJournal:
         if envelope is None:
             raise PopulationJournalError("a cycle requires its envelope")
 
-        envelope_payload = envelope.as_dict()
+        try:
+            envelope_payload = envelope.as_dict()
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise PopulationJournalError("cycle envelope cannot be serialized") from exc
+        validated_envelope = _validated_envelope(envelope_payload)
         cycle_id = envelope_payload.get("cycle_id")
         if not isinstance(cycle_id, str) or not re.fullmatch(r"[0-9a-f]{64}", cycle_id):
             raise PopulationJournalError("cycle envelope has an invalid cycle ID")
+        envelope_hash = validated_envelope.envelope_hash()
 
         rows: list[bytes] = []
+        row_payloads: list[Mapping[str, object]] = []
         for record in records:
             if not isinstance(record, PopulationDecision):
                 raise PopulationJournalError("records must contain PopulationDecision instances")
@@ -573,7 +1088,10 @@ class PopulationJournal:
                 raise PopulationJournalError("append batch mixes journal schema versions")
             if record.cycle_id != cycle_id:
                 raise PopulationJournalError("decision row does not belong to the envelope cycle")
-            rows.append(_canonical_bytes(record.as_dict()) + b"\n")
+            _validate_feature_provenance(record, envelope=validated_envelope)
+            row_payload = record.as_dict()
+            row_payloads.append(row_payload)
+            rows.append(_canonical_bytes(row_payload) + b"\n")
 
         expected_size = len(records)
         if expected_size:
@@ -585,14 +1103,19 @@ class PopulationJournal:
                 raise PopulationJournalError("cycle contains duplicate symbols")
             if len({record.snapshot_id for record in records}) != expected_size:
                 raise PopulationJournalError("cycle contains duplicate snapshots")
+        _validate_cycle_body(
+            validated_envelope,
+            declared_rows=expected_size,
+            row_symbols=[record.symbol for record in records],
+        )
 
-        snapshot_ids = [record.snapshot_id for record in records]
         header = _canonical_bytes(
             {
                 "record_type": RECORD_TYPE_HEADER,
                 "schema_version": SCHEMA_VERSION,
                 "cycle_id": cycle_id,
                 "row_count": expected_size,
+                "envelope_hash": envelope_hash,
                 "envelope": envelope_payload,
             }
         ) + b"\n"
@@ -602,13 +1125,18 @@ class PopulationJournal:
                 "schema_version": SCHEMA_VERSION,
                 "cycle_id": cycle_id,
                 "row_count": expected_size,
-                "rows_checksum": rows_checksum(snapshot_ids),
+                "envelope_hash": envelope_hash,
+                "rows_checksum": rows_checksum(row_payloads),
             }
         ) + b"\n"
 
         batch = header + b"".join(rows) + footer
-        with self._lock:
-            if self._last_cycle_id == cycle_id:
+        with self._lock, self._path_lock, _InterProcessPathLock(self._lock_path):
+            # Another object/process may have appended since this instance was
+            # constructed.  A cheap file fingerprint makes unchanged appends
+            # O(1), while any external change is fully validated before use.
+            self._refresh_if_changed()
+            if cycle_id in self._cycle_ids:
                 return False
             self._path.parent.mkdir(parents=True, exist_ok=True)
             with self._path.open("ab") as handle:
@@ -618,4 +1146,6 @@ class PopulationJournal:
                 handle.flush()
                 os.fsync(handle.fileno())
             self._last_cycle_id = cycle_id
+            self._cycle_ids.add(cycle_id)
+            self._file_state = _journal_file_state(self._path)
         return True

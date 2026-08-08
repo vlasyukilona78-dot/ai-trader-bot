@@ -91,9 +91,16 @@ class HigherTimeframeCacheV2Tests(unittest.TestCase):
         feed = _FakeFeed()
         cache = HigherTimeframeCache(feed, self._config(ttl_sec=1))
         cache.get("BTCUSDT", as_of=self._BAR_1230, now=1000.0)
+        fresh = cache.drain_timings()[0]
         feed.fail = True
         stale = cache.get("BTCUSDT", as_of=self._BAR_1255, now=5000.0)
         self.assertIsNotNone(stale)
+        fallback = cache.drain_timings()[0]
+        self.assertEqual(fallback["status"], "stale_cache")
+        self.assertTrue(fallback["cache_hit"])
+        self.assertEqual(fallback["source_ts"], fresh["source_ts"])
+        self.assertIsNotNone(fallback["cache_age_sec"])
+        self.assertEqual(fallback["error_code"], "RuntimeError")
 
     def test_failed_fetch_at_new_boundary_does_not_serve_previous_frame(self):
         feed = _FakeFeed()
@@ -120,6 +127,22 @@ class HigherTimeframeCacheV2Tests(unittest.TestCase):
         first.iloc[0, first.columns.get_loc("close")] = 999.0
         second = cache.get("BTCUSDT", as_of=self._BAR_1255, now=1001.0)
         self.assertEqual(second["close"].iloc[0], 1.0)
+
+    def test_same_boundary_cache_hit_keeps_original_source_timestamp_and_age(self):
+        feed = _FakeFeed()
+        cache = HigherTimeframeCache(feed, self._config(ttl_sec=600))
+        cache.get("BTCUSDT", as_of=self._BAR_1230, now=1000.0)
+        fresh = cache.drain_timings()[0]
+        cache.get("BTCUSDT", as_of=self._BAR_1255, now=1001.0)
+        hit = cache.drain_timings()[0]
+
+        self.assertEqual(fresh["status"], "ok")
+        self.assertFalse(fresh["cache_hit"])
+        self.assertIsNotNone(fresh["source_ts"])
+        self.assertEqual(hit["status"], "ok")
+        self.assertTrue(hit["cache_hit"])
+        self.assertEqual(hit["source_ts"], fresh["source_ts"])
+        self.assertIsNotNone(hit["cache_age_sec"])
 
     def test_legacy_feed_fetches_extra_bar_and_is_filtered(self):
         feed = _LegacyFeed()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 # Non-crypto derivative products listed alongside perpetuals (equity/index proxies).
@@ -63,23 +63,29 @@ class UniverseEntry:
 class UniverseSnapshot:
     entries: list[UniverseEntry] = field(default_factory=list)
     total_contracts: int = 0
-    # When this snapshot became the current one. It anchors the refresh TTL and
-    # is taken before the request, so it must never be used as the instant the
-    # data was known - see request_started_at/received_at for that.
+    # When the last successful snapshot became current. It anchors the refresh
+    # TTL. Fresh snapshots use their response instant; stale fallbacks retain
+    # the last successful anchor so the next cycle is still allowed to retry.
+    # Source age remains a separate fact below.
     refreshed_at: float = 0.0
     request_started_at: float = 0.0
     received_at: float = 0.0
     # When the exchange actually produced these rows. On a cache hit this stays
     # at the original response instant, so cached data cannot be presented as a
     # fresh answer.
-    source_ts: float = 0.0
+    source_ts: float | None = None
     cache_hit: bool = False
     cache_age_sec: float | None = None
     source_status: str = "ok"
+    source_error_code: str | None = None
     # Contract details are a separate optional request; it has its own timing.
     details_request_started_at: float | None = None
     details_received_at: float | None = None
     details_status: str | None = None
+    details_source_ts: float | None = None
+    details_cache_hit: bool = False
+    details_cache_age_sec: float | None = None
+    details_error_code: str | None = None
 
     @property
     def symbols(self) -> list[str]:
@@ -112,10 +118,54 @@ class SymbolUniverse:
     def snapshot(self) -> UniverseSnapshot:
         return self._snapshot
 
+    @staticmethod
+    def _safe_error_code(exc: BaseException, *, fallback: str) -> str:
+        name = type(exc).__name__
+        return name if name and name[0].isalpha() and name.replace("_", "").isalnum() else fallback
+
+    @staticmethod
+    def _safe_code_value(value: object, *, fallback: str) -> str:
+        text = str(value or "")
+        compact = text.replace("_", "").replace(".", "")
+        if text and text[0].isalpha() and compact.isalnum() and len(text) <= 128:
+            return text
+        return fallback
+
+    def _cached_snapshot(self, *, observed_at: float) -> UniverseSnapshot:
+        """Expose a local snapshot reuse as a cache read, not a fresh response."""
+
+        snapshot = self._snapshot
+        source_ts = snapshot.source_ts
+        cache_age = (
+            max(0.0, observed_at - source_ts) if source_ts is not None else None
+        )
+        details_source_ts = snapshot.details_source_ts
+        details_age = (
+            max(0.0, observed_at - details_source_ts)
+            if details_source_ts is not None
+            else None
+        )
+        return replace(
+            snapshot,
+            request_started_at=observed_at,
+            received_at=observed_at,
+            cache_hit=source_ts is not None,
+            cache_age_sec=cache_age,
+            details_request_started_at=(
+                observed_at if snapshot.details_request_started_at is not None else None
+            ),
+            details_received_at=(
+                observed_at if snapshot.details_received_at is not None else None
+            ),
+            details_cache_hit=details_source_ts is not None,
+            details_cache_age_sec=details_age,
+        )
+
     def refresh(self, *, force: bool = False, now: float | None = None) -> UniverseSnapshot:
         now = now if now is not None else time.time()
         age = now - self._snapshot.refreshed_at
         if self._snapshot.entries and age < self.config.refresh_sec and not force:
+            self._snapshot = self._cached_snapshot(observed_at=now)
             return self._snapshot
 
         # The response instant, not `now`. `now` was read before the request and
@@ -123,25 +173,86 @@ class SymbolUniverse:
         # it. Cache hits keep their own source instant so they are not laundered
         # into fresh responses.
         with_provenance = getattr(self.client, "fetch_all_tickers_with_provenance", None)
+        provenance_supported = callable(with_provenance)
         if callable(with_provenance):
             tickers, provenance = with_provenance(force=force)
         else:
             started = time.time()
-            tickers = self.client.fetch_all_tickers(force=force)
+            try:
+                tickers = self.client.fetch_all_tickers(force=force)
+                legacy_error_code = None
+            except Exception as exc:
+                tickers = []
+                legacy_error_code = self._safe_error_code(
+                    exc, fallback="TickerRequestUnavailable"
+                )
             answered = time.time()
             provenance = {
                 "request_started_at": started,
                 "received_at": answered,
-                "source_ts": answered,
+                "source_ts": answered if legacy_error_code is None else None,
                 "cache_hit": False,
-                "cache_age_sec": 0.0,
-                "status": "ok",
+                "cache_age_sec": 0.0 if legacy_error_code is None else None,
+                "status": "ok" if legacy_error_code is None else "error",
+                "error_code": legacy_error_code,
             }
         request_started_at = float(provenance["request_started_at"])
         received_at = float(provenance["received_at"])
-        if not tickers:
-            # Keep serving the previous snapshot rather than emptying the scan list.
-            return self._snapshot
+        source_status = str(provenance.get("status") or "error")
+        source_error_code = provenance.get("error_code")
+
+        # The legacy rows-only surface cannot distinguish a failed empty response
+        # from a real empty board. Treat it as unavailable; the real MEXC client
+        # supplies provenance and can represent a successful empty response.
+        if not tickers and not provenance_supported and source_status == "ok":
+            source_status = "error"
+            source_error_code = "LegacyTickerEmptyResponse"
+            provenance["source_ts"] = None
+            provenance["cache_age_sec"] = None
+
+        if not tickers and source_status != "ok":
+            if self._snapshot.entries and self._snapshot.source_ts is not None:
+                # A failed attempt may use the prior derived universe, but its
+                # source timestamp and age remain those of the prior response.
+                # Contract specs reused with that derived universe are a cache
+                # read too; do not leave their first-cycle provenance labelled
+                # as fresh in this later fallback cycle.
+                cached_snapshot = self._cached_snapshot(observed_at=received_at)
+                source_ts = cached_snapshot.source_ts
+                stale = replace(
+                    cached_snapshot,
+                    # Preserve the last successful TTL anchor so another cycle
+                    # can retry instead of treating this failed attempt as a
+                    # successful refresh for the next refresh interval.
+                    refreshed_at=self._snapshot.refreshed_at,
+                    request_started_at=request_started_at,
+                    received_at=received_at,
+                    source_ts=source_ts,
+                    cache_hit=True,
+                    cache_age_sec=max(0.0, request_started_at - source_ts),
+                    source_status="stale_cache",
+                    source_error_code=self._safe_code_value(
+                        source_error_code, fallback="TickerRequestUnavailable"
+                    ),
+                )
+                self._snapshot = stale
+                return stale
+            failed = UniverseSnapshot(
+                entries=[],
+                total_contracts=0,
+                refreshed_at=now,
+                request_started_at=request_started_at,
+                received_at=received_at,
+                source_ts=None,
+                cache_hit=False,
+                cache_age_sec=None,
+                source_status="error",
+                source_error_code=self._safe_code_value(
+                    source_error_code, fallback="TickerRequestUnavailable"
+                ),
+            )
+            self._snapshot = failed
+            return failed
 
         cfg = self.config
         quote_suffix = f"_{cfg.quote.upper()}"
@@ -152,17 +263,54 @@ class SymbolUniverse:
         details_started: float | None = None
         details_received: float | None = None
         details_status: str | None = None
+        details_source_ts: float | None = None
+        details_cache_hit = False
+        details_cache_age_sec: float | None = None
+        details_error_code: str | None = None
         if cfg.max_min_notional_usdt > 0:
             # A second, independent request: it gets its own timing rather than
             # sharing the ticker's.
-            details_started = time.time()
-            try:
-                details = self.client.fetch_contract_details()
-                details_status = "ok"
-            except Exception:
-                details = {}  # missing specs must not empty the scan list
-                details_status = "error"
-            details_received = time.time()
+            details_with_provenance = getattr(
+                self.client, "fetch_contract_details_with_provenance", None
+            )
+            if callable(details_with_provenance):
+                try:
+                    details, details_provenance = details_with_provenance(force=force)
+                except Exception as exc:
+                    details = {}
+                    details_started = details_received = time.time()
+                    details_status = "error"
+                    details_error_code = self._safe_error_code(
+                        exc, fallback="ContractDetailsUnavailable"
+                    )
+                else:
+                    details_started = float(details_provenance["request_started_at"])
+                    details_received = float(details_provenance["received_at"])
+                    raw_details_source_ts = details_provenance.get("source_ts")
+                    details_source_ts = (
+                        float(raw_details_source_ts)
+                        if raw_details_source_ts is not None
+                        else None
+                    )
+                    details_cache_hit = bool(details_provenance.get("cache_hit"))
+                    details_cache_age_sec = details_provenance.get("cache_age_sec")
+                    details_status = str(details_provenance.get("status") or "error")
+                    details_error_code = details_provenance.get("error_code")
+            else:
+                details_started = time.time()
+                try:
+                    details = self.client.fetch_contract_details(force=force)
+                    details_status = "ok"
+                except Exception as exc:
+                    details = {}  # missing specs must not empty the scan list
+                    details_status = "error"
+                    details_error_code = self._safe_error_code(
+                        exc, fallback="ContractDetailsUnavailable"
+                    )
+                details_received = time.time()
+                if details_status == "ok":
+                    details_source_ts = details_received
+                    details_cache_age_sec = 0.0
 
         for item in tickers:
             if not isinstance(item, dict):
@@ -215,16 +363,41 @@ class SymbolUniverse:
         self._snapshot = UniverseSnapshot(
             entries=entries,
             total_contracts=len(tickers),
-            refreshed_at=now,
+            refreshed_at=(
+                received_at
+                if source_status == "ok"
+                else float(provenance.get("source_ts") or 0.0)
+            ),
             request_started_at=request_started_at,
             received_at=received_at,
-            source_ts=float(provenance.get("source_ts") or received_at),
+            source_ts=(
+                float(provenance["source_ts"])
+                if provenance.get("source_ts") is not None
+                else None
+            ),
             cache_hit=bool(provenance.get("cache_hit")),
             cache_age_sec=provenance.get("cache_age_sec"),
-            source_status=str(provenance.get("status") or "ok"),
+            source_status=source_status,
+            source_error_code=(
+                self._safe_code_value(
+                    source_error_code, fallback="TickerRequestUnavailable"
+                )
+                if source_error_code is not None
+                else None
+            ),
             details_request_started_at=details_started,
             details_received_at=details_received,
             details_status=details_status,
+            details_source_ts=details_source_ts,
+            details_cache_hit=details_cache_hit,
+            details_cache_age_sec=details_cache_age_sec,
+            details_error_code=(
+                self._safe_code_value(
+                    details_error_code, fallback="ContractDetailsUnavailable"
+                )
+                if details_error_code is not None
+                else None
+            ),
         )
         return self._snapshot
 

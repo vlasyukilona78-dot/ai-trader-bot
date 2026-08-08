@@ -93,12 +93,14 @@ class ClosedBarContractV2Tests(unittest.TestCase):
 class _Client:
     def __init__(self):
         self.requests = []
+        self.ticker_requests = []
 
     def fetch_ohlcv(self, **kwargs):
         self.requests.append(kwargs)
         return _bars()
 
     def fetch_ticker_meta(self, symbol: str):
+        self.ticker_requests.append(symbol)
         return {"lastPrice": "123.5"}
 
     def close(self):
@@ -116,7 +118,8 @@ class ClosedMarketFrameV2Tests(unittest.TestCase):
         )
         self.assertEqual(client.requests[0]["limit"], 3)
         self.assertEqual(list(frame.ohlcv.index.hour), [11, 12])
-        self.assertEqual(frame.mark_price, 123.5)
+        self.assertEqual(frame.mark_price, float(frame.ohlcv.iloc[-1]["close"]))
+        self.assertEqual(client.ticker_requests, [])
         self.assertEqual(
             frame.candle_cutoff_ts,
             pd.Timestamp("2026-01-01T13:00:00Z").timestamp(),

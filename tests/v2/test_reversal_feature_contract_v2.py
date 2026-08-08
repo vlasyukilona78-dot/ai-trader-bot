@@ -10,6 +10,7 @@ from ai.reversal.feature_contract import (
     captured_feature_specs,
     feature_contract_hash,
     feature_registry_hash,
+    market_feature_hash,
     model_feature_names,
 )
 
@@ -138,3 +139,26 @@ def test_partial_gate_trace_has_fixed_schema_and_explicit_missingness() -> None:
     assert snapshot["availability_reason"]["rsi_4h"] == "not_computed"
     assert snapshot["coverage"]["expected"] == len(expected_names)
     assert 0.0 < snapshot["coverage"]["fraction"] < 1.0
+
+
+def test_market_feature_hash_binds_instrument_timeframe_and_snapshot() -> None:
+    snapshot = build_runtime_feature_snapshot(
+        _metadata(),
+        bar_cutoff_ts=1_700_002_800.0,
+    )
+
+    digest = market_feature_hash(snapshot, symbol="AAAUSDT", timeframe_seconds=3600)
+    assert re.fullmatch(r"[0-9a-f]{64}", digest)
+    assert (
+        market_feature_hash(dict(snapshot), symbol="AAAUSDT", timeframe_seconds=3600)
+        == digest
+    )
+    assert market_feature_hash(snapshot, symbol="BBBUSDT", timeframe_seconds=3600) != digest
+    assert market_feature_hash(snapshot, symbol="AAAUSDT", timeframe_seconds=900) != digest
+
+    changed = dict(snapshot)
+    changed["source_times"] = {"bar_cutoff_ts": 1_700_003_100.0}
+    assert (
+        market_feature_hash(changed, symbol="AAAUSDT", timeframe_seconds=3600)
+        != digest
+    )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import math
 from dataclasses import dataclass, field
 
 
@@ -47,15 +48,27 @@ class VolatilityContext:
         # progress - reintroducing exactly the scan-order dependence freezing
         # exists to remove.
         self._sweep_active = False
+        # All observations produced by one concurrent sweep are stamped with its
+        # start time. Worker completion time is scheduling noise: around the TTL
+        # boundary it used to decide which symbols survived into the next sweep,
+        # making the next floor depend on worker order.
+        self._sweep_timestamp: float | None = None
 
     def observe(self, symbol: str, atr_pct: float, *, now: float | None = None):
-        if atr_pct is None or atr_pct != atr_pct or atr_pct <= 0:
+        if atr_pct is None or not math.isfinite(float(atr_pct)) or atr_pct <= 0:
             return
-        self._observations[symbol] = _Observation(float(atr_pct), now if now is not None else time.time())
+        observed_at = self._sweep_timestamp if self._sweep_active else now
+        if observed_at is None:
+            observed_at = time.time()
+        if not math.isfinite(float(observed_at)):
+            raise ValueError("observation_timestamp_must_be_finite")
+        self._observations[symbol] = _Observation(float(atr_pct), float(observed_at))
 
     def _fresh_values(self, now: float | None = None) -> list[float]:
-        now = now if now is not None else time.time()
-        cutoff = now - self.config.max_age_sec
+        now_value = float(now if now is not None else time.time())
+        if not math.isfinite(now_value):
+            raise ValueError("volatility_clock_must_be_finite")
+        cutoff = now_value - self.config.max_age_sec
         stale = [s for s, o in self._observations.items() if o.ts < cutoff]
         for s in stale:
             del self._observations[s]
@@ -70,7 +83,11 @@ class VolatilityContext:
         floor for all of its symbols instead of watching the distribution build up
         underneath it.
         """
-        self._frozen = self._fresh_values(now)
+        sweep_timestamp = time.time() if now is None else float(now)
+        if not math.isfinite(sweep_timestamp):
+            raise ValueError("sweep_timestamp_must_be_finite")
+        self._frozen = self._fresh_values(sweep_timestamp)
+        self._sweep_timestamp = sweep_timestamp
         self._sweep_active = True
 
     def floor(self, *, now: float | None = None) -> float:

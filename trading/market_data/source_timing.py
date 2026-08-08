@@ -70,9 +70,11 @@ class SourceTiming:
 
         if self.source_as_of is not None:
             as_of = _finite(self.source_as_of, field="source_as_of")
-            # Already-closed market data cannot describe a moment the exchange had
-            # not reached when it answered.
-            if self.status == _STATUS_OK and as_of > received:
+            # A failed request may still return stale fallback data. Neither a
+            # success nor a fallback can describe a causal instant the process
+            # had not reached when the request completed. A failure with no data
+            # should use source_as_of=None rather than a requested future cutoff.
+            if as_of > received:
                 raise SourceTimingError("source_as_of_follows_received_at")
             object.__setattr__(self, "source_as_of", as_of)
 
@@ -86,8 +88,27 @@ class SourceTiming:
             if produced > received:
                 raise SourceTimingError("source_ts_follows_received_at")
             object.__setattr__(self, "source_ts", produced)
-        if self.cache_hit and self.source_ts is None:
-            raise SourceTimingError("cache_hit_requires_source_ts")
+        if self.cache_hit:
+            if self.source_ts is None:
+                raise SourceTimingError("cache_hit_requires_source_ts")
+            if self.cache_age_sec is None:
+                raise SourceTimingError("cache_hit_requires_cache_age_sec")
+            # A caller may measure age immediately before sending a request or
+            # immediately after receiving the local cache result.  Both are
+            # honest; an age outside that interval is not.  This catches a
+            # common provenance bug where the cache flag is set but age zero is
+            # attached to data produced minutes earlier.
+            earliest_age = max(0.0, started - self.source_ts)
+            latest_age = max(0.0, received - self.source_ts)
+            tolerance = 1e-6
+            if not (
+                earliest_age - tolerance
+                <= self.cache_age_sec
+                <= latest_age + tolerance
+            ):
+                raise SourceTimingError("cache_age_sec_is_incoherent_with_source_ts")
+        elif self.cache_age_sec not in (None, 0.0):
+            raise SourceTimingError("non_cache_source_must_not_have_positive_cache_age")
 
         if self.status == _STATUS_OK:
             if self.error_code is not None:

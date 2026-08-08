@@ -17,6 +17,7 @@ from ai.reversal.feature_contract import (
     FEATURE_CONTRACT_VERSION,
     build_runtime_feature_snapshot,
     feature_contract_hash,
+    market_feature_hash,
 )
 from trading.market_data.source_timing import SourceTiming, SourceTimingError
 from trading.market_data.universe import SymbolUniverse, UniverseConfig
@@ -62,11 +63,14 @@ def test_snapshot_carries_no_wall_clock() -> None:
     assert set(snapshot["source_times"]) == {"bar_cutoff_ts"}
 
 
-def test_runtime_timing_does_not_change_the_market_snapshot_hash() -> None:
-    """A slower cycle observes the same market."""
+def test_runtime_timing_changes_row_identity_but_not_the_market_feature_hash() -> None:
+    """A slower cycle is a distinct observation of the same market features."""
     fast = _records()[0]
     slow = _rebuild(
         fast,
+        # Real cycle identity contains the universe response instant, so another
+        # observation cycle intentionally receives another row identity.
+        cycle_id="f" * 64,
         decision_ts=fast.decision_ts + 45.0,
         ranking_ready_ts=fast.ranking_ready_ts + 60.0,
         cycle_completed_ts=fast.cycle_completed_ts + 60.0,
@@ -74,8 +78,13 @@ def test_runtime_timing_does_not_change_the_market_snapshot_hash() -> None:
         entry_eligible_ts=fast.entry_eligible_ts + 60.0,
     )
 
-    assert slow.input_hash == fast.input_hash
-    assert slow.snapshot_id == fast.snapshot_id
+    assert slow.input_hash != fast.input_hash
+    assert slow.snapshot_id != fast.snapshot_id
+    assert market_feature_hash(
+        slow.metadata["feature_snapshot"], symbol=slow.symbol, timeframe_seconds=3600
+    ) == market_feature_hash(
+        fast.metadata["feature_snapshot"], symbol=fast.symbol, timeframe_seconds=3600
+    )
 
 
 def test_feature_provenance_is_recorded_but_not_hashed() -> None:
@@ -116,10 +125,48 @@ def test_a_cache_hit_must_say_when_the_data_was_produced() -> None:
         )
 
 
+def test_a_cache_hit_must_report_its_age() -> None:
+    with pytest.raises(SourceTimingError, match="cache_hit_requires_cache_age_sec"):
+        SourceTiming(
+            source="universe_ticker",
+            request_started_at=2.0,
+            received_at=3.0,
+            cache_hit=True,
+            source_ts=1.0,
+        )
+
+
+def test_cache_age_must_match_the_source_and_observation_interval() -> None:
+    with pytest.raises(
+        SourceTimingError, match="cache_age_sec_is_incoherent_with_source_ts"
+    ):
+        SourceTiming(
+            source="universe_ticker",
+            request_started_at=100.0,
+            received_at=101.0,
+            cache_hit=True,
+            cache_age_sec=0.0,
+            source_ts=10.0,
+        )
+
+
 def test_source_ts_may_not_follow_the_response() -> None:
     with pytest.raises(SourceTimingError, match="source_ts_follows_received_at"):
         SourceTiming(
             source="universe_ticker", request_started_at=1.0, received_at=2.0, source_ts=3.0
+        )
+
+
+@pytest.mark.parametrize("status", ["error", "stale_cache"])
+def test_non_ok_source_as_of_may_not_follow_the_response(status: str) -> None:
+    with pytest.raises(SourceTimingError, match="source_as_of_follows_received_at"):
+        SourceTiming(
+            source="base_ohlcv",
+            request_started_at=10.0,
+            received_at=11.0,
+            status=status,
+            source_as_of=999.0,
+            error_code="SyntheticUnavailable",
         )
 
 

@@ -346,3 +346,69 @@ def build_runtime_feature_snapshot(
             "fraction": (present_count / expected) if expected else 0.0,
         },
     }
+
+
+def market_feature_hash(
+    snapshot: Mapping[str, Any],
+    *,
+    symbol: str,
+    timeframe_seconds: int,
+) -> str:
+    """Return the market-only identity of one canonical feature snapshot.
+
+    ``PopulationDecision.input_hash`` intentionally identifies a decision inside
+    a scan cycle and therefore includes ``cycle_id``.  It is not a market
+    identity: ``cycle_id`` contains the universe response instant. This digest
+    is kept separate and covers the instrument, timeframe and closed-cutoff
+    feature snapshot, so the same market inputs hash identically regardless of
+    worker/network latency without aliasing two different instruments.
+
+    The strict dataset reader rebuilds the snapshot from source metadata before
+    trusting this value.  Non-finite or otherwise non-canonical payloads fail
+    closed instead of receiving an unstable identity.
+    """
+
+    if not isinstance(snapshot, Mapping):
+        raise TypeError("feature snapshot must be a mapping")
+    if not isinstance(symbol, str) or not symbol.strip():
+        raise ValueError("market feature symbol must be non-empty")
+    if (
+        isinstance(timeframe_seconds, bool)
+        or not isinstance(timeframe_seconds, int)
+        or timeframe_seconds <= 0
+    ):
+        raise ValueError("market feature timeframe must be positive integer seconds")
+
+    def json_value(value: Any) -> Any:
+        # PopulationDecision freezes nested mappings with MappingProxyType and
+        # sequences as tuples. They are still the same JSON value and must hash
+        # exactly like the mutable runtime snapshot from which they came.
+        if isinstance(value, Mapping):
+            if any(not isinstance(key, str) for key in value):
+                raise TypeError("feature snapshot keys must be strings")
+            return {key: json_value(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [json_value(item) for item in value]
+        if value is None or isinstance(value, (str, bool, int)):
+            return value
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("feature snapshot contains a non-finite number")
+            return value
+        raise TypeError(f"unsupported feature snapshot value: {type(value).__name__}")
+
+    try:
+        encoded = json.dumps(
+            {
+                "symbol": symbol,
+                "timeframe_seconds": timeframe_seconds,
+                "feature_snapshot": json_value(snapshot),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("feature snapshot is not canonical JSON") from exc
+    return hashlib.sha256(encoded).hexdigest()

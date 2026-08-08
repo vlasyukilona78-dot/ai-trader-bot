@@ -4,9 +4,10 @@ import json
 
 import pytest
 
-from ai.reversal.feature_contract import build_runtime_feature_snapshot
+from ai.reversal.feature_contract import build_runtime_feature_snapshot, market_feature_hash
 from ai.reversal.population_dataset import (
     PopulationDatasetError,
+    iter_population_cycles,
     iter_population_feature_rows,
     model_input_records,
     population_feature_records,
@@ -20,6 +21,10 @@ _UNIVERSE_TIMING = SourceTiming(
     source="universe",
     request_started_at=1_700_000_000.0,
     received_at=1_700_000_001.0,
+    source_as_of=1_699_999_990.0,
+    cache_hit=True,
+    cache_age_sec=11.0,
+    source_ts=1_699_999_990.0,
 )
 
 
@@ -38,6 +43,13 @@ def _envelope(**overrides) -> CycleEnvelope:
         cycle_completed_ts=1_700_002_805.0,
     )
     values.update(overrides)
+    if "cycle_id" not in overrides:
+        values["cycle_id"] = make_cycle_id(
+            timeframe=values["timeframe"],
+            candle_cutoff_ts=values["candle_cutoff_ts"],
+            universe_received_at=values["universe_timing"].received_at,
+            universe_symbols=values["universe_symbols"],
+        )
     return CycleEnvelope.build(**values)
 
 
@@ -64,7 +76,7 @@ def _rewrite(path, rows) -> None:
     )
 
 
-def _metadata(*, funding: float | None) -> dict:
+def _metadata(*, funding: float | None, symbol: str = "AAAUSDT") -> dict:
     metadata = {
         "universe": {
             "turnover_24h_usdt": 1_000_000.0,
@@ -85,6 +97,15 @@ def _metadata(*, funding: float | None) -> dict:
         metadata,
         bar_cutoff_ts=1_700_002_800.0,
     )
+    metadata["feature_provenance"] = {
+        "universe_received_at": _UNIVERSE_TIMING.received_at,
+        "universe_source_ts": _UNIVERSE_TIMING.source_ts,
+        "universe_cache_hit": _UNIVERSE_TIMING.cache_hit,
+        "envelope_hash": _envelope().envelope_hash(),
+        "market_feature_hash": market_feature_hash(
+            metadata["feature_snapshot"], symbol=symbol, timeframe_seconds=3600
+        ),
+    }
     return metadata
 
 
@@ -116,7 +137,7 @@ def _records() -> list[PopulationDecision]:
                 action="HOLD",
                 reason="test",
                 confidence=0.0,
-                metadata=_metadata(funding=funding),
+                metadata=_metadata(funding=funding, symbol=symbol),
                 cycle_ordinal=ordinal,
                 cycle_size=2,
             )
@@ -141,6 +162,8 @@ def test_reader_preserves_complete_population_and_real_missingness(tmp_path) -> 
     assert flat[0]["funding_rate"] == 0.0
     assert flat[1]["funding_rate"] is None
     assert flat[1]["funding_rate__observed"] == 0
+    assert flat[0]["envelope_hash"] == rows[0].envelope_hash
+    assert flat[0]["market_feature_hash"] == rows[0].market_feature_hash
 
     model_rows = model_input_records(path)
     assert "action" not in model_rows[0]
@@ -148,6 +171,19 @@ def test_reader_preserves_complete_population_and_real_missingness(tmp_path) -> 
     assert "open_interest" not in model_rows[0]["features"]
     assert "poc" not in model_rows[0]["features"]
     assert "funding_rate" in model_rows[0]["features"]
+    assert model_rows[0]["envelope_hash"] == rows[0].envelope_hash
+    assert model_rows[0]["market_feature_hash"] == rows[0].market_feature_hash
+
+
+def test_reader_round_trips_all_scanner_cache_provenance(tmp_path) -> None:
+    path = tmp_path / "population.jsonl"
+    _write(path)
+
+    envelope, _ = next(iter(iter_population_cycles(path)))
+    assert envelope.universe_timing.as_dict() == _UNIVERSE_TIMING.as_dict()
+    assert envelope.universe_timing.cache_hit is True
+    assert envelope.universe_timing.cache_age_sec == 11.0
+    assert envelope.universe_timing.source_ts == 1_699_999_990.0
 
 
 def test_reader_rejects_contract_hash_drift(tmp_path) -> None:
@@ -169,6 +205,50 @@ def test_reader_rejects_feature_tampering_even_with_valid_contract_hash(tmp_path
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
 
     with pytest.raises(PopulationDatasetError, match="feature_snapshot_source_mismatch"):
+        list(iter_population_feature_rows(path))
+
+
+def test_reader_rejects_row_envelope_hash_tampering(tmp_path) -> None:
+    path = tmp_path / "population.jsonl"
+    _write(path)
+    rows = _lines(path)
+    rows[1]["metadata"]["feature_provenance"]["envelope_hash"] = "0" * 64
+    _rewrite(path, rows)
+
+    with pytest.raises(PopulationDatasetError, match="envelope_hash"):
+        list(iter_population_feature_rows(path))
+
+
+def test_reader_rejects_market_feature_hash_tampering(tmp_path) -> None:
+    path = tmp_path / "population.jsonl"
+    _write(path)
+    rows = _lines(path)
+    rows[1]["metadata"]["feature_provenance"]["market_feature_hash"] = "0" * 64
+    _rewrite(path, rows)
+
+    with pytest.raises(PopulationDatasetError, match="market_feature_hash_mismatch"):
+        list(iter_population_feature_rows(path))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("universe_received_at", _UNIVERSE_TIMING.received_at + 1.0, "received_at_mismatch"),
+        ("universe_source_ts", _UNIVERSE_TIMING.source_ts + 1.0, "universe_source_ts"),
+        ("universe_cache_hit", False, "universe_cache_hit"),
+        ("unexpected", "value", "feature_provenance_schema_mismatch"),
+    ],
+)
+def test_reader_rejects_drifted_feature_provenance(
+    tmp_path, field, value, message
+) -> None:
+    path = tmp_path / "population.jsonl"
+    _write(path)
+    rows = _lines(path)
+    rows[1]["metadata"]["feature_provenance"][field] = value
+    _rewrite(path, rows)
+
+    with pytest.raises(PopulationDatasetError, match=message):
         list(iter_population_feature_rows(path))
 
 

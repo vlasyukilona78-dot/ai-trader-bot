@@ -138,7 +138,11 @@ def test_exception_message_is_never_serialized(tmp_path) -> None:
         )
 
     path = tmp_path / "population.jsonl"
-    PopulationJournal(path).append_cycle([record], envelope=_envelope())
+    records = [
+        record.__class__(**{**record.__dict__, "cycle_ordinal": 0, "cycle_size": 2}),
+        _record(symbol="BBB_USDT", cycle_ordinal=1, cycle_size=2),
+    ]
+    PopulationJournal(path).append_cycle(records, envelope=_envelope())
     contents = path.read_text(encoding="utf-8")
 
     assert secret_marker not in contents
@@ -258,16 +262,35 @@ def test_no_data_uses_absent_bar_timestamps_instead_of_a_sentinel() -> None:
     assert record.base_bar_close_ts is None
 
 
+def test_feature_bearing_base_bar_must_close_at_the_causal_cutoff() -> None:
+    with pytest.raises(PopulationJournalError, match="does not close at the causal cutoff"):
+        _record(
+            base_bar_open_ts=1_699_999_500.0,
+            base_bar_close_ts=1_699_999_800.0,
+        )
+
+
+def test_base_bar_must_be_aligned_to_the_timeframe() -> None:
+    with pytest.raises(PopulationJournalError, match="not aligned"):
+        _record(
+            base_bar_open_ts=1_699_999_800.5,
+            base_bar_close_ts=1_700_000_100.0,
+        )
+
+
 def test_append_cycle_deduplicates_the_latest_complete_cycle(tmp_path) -> None:
     path = tmp_path / "population.jsonl"
-    record = _record()
+    records = [
+        _record(symbol="AAA_USDT", cycle_ordinal=0, cycle_size=2),
+        _record(symbol="BBB_USDT", cycle_ordinal=1, cycle_size=2),
+    ]
     journal = PopulationJournal(path)
 
-    assert journal.append_cycle([record], envelope=_envelope()) is True
-    assert journal.append_cycle([record], envelope=_envelope()) is False
-    assert PopulationJournal(path).append_cycle([record], envelope=_envelope()) is False
-    # header + one decision row + footer, written exactly once
-    assert len(path.read_text(encoding="utf-8").splitlines()) == 3
+    assert journal.append_cycle(records, envelope=_envelope()) is True
+    assert journal.append_cycle(records, envelope=_envelope()) is False
+    assert PopulationJournal(path).append_cycle(records, envelope=_envelope()) is False
+    # header + two decision rows + footer, written exactly once
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 4
 
 
 def test_append_cycle_requires_complete_ordered_batch(tmp_path) -> None:

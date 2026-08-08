@@ -209,6 +209,9 @@ class _Logger:
     def warning(self, msg, *a, **k):
         self.warnings.append(msg)
 
+    def error(self, msg, *a, **k):
+        self.warnings.append(msg)
+
 
 def _ohlcv(n=100):
     frame = pd.DataFrame({
@@ -334,6 +337,9 @@ class ScanOnceV2Tests(unittest.TestCase):
             journal.cycles[0][0].universe_received_at,
         )
         self.assertRegex(feature_provenance["envelope_hash"], r"^[0-9a-f]{64}$")
+        self.assertRegex(
+            feature_provenance["market_feature_hash"], r"^[0-9a-f]{64}$"
+        )
         provenance = journal.cycles[0][0].metadata["provenance"]
         self.assertRegex(provenance["strategy_config_hash"], r"^[0-9a-f]{64}$")
         self.assertRegex(provenance["universe_policy_hash"], r"^[0-9a-f]{64}$")
@@ -523,7 +529,7 @@ class ScanCliV2Tests(unittest.TestCase):
             defaults = parse_args()
         self.assertEqual(
             defaults.population_journal,
-            "data/runtime/mexc_population_decisions.jsonl",
+            "data/runtime/mexc_population_decisions_v4.jsonl",
         )
         self.assertFalse(defaults.disable_population_journal)
 

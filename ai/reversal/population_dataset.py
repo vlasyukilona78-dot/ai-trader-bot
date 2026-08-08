@@ -17,8 +17,8 @@ from typing import Any, Iterator, Mapping
 
 from trading.market_data.bar_contract import interval_seconds
 from trading.metrics.cycle_envelope import CycleEnvelope, CycleEnvelopeError
-from trading.market_data.source_timing import SourceTiming, SourceTimingError
 from trading.metrics.population_journal import (
+    FEATURE_PROVENANCE_KEYS,
     RECORD_TYPE_DECISION,
     RECORD_TYPE_FOOTER,
     RECORD_TYPE_HEADER,
@@ -27,7 +27,7 @@ from trading.metrics.population_journal import (
     PopulationJournalError,
     _causal_metadata,
     make_cycle_id,
-    rows_checksum,
+    update_rows_checksum,
 )
 
 from .feature_contract import (
@@ -35,6 +35,7 @@ from .feature_contract import (
     build_runtime_feature_snapshot,
     captured_feature_specs,
     feature_contract_hash,
+    market_feature_hash,
     model_feature_names,
 )
 
@@ -74,6 +75,8 @@ class PopulationFeatureRow:
     decision_completed_ts: float
     universe_refreshed_at: float
     universe_received_at: float
+    universe_source_ts: float | None
+    universe_cache_hit: bool
     ranking_ready_ts: float
     cycle_completed_ts: float
     actionable_ts: float
@@ -83,6 +86,8 @@ class PopulationFeatureRow:
     universe_policy_hash: str
     feature_contract_version: str
     feature_contract_hash: str
+    envelope_hash: str
+    market_feature_hash: str
     features: Mapping[str, float | None]
     observed: Mapping[str, int]
     availability_reason: Mapping[str, str]
@@ -154,6 +159,9 @@ def _parse_feature_row(payload: Mapping[str, Any]) -> PopulationFeatureRow:
     except (PopulationJournalError, TypeError, ValueError) as exc:
         raise PopulationDatasetError("invalid_population_record") from exc
 
+    if record.as_dict() != dict(payload):
+        raise PopulationDatasetError("population_record_source_mismatch")
+
     encoded_timeframe_seconds = _integer(
         payload.get("timeframe_seconds"), field="timeframe_seconds"
     )
@@ -183,6 +191,43 @@ def _parse_feature_row(payload: Mapping[str, Any]) -> PopulationFeatureRow:
     )
     if snapshot != rebuilt_snapshot:
         raise PopulationDatasetError("feature_snapshot_source_mismatch")
+
+    feature_provenance = _mapping(
+        metadata.get("feature_provenance"), field="feature_provenance"
+    )
+    if set(feature_provenance) != FEATURE_PROVENANCE_KEYS:
+        raise PopulationDatasetError("feature_provenance_schema_mismatch")
+    recorded_envelope_hash = feature_provenance.get("envelope_hash")
+    recorded_market_hash = feature_provenance.get("market_feature_hash")
+    provenance_received_at = _finite_number(
+        feature_provenance.get("universe_received_at"),
+        field="feature_provenance_universe_received_at",
+    )
+    raw_source_ts = feature_provenance.get("universe_source_ts")
+    provenance_source_ts = (
+        _finite_number(raw_source_ts, field="feature_provenance_universe_source_ts")
+        if raw_source_ts is not None
+        else None
+    )
+    provenance_cache_hit = feature_provenance.get("universe_cache_hit")
+    if type(provenance_cache_hit) is not bool:
+        raise PopulationDatasetError("feature_provenance_universe_cache_hit_must_be_boolean")
+    if provenance_received_at != record.universe_received_at:
+        raise PopulationDatasetError("feature_provenance_universe_received_at_mismatch")
+    if not isinstance(recorded_envelope_hash, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", recorded_envelope_hash
+    ):
+        raise PopulationDatasetError("feature_provenance_envelope_hash_must_be_sha256")
+    if not isinstance(recorded_market_hash, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", recorded_market_hash
+    ):
+        raise PopulationDatasetError("feature_provenance_market_feature_hash_must_be_sha256")
+    if recorded_market_hash != market_feature_hash(
+        rebuilt_snapshot,
+        symbol=record.symbol,
+        timeframe_seconds=interval_seconds(record.timeframe),
+    ):
+        raise PopulationDatasetError("market_feature_hash_mismatch")
 
     raw_values = _mapping(snapshot.get("values"), field="feature_values")
     raw_observed = _mapping(snapshot.get("observed"), field="feature_observed")
@@ -269,6 +314,8 @@ def _parse_feature_row(payload: Mapping[str, Any]) -> PopulationFeatureRow:
         decision_completed_ts=record.decision_ts,
         universe_refreshed_at=record.universe_refreshed_at,
         universe_received_at=record.universe_received_at,
+        universe_source_ts=provenance_source_ts,
+        universe_cache_hit=provenance_cache_hit,
         ranking_ready_ts=record.ranking_ready_ts,
         cycle_completed_ts=record.cycle_completed_ts,
         actionable_ts=record.actionable_ts,
@@ -278,6 +325,8 @@ def _parse_feature_row(payload: Mapping[str, Any]) -> PopulationFeatureRow:
         universe_policy_hash=universe_policy_hash,
         feature_contract_version=contract_version,
         feature_contract_hash=contract_hash,
+        envelope_hash=recorded_envelope_hash,
+        market_feature_hash=recorded_market_hash,
         features=features,
         observed=observed,
         availability_reason=availability_reason,
@@ -293,48 +342,9 @@ def _rebuild_envelope(payload: Mapping[str, Any]) -> CycleEnvelope:
     """
 
     try:
-        timings = tuple(
-            SourceTiming(
-                source=str(item.get("source")),
-                request_started_at=item.get("request_started_at"),
-                received_at=item.get("received_at"),
-                status=str(item.get("status")),
-                source_as_of=item.get("source_as_of"),
-                error_code=item.get("error_code"),
-            )
-            for item in payload.get("source_timings", ())
-        )
-    except (AttributeError, SourceTimingError, TypeError, ValueError) as exc:
-        raise PopulationDatasetError("invalid_cycle_source_timing") from exc
-    if not timings:
-        raise PopulationDatasetError("cycle_envelope_has_no_source_timings")
-
-    universe_name = str(_mapping(payload.get("universe_timing"), field="universe_timing").get("source"))
-    universe = next((timing for timing in timings if timing.source == universe_name), None)
-    if universe is None:
-        raise PopulationDatasetError("cycle_envelope_universe_timing_missing")
-
-    try:
-        rebuilt = CycleEnvelope.build(
-            cycle_id=str(payload.get("cycle_id") or ""),
-            timeframe=str(payload.get("timeframe") or ""),
-            cycle_started_at=payload.get("cycle_started_at"),
-            candle_cutoff_ts=payload.get("candle_cutoff_ts"),
-            universe_symbols=tuple(payload.get("universe_symbols", ())),
-            universe_timing=universe,
-            source_timings=timings,
-            strategy_config_hash=str(payload.get("strategy_config_hash") or ""),
-            universe_policy_hash=str(payload.get("universe_policy_hash") or ""),
-            ranking_ready_ts=payload.get("ranking_ready_ts"),
-            cycle_completed_ts=payload.get("cycle_completed_ts"),
-            status=str(payload.get("status") or ""),
-            error_code=payload.get("error_code"),
-        )
+        rebuilt = CycleEnvelope.from_dict(payload)
     except (CycleEnvelopeError, TypeError, ValueError) as exc:
         raise PopulationDatasetError("invalid_cycle_envelope") from exc
-
-    if rebuilt.as_dict() != dict(payload):
-        raise PopulationDatasetError("cycle_envelope_source_mismatch")
     return rebuilt
 
 
@@ -357,14 +367,36 @@ def _check_row_against_envelope(row: PopulationFeatureRow, envelope: CycleEnvelo
             raise PopulationDatasetError(f"row_disagrees_with_cycle_envelope:{row_field}")
     if row.universe_received_at != envelope.universe_timing.received_at:
         raise PopulationDatasetError("row_disagrees_with_cycle_envelope:universe_received_at")
+    if row.universe_source_ts != envelope.universe_timing.source_ts:
+        raise PopulationDatasetError("row_disagrees_with_cycle_envelope:universe_source_ts")
+    if row.universe_cache_hit is not envelope.universe_timing.cache_hit:
+        raise PopulationDatasetError("row_disagrees_with_cycle_envelope:universe_cache_hit")
+    if row.envelope_hash != envelope.envelope_hash():
+        raise PopulationDatasetError("row_disagrees_with_cycle_envelope:envelope_hash")
 
 
-def iter_population_cycles(path: str | Path) -> Iterator[tuple[CycleEnvelope, list[PopulationFeatureRow]]]:
-    """Yield each complete, verified cycle as its envelope plus ordered rows."""
+def _journal_fingerprint(source: Path) -> tuple[int, int]:
+    """Return a cheap stability token and reject a torn final JSONL record."""
 
-    source = Path(path)
-    if not source.exists():
-        raise PopulationDatasetError("population_journal_not_found")
+    try:
+        stat = source.stat()
+        if stat.st_size:
+            with source.open("rb") as handle:
+                handle.seek(-1, 2)
+                if handle.read(1) != b"\n":
+                    raise PopulationDatasetError("journal_ends_without_newline")
+    except PopulationDatasetError:
+        raise
+    except OSError as exc:
+        raise PopulationDatasetError("population_journal_unreadable") from exc
+    return stat.st_size, stat.st_mtime_ns
+
+
+def _parse_population_cycles(
+    source: Path,
+) -> Iterator[tuple[CycleEnvelope, list[PopulationFeatureRow]]]:
+    """Parse one immutable view. The public reader performs a validation pass first."""
+
     try:
         handle = source.open("r", encoding="utf-8")
     except (OSError, UnicodeError) as exc:
@@ -372,8 +404,12 @@ def iter_population_cycles(path: str | Path) -> Iterator[tuple[CycleEnvelope, li
 
     envelope: CycleEnvelope | None = None
     declared_rows = 0
+    declared_envelope_hash: str | None = None
     cycle_rows: list[PopulationFeatureRow] = []
+    seen_symbols: set[str] = set()
+    seen_snapshots: set[str] = set()
     completed_cycles: set[str] = set()
+    rows_digest = hashlib.sha256()
     saw_any = False
 
     with handle:
@@ -399,6 +435,15 @@ def iter_population_cycles(path: str | Path) -> Iterator[tuple[CycleEnvelope, li
                 record_type = payload.get("record_type")
 
                 if record_type == RECORD_TYPE_HEADER:
+                    if set(payload) != {
+                        "record_type",
+                        "schema_version",
+                        "cycle_id",
+                        "row_count",
+                        "envelope_hash",
+                        "envelope",
+                    }:
+                        raise PopulationDatasetError("cycle_header_schema_mismatch")
                     if envelope is not None:
                         raise PopulationDatasetError("new_cycle_before_previous_cycle_completed")
                     envelope = _rebuild_envelope(
@@ -406,10 +451,27 @@ def iter_population_cycles(path: str | Path) -> Iterator[tuple[CycleEnvelope, li
                     )
                     if envelope.cycle_id != payload.get("cycle_id"):
                         raise PopulationDatasetError("cycle_header_id_mismatch")
+                    expected_cycle_id = make_cycle_id(
+                        timeframe=envelope.timeframe,
+                        candle_cutoff_ts=envelope.candle_cutoff_ts,
+                        universe_received_at=envelope.universe_timing.received_at,
+                        universe_symbols=envelope.universe_symbols,
+                        schema_version=SCHEMA_VERSION,
+                    )
+                    if expected_cycle_id != envelope.cycle_id:
+                        raise PopulationDatasetError("population_cycle_id_mismatch")
                     if envelope.cycle_id in completed_cycles:
                         raise PopulationDatasetError("duplicate_cycle")
                     declared_rows = _integer(payload.get("row_count"), field="row_count")
+                    if declared_rows < 0:
+                        raise PopulationDatasetError("cycle_row_count_must_not_be_negative")
+                    declared_envelope_hash = payload.get("envelope_hash")
+                    if declared_envelope_hash != envelope.envelope_hash():
+                        raise PopulationDatasetError("cycle_header_envelope_hash_mismatch")
                     cycle_rows = []
+                    rows_digest = hashlib.sha256()
+                    seen_symbols = set()
+                    seen_snapshots = set()
                     saw_any = True
                     continue
 
@@ -420,38 +482,55 @@ def iter_population_cycles(path: str | Path) -> Iterator[tuple[CycleEnvelope, li
                     row = _parse_feature_row(payload)
                     if row.cycle_ordinal != len(cycle_rows) or row.cycle_size != declared_rows:
                         raise PopulationDatasetError("incomplete_or_unordered_cycle")
-                    if any(item.symbol == row.symbol for item in cycle_rows):
+                    if row.symbol in seen_symbols or row.snapshot_id in seen_snapshots:
                         raise PopulationDatasetError("duplicate_symbol_or_snapshot_in_cycle")
-                    if any(item.snapshot_id == row.snapshot_id for item in cycle_rows):
-                        raise PopulationDatasetError("duplicate_symbol_or_snapshot_in_cycle")
+                    seen_symbols.add(row.symbol)
+                    seen_snapshots.add(row.snapshot_id)
                     _check_row_against_envelope(row, envelope)
                     cycle_rows.append(row)
+                    update_rows_checksum(rows_digest, payload)
                     continue
 
                 if record_type == RECORD_TYPE_FOOTER:
+                    if set(payload) != {
+                        "record_type",
+                        "schema_version",
+                        "cycle_id",
+                        "row_count",
+                        "envelope_hash",
+                        "rows_checksum",
+                    }:
+                        raise PopulationDatasetError("cycle_footer_schema_mismatch")
                     if payload.get("cycle_id") != envelope.cycle_id:
                         raise PopulationDatasetError("cycle_footer_id_mismatch")
-                    if _integer(payload.get("row_count"), field="row_count") != len(cycle_rows):
+                    footer_rows = _integer(payload.get("row_count"), field="row_count")
+                    if footer_rows != declared_rows or declared_rows != len(cycle_rows):
                         raise PopulationDatasetError("cycle_row_count_mismatch")
-                    if payload.get("rows_checksum") != rows_checksum(
-                        [item.snapshot_id for item in cycle_rows]
-                    ):
+                    if payload.get("envelope_hash") != declared_envelope_hash:
+                        raise PopulationDatasetError("cycle_footer_envelope_hash_mismatch")
+                    if payload.get("rows_checksum") != rows_digest.hexdigest():
                         raise PopulationDatasetError("cycle_rows_checksum_mismatch")
-                    if cycle_rows:
-                        expected_cycle_id = make_cycle_id(
-                            timeframe=envelope.timeframe,
-                            candle_cutoff_ts=envelope.candle_cutoff_ts,
-                            universe_received_at=envelope.universe_timing.received_at,
-                            universe_symbols=[item.symbol for item in cycle_rows],
-                            schema_version=SCHEMA_VERSION,
+
+                    row_symbols = tuple(item.symbol for item in cycle_rows)
+                    if envelope.status == "completed":
+                        if not row_symbols:
+                            raise PopulationDatasetError("completed_cycle_has_no_decision_rows")
+                        if row_symbols != envelope.universe_symbols:
+                            raise PopulationDatasetError("cycle_population_universe_mismatch")
+                    elif row_symbols:
+                        raise PopulationDatasetError(
+                            f"{envelope.status}_cycle_must_not_contain_decision_rows"
                         )
-                        if expected_cycle_id != envelope.cycle_id:
-                            raise PopulationDatasetError("population_cycle_id_mismatch")
+
                     completed_cycles.add(envelope.cycle_id)
                     yield envelope, cycle_rows
                     envelope = None
                     declared_rows = 0
+                    declared_envelope_hash = None
                     cycle_rows = []
+                    rows_digest = hashlib.sha256()
+                    seen_symbols = set()
+                    seen_snapshots = set()
                     continue
 
                 raise PopulationDatasetError(f"unknown_journal_record_type:{record_type!r}")
@@ -462,6 +541,29 @@ def iter_population_cycles(path: str | Path) -> Iterator[tuple[CycleEnvelope, li
         raise PopulationDatasetError("journal_ends_with_incomplete_cycle")
     if not saw_any:
         raise PopulationDatasetError("population_journal_is_empty")
+
+
+def iter_population_cycles(path: str | Path) -> Iterator[tuple[CycleEnvelope, list[PopulationFeatureRow]]]:
+    """Yield cycles only after the entire journal has passed strict validation.
+
+    The first pass deliberately yields nothing to the caller.  This prevents a
+    streaming export from consuming valid early cycles before discovering a
+    corrupt or mixed-schema record later in the same file.
+    """
+
+    source = Path(path)
+    if not source.exists():
+        raise PopulationDatasetError("population_journal_not_found")
+    before = _journal_fingerprint(source)
+    for _ in _parse_population_cycles(source):
+        pass
+    validated = _journal_fingerprint(source)
+    if validated != before:
+        raise PopulationDatasetError("population_journal_changed_during_validation")
+    for cycle in _parse_population_cycles(source):
+        if _journal_fingerprint(source) != validated:
+            raise PopulationDatasetError("population_journal_changed_after_validation")
+        yield cycle
 
 
 def iter_population_feature_rows(path: str | Path) -> Iterator[PopulationFeatureRow]:
@@ -490,6 +592,8 @@ def population_feature_records(path: str | Path) -> list[dict[str, Any]]:
             "decision_completed_ts": row.decision_completed_ts,
             "universe_refreshed_at": row.universe_refreshed_at,
             "universe_received_at": row.universe_received_at,
+            "universe_source_ts": row.universe_source_ts,
+            "universe_cache_hit": row.universe_cache_hit,
             "ranking_ready_ts": row.ranking_ready_ts,
             "cycle_completed_ts": row.cycle_completed_ts,
             "actionable_ts": row.actionable_ts,
@@ -499,6 +603,8 @@ def population_feature_records(path: str | Path) -> list[dict[str, Any]]:
             "universe_policy_hash": row.universe_policy_hash,
             "feature_contract_version": row.feature_contract_version,
             "feature_contract_hash": row.feature_contract_hash,
+            "envelope_hash": row.envelope_hash,
+            "market_feature_hash": row.market_feature_hash,
         }
         record.update(row.features)
         record.update({f"{name}__observed": value for name, value in row.observed.items()})
@@ -521,6 +627,8 @@ def model_input_records(path: str | Path) -> list[dict[str, Any]]:
                 "cycle_id": row.cycle_id,
                 "symbol": row.symbol,
                 "bar_cutoff_ts": row.bar_cutoff_ts,
+                "envelope_hash": row.envelope_hash,
+                "market_feature_hash": row.market_feature_hash,
                 "feature_names": names,
                 "features": {name: row.features[name] for name in names},
                 "observed": {name: row.observed[name] for name in names},

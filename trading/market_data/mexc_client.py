@@ -96,7 +96,10 @@ class MexcContractClient:
         self._session.headers.update({"User-Agent": "crypto-ai-bot/2.0", "Accept": "application/json"})
         self._tickers_cache: list[dict[str, Any]] = []
         self._tickers_cache_ts: float = 0.0
+        self._tickers_cache_initialized = False
         self._details_cache: dict[str, dict[str, Any]] = {}
+        self._details_cache_ts: float = 0.0
+        self._details_cache_initialized = False
         self._lock = threading.Lock()
 
     def close(self):
@@ -158,15 +161,18 @@ class MexcContractClient:
         with self._lock:
             cached = list(self._tickers_cache)
             cached_ts = self._tickers_cache_ts
+            cache_initialized = self._tickers_cache_initialized
         fresh = (started - cached_ts) < self.tickers_cache_ttl_sec
-        if cached and fresh and not force:
+        if cache_initialized and fresh and not force:
+            received = time.time()
             return cached, {
                 "request_started_at": started,
-                "received_at": time.time(),
+                "received_at": received,
                 "source_ts": cached_ts,
                 "cache_hit": True,
                 "cache_age_sec": max(0.0, started - cached_ts),
                 "status": "ok",
+                "error_code": None,
             }
 
         payload = self._request_public("/api/v1/contract/ticker")
@@ -178,15 +184,19 @@ class MexcContractClient:
             return cached, {
                 "request_started_at": started,
                 "received_at": received,
-                "source_ts": cached_ts,
-                "cache_hit": bool(cached),
-                "cache_age_sec": max(0.0, started - cached_ts) if cached else None,
-                "status": "stale_cache" if cached else "error",
+                "source_ts": cached_ts if cache_initialized else None,
+                "cache_hit": cache_initialized,
+                "cache_age_sec": (
+                    max(0.0, started - cached_ts) if cache_initialized else None
+                ),
+                "status": "stale_cache" if cache_initialized else "error",
+                "error_code": "MexcTickerUnavailable",
             }
 
         with self._lock:
             self._tickers_cache = items
             self._tickers_cache_ts = received
+            self._tickers_cache_initialized = True
         return list(items), {
             "request_started_at": started,
             "received_at": received,
@@ -194,6 +204,7 @@ class MexcContractClient:
             "cache_hit": False,
             "cache_age_sec": 0.0,
             "status": "ok",
+            "error_code": None,
         }
 
     def fetch_all_tickers(self, force: bool = False) -> list[dict[str, Any]]:
@@ -205,26 +216,69 @@ class MexcContractClient:
         items, _ = self.fetch_all_tickers_with_provenance(force=force)
         return items
 
-    def fetch_contract_details(self, force: bool = False) -> dict[str, dict[str, Any]]:
-        """Contract specs for every symbol, keyed by MEXC symbol, cached for the session.
+    def fetch_contract_details_with_provenance(
+        self, force: bool = False
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+        """Contract specs plus truthful fresh/cache/error provenance.
 
         One call covers the whole board, so the minimum tradeable size can be
-        checked without a per-symbol request.
+        checked without a per-symbol request.  An empty mapping is ambiguous on
+        its own: it can be a valid empty response, a cached empty response, or a
+        failed first request.  The companion provenance keeps those cases
+        distinct.
         """
+        started = time.time()
         with self._lock:
-            if self._details_cache and not force:
-                return dict(self._details_cache)
+            cached = dict(self._details_cache)
+            cached_ts = self._details_cache_ts
+            cache_initialized = self._details_cache_initialized
+        if cache_initialized and not force:
+            return cached, {
+                "request_started_at": started,
+                "received_at": time.time(),
+                "source_ts": cached_ts,
+                "cache_hit": True,
+                "cache_age_sec": max(0.0, started - cached_ts),
+                "status": "ok",
+                "error_code": None,
+            }
 
         payload = self._request_public("/api/v1/contract/detail")
+        received = time.time()
         items = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(items, list):
-            with self._lock:
-                return dict(self._details_cache)
+            return cached, {
+                "request_started_at": started,
+                "received_at": received,
+                "source_ts": cached_ts if cache_initialized else None,
+                "cache_hit": cache_initialized,
+                "cache_age_sec": (
+                    max(0.0, started - cached_ts) if cache_initialized else None
+                ),
+                "status": "stale_cache" if cache_initialized else "error",
+                "error_code": "MexcContractDetailsUnavailable",
+            }
 
         out = {str(i.get("symbol")): i for i in items if isinstance(i, dict) and i.get("symbol")}
         with self._lock:
             self._details_cache = out
-            return dict(out)
+            self._details_cache_ts = received
+            self._details_cache_initialized = True
+        return dict(out), {
+            "request_started_at": started,
+            "received_at": received,
+            "source_ts": received,
+            "cache_hit": False,
+            "cache_age_sec": 0.0,
+            "status": "ok",
+            "error_code": None,
+        }
+
+    def fetch_contract_details(self, force: bool = False) -> dict[str, dict[str, Any]]:
+        """Backward-compatible rows-only contract-details surface."""
+
+        details, _ = self.fetch_contract_details_with_provenance(force=force)
+        return details
 
     @staticmethod
     def _translate_ticker(item: dict[str, Any]) -> dict[str, Any]:

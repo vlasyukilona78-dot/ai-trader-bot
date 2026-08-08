@@ -10,6 +10,7 @@ from .feature_contract import (
     configuration_hash,
     feature_contract_hash,
     feature_registry_hash,
+    market_feature_hash,
     model_feature_names,
     model_feature_specs,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "configuration_hash",
     "feature_contract_hash",
     "feature_registry_hash",
+    "market_feature_hash",
     "model_feature_names",
     "model_feature_specs",
 ]

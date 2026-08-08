@@ -16,14 +16,18 @@ import hashlib
 import json
 import math
 import re
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 from trading.market_data.bar_contract import (
     interval_seconds,
     is_bar_aligned,
     next_bar_open_ts,
 )
-from trading.market_data.source_timing import SourceTiming, latest_received_at
+from trading.market_data.source_timing import (
+    SourceTiming,
+    SourceTimingError,
+    latest_received_at,
+)
 
 
 CYCLE_ENVELOPE_SCHEMA_VERSION = 2
@@ -214,6 +218,77 @@ class CycleEnvelope:
             status=status,
             error_code=error_code,
         )
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "CycleEnvelope":
+        """Rebuild a serialized envelope without dropping provenance fields.
+
+        This is intentionally stricter than a permissive deserializer.  A
+        journal envelope is part of the evidence chain, so missing, additional,
+        or silently defaulted fields are schema drift rather than compatibility.
+        In particular, all cache provenance on ``SourceTiming`` must survive a
+        writer/reader round trip exactly.
+        """
+
+        if not isinstance(payload, Mapping):
+            raise CycleEnvelopeError("cycle_envelope_must_be_a_mapping")
+
+        def rebuild_timing(value: object, *, field: str) -> SourceTiming:
+            if not isinstance(value, Mapping):
+                raise CycleEnvelopeError(f"{field}_must_be_a_mapping")
+            cache_hit = value.get("cache_hit")
+            if not isinstance(cache_hit, bool):
+                raise CycleEnvelopeError(f"{field}_cache_hit_must_be_boolean")
+            try:
+                return SourceTiming(
+                    source=value.get("source"),
+                    request_started_at=value.get("request_started_at"),
+                    received_at=value.get("received_at"),
+                    status=value.get("status"),
+                    source_as_of=value.get("source_as_of"),
+                    error_code=value.get("error_code"),
+                    cache_hit=cache_hit,
+                    cache_age_sec=value.get("cache_age_sec"),
+                    source_ts=value.get("source_ts"),
+                )
+            except (SourceTimingError, TypeError, ValueError) as exc:
+                raise CycleEnvelopeError(f"invalid_{field}") from exc
+
+        raw_timings = payload.get("source_timings")
+        if not isinstance(raw_timings, (list, tuple)):
+            raise CycleEnvelopeError("source_timings_must_be_a_sequence")
+        timings = tuple(
+            rebuild_timing(value, field=f"source_timings_{index}")
+            for index, value in enumerate(raw_timings)
+        )
+        universe = rebuild_timing(payload.get("universe_timing"), field="universe_timing")
+        if sum(timing == universe for timing in timings) != 1:
+            raise CycleEnvelopeError("universe_timing_must_match_exactly_one_source_timing")
+
+        try:
+            rebuilt = cls.build(
+                cycle_id=payload.get("cycle_id"),
+                timeframe=payload.get("timeframe"),
+                cycle_started_at=payload.get("cycle_started_at"),
+                candle_cutoff_ts=payload.get("candle_cutoff_ts"),
+                universe_symbols=payload.get("universe_symbols"),
+                universe_timing=universe,
+                source_timings=timings,
+                strategy_config_hash=payload.get("strategy_config_hash"),
+                universe_policy_hash=payload.get("universe_policy_hash"),
+                ranking_ready_ts=payload.get("ranking_ready_ts"),
+                cycle_completed_ts=payload.get("cycle_completed_ts"),
+                status=payload.get("status"),
+                error_code=payload.get("error_code"),
+            )
+        except (CycleEnvelopeError, TypeError, ValueError) as exc:
+            raise CycleEnvelopeError("invalid_cycle_envelope") from exc
+
+        # This comparison catches omitted cache fields, unknown fields, a stale
+        # schema/timing basis, and callers that attempted to coerce JSON types.
+        if rebuilt.as_dict() != dict(payload):
+            raise CycleEnvelopeError("cycle_envelope_source_mismatch")
+        return rebuilt
 
     def as_dict(self) -> dict[str, object]:
         return {

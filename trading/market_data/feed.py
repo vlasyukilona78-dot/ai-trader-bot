@@ -75,10 +75,15 @@ class MarketDataFeed:
         metadata = dict(closed.attrs)
         closed = closed.tail(requested).copy()
         closed.attrs.update(metadata)
+        # A closed-frame read must not smuggle a later live ticker into an
+        # otherwise point-in-time object.  The scanner intentionally values the
+        # decision at the last closed close; keeping that same causal reference
+        # here also removes one unnecessary public request per symbol and cycle.
+        mark_price = float(closed.iloc[-1]["close"]) if not closed.empty else 0.0
         return MarketFrame(
             symbol=symbol,
             ohlcv=closed,
-            mark_price=self._fetch_mark_price(symbol),
+            mark_price=mark_price,
             candle_cutoff_ts=closed.attrs["candle_cutoff_ts"],
             last_bar_open_ts=closed.attrs["last_bar_open_ts"],
             last_bar_close_ts=closed.attrs["last_bar_close_ts"],
