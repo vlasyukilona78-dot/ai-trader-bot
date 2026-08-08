@@ -12,6 +12,7 @@ from backtesting.single_position import (
     SinglePositionContract,
     SinglePositionContractError,
     SizingRules,
+    build_replay_evidence,
     replay_single_short,
     select_single_position,
 )
@@ -205,7 +206,6 @@ class SinglePositionSelectionV2Tests(unittest.TestCase):
         self,
         score: float,
         symbol: str,
-        exit_ts: float,
         *,
         cohort_id: str = _COHORT,
         entry_bar_open_ts: float = _ENTRY_BAR_OPEN_TS,
@@ -219,26 +219,27 @@ class SinglePositionSelectionV2Tests(unittest.TestCase):
             entry_eligible_ts=entry_bar_open_ts - 240.0,
             entry_bar_open_ts=entry_bar_open_ts,
         )
+        contract = _contract()
+        bars = _bars(
+            [(100.0, 101.0, 99.0, 100.0), (100.0, 101.0, 99.0, 100.0)],
+            start_ts=entry_bar_open_ts,
+        )
         result = replay_single_short(
-            _bars(
-                [(100.0, 101.0, 99.0, 100.0), (100.0, 101.0, 99.0, 100.0)],
-                start_ts=entry_bar_open_ts,
-            ),
+            bars,
             plan=plan,
-            contract=_contract(),
+            contract=contract,
         )
-        return ScoredCandidate(
-            score, plan, result.__class__(**{**result.__dict__, "exit_ts": exit_ts})
-        )
+        evidence = build_replay_evidence(bars, plan=plan, contract=contract)
+        return ScoredCandidate(score, plan, contract, evidence, result)
 
     def test_highest_score_wins_cohort_and_book_stays_single(self):
-        a = self._scored(0.6, "AUSDT", 2000.0)
-        b = self._scored(0.9, "BUSDT", 2000.0)
+        a = self._scored(0.6, "AUSDT")
+        b = self._scored(0.9, "BUSDT")
         busy = self._scored(
-            0.95, "CUSDT", 2100.0, cohort_id="cycle-2", entry_bar_open_ts=1800.0
+            0.95, "CUSDT", cohort_id="cycle-2", entry_bar_open_ts=1500.0
         )
         later = self._scored(
-            0.7, "DUSDT", 2600.0, cohort_id="cycle-3", entry_bar_open_ts=2400.0
+            0.7, "DUSDT", cohort_id="cycle-3", entry_bar_open_ts=1800.0
         )
 
         selection = select_single_position([a, later, busy, b], minimum_score=0.5)
@@ -247,15 +248,22 @@ class SinglePositionSelectionV2Tests(unittest.TestCase):
         self.assertEqual(selection.skipped_busy, 2)
 
     def test_threshold_and_unfilled_are_counted_without_selection(self):
-        below = self._scored(0.4, "AUSDT", 1600.0)
+        below = self._scored(0.4, "AUSDT")
         invalid_plan = _plan(symbol="BUSDT")
+        contract = _contract()
+        invalid_bars = _bars(
+            [(106.0, 107.0, 105.5, 106.0), (106.0, 107.0, 105.0, 106.0)]
+        )
         invalid = replay_single_short(
-            _bars([(106.0, 107.0, 105.5, 106.0), (106.0, 107.0, 105.0, 106.0)]),
+            invalid_bars,
             plan=invalid_plan,
-            contract=_contract(),
+            contract=contract,
+        )
+        evidence = build_replay_evidence(
+            invalid_bars, plan=invalid_plan, contract=contract
         )
         selection = select_single_position(
-            [below, ScoredCandidate(0.8, invalid_plan, invalid)],
+            [below, ScoredCandidate(0.8, invalid_plan, contract, evidence, invalid)],
             minimum_score=0.5,
         )
 
@@ -265,15 +273,22 @@ class SinglePositionSelectionV2Tests(unittest.TestCase):
 
     def test_unfilled_top_score_does_not_promote_runner_up_with_hindsight(self):
         top_plan = _plan(symbol="TOPUSDT")
-        invalid = replay_single_short(
-            _bars([(106.0, 107.0, 105.5, 106.0), (106.0, 107.0, 105.0, 106.0)]),
-            plan=top_plan,
-            contract=_contract(),
+        contract = _contract()
+        invalid_bars = _bars(
+            [(106.0, 107.0, 105.5, 106.0), (106.0, 107.0, 105.0, 106.0)]
         )
-        runner_up = self._scored(0.8, "RUNNERUSDT", 1600.0)
+        invalid = replay_single_short(
+            invalid_bars,
+            plan=top_plan,
+            contract=contract,
+        )
+        evidence = build_replay_evidence(
+            invalid_bars, plan=top_plan, contract=contract
+        )
+        runner_up = self._scored(0.8, "RUNNERUSDT")
 
         selection = select_single_position(
-            [ScoredCandidate(0.9, top_plan, invalid), runner_up],
+            [ScoredCandidate(0.9, top_plan, contract, evidence, invalid), runner_up],
             minimum_score=0.5,
         )
 

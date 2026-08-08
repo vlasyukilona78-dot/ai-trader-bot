@@ -11,8 +11,11 @@ evidence that the strategy has an edge or is safe for live trading.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+import hashlib
+import json
 import math
+import re
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -20,6 +23,8 @@ import pandas as pd
 
 
 _EPS = 1e-9
+SINGLE_POSITION_SCHEMA_VERSION = 3
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class SinglePositionContractError(ValueError):
@@ -27,12 +32,72 @@ class SinglePositionContractError(ValueError):
 
 
 def _finite(value: float) -> bool:
-    return math.isfinite(float(value))
+    if isinstance(value, (bool, np.bool_)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
 
 
 def _require_finite_positive(name: str, value: float) -> None:
     if not _finite(value) or float(value) <= 0:
         raise SinglePositionContractError(f"{name}_must_be_finite_positive")
+
+
+def _require_close(name: str, actual: float, expected: float) -> None:
+    """Reject derived values that do not belong to the recorded replay.
+
+    Results are persisted and may later be reconstructed without going through
+    :func:`replay_single_short`.  Checking the arithmetic at the data boundary
+    prevents a malformed row from changing selection or aggregate PnL while
+    still allowing ordinary floating-point round-off.
+    """
+
+    if not math.isclose(float(actual), float(expected), rel_tol=1e-9, abs_tol=1e-9):
+        raise SinglePositionContractError(f"{name}_inconsistent")
+
+
+def _require_timestamp_equal(name: str, actual: float, expected: float) -> None:
+    """Require bar-clock equality without a magnitude-dependent tolerance."""
+
+    if not math.isclose(float(actual), float(expected), rel_tol=0.0, abs_tol=_EPS):
+        raise SinglePositionContractError(f"{name}_inconsistent")
+
+
+def _canonical_float(name: str, value: float) -> float:
+    """Return the one JSON representation used by every v3 identity hash."""
+
+    if not _finite(value):
+        raise SinglePositionContractError(f"{name}_must_be_finite")
+    numeric = float(value)
+    # JSON distinguishes -0.0 from 0.0 although the replay does not.  Normalise
+    # that one representational ambiguity before hashing.
+    return 0.0 if numeric == 0.0 else numeric
+
+
+def _canonical_sha256(kind: str, payload: object) -> str:
+    envelope = {
+        "kind": kind,
+        "schema_version": SINGLE_POSITION_SCHEMA_VERSION,
+        "payload": payload,
+    }
+    try:
+        encoded = json.dumps(
+            envelope,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise SinglePositionContractError(f"{kind}_is_not_canonical_json") from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _require_sha256(name: str, value: str) -> None:
+    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+        raise SinglePositionContractError(f"{name}_must_be_lowercase_sha256")
 
 
 @dataclass(frozen=True)
@@ -46,6 +111,9 @@ class ExecutionCosts:
     exit_slippage: float
 
     def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
         for name, value in (
             ("entry_fee_rate", self.entry_fee_rate),
             ("exit_fee_rate", self.exit_fee_rate),
@@ -70,6 +138,9 @@ class SizingRules:
     min_notional_quote: float
 
     def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
         for name, value in (
             ("equity_quote", self.equity_quote),
             ("risk_fraction", self.risk_fraction),
@@ -96,18 +167,29 @@ class SinglePositionContract:
     max_holding_seconds: int
     side: str = "SHORT"
     max_concurrent_positions: int = 1
-    # v2 moved the entry reference from the decision instant to the first bar
-    # opening strictly after it. A v1 result was measured from a bar the decision
-    # did not precede, so the versions are not comparable.
-    schema_version: int = 2
+    # v3 cryptographically binds the complete plan, contract and replay input to
+    # every result.  v1/v2 rows cannot be interpreted as v3 because they did not
+    # carry enough information to revalidate costs, sizing or bar chronology.
+    schema_version: int = SINGLE_POSITION_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if not isinstance(self.costs, ExecutionCosts):
+            raise SinglePositionContractError("contract_requires_execution_costs")
+        if not isinstance(self.sizing, SizingRules):
+            raise SinglePositionContractError("contract_requires_sizing_rules")
+        self.costs.validate()
+        self.sizing.validate()
         if self.side != "SHORT":
             raise SinglePositionContractError("only_short_is_supported")
-        if self.max_concurrent_positions != 1:
+        if type(self.max_concurrent_positions) is not int or self.max_concurrent_positions != 1:
             raise SinglePositionContractError("concurrency_must_equal_one")
-        if self.schema_version != 2:
+        if type(self.schema_version) is not int or self.schema_version != SINGLE_POSITION_SCHEMA_VERSION:
             raise SinglePositionContractError("unsupported_schema_version")
+        if type(self.bar_interval_seconds) is not int or type(self.max_holding_seconds) is not int:
+            raise SinglePositionContractError("bar_interval_and_horizon_must_be_integers")
         if self.bar_interval_seconds <= 0 or self.max_holding_seconds <= 0:
             raise SinglePositionContractError("bar_interval_and_horizon_must_be_positive")
         if self.max_holding_seconds % self.bar_interval_seconds != 0:
@@ -137,6 +219,9 @@ class EntryPlan:
     take_profit_price: float
 
     def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
         if not self.symbol or not self.symbol.strip():
             raise SinglePositionContractError("symbol_required")
         if not isinstance(self.cohort_id, str) or not self.cohort_id.strip():
@@ -169,17 +254,256 @@ class FundingPayment:
     mark_price: float
 
     def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
         if not _finite(self.timestamp) or not _finite(self.rate):
             raise SinglePositionContractError("funding_timestamp_and_rate_must_be_finite")
         _require_finite_positive("funding_mark_price", self.mark_price)
 
 
+def _plan_payload(plan: EntryPlan) -> dict[str, object]:
+    if not isinstance(plan, EntryPlan):
+        raise SinglePositionContractError("plan_hash_requires_entry_plan")
+    plan.validate()
+    return {
+        "symbol": plan.symbol,
+        "cohort_id": plan.cohort_id,
+        "decision_ts": _canonical_float("decision_ts", plan.decision_ts),
+        "actionable_ts": _canonical_float("actionable_ts", plan.actionable_ts),
+        "entry_eligible_ts": _canonical_float("entry_eligible_ts", plan.entry_eligible_ts),
+        "entry_bar_open_ts": _canonical_float(
+            "entry_bar_open_ts", plan.entry_bar_open_ts
+        ),
+        "decision_price": _canonical_float("decision_price", plan.decision_price),
+        "stop_price": _canonical_float("stop_price", plan.stop_price),
+        "take_profit_price": _canonical_float(
+            "take_profit_price", plan.take_profit_price
+        ),
+    }
+
+
+def plan_hash(plan: EntryPlan) -> str:
+    """Canonical SHA-256 identity of every executable EntryPlan field."""
+
+    return _canonical_sha256("single_position_entry_plan", _plan_payload(plan))
+
+
+def _contract_payload(contract: SinglePositionContract) -> dict[str, object]:
+    if not isinstance(contract, SinglePositionContract):
+        raise SinglePositionContractError(
+            "contract_hash_requires_single_position_contract"
+        )
+    contract.validate()
+    costs = contract.costs
+    sizing = contract.sizing
+    return {
+        "costs": {
+            "entry_fee_rate": _canonical_float(
+                "entry_fee_rate", costs.entry_fee_rate
+            ),
+            "exit_fee_rate": _canonical_float("exit_fee_rate", costs.exit_fee_rate),
+            "half_spread": _canonical_float("half_spread", costs.half_spread),
+            "entry_slippage": _canonical_float(
+                "entry_slippage", costs.entry_slippage
+            ),
+            "exit_slippage": _canonical_float("exit_slippage", costs.exit_slippage),
+        },
+        "sizing": {
+            "equity_quote": _canonical_float("equity_quote", sizing.equity_quote),
+            "risk_fraction": _canonical_float("risk_fraction", sizing.risk_fraction),
+            "max_notional_quote": _canonical_float(
+                "max_notional_quote", sizing.max_notional_quote
+            ),
+            "max_leverage": _canonical_float("max_leverage", sizing.max_leverage),
+            "quantity_step": _canonical_float("quantity_step", sizing.quantity_step),
+            "min_quantity": _canonical_float("min_quantity", sizing.min_quantity),
+            "min_notional_quote": _canonical_float(
+                "min_notional_quote", sizing.min_notional_quote
+            ),
+        },
+        "bar_interval_seconds": contract.bar_interval_seconds,
+        "max_holding_seconds": contract.max_holding_seconds,
+        "side": contract.side,
+        "max_concurrent_positions": contract.max_concurrent_positions,
+        "contract_schema_version": contract.schema_version,
+    }
+
+
+def contract_hash(contract: SinglePositionContract) -> str:
+    """Canonical SHA-256 identity of costs, sizing and replay mechanics."""
+
+    return _canonical_sha256(
+        "single_position_contract", _contract_payload(contract)
+    )
+
+
+def _funding_payload(payment: FundingPayment) -> dict[str, float]:
+    if not isinstance(payment, FundingPayment):
+        raise SinglePositionContractError("funding_payments_must_be_typed")
+    payment.validate()
+    return {
+        "timestamp": _canonical_float("funding_timestamp", payment.timestamp),
+        "rate": _canonical_float("funding_rate", payment.rate),
+        "mark_price": _canonical_float("funding_mark_price", payment.mark_price),
+    }
+
+
+def _validate_funding_sequence(
+    funding_payments: tuple[FundingPayment, ...],
+) -> None:
+    previous_timestamp = -math.inf
+    for payment in funding_payments:
+        if not isinstance(payment, FundingPayment):
+            raise SinglePositionContractError("funding_payments_must_be_typed")
+        payment.validate()
+        timestamp = float(payment.timestamp)
+        if timestamp <= previous_timestamp:
+            raise SinglePositionContractError(
+                "funding_timestamps_must_be_strictly_increasing"
+            )
+        previous_timestamp = timestamp
+
+
+def _bar_evidence_payload(
+    row: tuple[float, float, float, float, float],
+) -> dict[str, float]:
+    if type(row) is not tuple or len(row) != 5:
+        raise SinglePositionContractError("replay_evidence_bar_shape_invalid")
+    timestamp, open_price, high, low, close = row
+    return {
+        "time": _canonical_float("bar_time", timestamp),
+        "open": _canonical_float("bar_open", open_price),
+        "high": _canonical_float("bar_high", high),
+        "low": _canonical_float("bar_low", low),
+        "close": _canonical_float("bar_close", close),
+    }
+
+
+def _replay_input_digest_from_components(
+    *,
+    bound_plan_hash: str,
+    bound_contract_hash: str,
+    bars: tuple[tuple[float, float, float, float, float], ...],
+    funding_payments: tuple[FundingPayment, ...],
+) -> str:
+    _require_sha256("replay_evidence_plan_hash", bound_plan_hash)
+    _require_sha256("replay_evidence_contract_hash", bound_contract_hash)
+    return _canonical_sha256(
+        "single_position_replay_input",
+        {
+            "plan_hash": bound_plan_hash,
+            "contract_hash": bound_contract_hash,
+            "bars": [_bar_evidence_payload(row) for row in bars],
+            # This sequence is already proved strictly chronological. Duplicate
+            # settlement timestamps are forbidden so one event cannot be
+            # credited twice merely by repeating a row.
+            "funding_payments": [
+                _funding_payload(payment) for payment in funding_payments
+            ],
+        },
+    )
+
+
+@dataclass(frozen=True)
+class ReplayEvidence:
+    """Immutable, independently checkable market input for one replay.
+
+    A bare digest supplied by the result is not evidence: it can be replaced and
+    the result content hash recomputed.  This object carries the actual
+    normalised bars and ordered funding observations whose digest it claims.
+    """
+
+    plan_hash: str
+    contract_hash: str
+    bars: tuple[tuple[float, float, float, float, float], ...]
+    funding_payments: tuple[FundingPayment, ...]
+    replay_input_hash: str
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        _require_sha256("replay_evidence_plan_hash", self.plan_hash)
+        _require_sha256("replay_evidence_contract_hash", self.contract_hash)
+        _require_sha256("replay_evidence_input_hash", self.replay_input_hash)
+        if type(self.bars) is not tuple or not self.bars:
+            raise SinglePositionContractError("replay_evidence_bars_must_be_non_empty_tuple")
+        for row in self.bars:
+            payload = _bar_evidence_payload(row)
+            if any(
+                payload[field_name] <= 0
+                for field_name in ("open", "high", "low", "close")
+            ):
+                raise SinglePositionContractError("replay_evidence_bar_prices_must_be_positive")
+            if not (
+                payload["high"] >= max(payload["open"], payload["close"])
+                and payload["low"] <= min(payload["open"], payload["close"])
+                and payload["high"] >= payload["low"]
+            ):
+                raise SinglePositionContractError("replay_evidence_ohlc_invalid")
+        if type(self.funding_payments) is not tuple:
+            raise SinglePositionContractError("replay_evidence_funding_must_be_tuple")
+        _validate_funding_sequence(self.funding_payments)
+        expected = _replay_input_digest_from_components(
+            bound_plan_hash=self.plan_hash,
+            bound_contract_hash=self.contract_hash,
+            bars=self.bars,
+            funding_payments=self.funding_payments,
+        )
+        if self.replay_input_hash != expected:
+            raise SinglePositionContractError("replay_evidence_hash_mismatch")
+
+    def to_frame(self) -> pd.DataFrame:
+        self.validate()
+        return pd.DataFrame(
+            self.bars,
+            columns=("time", "open", "high", "low", "close"),
+            dtype=float,
+        )
+
+    def validate_against(
+        self,
+        *,
+        plan: EntryPlan,
+        contract: SinglePositionContract,
+    ) -> None:
+        self.validate()
+        if not isinstance(plan, EntryPlan):
+            raise SinglePositionContractError("replay_evidence_requires_entry_plan")
+        if not isinstance(contract, SinglePositionContract):
+            raise SinglePositionContractError("replay_evidence_requires_contract")
+        if self.plan_hash != plan_hash(plan):
+            raise SinglePositionContractError("replay_evidence_plan_hash_mismatch")
+        if self.contract_hash != contract_hash(contract):
+            raise SinglePositionContractError("replay_evidence_contract_hash_mismatch")
+        normalised = _normalise_bars(
+            self.to_frame(),
+            entry_bar_open_ts=plan.entry_bar_open_ts,
+            contract=contract,
+        )
+        if _normalised_bar_tuples(normalised) != self.bars:
+            raise SinglePositionContractError("replay_evidence_bars_not_canonical")
+
+
 @dataclass(frozen=True)
 class SinglePositionResult:
+    """A schema-v3 replay outcome bound to its complete causal inputs.
+
+    The four hashes are required fields, not compatibility conveniences.  A
+    v1/v2 result therefore cannot cross the candidate/portfolio boundary by
+    leaving them blank.  ``result_hash`` covers every other field in this
+    dataclass, including the input identities.
+    """
+
     symbol: str
     cohort_id: str
     decision_ts: float
     entry_bar_open_ts: float
+    plan_hash: str
+    contract_hash: str
+    replay_input_hash: str
+    result_hash: str
     filled: bool
     exit_reason: str
     entry_ts: float | None
@@ -201,35 +525,473 @@ class SinglePositionResult:
     return_on_risk: float
     bars_held: int
     funding_events_applied: int
+    bar_interval_seconds: int
+    max_holding_seconds: int
     contract_schema_version: int
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        """Validate a replay result independently of its constructor path.
+
+        ``select_single_position`` calls this again deliberately.  Frozen
+        dataclasses can still be corrupted by unsafe deserializers or
+        ``object.__setattr__``; the portfolio boundary must therefore fail closed
+        even when construction-time validation was bypassed.
+        """
+
+        if not isinstance(self.symbol, str) or not self.symbol.strip():
+            raise SinglePositionContractError("result_symbol_required")
+        if not isinstance(self.cohort_id, str) or not self.cohort_id.strip():
+            raise SinglePositionContractError("result_cohort_id_required")
+        if len(self.cohort_id) > 128:
+            raise SinglePositionContractError("result_cohort_id_too_long")
+        if type(self.filled) is not bool:
+            raise SinglePositionContractError("result_filled_must_be_boolean")
+        if not isinstance(self.exit_reason, str) or not self.exit_reason:
+            raise SinglePositionContractError("result_exit_reason_required")
+
+        _require_sha256("result_plan_hash", self.plan_hash)
+        _require_sha256("result_contract_hash", self.contract_hash)
+        _require_sha256("result_replay_input_hash", self.replay_input_hash)
+        _require_sha256("result_hash", self.result_hash)
+
+        for name in ("decision_ts", "entry_bar_open_ts"):
+            if not _finite(getattr(self, name)):
+                raise SinglePositionContractError(f"result_{name}_must_be_finite")
+        if self.entry_bar_open_ts <= self.decision_ts:
+            raise SinglePositionContractError("result_entry_bar_must_follow_decision")
+
+        _require_finite_positive("result_stop_price", self.stop_price)
+        _require_finite_positive("result_take_profit_price", self.take_profit_price)
+        if self.stop_price <= self.take_profit_price:
+            raise SinglePositionContractError("result_short_levels_are_inverted")
+
+        numeric_fields = (
+            "quantity",
+            "initial_notional_quote",
+            "risk_budget_quote",
+            "gross_pnl_quote",
+            "fees_quote",
+            "funding_pnl_quote",
+            "net_pnl_quote",
+            "return_on_notional",
+            "return_on_risk",
+        )
+        for name in numeric_fields:
+            if not _finite(getattr(self, name)):
+                raise SinglePositionContractError(f"result_{name}_must_be_finite")
+        if self.quantity < 0 or self.initial_notional_quote < 0 or self.fees_quote < 0:
+            raise SinglePositionContractError("result_non_negative_amount_is_negative")
+        if self.risk_budget_quote <= 0:
+            raise SinglePositionContractError("result_risk_budget_must_be_positive")
+
+        for name in (
+            "bars_held",
+            "funding_events_applied",
+            "bar_interval_seconds",
+            "max_holding_seconds",
+            "contract_schema_version",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int:
+                raise SinglePositionContractError(f"result_{name}_must_be_integer")
+        if self.bars_held < 0 or self.funding_events_applied < 0:
+            raise SinglePositionContractError("result_counts_must_be_non_negative")
+        if self.bar_interval_seconds <= 0 or self.max_holding_seconds <= 0:
+            raise SinglePositionContractError(
+                "result_bar_interval_and_horizon_must_be_positive"
+            )
+        if self.max_holding_seconds % self.bar_interval_seconds != 0:
+            raise SinglePositionContractError("result_horizon_must_contain_whole_bars")
+        if self.contract_schema_version != SINGLE_POSITION_SCHEMA_VERSION:
+            raise SinglePositionContractError("result_unsupported_contract_schema_version")
+        if abs(math.remainder(self.entry_bar_open_ts, self.bar_interval_seconds)) > _EPS:
+            raise SinglePositionContractError("result_entry_bar_must_be_bar_aligned")
+
+        optional_fields = (
+            "entry_ts",
+            "exit_ts",
+            "entry_reference_price",
+            "entry_fill_price",
+            "exit_reference_price",
+            "exit_fill_price",
+        )
+        for name in optional_fields:
+            value = getattr(self, name)
+            if value is not None and not _finite(value):
+                raise SinglePositionContractError(f"result_{name}_must_be_finite_or_none")
+
+        filled_reasons = {"horizon", "stop", "stop_gap", "take_profit"}
+        unfilled_reasons = {
+            "entry_invalidated_by_stop_gap",
+            "entry_invalidated_by_target_gap",
+            "below_instrument_minimum",
+        }
+        if not self.filled:
+            if self.exit_reason not in unfilled_reasons:
+                raise SinglePositionContractError("result_invalid_unfilled_exit_reason")
+            if any(getattr(self, name) is not None for name in optional_fields):
+                raise SinglePositionContractError("result_unfilled_trade_has_fill_data")
+            zero_fields = (
+                "quantity",
+                "initial_notional_quote",
+                "gross_pnl_quote",
+                "fees_quote",
+                "funding_pnl_quote",
+                "net_pnl_quote",
+                "return_on_notional",
+                "return_on_risk",
+            )
+            if any(float(getattr(self, name)) != 0.0 for name in zero_fields):
+                raise SinglePositionContractError("result_unfilled_trade_has_nonzero_amounts")
+            if self.bars_held != 0 or self.funding_events_applied != 0:
+                raise SinglePositionContractError("result_unfilled_trade_has_nonzero_counts")
+            self._validate_result_hash()
+            return
+
+        if self.exit_reason not in filled_reasons:
+            raise SinglePositionContractError("result_invalid_filled_exit_reason")
+        if any(getattr(self, name) is None for name in optional_fields):
+            raise SinglePositionContractError("result_filled_trade_missing_fill_data")
+
+        # The None case was rejected immediately above. Local names make the
+        # chronology and arithmetic below explicit to both type checkers and
+        # future readers of the executable contract.
+        entry_ts = float(self.entry_ts)  # type: ignore[arg-type]
+        exit_ts = float(self.exit_ts)  # type: ignore[arg-type]
+        entry_reference = float(self.entry_reference_price)  # type: ignore[arg-type]
+        entry_fill = float(self.entry_fill_price)  # type: ignore[arg-type]
+        exit_reference = float(self.exit_reference_price)  # type: ignore[arg-type]
+        exit_fill = float(self.exit_fill_price)  # type: ignore[arg-type]
+
+        for name, value in (
+            ("entry_reference_price", entry_reference),
+            ("entry_fill_price", entry_fill),
+            ("exit_reference_price", exit_reference),
+            ("exit_fill_price", exit_fill),
+        ):
+            _require_finite_positive(f"result_{name}", value)
+        if entry_ts != self.entry_bar_open_ts:
+            raise SinglePositionContractError("result_entry_ts_differs_from_entry_bar")
+        if exit_ts <= entry_ts:
+            raise SinglePositionContractError("result_exit_ts_must_follow_entry_ts")
+        if self.bars_held <= 0:
+            raise SinglePositionContractError("result_filled_trade_must_hold_a_bar")
+        maximum_bars = self.max_holding_seconds // self.bar_interval_seconds
+        if self.bars_held > maximum_bars:
+            raise SinglePositionContractError("result_bars_held_exceeds_horizon")
+        _require_timestamp_equal(
+            "result_exit_ts",
+            exit_ts,
+            entry_ts + self.bars_held * self.bar_interval_seconds,
+        )
+        if self.exit_reason == "horizon" and self.bars_held != maximum_bars:
+            raise SinglePositionContractError("result_horizon_exit_precedes_horizon")
+        if self.quantity <= 0 or self.initial_notional_quote <= 0:
+            raise SinglePositionContractError("result_filled_trade_amounts_must_be_positive")
+        if not self.stop_price > entry_reference > self.take_profit_price:
+            raise SinglePositionContractError("result_entry_reference_outside_short_levels")
+        if entry_fill > entry_reference and not math.isclose(
+            entry_fill, entry_reference, rel_tol=1e-9, abs_tol=1e-9
+        ):
+            raise SinglePositionContractError("result_short_entry_fill_has_price_improvement")
+        if exit_fill < exit_reference and not math.isclose(
+            exit_fill, exit_reference, rel_tol=1e-9, abs_tol=1e-9
+        ):
+            raise SinglePositionContractError("result_short_exit_fill_has_price_improvement")
+        if self.funding_events_applied == 0 and self.funding_pnl_quote != 0.0:
+            raise SinglePositionContractError("result_funding_pnl_without_funding_events")
+
+        if self.exit_reason == "stop":
+            _require_close("result_stop_exit_reference", exit_reference, self.stop_price)
+        elif self.exit_reason == "stop_gap" and exit_reference < self.stop_price:
+            raise SinglePositionContractError("result_stop_gap_reference_below_stop")
+        elif self.exit_reason == "take_profit":
+            _require_close(
+                "result_take_profit_exit_reference", exit_reference, self.take_profit_price
+            )
+        elif self.exit_reason == "horizon" and not (
+            self.stop_price > exit_reference > self.take_profit_price
+        ):
+            raise SinglePositionContractError("result_horizon_reference_outside_short_levels")
+
+        _require_close(
+            "result_initial_notional",
+            self.initial_notional_quote,
+            self.quantity * entry_fill,
+        )
+        _require_close(
+            "result_gross_pnl",
+            self.gross_pnl_quote,
+            self.quantity * (entry_fill - exit_fill),
+        )
+        _require_close(
+            "result_net_pnl",
+            self.net_pnl_quote,
+            self.gross_pnl_quote - self.fees_quote + self.funding_pnl_quote,
+        )
+        _require_close(
+            "result_return_on_notional",
+            self.return_on_notional,
+            self.net_pnl_quote / self.initial_notional_quote,
+        )
+        _require_close(
+            "result_return_on_risk",
+            self.return_on_risk,
+            self.net_pnl_quote / self.risk_budget_quote,
+        )
+        self._validate_result_hash()
+
+    def _validate_result_hash(self) -> None:
+        if self.result_hash != single_position_result_hash(self):
+            raise SinglePositionContractError("result_hash_mismatch")
+
+    def validate_against(
+        self,
+        *,
+        plan: EntryPlan,
+        contract: SinglePositionContract,
+    ) -> None:
+        """Revalidate this persisted result against its actual plan/contract."""
+
+        self.validate()
+        if not isinstance(plan, EntryPlan):
+            raise SinglePositionContractError("result_requires_bound_entry_plan")
+        if not isinstance(contract, SinglePositionContract):
+            raise SinglePositionContractError("result_requires_bound_contract")
+        plan.validate()
+        contract.validate()
+
+        expected_plan_hash = plan_hash(plan)
+        expected_contract_hash = contract_hash(contract)
+        if self.plan_hash != expected_plan_hash:
+            raise SinglePositionContractError("result_plan_hash_mismatch")
+        if self.contract_hash != expected_contract_hash:
+            raise SinglePositionContractError("result_contract_hash_mismatch")
+        if self.bar_interval_seconds != contract.bar_interval_seconds:
+            raise SinglePositionContractError("result_bar_interval_differs_from_contract")
+        if self.max_holding_seconds != contract.max_holding_seconds:
+            raise SinglePositionContractError("result_horizon_differs_from_contract")
+        if self.contract_schema_version != contract.schema_version:
+            raise SinglePositionContractError("result_schema_differs_from_contract")
+
+        for field_name in (
+            "symbol",
+            "cohort_id",
+            "decision_ts",
+            "entry_bar_open_ts",
+            "stop_price",
+            "take_profit_price",
+        ):
+            if getattr(self, field_name) != getattr(plan, field_name):
+                raise SinglePositionContractError(
+                    f"candidate_plan_and_result_{field_name}_differ"
+                )
+
+        expected_entry_bar = first_reachable_bar_open(
+            plan.entry_eligible_ts, contract.bar_interval_seconds
+        )
+        if abs(plan.entry_bar_open_ts - expected_entry_bar) > _EPS:
+            raise SinglePositionContractError(
+                "entry_bar_must_be_the_first_reachable_bar"
+            )
+
+        expected_risk_budget = (
+            contract.sizing.equity_quote * contract.sizing.risk_fraction
+        )
+        _require_close(
+            "result_risk_budget", self.risk_budget_quote, expected_risk_budget
+        )
+        if not self.filled:
+            return
+
+        # The filled result must be arithmetically reproducible from the bound
+        # execution contract.  This closes the v2 hole where a row could retain
+        # plausible PnL while silently swapping fees, slippage or sizing rules.
+        entry_reference = float(self.entry_reference_price)  # type: ignore[arg-type]
+        exit_reference = float(self.exit_reference_price)  # type: ignore[arg-type]
+        expected_entry_fill = _short_entry_fill(entry_reference, contract.costs)
+        expected_exit_fill = _short_exit_fill(exit_reference, contract.costs)
+        _require_close(
+            "result_entry_fill_from_contract",
+            float(self.entry_fill_price),  # type: ignore[arg-type]
+            expected_entry_fill,
+        )
+        _require_close(
+            "result_exit_fill_from_contract",
+            float(self.exit_fill_price),  # type: ignore[arg-type]
+            expected_exit_fill,
+        )
+
+        expected_stop_fill = _short_exit_fill(plan.stop_price, contract.costs)
+        expected_quantity, _ = _size_position(
+            expected_entry_fill, expected_stop_fill, contract
+        )
+        _require_close("result_quantity_from_contract", self.quantity, expected_quantity)
+
+        expected_fees = self.quantity * (
+            expected_entry_fill * contract.costs.entry_fee_rate
+            + expected_exit_fill * contract.costs.exit_fee_rate
+        )
+        _require_close("result_fees_from_contract", self.fees_quote, expected_fees)
+
+        sizing = contract.sizing
+        if self.quantity + _EPS < sizing.min_quantity:
+            raise SinglePositionContractError("result_quantity_below_contract_minimum")
+        if self.initial_notional_quote + _EPS < sizing.min_notional_quote:
+            raise SinglePositionContractError("result_notional_below_contract_minimum")
+        if self.initial_notional_quote > sizing.max_notional_quote + _EPS:
+            raise SinglePositionContractError("result_notional_exceeds_contract_maximum")
+        if (
+            self.initial_notional_quote
+            > sizing.equity_quote * sizing.max_leverage + _EPS
+        ):
+            raise SinglePositionContractError("result_notional_exceeds_contract_leverage")
+
+        stop_loss_per_unit = (
+            expected_stop_fill
+            - expected_entry_fill
+            + expected_entry_fill * contract.costs.entry_fee_rate
+            + expected_stop_fill * contract.costs.exit_fee_rate
+        )
+        if self.quantity * stop_loss_per_unit > expected_risk_budget + _EPS:
+            raise SinglePositionContractError("result_stop_risk_exceeds_budget")
+
+
+def _optional_canonical_float(name: str, value: float | None) -> float | None:
+    return None if value is None else _canonical_float(name, value)
+
+
+def _result_payload(result: SinglePositionResult) -> dict[str, object]:
+    return {
+        "symbol": result.symbol,
+        "cohort_id": result.cohort_id,
+        "decision_ts": _canonical_float("result_decision_ts", result.decision_ts),
+        "entry_bar_open_ts": _canonical_float(
+            "result_entry_bar_open_ts", result.entry_bar_open_ts
+        ),
+        "plan_hash": result.plan_hash,
+        "contract_hash": result.contract_hash,
+        "replay_input_hash": result.replay_input_hash,
+        "filled": result.filled,
+        "exit_reason": result.exit_reason,
+        "entry_ts": _optional_canonical_float("result_entry_ts", result.entry_ts),
+        "exit_ts": _optional_canonical_float("result_exit_ts", result.exit_ts),
+        "entry_reference_price": _optional_canonical_float(
+            "result_entry_reference_price", result.entry_reference_price
+        ),
+        "entry_fill_price": _optional_canonical_float(
+            "result_entry_fill_price", result.entry_fill_price
+        ),
+        "exit_reference_price": _optional_canonical_float(
+            "result_exit_reference_price", result.exit_reference_price
+        ),
+        "exit_fill_price": _optional_canonical_float(
+            "result_exit_fill_price", result.exit_fill_price
+        ),
+        "stop_price": _canonical_float("result_stop_price", result.stop_price),
+        "take_profit_price": _canonical_float(
+            "result_take_profit_price", result.take_profit_price
+        ),
+        "quantity": _canonical_float("result_quantity", result.quantity),
+        "initial_notional_quote": _canonical_float(
+            "result_initial_notional_quote", result.initial_notional_quote
+        ),
+        "risk_budget_quote": _canonical_float(
+            "result_risk_budget_quote", result.risk_budget_quote
+        ),
+        "gross_pnl_quote": _canonical_float(
+            "result_gross_pnl_quote", result.gross_pnl_quote
+        ),
+        "fees_quote": _canonical_float("result_fees_quote", result.fees_quote),
+        "funding_pnl_quote": _canonical_float(
+            "result_funding_pnl_quote", result.funding_pnl_quote
+        ),
+        "net_pnl_quote": _canonical_float(
+            "result_net_pnl_quote", result.net_pnl_quote
+        ),
+        "return_on_notional": _canonical_float(
+            "result_return_on_notional", result.return_on_notional
+        ),
+        "return_on_risk": _canonical_float(
+            "result_return_on_risk", result.return_on_risk
+        ),
+        "bars_held": result.bars_held,
+        "funding_events_applied": result.funding_events_applied,
+        "bar_interval_seconds": result.bar_interval_seconds,
+        "max_holding_seconds": result.max_holding_seconds,
+        "contract_schema_version": result.contract_schema_version,
+    }
+
+
+def single_position_result_hash(result: SinglePositionResult) -> str:
+    """Canonical SHA-256 over a v3 result and its three input identities."""
+
+    if not isinstance(result, SinglePositionResult):
+        raise SinglePositionContractError(
+            "result_hash_requires_single_position_result"
+        )
+    return _canonical_sha256("single_position_result", _result_payload(result))
+
+
+def _build_result(**values: object) -> SinglePositionResult:
+    """Construct a result whose mandatory content hash is correct at birth."""
+
+    # Validation is intentionally delegated to SinglePositionResult.  The
+    # temporary object bypasses __init__ only to compute the digest over exactly
+    # the same field representation that the final constructor will validate.
+    temporary = object.__new__(SinglePositionResult)
+    for name, value in values.items():
+        object.__setattr__(temporary, name, value)
+    digest = single_position_result_hash(temporary)
+    return SinglePositionResult(**values, result_hash=digest)  # type: ignore[arg-type]
 
 
 @dataclass(frozen=True)
 class ScoredCandidate:
-    """A causal score, the plan it scored, and the replay outcome.
+    """A causal score plus plan, contract, market evidence and replay outcome.
 
-    The plan is kept alongside the result so selection can read cohort membership
-    and entry timing from what was known before the replay, never from the
-    outcome.
+    Every binding object is required. Selection can read causal cohort timing,
+    revalidate economics and deterministically reproduce the outcome from the
+    concrete bars/funding instead of trusting a self-asserted digest.
     """
 
     score: float
     plan: EntryPlan
+    contract: SinglePositionContract
+    evidence: ReplayEvidence
     result: SinglePositionResult
 
     def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
         if not _finite(self.score):
             raise SinglePositionContractError("candidate_score_must_be_finite")
         if not isinstance(self.plan, EntryPlan):
             raise SinglePositionContractError("candidate_requires_its_entry_plan")
-        # A result produced from a different plan describes a different trade. Only
-        # comparing the symbol would let a replay of another cohort, decision or
-        # entry bar be scored as if it were this one.
-        for field_name in ("symbol", "cohort_id", "decision_ts", "entry_bar_open_ts"):
-            if getattr(self.plan, field_name) != getattr(self.result, field_name):
-                raise SinglePositionContractError(
-                    f"candidate_plan_and_result_{field_name}_differ"
-                )
+        if not isinstance(self.contract, SinglePositionContract):
+            raise SinglePositionContractError("candidate_requires_its_contract")
+        if not isinstance(self.evidence, ReplayEvidence):
+            raise SinglePositionContractError("candidate_requires_replay_evidence")
+        if not isinstance(self.result, SinglePositionResult):
+            raise SinglePositionContractError("candidate_requires_single_position_result")
+        self.result.validate_against(plan=self.plan, contract=self.contract)
+        self.evidence.validate_against(plan=self.plan, contract=self.contract)
+        if self.result.replay_input_hash != self.evidence.replay_input_hash:
+            raise SinglePositionContractError("candidate_replay_input_hash_mismatch")
+        expected_result = replay_single_short(
+            self.evidence.to_frame(),
+            plan=self.plan,
+            contract=self.contract,
+            funding_payments=self.evidence.funding_payments,
+        )
+        if self.result != expected_result:
+            raise SinglePositionContractError(
+                "candidate_result_differs_from_replay_evidence"
+            )
         if self.result.filled and self.result.entry_ts != self.plan.entry_bar_open_ts:
             raise SinglePositionContractError("filled_entry_ts_differs_from_the_plan")
 
@@ -242,12 +1004,21 @@ class SinglePositionSelection:
     skipped_busy: int
 
 
-def _empty_result(plan: EntryPlan, contract: SinglePositionContract, reason: str) -> SinglePositionResult:
-    return SinglePositionResult(
+def _empty_result(
+    plan: EntryPlan,
+    contract: SinglePositionContract,
+    reason: str,
+    *,
+    input_hash: str,
+) -> SinglePositionResult:
+    return _build_result(
         symbol=plan.symbol,
         cohort_id=plan.cohort_id,
         decision_ts=float(plan.decision_ts),
         entry_bar_open_ts=float(plan.entry_bar_open_ts),
+        plan_hash=plan_hash(plan),
+        contract_hash=contract_hash(contract),
+        replay_input_hash=input_hash,
         filled=False,
         exit_reason=reason,
         entry_ts=None,
@@ -269,6 +1040,8 @@ def _empty_result(plan: EntryPlan, contract: SinglePositionContract, reason: str
         return_on_risk=0.0,
         bars_held=0,
         funding_events_applied=0,
+        bar_interval_seconds=contract.bar_interval_seconds,
+        max_holding_seconds=contract.max_holding_seconds,
         contract_schema_version=contract.schema_version,
     )
 
@@ -291,6 +1064,8 @@ def _normalise_bars(
     entry_bar_open_ts: float,
     contract: SinglePositionContract,
 ) -> pd.DataFrame:
+    if not isinstance(bars, pd.DataFrame):
+        raise SinglePositionContractError("bars_must_be_a_dataframe")
     required = {"time", "open", "high", "low", "close"}
     missing = sorted(required - set(bars.columns))
     if missing:
@@ -332,6 +1107,112 @@ def _normalise_bars(
     if abs((timestamps[-1] + interval) - deadline) > _EPS:
         raise SinglePositionContractError("last_bar_must_close_at_horizon")
     return frame
+
+
+def _normalised_bar_tuples(
+    frame: pd.DataFrame,
+) -> tuple[tuple[float, float, float, float, float], ...]:
+    payload: list[tuple[float, float, float, float, float]] = []
+    for row in frame.itertuples(index=False):
+        payload.append(
+            (
+                _canonical_float("bar_time", row.time),
+                _canonical_float("bar_open", row.open),
+                _canonical_float("bar_high", row.high),
+                _canonical_float("bar_low", row.low),
+                _canonical_float("bar_close", row.close),
+            )
+        )
+    return tuple(payload)
+
+
+def _typed_funding_payments(
+    funding_payments: Iterable[FundingPayment],
+) -> tuple[FundingPayment, ...]:
+    try:
+        payments = tuple(funding_payments)
+    except TypeError as exc:
+        raise SinglePositionContractError("funding_payments_must_be_iterable") from exc
+    _validate_funding_sequence(payments)
+    return payments
+
+
+def _evidence_from_normalised(
+    frame: pd.DataFrame,
+    *,
+    plan: EntryPlan,
+    contract: SinglePositionContract,
+    funding_payments: tuple[FundingPayment, ...],
+) -> ReplayEvidence:
+    bound_plan_hash = plan_hash(plan)
+    bound_contract_hash = contract_hash(contract)
+    evidence_bars = _normalised_bar_tuples(frame)
+    digest = _replay_input_digest_from_components(
+        bound_plan_hash=bound_plan_hash,
+        bound_contract_hash=bound_contract_hash,
+        bars=evidence_bars,
+        funding_payments=funding_payments,
+    )
+    return ReplayEvidence(
+        plan_hash=bound_plan_hash,
+        contract_hash=bound_contract_hash,
+        bars=evidence_bars,
+        funding_payments=funding_payments,
+        replay_input_hash=digest,
+    )
+
+
+def build_replay_evidence(
+    bars: pd.DataFrame,
+    *,
+    plan: EntryPlan,
+    contract: SinglePositionContract,
+    funding_payments: Iterable[FundingPayment] = (),
+) -> ReplayEvidence:
+    """Build the mandatory, concrete evidence for a scored replay outcome."""
+
+    if not isinstance(plan, EntryPlan):
+        raise SinglePositionContractError("replay_evidence_requires_entry_plan")
+    if not isinstance(contract, SinglePositionContract):
+        raise SinglePositionContractError("replay_evidence_requires_contract")
+    plan.validate()
+    contract.validate()
+    expected_entry_bar = first_reachable_bar_open(
+        plan.entry_eligible_ts, contract.bar_interval_seconds
+    )
+    if abs(plan.entry_bar_open_ts - expected_entry_bar) > _EPS:
+        raise SinglePositionContractError("entry_bar_must_be_the_first_reachable_bar")
+    frame = _normalise_bars(
+        bars, entry_bar_open_ts=plan.entry_bar_open_ts, contract=contract
+    )
+    payments = _typed_funding_payments(funding_payments)
+    return _evidence_from_normalised(
+        frame,
+        plan=plan,
+        contract=contract,
+        funding_payments=payments,
+    )
+
+
+def replay_input_hash(
+    bars: pd.DataFrame,
+    *,
+    plan: EntryPlan,
+    contract: SinglePositionContract,
+    funding_payments: Iterable[FundingPayment] = (),
+) -> str:
+    """Recompute the exact canonical input identity carried by a v3 result."""
+
+    if not isinstance(plan, EntryPlan):
+        raise SinglePositionContractError("replay_hash_requires_entry_plan")
+    if not isinstance(contract, SinglePositionContract):
+        raise SinglePositionContractError("replay_hash_requires_contract")
+    return build_replay_evidence(
+        bars,
+        plan=plan,
+        contract=contract,
+        funding_payments=funding_payments,
+    ).replay_input_hash
 
 
 def _short_entry_fill(reference: float, costs: ExecutionCosts) -> float:
@@ -392,6 +1273,13 @@ def replay_single_short(
     Only payments with ``entry_ts < timestamp <= exit_ts`` are applied.
     """
 
+    if not isinstance(plan, EntryPlan):
+        raise SinglePositionContractError("replay_requires_entry_plan")
+    if not isinstance(contract, SinglePositionContract):
+        raise SinglePositionContractError("replay_requires_single_position_contract")
+    plan.validate()
+    contract.validate()
+
     expected_entry_bar = first_reachable_bar_open(
         plan.entry_eligible_ts, contract.bar_interval_seconds
     )
@@ -401,11 +1289,29 @@ def replay_single_short(
     frame = _normalise_bars(
         bars, entry_bar_open_ts=plan.entry_bar_open_ts, contract=contract
     )
+    payments = _typed_funding_payments(funding_payments)
+    evidence = _evidence_from_normalised(
+        frame,
+        plan=plan,
+        contract=contract,
+        funding_payments=payments,
+    )
+    input_hash = evidence.replay_input_hash
     first_open = float(frame.iloc[0]["open"])
     if first_open >= plan.stop_price * (1.0 - _EPS):
-        return _empty_result(plan, contract, "entry_invalidated_by_stop_gap")
+        return _empty_result(
+            plan,
+            contract,
+            "entry_invalidated_by_stop_gap",
+            input_hash=input_hash,
+        )
     if first_open <= plan.take_profit_price * (1.0 + _EPS):
-        return _empty_result(plan, contract, "entry_invalidated_by_target_gap")
+        return _empty_result(
+            plan,
+            contract,
+            "entry_invalidated_by_target_gap",
+            input_hash=input_hash,
+        )
 
     entry_fill = _short_entry_fill(first_open, contract.costs)
     stop_fill = _short_exit_fill(plan.stop_price, contract.costs)
@@ -417,7 +1323,12 @@ def replay_single_short(
         or quantity + _EPS < sizing.min_quantity
         or initial_notional + _EPS < sizing.min_notional_quote
     ):
-        return _empty_result(plan, contract, "below_instrument_minimum")
+        return _empty_result(
+            plan,
+            contract,
+            "below_instrument_minimum",
+            input_hash=input_hash,
+        )
 
     exit_reason = "horizon"
     exit_reference = float(frame.iloc[-1]["close"])
@@ -470,17 +1381,20 @@ def replay_single_short(
     funding_cutoff_ts = exit_ts if exit_reason == "horizon" else exit_bar_open_ts
     funding_pnl = 0.0
     funding_count = 0
-    for payment in funding_payments:
+    for payment in payments:
         if entry_ts < payment.timestamp <= funding_cutoff_ts:
             funding_pnl += quantity * payment.mark_price * payment.rate
             funding_count += 1
 
     net_pnl = gross_pnl - fees + funding_pnl
-    return SinglePositionResult(
+    return _build_result(
         symbol=plan.symbol,
         cohort_id=plan.cohort_id,
         decision_ts=float(plan.decision_ts),
         entry_bar_open_ts=float(plan.entry_bar_open_ts),
+        plan_hash=plan_hash(plan),
+        contract_hash=contract_hash(contract),
+        replay_input_hash=input_hash,
         filled=True,
         exit_reason=exit_reason,
         entry_ts=entry_ts,
@@ -502,6 +1416,8 @@ def replay_single_short(
         return_on_risk=net_pnl / risk_budget,
         bars_held=exit_bar_index + 1,
         funding_events_applied=funding_count,
+        bar_interval_seconds=contract.bar_interval_seconds,
+        max_holding_seconds=contract.max_holding_seconds,
         contract_schema_version=contract.schema_version,
     )
 
@@ -531,6 +1447,12 @@ def select_single_position(
     # silently split or merge cohorts.
     cohort_timing: dict[str, tuple[float, float, float]] = {}
     for candidate in candidates:
+        if not isinstance(candidate, ScoredCandidate):
+            raise SinglePositionContractError("selector_requires_scored_candidates")
+        # Revalidate at the portfolio boundary. This protects concurrency-one
+        # from unsafe deserializers that bypassed the frozen dataclass constructor
+        # and injected (for example) a NaN exit timestamp.
+        candidate.validate()
         timing = (
             candidate.plan.actionable_ts,
             candidate.plan.entry_eligible_ts,
@@ -593,6 +1515,8 @@ def select_single_position(
         if not chosen.result.filled or chosen.result.exit_ts is None:
             skipped_unfilled += 1
             continue
+        if not _finite(chosen.result.exit_ts):
+            raise SinglePositionContractError("selected_exit_ts_must_be_finite")
         selected.append(chosen)
         active_until = float(chosen.result.exit_ts)
 

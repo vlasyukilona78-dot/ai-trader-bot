@@ -17,6 +17,7 @@ from ai.reversal.population_dataset import PopulationDatasetError, population_fe
 from backtesting.single_position import (
     ScoredCandidate,
     SinglePositionContractError,
+    build_replay_evidence,
     select_single_position,
 )
 from trading.market_data.bar_contract import interval_seconds, is_bar_aligned, next_bar_open_ts
@@ -119,7 +120,7 @@ def test_cycle_id_ignores_everything_a_worker_could_influence() -> None:
 
 
 def _candidate(score: float, symbol: str, *, cohort_id: str, entry_bar_open_ts: float,
-               decision_ts: float, exit_ts: float,
+               decision_ts: float,
                actionable_ts: float | None = None) -> ScoredCandidate:
     from backtesting.single_position import replay_single_short
 
@@ -131,21 +132,26 @@ def _candidate(score: float, symbol: str, *, cohort_id: str, entry_bar_open_ts: 
         entry_eligible_ts=entry_bar_open_ts - 240.0,
         entry_bar_open_ts=entry_bar_open_ts,
     )
-    result = replay_single_short(
-        _bars([(100.0, 101.0, 99.0, 100.0), (100.0, 101.0, 99.0, 100.0)],
-              start_ts=entry_bar_open_ts),
-        plan=plan,
-        contract=_contract(),
+    contract = _contract()
+    bars = _bars(
+        [(100.0, 101.0, 99.0, 100.0), (100.0, 101.0, 99.0, 100.0)],
+        start_ts=entry_bar_open_ts,
     )
-    return ScoredCandidate(score, plan, result.__class__(**{**result.__dict__, "exit_ts": exit_ts}))
+    result = replay_single_short(
+        bars,
+        plan=plan,
+        contract=contract,
+    )
+    evidence = build_replay_evidence(bars, plan=plan, contract=contract)
+    return ScoredCandidate(score, plan, contract, evidence, result)
 
 
 def test_one_cycle_with_different_per_symbol_timestamps_is_one_cohort() -> None:
     """Symbols decided milliseconds apart inside a cycle still compete once."""
     winner = _candidate(0.9, "AUSDT", cohort_id="cycle-1", entry_bar_open_ts=1200.0,
-                        decision_ts=900.0, exit_ts=2000.0)
+                        decision_ts=900.0)
     loser = _candidate(0.6, "BUSDT", cohort_id="cycle-1", entry_bar_open_ts=1200.0,
-                       decision_ts=947.3, exit_ts=2000.0)
+                       decision_ts=947.3)
 
     selection = select_single_position([loser, winner], minimum_score=0.5)
 
@@ -156,9 +162,9 @@ def test_one_cycle_with_different_per_symbol_timestamps_is_one_cohort() -> None:
 def test_two_cohorts_sharing_a_timestamp_do_not_merge() -> None:
     """Identical decision clocks are not evidence of a shared cohort."""
     first = _candidate(0.9, "AUSDT", cohort_id="cycle-1", entry_bar_open_ts=1200.0,
-                       decision_ts=900.0, exit_ts=1300.0)
-    second = _candidate(0.6, "BUSDT", cohort_id="cycle-2", entry_bar_open_ts=1500.0,
-                        decision_ts=900.0, exit_ts=1800.0)
+                       decision_ts=900.0)
+    second = _candidate(0.6, "BUSDT", cohort_id="cycle-2", entry_bar_open_ts=1800.0,
+                        decision_ts=900.0)
 
     selection = select_single_position([first, second], minimum_score=0.5)
 
@@ -169,9 +175,9 @@ def test_two_cohorts_sharing_a_timestamp_do_not_merge() -> None:
 
 def test_a_cohort_may_not_carry_two_different_entry_times() -> None:
     left = _candidate(0.9, "AUSDT", cohort_id="cycle-1", entry_bar_open_ts=1200.0,
-                      decision_ts=900.0, exit_ts=2000.0)
+                      decision_ts=900.0)
     right = _candidate(0.6, "BUSDT", cohort_id="cycle-1", entry_bar_open_ts=1500.0,
-                       decision_ts=900.0, exit_ts=2000.0)
+                       decision_ts=900.0)
 
     with pytest.raises(SinglePositionContractError, match="cohort_timing_conflict"):
         select_single_position([left, right], minimum_score=0.5)
@@ -179,11 +185,17 @@ def test_a_cohort_may_not_carry_two_different_entry_times() -> None:
 
 def test_candidate_requires_the_plan_it_scored() -> None:
     candidate = _candidate(0.9, "AUSDT", cohort_id="cycle-1", entry_bar_open_ts=1200.0,
-                           decision_ts=900.0, exit_ts=2000.0)
+                           decision_ts=900.0)
     other = _plan(symbol="OTHERUSDT", cohort_id="cycle-9")
 
     with pytest.raises(SinglePositionContractError):
-        ScoredCandidate(0.9, other, candidate.result)
+        ScoredCandidate(
+            0.9,
+            other,
+            candidate.contract,
+            candidate.evidence,
+            candidate.result,
+        )
 
 
 # --------------------------------------------------------------------------
@@ -311,9 +323,9 @@ def test_universe_received_at_is_taken_after_the_response() -> None:
 
     assert snapshot.symbols == ["AAAUSDT"]
     assert snapshot.received_at >= client.called_at
-    # `refreshed_at` is read before the request and is therefore always earlier;
-    # it must never stand in for the moment the data was known.
-    assert snapshot.refreshed_at < snapshot.received_at
+    # The TTL anchor is the completed successful refresh, never the instant read
+    # before sending the request.
+    assert snapshot.refreshed_at == snapshot.received_at
     assert snapshot.request_started_at <= snapshot.received_at
 
 
@@ -429,35 +441,51 @@ def test_plan_requires_eligibility_not_only_actionability() -> None:
 
 
 @pytest.mark.parametrize(
-    "field,value",
-    [("decision_ts", 901.0), ("entry_bar_open_ts", 1500.0)],
+    "field,value,error",
+    [
+        ("decision_ts", 901.0, "result_hash_mismatch"),
+        ("entry_bar_open_ts", 1500.0, "entry_ts_differs_from_entry_bar"),
+    ],
 )
-def test_candidate_rejects_a_result_from_a_different_plan(field, value) -> None:
+def test_candidate_rejects_a_result_from_a_different_plan(field, value, error) -> None:
     candidate = _candidate(0.9, "AUSDT", cohort_id="cycle-1", entry_bar_open_ts=1200.0,
-                           decision_ts=900.0, exit_ts=2000.0)
-    mismatched = candidate.result.__class__(**{**candidate.result.__dict__, field: value})
+                           decision_ts=900.0)
 
-    with pytest.raises(SinglePositionContractError, match=f"result_{field}_differ"):
-        ScoredCandidate(0.9, candidate.plan, mismatched)
+    # Result-level chronology now rejects an internally inconsistent entry bar
+    # before ScoredCandidate needs to compare it with the plan.
+    with pytest.raises(SinglePositionContractError, match=error):
+        mismatched = candidate.result.__class__(**{**candidate.result.__dict__, field: value})
+        ScoredCandidate(
+            0.9,
+            candidate.plan,
+            candidate.contract,
+            candidate.evidence,
+            mismatched,
+        )
 
 
 def test_candidate_rejects_a_fill_that_did_not_happen_on_the_planned_bar() -> None:
     candidate = _candidate(0.9, "AUSDT", cohort_id="cycle-1", entry_bar_open_ts=1200.0,
-                           decision_ts=900.0, exit_ts=2000.0)
+                           decision_ts=900.0)
     assert candidate.result.filled
-    moved = candidate.result.__class__(**{**candidate.result.__dict__, "entry_ts": 1500.0})
-
-    with pytest.raises(SinglePositionContractError, match="filled_entry_ts_differs"):
-        ScoredCandidate(0.9, candidate.plan, moved)
+    with pytest.raises(SinglePositionContractError, match="entry_ts_differs_from_entry_bar"):
+        moved = candidate.result.__class__(**{**candidate.result.__dict__, "entry_ts": 1500.0})
+        ScoredCandidate(
+            0.9,
+            candidate.plan,
+            candidate.contract,
+            candidate.evidence,
+            moved,
+        )
 
 
 def test_same_entry_bar_is_reserved_by_the_earliest_actionable_cohort() -> None:
     """Two cycles can target one bar. The earlier decision keeps it; ordering by
     cohort_id would decide it by SHA order, which means nothing causally."""
     early = _candidate(0.5, "EARLYUSDT", cohort_id="zzz-late-hash", entry_bar_open_ts=1200.0,
-                       decision_ts=900.0, exit_ts=2000.0, actionable_ts=940.0)
+                       decision_ts=900.0, actionable_ts=940.0)
     late = _candidate(0.9, "LATEUSDT", cohort_id="aaa-early-hash", entry_bar_open_ts=1200.0,
-                      decision_ts=900.0, exit_ts=2000.0, actionable_ts=950.0)
+                      decision_ts=900.0, actionable_ts=950.0)
 
     selection = select_single_position([late, early], minimum_score=0.1)
 
@@ -469,16 +497,28 @@ def test_an_unfilled_earlier_cohort_does_not_hand_the_bar_to_a_later_one() -> No
     from backtesting.single_position import replay_single_short
 
     invalid_plan = _plan(symbol="EARLYUSDT", cohort_id="cycle-early")
+    invalid_bars = _bars(
+        [(106.0, 107.0, 105.5, 106.0), (106.0, 107.0, 105.0, 106.0)]
+    )
     invalid = replay_single_short(
-        _bars([(106.0, 107.0, 105.5, 106.0), (106.0, 107.0, 105.0, 106.0)]),
+        invalid_bars,
         plan=invalid_plan,
         contract=_contract(),
     )
+    invalid_evidence = build_replay_evidence(
+        invalid_bars, plan=invalid_plan, contract=_contract()
+    )
     later = _candidate(0.9, "LATEUSDT", cohort_id="cycle-late", entry_bar_open_ts=1200.0,
-                       decision_ts=900.0, exit_ts=2000.0, actionable_ts=955.0)
+                       decision_ts=900.0, actionable_ts=955.0)
 
     selection = select_single_position(
-        [ScoredCandidate(0.95, invalid_plan, invalid), later], minimum_score=0.1
+        [
+            ScoredCandidate(
+                0.95, invalid_plan, _contract(), invalid_evidence, invalid
+            ),
+            later,
+        ],
+        minimum_score=0.1,
     )
 
     # The earlier cohort's entry simply did not happen; that is not permission for
