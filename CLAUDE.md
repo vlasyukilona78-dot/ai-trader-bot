@@ -13,22 +13,23 @@ API, or giving a strategy verdict:
    read-only orientation/review sequence.
 2. Read `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` in full. It is the
    authoritative MEXC strategy, data, model and implementation plan.
-3. Read the current checkpoint and the final 2026-08-08 section of
+3. Read the current checkpoint and the latest 2026-08-09 section of
    `docs/AI_HANDOFF.md`. Earlier sections are an audit history and contain
    superseded findings.
 4. Verify the worktree, branch, local HEAD and remote HEAD yourself. The
    published AI foundation anchor is `f0b43d6` on
    `claude/codex-project-review-04581e`; the 2026-08-08 StrategySpec/journal-v5
-   code tip is `2d0efcb`, the behavioral-compatibility tip is `258c35f`, and
-   current HEAD must descend from all three anchors.
+   code tip is `2d0efcb`, the behavioral-compatibility tip is `258c35f`, the
+   versioned-evidence compatibility tip is `1971b77`, and current HEAD must
+   descend from all four anchors.
 
 ## Current product truth
 
 - Target exchange: MEXC futures.
 - Scope: public-data, signals-only causal research. There is no production MEXC
   private execution adapter in this line.
-- Latest executable tip and test receipt: `258c35f`; `580 passed, 4 skipped`,
-  with two known pytest collection warnings (`14.99s`).
+- Latest executable tip and test receipt: `1971b77`; `590 passed, 4 skipped`,
+  with two known pytest collection warnings (`18.95s`).
 - Generic pump-fade has not demonstrated stable positive edge after costs. The
   earlier DCA/positive-expectancy claims are retracted hypotheses, not evidence.
 - Phase 0 plus the Phase 1 timing, replay, canonical StrategySpec and evidence
@@ -37,8 +38,8 @@ API, or giving a strategy verdict:
 - Focused review found no open P0/P1 in the implemented StrategySpec/runtime
   scope and no P0/P1/P2 in the journal/checkpoint scope. Its one StrategySpec
   P2 was the lack of numeric behavioral anchors behind declarative revisions;
-  `258c35f` closes it with tests and a fixture only, without changing runtime
-  algorithms, thresholds, spec version or hashes.
+  `258c35f` closed it. Independent red-team review of the later versioned
+  evidence checkpoint `1971b77` found no P0/P1/P2 in that change scope.
 - The MEXC runtime loads one strict strategy-spec YAML; its canonical committed
   default is `config/mexc_strategy_v2.yaml`, while `--strategy-spec` may select
   another fully validated file. The pinned contract hash is `9c62b88b...e3dd`;
@@ -50,10 +51,10 @@ API, or giving a strategy verdict:
   profile levels, and the default armed-HOLD to confirmed-SHORT decision,
   trace and proposal. A committed CycleEnvelope-v3 fixture also proves that
   frozen `mexc_strategy_v2` evidence remains readable.
-- Do not implement a future `mexc_strategy_v3` as a naive global version-literal
-  bump. Persisted evidence needs a version-dispatched reader that retains the
-  frozen v2 parser/hashes, while v3 types, config and evidence live in a separate
-  version namespace. The frozen v2 fixture must remain green.
+- Persisted evidence now uses a version-dispatched reader with a frozen v2
+  parser, contract hash and instance-hash path. A future `mexc_strategy_v3`
+  must add a separate registered parser/types/config/evidence namespace rather
+  than altering the v2 codec or regenerating its fixture.
 - For a faster strategy, separate event/state horizons from estimator warm-up
   and sample budgets. `pump_window` and confirmation timing are not the same kind
   of parameter as RSI/ATR/EMA/VP history. A Min15 design is a new strategy
@@ -62,7 +63,11 @@ API, or giving a strategy verdict:
   about earlier intent, not an accepted timeframe decision.
 - The current runtime-population path is
   `data/runtime/mexc_population_decisions_v5.jsonl`; older journal schemas and
-  legacy event-conditioned CSV are not accepted by the strict reader.
+  legacy event-conditioned CSV are not accepted by the strict reader. Every
+  journal file is homogeneous in exact StrategySpec version, contract hash and
+  instance hash; restart, append and strict dataset reading reject mixtures.
+  Model-input records expose that identity as non-feature provenance metadata,
+  never as predictive input.
 - Journal v5 is internally chained and rejects corruption, partial edits,
   incomplete writes and stale-writer rewrites relative to the prefix that writer
   already observed. A fresh reader cannot distinguish a clean shorter prefix or

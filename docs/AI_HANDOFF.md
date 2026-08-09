@@ -7,13 +7,14 @@ Updated: 2026-08-09, Europe/Moscow
 > `docs/CLAUDE_REVIEW_PROMPT_2026-08-03.md`, then treat
 > `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` as the current MEXC plan. The
 > published AI foundation anchor is `f0b43d6`; the StrategySpec/journal-v5
-> foundation tip is `2d0efcb`, and the latest executable code tip is `258c35f`.
+> foundation tip is `2d0efcb`, the frozen-behavior tip is `258c35f`, and the
+> latest executable code tip is `1971b77`.
 > Discover any later documentation-only descendant with `git log`. The
 > `98217df`/`340 passed`
 > checkpoint immediately below is a
 > preserved earlier causal-scanner snapshot, not the latest foundation state.
-> Latest code validation: `580 passed, 4 skipped, 2 known collection warnings`
-> (`14.99s`). Current journal path:
+> Latest code validation: `590 passed, 4 skipped, 2 known collection warnings`
+> (`18.95s`). Current journal path:
 > `data/runtime/mexc_population_decisions_v5.jsonl`.
 
 ## Earlier causal-scanner checkpoint — 2026-08-03
@@ -1781,3 +1782,71 @@ No exchange/network call, scanner, bot, Telegram, model training, testnet,
 private or live path was run for this follow-up, and `.env` was not read. These
 locks establish compatibility and implementation identity only: they do not
 establish trading edge, validate a model or relax any live-risk boundary.
+
+## Version-dispatched StrategySpec evidence checkpoint — 2026-08-09
+
+This append-only checkpoint supersedes the remaining v3-readiness caveat in the
+previous section. The executable change is:
+
+```text
+1971b77 feat(strategy): preserve versioned evidence compatibility
+```
+
+### Frozen evidence and identity boundaries
+
+- `mexc_strategy_v2` now has an explicit registered evidence decoder. Its
+  parser, contract-hash derivation and instance-hash derivation remain bound to
+  v2 rather than to a mutable global "current version" alias.
+- The pinned v2 contract and default-instance hashes are unchanged. The frozen
+  payload/CycleEnvelope fixture and behavioural vectors remain compatibility
+  tripwires; no fixture was regenerated to conceal drift.
+- `CycleEnvelope v3` dispatches by the persisted version, rebuilds the canonical
+  payload and checks the exact `(version, contract hash, instance hash)`
+  identity. Unknown versions and outer/payload version disagreement fail closed.
+- Population journal v5 binds each file to one exact StrategySpec identity.
+  Restart and append reject a different identity before export or additional
+  bytes, including a different operator-selected YAML instance under v2.
+- The strict population reader independently enforces the same homogeneous
+  identity. `model_input_records()` carries the three identity fields as
+  provenance metadata outside the feature vector, so downstream datasets can
+  detect accidental cross-version or cross-instance concatenation without
+  teaching the model the strategy identity.
+
+This prepares a safe namespace boundary for a future `mexc_strategy_v3`; it
+does not define v3 parameters, select Min15, change the frozen Min60/45-hour v2
+control or choose an arm-time versus post-confirmation estimand. A future v3
+must register separate types/parser/config/evidence while the v2 decoder and
+fixtures remain readable and green.
+
+### Independent validation and operational boundary
+
+```text
+full pytest at 1971b77: 590 passed, 4 skipped,
+                       2 known PytestCollectionWarning (18.95s)
+independent red-team: no P0/P1/P2 in the checkpoint change scope
+git diff --check: clean
+```
+
+The checkpoint changes evidence decoding, identity validation and export
+provenance only. It does **not** change strategy behaviour, indicators,
+thresholds, network use, model selection/training, signal delivery, execution or
+live-risk permissions. No exchange/network call, scanner, bot, Telegram, model
+training, testnet, private or live path was run, and `.env` was not read.
+
+Next implementation order remains:
+
+1. Add typed arm/confirm lifecycle plus per-symbol base and
+   per-symbol/per-timeframe HTF provenance.
+2. Separate persisted identities for `MarketFeatureSnapshot`,
+   `RuleEvaluation`, `TradeProposal`, `OutcomeLabel` and `ShadowPrediction`.
+3. Add point-in-time instrument rules: contract size, quantity step, minimums,
+   leverage rules, source timestamp and content hash.
+4. Compute gate-independent causal features and the raw-contract
+   inclusion/exclusion ledger.
+5. Build the journal-to-TradeProposal-to-OutcomeLabel bridge and connect it to
+   the single-position replay.
+6. Compare physical-time hypotheses chronologically while retaining v2 as the
+   frozen control; choose no faster strategy without evidence.
+7. Only after prospective labels mature, run simple baselines and then the
+   LightGBM proposal-conditioned outcome plus separate EV candidate, with
+   CatBoost as challenger.

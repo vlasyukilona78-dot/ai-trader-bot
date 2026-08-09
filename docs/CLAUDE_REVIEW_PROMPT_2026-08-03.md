@@ -2,8 +2,8 @@
 
 This prompt is intentionally self-contained. It is for a fresh Claude Code
 account reviewing the preserved root/Bybit line and the selected MEXC causal
-research line after the canonical StrategySpec, journal-v5 and frozen-v2
-behavioral-semantics commits.
+research line after the canonical StrategySpec, journal-v5, frozen-v2
+behavioral-semantics and version-dispatched evidence-compatibility commits.
 
 The task is an independent audit, not implementation. Do not change files,
 stage, commit, push, switch branches, pull, reset, clean, launch the bot or
@@ -40,14 +40,15 @@ AI foundation anchor: f0b43d6
 earlier Phase 1 hardening tip: e0e4cb4
 canonical StrategySpec commit: bebfd0d
 journal-v5 executable commit: 2d0efcb
-latest executable/test-contract tip: 258c35f
+frozen-v2 behavioral checkpoint: 258c35f
+latest executable/evidence-compatibility tip: 1971b77
 remote branch: origin/claude/codex-project-review-04581e
 ```
 
 The handoff documents may be a later documentation-only descendant of
-`258c35f`. Discover the exact current HEAD from Git. Treat `258c35f` as the
-latest executable/test-contract tip, not necessarily as the final documentation
-HEAD.
+`1971b77`. Discover the exact current HEAD from Git. Treat `1971b77` as the
+latest executable tip at this checkpoint, not necessarily as the final
+documentation HEAD.
 
 Other worktrees may exist. Inventory them, report them, and do not modify them.
 Do not transfer MEXC code into root/Bybit without a separate explicit plan.
@@ -77,15 +78,19 @@ git -C $MEXC merge-base --is-ancestor e0e4cb4 HEAD
 git -C $MEXC merge-base --is-ancestor bebfd0d HEAD
 git -C $MEXC merge-base --is-ancestor 2d0efcb HEAD
 git -C $MEXC merge-base --is-ancestor 258c35f HEAD
+git -C $MEXC merge-base --is-ancestor 1971b77 HEAD
 git -C $MEXC ls-files -- .env
 ```
 
 Expected facts at the published checkpoint:
 
-- the current MEXC HEAD descends from all five listed anchors;
+- the current MEXC HEAD descends from all six listed anchors;
 - `bebfd0d` and `2d0efcb` are consecutive executable commits;
 - `258c35f` follows them and adds frozen v2 behavioral and compatibility
   evidence without changing thresholds or runtime strategy logic;
+- `1971b77` adds version-dispatched historical evidence decoding and exact
+  StrategySpec identity guards for journal/dataset/model export without choosing
+  a v3 timeframe, thresholds or changing v2 runtime decisions;
 - after publication, local and upstream should match and the MEXC worktree
   should be clean;
 - root and root upstream match at `f01591f`; the three root `.idea/*` changes
@@ -131,6 +136,7 @@ e0e4cb4 fix(strategy): fail closed without benchmark context
 bebfd0d feat(strategy): define canonical MEXC strategy spec
 2d0efcb feat(journal): chain schema-v5 population evidence
 258c35f test(strategy): pin v2 behavioral semantics
+1971b77 feat(strategy): preserve versioned evidence compatibility
 ```
 
 Use `git show --stat <hash>` and targeted `git show <hash> -- <path>`. Explain
@@ -143,6 +149,7 @@ Verify every value from code and the committed YAML:
 | Boundary | Expected identity |
 |---|---|
 | MEXC strategy specification | `mexc_strategy_v2` |
+| registered evidence versions | only `mexc_strategy_v2` at this checkpoint |
 | canonical MEXC source | `config/mexc_strategy_v2.yaml` |
 | StrategySpec contract hash | `9c62b88b7804e9663bae6f0eb429c58c541680b61d307c4f16032cb0b62fe3dd` |
 | committed default instance hash | `9f0b2d7035c2a82ab1b6d8595245b8c3a7a8b9faad17bea8c57f6fcacb189466` |
@@ -156,6 +163,12 @@ Verify every value from code and the committed YAML:
 The StrategySpec contract hash pins the declarative field/layout/adapter
 contract. It is not a hash of all Python implementation bytes. The instance
 hash identifies the complete canonical YAML payload.
+
+Commit `1971b77` makes the v2 evidence codec version-specific and dispatched by
+the persisted version. This is a code-enforced compatibility/regression boundary,
+not a claim that local code or evidence files are absolutely immutable or that
+their origin is externally authenticated. The detached checkpoint trust boundary
+described below remains unchanged.
 
 The legacy root `config/config.yaml` is not the MEXC source of truth and contains
 different Bybit-era values. Confirm that the MEXC scanner loads the dedicated
@@ -172,8 +185,9 @@ Confirm from code and tests:
    parameters, volume profile and both history gates are built from the same
    resolved specification.
 3. `CycleEnvelope` stores the full canonical payload plus contract/instance
-   hashes, rebuilds it strictly, and rejects a timeframe inconsistent with the
-   spec.
+   hashes, dispatches decoding by its persisted spec version, rebuilds it
+   strictly, and rejects an unsupported/mismatched version or a timeframe
+   inconsistent with the spec.
 4. Unknown, missing, duplicate or mistyped YAML values fail closed.
 5. Every declared numeric indicator field executes on both base and HTF paths;
    history and volume-profile parameters are live rather than decorative.
@@ -185,9 +199,17 @@ Confirm from code and tests:
    above. Explain what those finite golden vectors prove and what they cannot
    prove about every possible market path.
 8. The frozen `tests/fixtures/mexc_strategy_v2_cycle_envelope_v3.json` rebuilds
-   with the pinned v2 contract and instance hashes. Confirm that the fixture is
-   canonical and readable; do not infer that a future global version bump will
-   remain compatible without a version-dispatched parser.
+   through the version-dispatched v2 path with the pinned v2 contract and
+   instance hashes. Confirm that it is canonical and that its hashes remain
+   unchanged from `258c35f`.
+9. Journal append/restart inspection, strict dataset reading and model export
+   require one exact `(spec version, contract hash, instance hash)` identity per
+   file. Model records expose that identity as metadata outside the predictive
+   feature whitelist.
+
+A future `mexc_strategy_v3` is not implemented. It must add new types, config,
+parser, hash implementation and a separate evidence namespace. No v3 timeframe,
+window or threshold has been selected.
 
 The present executable timeframe semantics are explicit:
 
@@ -322,12 +344,14 @@ Inspect at least these tests:
 5. Frozen-universe funding reaches `StrategyContext`; live ticker data is not
    reintroduced into the closed-bar decision.
 6. Strategy/universe hashes and snapshot/cycle/input/envelope/market-feature
-   identities are rebuilt rather than trusted.
+   identities are rebuilt rather than trusted; the StrategySpec evidence decoder
+   is selected by persisted version and each journal is homogeneous in the exact
+   version/contract/instance triple.
 7. Empty-universe and pre-evaluation failures leave durable zero-row cycles.
 8. The strict reader rejects malformed, incomplete, reordered, mixed-schema or
    drifting cycles before an export can partially consume them.
-9. Model input exposes only the model whitelist and obeys the checkpoint rules
-   above.
+9. Model input exposes only the model whitelist, carries exact StrategySpec
+   identity as non-feature metadata, and obeys the checkpoint rules above.
 10. Legacy event-conditioned CSV and `ai/train.py` cannot be mistaken for the
     new population admission path.
 
@@ -347,8 +371,11 @@ files:
   excluded. Explain why this locks a representative path, not every strategy
   branch or sub-quantization numerical change;
 - the frozen v2 cycle-envelope fixture must retain its canonical payload digest,
-  rebuild its exact v2 contract/instance hashes and remain readable after any
-  future spec version is introduced;
+  rebuild its exact v2 contract/instance hashes through the v2 dispatch path;
+  unknown or outer/payload-mismatched versions must fail closed;
+- a journal or model-input export must reject a second exact StrategySpec
+  identity, including a coherently rehashed different instance under the same v2
+  contract, before treating the file as one population;
 - rehashed outcome substitution, forged costs/sizing/timing, false replay-input
   hashes and evidence from a different bar;
 - malformed rows, full-row/provenance edits, incomplete tails, duplicate cycles,
@@ -371,22 +398,18 @@ test proves and what it cannot prove.
 
 Rank any additional findings P0/P1/P2. At minimum assess these remaining items:
 
-1. Choose and version the intended physical fast-pump windows. Do not mix that
-   research decision with mechanical StrategySpec plumbing or threshold tuning.
-   First decide whether the frozen Min60/45-hour hypothesis remains the active
-   v2 strategy or a distinct v3 hypothesis is required. A physical-duration
-   template resolved for Min60 and Min15 would produce two canonical spec
-   instances; it is not literally one unchanged executable YAML because
-   `base_interval` belongs to spec identity. Declare field-by-field units,
-   divisibility/rounding and bar-boundary rules. Equal duration across different
-   sampling intervals is not behavioral parity and needs a new causal evaluation.
-   Before changing the global current version, add version-dispatched parsing
-   and prove the committed v2 envelope fixture remains readable; the current
-   `MexcStrategySpec`/`CycleEnvelope` validation accepts only the current version.
-2. Add per-symbol base and per-symbol/per-timeframe HTF provenance. Current
-   cycle timing is aggregated and delivery latency is not execution proof.
-3. Define typed arm-time, confirmation-time and proposal-time lifecycle without
-   overwriting earlier state.
+The mechanical version-dispatch prerequisite is complete in `1971b77`; do not
+report it as open. The next ordered slice is lifecycle plus provenance:
+
+1. Define typed arm-time, scoring-time, confirmation-time and proposal-time
+   states without overwriting earlier evidence. Add per-symbol base and
+   per-symbol/per-timeframe HTF provenance; current cycle timing is aggregated
+   and delivery latency is not execution proof. This slice must not change v2
+   timeframe, windows or thresholds.
+2. Separate durable identities for MarketFeatureSnapshot, RuleEvaluation,
+   TradeProposal, OutcomeLabel and ShadowPrediction.
+3. Add point-in-time instrument specifications: contract size, quantity step,
+   minimums, leverage rules, source timestamp and content hash.
 4. Build a point-in-time ledger of every MEXC USDT contract with explicit
    inclusion/exclusion reasons, not only the filtered scan universe.
 5. Compute the complete causal feature snapshot before rule gates so missingness
@@ -394,20 +417,21 @@ Rank any additional findings P0/P1/P2. At minimum assess these remaining items:
 6. Implement causal Fibonacci/overhead, weakness, confluence, 1h RSI and
    liquidation context in the runtime decision path rather than merely declaring
    them offline/planned.
-7. Add point-in-time instrument specifications: contract size, quantity step,
-   minimums, leverage rules, source timestamp and content hash.
-8. Normalize OI to notional and price-relative POC/VAH/VAL distances; raw
+7. Normalize OI to notional and price-relative POC/VAH/VAL distances; raw
    cross-symbol levels remain diagnostic.
-9. Separate durable identities for MarketFeatureSnapshot, RuleEvaluation,
-   TradeProposal, OutcomeLabel and ShadowPrediction.
-10. Connect population cycles to executable single-position labels with exact
-    fees, spread, slippage, funding, stop/TP geometry and concurrency.
-11. Define a real external checkpoint publication/retention workflow. The
+8. Connect population cycles to executable single-position labels with exact
+   fees, spread, slippage, funding, stop/TP geometry and concurrency.
+9. Only after that plumbing, define and compare a separately versioned intended
+   fast-pump time hypothesis. Frozen Min60/45-hour v2 remains the control. Future
+   v3 requires new types/config/parser/hash/evidence namespace; no timeframe,
+   field value or threshold has been selected. Equal elapsed duration at Min15
+   and Min60 is not behavioral parity.
+10. Define a real external checkpoint publication/retention workflow. The
     detached receipt API alone does not create an external trust domain.
-12. Build forward-data manifests and only then purged chronological evaluation,
+11. Build forward-data manifests and only then purged chronological evaluation,
     embargo, untouched test data, symbol/time-clustered uncertainty and matched
     random/rules/no-trade baselines.
-13. Keep legacy event-conditioned datasets, old calibration claims and
+12. Keep legacy event-conditioned datasets, old calibration claims and
     `ai/train.py` outside the causal admission path.
 
 ## Model and tooling architecture to challenge
@@ -469,16 +493,18 @@ MEXC worktree:
   -m pytest -q
 ```
 
-Recorded result at executable/test-contract tip `258c35f`:
+Recorded result at executable/evidence-compatibility tip `1971b77`:
 
 ```text
-580 passed, 4 skipped, 2 known PytestCollectionWarning (14.99s)
+590 passed, 4 skipped, 2 known PytestCollectionWarning (18.95s)
 ```
 
 The focused StrategySpec/runtime review found no remaining P0/P1. The focused
 journal/checkpoint red-team found no remaining P0/P1/P2 after the two-pass
 replacement and anchored-reader fixes. Re-audit those conclusions; do not repeat
-them merely because they are written here.
+them merely because they are written here. Also re-audit the new version dispatch,
+exact journal identity latch and model-export identity metadata; passing tests do
+not establish external evidence authenticity.
 
 Do not run the scanner, bot, ad-hoc network scripts or tests requiring private
 credentials, exchange access or Telegram delivery.
@@ -488,7 +514,7 @@ credentials, exchange access or Telegram delivery.
 Return one read-only review before proposing any edits:
 
 1. exact root/MEXC worktree, branch, HEAD, upstream and dirty-state facts;
-2. commit-by-commit explanation through executable/test-contract tip `258c35f`, plus any later
+2. commit-by-commit explanation through executable tip `1971b77`, plus any later
    documentation-only descendants;
 3. a causal data-flow map from MEXC sources through StrategySpec, universe,
    closed bars, features, rules, population journal/checkpoint, proposal, label,
@@ -505,11 +531,11 @@ Return one read-only review before proposing any edits:
 12. a final operational verdict covering bot state, secret status, edge status,
     model status and the safest next code decision.
 
-Do not make changes during this pass. The immediate research decision is whether
-to keep the frozen Min60/45-hour v2 hypothesis or define a separately versioned
-physical-duration hypothesis with explicit field units. Version dispatch and
-continued v2 evidence readability are prerequisites to v3, not outcomes to
-assume. Typed lifecycle, per-source provenance and unconditional market-feature
-plumbing may continue without silently choosing new horizons. Private execution
-and live trading remain a separate future project and require a reproducible
-edge plus rotated credentials.
+Do not make changes during this pass. Version dispatch and continued v2 evidence
+readability are now implemented claims to verify, not prerequisites still waiting
+for code. The immediate next code slice is typed arm/confirm/proposal lifecycle
+plus per-symbol/per-timeframe provenance, without changing the frozen
+Min60/45-hour v2 hypothesis. A future physical-duration v3 requires its own
+types/config/parser/hash/evidence namespace; no timeframe, window or threshold has
+been chosen. Private execution and live trading remain a separate future project
+and require a reproducible edge plus rotated credentials.
