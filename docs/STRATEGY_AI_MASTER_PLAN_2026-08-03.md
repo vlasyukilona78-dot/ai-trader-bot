@@ -1,16 +1,18 @@
 # Koteika Ultra — единая стратегия, AI-архитектура и новый план
 
-Актуально: **2026-08-08, Europe/Moscow**. Целевая площадка: **MEXC futures**.
+Актуально: **2026-08-09, Europe/Moscow**. Целевая площадка: **MEXC futures**.
 
 Этот документ заменяет идею «добавить одну умную нейросеть, которая почувствует
 разворот» на проверяемую систему. Он объединяет исполняемую стратегию, causal
 feature contract, single-position PnL, роли моделей, research-инструменты и
 правила допуска в shadow. До доказанного edge система остаётся signals-only.
 
-## 0. Исполняемый checkpoint 2026-08-08
+## 0. Исполняемый checkpoint 2026-08-09
 
 Текущее состояние кода, которое заменяет более ранние промежуточные статусы ниже:
 
+- latest executable tip: **`258c35f`** (`test(strategy): pin v2 behavioral
+  semantics`); он наследует StrategySpec/journal-v5 tip `2d0efcb`;
 - реализован строгий `MexcStrategySpec` version `mexc_strategy_v2` с отдельным
   `config/mexc_strategy_v2.yaml`; production scanner, `LayeredPumpStrategy`, base
   indicators, HTF indicators, volume profile и evidence используют один resolved
@@ -26,8 +28,20 @@ feature contract, single-position PnL, роли моделей, research-инс�
   и instance hash; его timeframe обязан совпадать со spec по физической длине бара;
 - journal v5 образует непрерывную цепочку `journal_id` / `sequence_no` /
   `prev_cycle_commit` / `cycle_commit`, проверяемую при reopen и строгом чтении;
-- полный локальный regression checkpoint: **576 passed, 4 skipped, 2 known
-  collection warnings**. Это проверка инвариантов, а не доказательство edge.
+- numeric golden vectors фиксируют семантику cumulative VWAP, close-to-close OBV,
+  candle-direction CVD и точные POC/VAH/VAL `core_volume_profile_v1`; отдельный
+  golden lifecycle фиксирует default `armed HOLD → confirmed SHORT_ENTRY`, полный
+  стабильный trace и proposal, исключая только wall-clock identity;
+- frozen fixture `tests/fixtures/mexc_strategy_v2_cycle_envelope_v3.json`
+  закрепляет canonical v2 hashes/payload и доказывает чтение исторического
+  `mexc_strategy_v2` evidence через `CycleEnvelope v3`;
+- focused StrategySpec/runtime review: **нет открытых P0/P1**. Единственный P2 —
+  отсутствие численных behavioral anchors за declarative revisions — закрыт
+  `258c35f` только тестами/fixture; production algorithms, thresholds, spec
+  version и hashes не изменились. Journal/checkpoint red-team также не оставил
+  P0/P1/P2;
+- полный локальный regression checkpoint: **580 passed, 4 skipped, 2 known
+  collection warnings (`14.99s`)**. Это проверка инвариантов, а не доказательство edge.
 
 ### Граница доверия journal v5
 
@@ -43,18 +57,30 @@ Tamper-evidence появляется только при явной переда
 намеренно отсутствует. Model-input reader требует внешний checkpoint либо явный
 unsafe override и по умолчанию выдаёт только заякоренный prefix.
 
-### Текущие физические длительности fixed-bar стратегии
+### Текущие physical semantics: event horizons и estimator/sample budgets
 
 `window_semantics=fixed_bar_counts`: смена base interval меняет физическую длину
 окна; код не делает скрытого пересчёта в секунды. При текущих `Min60` base и
-`Hour4` HTF исполняются именно такие длительности:
+`Hour4` HTF параметры делятся на два разных класса.
 
-| Параметр | Bars × source timeframe | Физическая длительность сейчас |
+Событийные, state-transition и structural horizons описывают, какую рыночную
+историю считает одной гипотезой сама стратегия:
+
+| Event/state parameter | Bars × source timeframe | Физическая длительность v2 |
 |---|---:|---:|
 | `pump_window_bars` | 45 × Min60 | 45 часов |
 | `confirmation_max_wait_bars` | 3 × Min60 | до 3 часов |
 | `msb_recent_bars` / `msb_lookback` | 6 / 20 × Min60 | 6 / 20 часов |
 | `weakness_lookback` | 4 × Min60 | 4 часа |
+| `structural_anchor_htf_bars` | 12 × Hour4 | 48 часов |
+
+Estimator, warm-up и sample budgets задают число наблюдений и устойчивость
+оценки. Они имеют физическую длительность при данном source timeframe, но не
+являются автоматически «длительностью пампа»:
+
+| Estimator/sample parameter | Bars × source timeframe | Фактический budget v2 |
+|---|---:|---:|
+| base input frame | 320 × Min60 | до 320 часовых баров |
 | `liquidity_lookback_bars` | 12 × Min60 | 12 часов |
 | `relative_strength_lookback` | 24 × Min60 | 24 часа |
 | base RSI / ATR configured period | 14 × Min60 | 14 часовых баров |
@@ -62,14 +88,22 @@ unsafe override и по умолчанию выдаёт только заяко�
 | base EMA spans | 20 / 50 × Min60 | span 20 / 50 часовых баров; EMA не имеет конечного окна |
 | base BB / Keltner / volume MA periods | 20 / 20 / 20 × Min60 | 20 часовых баров; Keltner содержит EMA |
 | VWAP / OBV / candle-CVD | cumulative input frame | до 320 часовых баров текущего frame |
-| volume profile | 120 × Min60 | 120 часов |
+| volume profile | window 120, minimum history/sample 20/24 × Min60 | до 120 часов; отдельные eligibility/sample floors |
 | HTF RSI configured period | 14 × Hour4 | 14 четырёхчасовых баров (56 часов) |
-| `structural_anchor_htf_bars` | 12 × Hour4 | 48 часов |
 
-Теперь эти значения доказуемо соответствуют исполняемому spec. Остаётся отдельное
-исследовательское решение: являются ли именно такие физические горизонты
-задуманной стратегией. Менять их вместе с threshold calibration запрещено: сначала
-выбирается временной контракт, затем он проверяется как новая frozen hypothesis.
+Теперь эти значения доказуемо соответствуют исполняемому v2 spec. При проектировании
+Min15 нельзя механически делить или сохранять **все** bar counts одним правилом:
+event horizons должны соответствовать рыночной гипотезе, а estimator/sample budgets
+— достаточной истории, resolution и warm-up. Min15 поэтому является новой стратегией
+в отдельной version namespace, а не override frozen `mexc_strategy_v2`.
+
+Исторический комментарий `SignalConfig` связывает «45 bars» с наблюдением о
+трёхпроцентном движении примерно за 20 минут; старые collectors также работали с
+minute timeframes. Это **историческая подсказка о возможном быстром intent**, а не
+принятое решение. Она не доказывает ни выбор Min15, ни 45 баров на Min15, ни иной
+конкретный horizon. Менять временной контракт вместе с threshold calibration
+запрещено: сначала новая hypothesis получает отдельную версию и acceptance, затем
+оценивается без молчаливого переноса claims из no-edge v2.
 
 ## 1. Итоговое решение
 
@@ -84,6 +118,14 @@ unsafe override и по умолчанию выдаёт только заяко�
 - uncertainty / причину abstain. Здесь uncertainty — это schema/staleness/OOD
   abstain, predictive entropy и dispersion между folds/seeds, а не магическое
   свойство одного дерева.
+
+Это **proposal-conditioned** target: модель отвечает, что произойдёт с конкретным
+causal proposal и его execution contract. Поэтому proposal features — stop/target
+distance, realized risk/reward и cost geometry — сохраняются как conditioning
+inputs. Если исследуется чистая вероятность направления/разворота рынка независимо
+от сделки, это другой target, другой dataset view и отдельная model head; proposal-
+derived features в такой pure-direction задаче запрещены. Эти две постановки нельзя
+смешивать в одной метрике или выдавать одну за другую.
 
 LightGBM сравнивается с logistic baseline, frozen rules и matched-random. CatBoost
 идёт первым challenger; XGBoost AFT — отдельный auxiliary time-to-exit experiment.
@@ -129,9 +171,15 @@ manual promotion и отсутствие private/live доступа до рот
 
 Раздел сохраняет исторический audit trail. Пункты, закрытые checkpoint 2026-08-08,
 не удаляются, а явно помечаются **superseded**; непомеченная часть остаётся
-действующим разрывом.
+известной roadmap-границей. На executable tip `258c35f` focused review не оставил
+открытых P0/P1 **в уже реализованном StrategySpec/runtime scope**. Перечисленные
+ниже dataset, lifecycle, provenance и feature-parity работы не стали выполненными,
+но они уже явно отделены и блокируют model fit, поэтому не являются новой
+необнаруженной P0/P1-регрессией текущего signals-only worktree. Единственный
+focused-review P2 (revision literals без numerical behavioral anchors) закрыт
+`258c35f` без изменения runtime behavior.
 
-### P0 — время и исполнимость
+### Исторический P0 — время и исполнимость (часть закрыта; time-hypothesis остаётся)
 
 - **Историческая находка, уточнена (частично superseded):** scanner действительно
   использует `Min60`, поэтому `pump_window_bars=45` — это 45
@@ -152,7 +200,7 @@ manual promotion и отсутствие private/live доступа до рот
   journal→proposal→label bridge. Research timing не является доказательством
   своевременной Telegram/live-доставки.
 
-### P0 — dataset / labels / model
+### Исторический P0 — dataset / labels / model (model-ready path остаётся заблокирован)
 
 - **Superseded по версии:** промежуточный population journal v4 заменён journal v5
   с chain/checkpoint semantics. Строгий reader образует проверяемый ordered
@@ -164,7 +212,7 @@ manual promotion и отсутствие private/live доступа до рот
 - MEXC inference к scanner не подключён. Старые pickle без manifest/hash не
   являются допустимыми artifacts и не должны загружаться.
 
-### P0 — feature parity
+### Исторический P0 — feature parity (silent activation закрыта; parity не завершена)
 
 - Funding из frozen universe snapshot уже передаётся в strategy context; raw OI
   по-прежнему не нормализован по contract size и остаётся diagnostic/unconsumed.
@@ -183,7 +231,7 @@ manual promotion и отсутствие private/live доступа до рот
   L1b/L1c как typed lifecycle. Нужны связанные `CandidateArmSnapshot` и
   `ConfirmationSnapshot`, а момент model scoring должен быть выбран заранее.
 
-### P1 — конфигурация и provenance
+### Исторический P1 — конфигурация и provenance (config drift закрыт; gaps остаются)
 
 - **Superseded:** legacy `config/config.yaml` по-прежнему не является источником
   MEXC defaults, но теперь это намеренно: scanner загружает отдельный строгий
@@ -253,6 +301,26 @@ Scanner теперь:
 - `CycleEnvelope v3` повторно строит spec из payload и связывает его с физическим
   timeframe цикла.
 
+Behavioral/compatibility checkpoint `258c35f` добавляет три исполняемых locks:
+
+- exact numeric vectors для VWAP/OBV/candle-CVD;
+- exact volume-profile POC/VAH/VAL vector, фиксирующий tail window, bins, POC и
+  descending-volume value-area semantics;
+- rounded canonical digest полного default lifecycle `armed HOLD → confirmed
+  SHORT_ENTRY`, включая stable decision, trace и proposal поля. Из digest исключены
+  только wall-clock `created_at` и `legacy_signal_id`.
+
+Отдельная frozen fixture сохраняет canonical `mexc_strategy_v2` payload, v2 hashes
+и `CycleEnvelope v3`. Она является compatibility gate: новый current spec не имеет
+права сделать существующее v2 evidence нечитаемым.
+
+Поэтому будущий `mexc_strategy_v3` нельзя реализовать простой заменой глобального
+`MEXC_STRATEGY_SPEC_VERSION`/expected literal и текущего parser. Нужен
+version-dispatched evidence reader/registry: persisted `strategy_spec_version`
+выбирает неизменяемый v2 parser с его hashes либо отдельные v3 types/parser/hash.
+V3 config, artifacts и runtime evidence получают отдельную version namespace;
+frozen v2 fixture остаётся обязательным regression test.
+
 Population journal v5 добавляет domain-separated cycle commitments, непрерывную
 цепочку, restart audit и detached `JournalCheckpointReceipt`. Это обеспечивает
 внутреннюю целостность и external-prefix anchoring в заявленной выше границе, но
@@ -267,8 +335,8 @@ proposal/label bridge отсутствуют, а новая prospective populati
 | Блок | Текущий runtime | Contract | Что исправить до model fit |
 |---|---|---|---|
 | Universe | весь **уже отфильтрованный** turnover-band cycle journalled | conditional population boundary | ledger всех USDT contracts: included/exclusion reason, received-at, policy hash, instrument rules |
-| Input | один closed cutoff, Min60/320 | `mexc_strategy_v2`, CycleEnvelope v3 | выбрать intended physical horizons; текущие fixed-bar durations уже записаны и hashed |
-| L1 pump | recent band event + RSI/volume + move/retrace | candidate features + frozen rule baseline | unconditional values; отдельно проверить frozen 45-hour hypothesis либо ввести новую spec version |
+| Input | один closed cutoff, Min60/320 | `mexc_strategy_v2`, CycleEnvelope v3; frozen v2 compatibility fixture | до Min15 сначала добавить version-dispatched v2 reader и отдельную v3 namespace; event horizons проектировать отдельно от estimator/sample budgets |
+| L1 pump | recent band event + RSI/volume + move/retrace | candidate features + frozen rule baseline | unconditional values; 45-hour v2 остаётся frozen, а historical 45-bar/minute clue не выбирает новый horizon |
 | L1b quality | ATR floor + exact quote turnover; legacy fallback существует | features; data quality отдельно | fallback `close×contract volume` помечать missing, interval-normalized turnover, no early truncation |
 | L1c market | BTC RS, 4h RSI, optional overhead/chase; unsupported 1h/confluence nonzero fail-closed | numeric context | explicit missing, fixed 1h/4h sources, fib/confluence ablation |
 | L2 weakness | OBV/CVD proxy, default off | challenger features | always measure; tag proxy; collect trades before true flow claim |
@@ -298,7 +366,7 @@ proposal/label bridge отсутствуют, а новая prospective populati
 | Модель | Роль | Сильная сторона | Основной риск | Решение |
 |---|---|---|---|---|
 | Logistic / constant prior | sanity baseline | прозрачность, выявляет ложную сложность | underfit | обязательна |
-| LightGBM multiclass + EV head | первый champion candidate | tabular, missing values, CPU, быстрые ablations | class probabilities не описывают timeout payoff; overfit | **первый fit после prospective maturity** |
+| LightGBM multiclass + EV head | первый proposal-conditioned champion candidate | tabular, missing values, CPU, быстрые ablations; proposal geometry остаётся conditioning input | class probabilities не описывают timeout payoff; overfit | **первый fit после prospective maturity**; pure direction — отдельный target/head без proposal fields |
 | CatBoost | первый challenger | categories и ordered boosting | symbol memorization/unseen listings | после LGBM, с/без symbol ID и unseen-symbol cohorts |
 | XGBoost classifier | parity benchmark | зрелая экосистема | старый `auto` скрывал выбор | только explicit experiment |
 | XGBoost AFT | time-to-exit auxiliary | censored duration | не решает competing risks сам | отдельная ablation |
@@ -431,7 +499,8 @@ market snapshot hash. Это позволяет честно сравниват�
 - [x] Strategy/universe config fingerprints and model-role whitelist.
 - [x] Unfilled-leader same-cohort look-ahead removed.
 - [x] **Исторический regression checkpoint, superseded:** `352 passed, 4 skipped,
-  2 known collection warnings`; актуальный результат приведён в §0.
+  2 known collection warnings`; актуальный receipt `580 passed, 4 skipped,
+  2 known collection warnings (14.99s)` приведён в §0.
 - [x] Изменения разделены на reviewable commits и опубликованы fast-forward:
   `0b010e8`, `3ff8de0`, `29536f1`.
 
@@ -488,8 +557,9 @@ runtime- и schema-блокеры. Дефекты устранены тремя 
 - [x] Холодный старт волатильности инвариантен к порядку воркеров (проверено на
   реальной `LayeredPumpStrategy`, 28 символов, оба порядка).
 - [x] **Исторический regression checkpoint, superseded:** `529 passed, 4 skipped,
-  2 known collection warnings` (`13.85s`). Актуальный результат: `576 passed,
-  4 skipped, 2 known collection warnings`.
+  2 known collection warnings` (`13.85s`). Следующий исторический checkpoint был
+  `576 passed, 4 skipped, 2 known collection warnings`; актуальный результат:
+  `580 passed, 4 skipped, 2 known collection warnings (14.99s)`.
 
 Что timing **не** доказывает: `entry_bar_open_ts` помечен
 `timing_basis="research_ranking_ready"`. Он обосновывает сравнимость когорты в
@@ -518,7 +588,8 @@ Hardening 2026-08-08 опубликован тремя отдельными code
   совпадение физического timeframe;
 - `mexc_strategy_v2`: dedicated YAML, единые runtime adapters и fail-closed
   проверка spec/runtime drift;
-- полный regression: `576 passed, 4 skipped, 2 known collection warnings`.
+- **исторический regression receipt:** `576 passed, 4 skipped, 2 known collection
+  warnings (15.12s)`; superseding tip `258c35f` и его receipt приведены ниже.
 
 Дополнительно fresh/TTL-cache/stale-cache/first-failure сохраняют разные
 provenance; contract details имеют отдельный clock; mixed HTF cache не выдаётся
@@ -529,27 +600,44 @@ timeframe и market-only snapshot. При этом `PopulationDecision.input_has
 `snapshot_id` намеренно продолжают включать cycle/rule identity, поэтому это не
 замена отдельным persisted `MarketFeatureSnapshot` и `RuleEvaluation`.
 
+Behavioral compatibility checkpoint `258c35f` не меняет production behavior:
+
+- indicator и volume-profile semantics получили numerical golden locks; один
+  representative default arm→confirm logic/proposal path закреплён явными
+  assertions и digest с округлением float до 12 знаков;
+- committed v2 envelope fixture фиксирует canonical SHA-256, v2 contract/instance
+  hashes и чтение через текущий strict path;
+- focused review после закрытия P2: StrategySpec/runtime **P0/P1 none**,
+  journal/checkpoint **P0/P1/P2 none**;
+- полный receipt: **580 passed, 4 skipped, 2 known PytestCollectionWarning
+  (14.99s)**; scanner, network, Telegram, model fit и private APIs не запускались.
+
 Новый remaining order после checkpoint:
 
 1. **[x] Superseded/выполнено:** ввести `StrategySpecV2`, dedicated YAML, один
    canonical instance hash и именованные source-timeframe bars. Текущие durations
-   приведены в §0; скрытого пересчёта в секунды нет.
-2. **Сначала выбрать intended time contract без калибровки thresholds:** оставить
-   frozen `Min60`/45-hour hypothesis либо создать новую spec version с отдельными
-   feature/base/execution и Min15/Min60/Hour4 ролями. Не менять смысл окон
-   молча внутри текущего instance hash.
-3. Разделить armed и confirmed как typed states и заранее закрепить scoring
+   приведены в §0; behavioral semantics и v2 envelope закреплены `258c35f`.
+2. **До создания v3 построить compatibility dispatch:** persisted
+   `strategy_spec_version` выбирает неизменяемый v2 reader/parser/hash namespace;
+   новые v3 types/config/hash/evidence живут отдельно. Naive global bump, после
+   которого frozen v2 fixture перестаёт читаться, запрещён.
+3. **Выбрать новую intended time hypothesis без калибровки thresholds:** текущий
+   `mexc_strategy_v2` остаётся frozen Min60/45-hour baseline. Возможный Min15 path
+   является новой стратегией: event/state horizons задаются отдельно от estimator
+   warm-up/sample budgets. Историческая связь «45 bars» с minute-scale pump —
+   только clue, не принятое значение ни одного нового параметра.
+4. Разделить armed и confirmed как typed states и заранее закрепить scoring
    instant; cycle-complete, research-actionable и eligible entry уже разделены.
-4. Разделить persisted identity `MarketFeatureSnapshot`, `RuleEvaluation`,
+5. Разделить persisted identity `MarketFeatureSnapshot`, `RuleEvaluation`,
    `TradeProposal` и prediction; одновременно сделать per-symbol base и
    per-symbol/per-timeframe HTF timing, а не только cycle aggregate.
-5. Получать point-in-time instrument specs: contract size, quantity step,
+6. Получать point-in-time instrument specs: contract size, quantity step,
    minimum quantity/notional, leverage, timestamp и hash.
-6. Завершить unconditional feature parity и raw-contract inclusion ledger до
+7. Завершить unconditional feature parity и raw-contract inclusion ledger до
    построения labels: ранний gate не должен определять missingness.
-7. Добавить durable public serialization/reader для single-position v3,
+8. Добавить durable public serialization/reader для single-position v3,
    forward-data manifest и journal→proposal→label bridge.
-8. Только после новой schema и external checkpoint procedure начинать
+9. Только после новой schema и external checkpoint procedure начинать
    prospective collection/maturation; затем chronological evaluation и первый fit.
 
 Для каждого фактически используемого journal v5 prefix оператор должен вынести
@@ -566,7 +654,9 @@ Acceptance: worker count/order не меняет snapshot, ranking, entry или
 
 1. Вычислять полный snapshot для каждого feature-valid symbol до rule gates.
 2. Journal raw ledger всех MEXC USDT contracts с inclusion/exclusion reason.
-3. Подключить настоящие closed Min15/Min60/Hour4 frames.
+3. После version-dispatched v2/v3 boundary подключить настоящие closed
+   Min15/Min60/Hour4 frames согласно отдельной новой strategy namespace; не
+   переопределять frozen v2.
 4. Реализовать explicit 1h RSI, overhead, Fibonacci, confluence, weakness,
    exhaustion/wicks/acceleration; gates оставить выключенными.
 5. Добавить funding/OI value, units, observed_at, age, change; raw `holdVol`
@@ -617,8 +707,10 @@ candidate и создаёт immutable evaluation receipt.
 
 ### Phase 6 — LightGBM shadow candidate
 
-1. Train fixed small multiclass LightGBM + conditional payoff/EV head; proposal
-   geometry является явным conditioning input; без scaler и auto fallback.
+1. Train fixed small multiclass LightGBM + conditional payoff/EV head для
+   proposal-conditioned outcome; proposal geometry остаётся явным conditioning
+   input, без scaler и auto fallback. Pure direction/reversal допускается только
+   как отдельный target/head и исключает proposal-derived features.
 2. Separate calibration slice; fit calibrator не видит test.
 3. Manifest содержит code/data/feature/label/contract/fold hashes.
 4. Inference append-only, exception/schema/drift => abstain.
@@ -677,6 +769,12 @@ capital caps и emergency stop. Текущее разрешение менять
     coordinated rewrite проходит только без trusted receipt и обнаруживается с ним.
 16. Cycle timeframe физически совпадает со StrategySpec; custom indicator/VP/HTF
     параметры меняют реальное исполнение, а не только instance hash.
+17. Indicator/VP/logic revision literals имеют numerical behavioral locks; full
+    logic digest исключает только wall-clock identity, но сохраняет decision,
+    trace и proposal semantics.
+18. После появления нового current spec frozen `mexc_strategy_v2` fixture всё ещё
+    читается version-dispatched v2 path и сохраняет исходные payload/hashes;
+    v3 не переиспользует v2 namespace.
 
 ## 11. Текущий operational verdict
 
@@ -690,10 +788,17 @@ capital caps и emergency stop. Текущее разрешение менять
   `CycleEnvelope v3`, `mexc_strategy_v2` и single-position v3; benchmark
   fail-closed. Hash-chain без вынесенного receipt остаётся unanchored. Это делает
   evidence строже, но **edge по-прежнему не установлен**.
-- Следующий порядок: выбрать intended physical time contract → typed arm/confirm
-  lifecycle → persisted snapshot/rule identity и per-symbol timings → point-in-time
-  instrument specs → unconditional parity/raw ledger → proposal/label bridge →
-  externally checkpointed prospective collection. Model fit до этого запрещён.
+- Executable tip `258c35f`: `580 passed, 4 skipped, 2 known
+  PytestCollectionWarning (14.99s)`; focused implemented-scope verdict — P0/P1
+  none, закрытый P2 не менял production behavior. Frozen v2 compatibility и
+  indicator/VP и representative default lifecycle locks включены в этот receipt.
+- Следующий порядок: version-dispatched immutable v2 reader + отдельная v3
+  namespace → отдельная новая time hypothesis с раздельными event horizons и
+  estimator/sample budgets (Min15 остаётся кандидатом до явного выбора) → typed
+  arm/confirm lifecycle → persisted snapshot/rule identity и per-symbol timings
+  → point-in-time instrument specs → unconditional parity/raw ledger →
+  proposal/label bridge → externally checkpointed prospective collection. Model
+  fit до этого запрещён.
 
 ## 12. Первичные источники для выбора технологий
 

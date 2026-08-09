@@ -1,18 +1,19 @@
 # AI collaboration handoff
 
-Updated: 2026-08-08, Europe/Moscow
+Updated: 2026-08-09, Europe/Moscow
 
 > [!IMPORTANT]
 > Fresh-session entrypoint: read `CLAUDE.md` and
 > `docs/CLAUDE_REVIEW_PROMPT_2026-08-03.md`, then treat
 > `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` as the current MEXC plan. The
-> published AI foundation anchor is `f0b43d6`; the latest StrategySpec/journal-v5
-> code tip is `2d0efcb`. Discover the later documentation-only descendant with
-> `git log`. The `98217df`/`340 passed`
+> published AI foundation anchor is `f0b43d6`; the StrategySpec/journal-v5
+> foundation tip is `2d0efcb`, and the latest executable code tip is `258c35f`.
+> Discover any later documentation-only descendant with `git log`. The
+> `98217df`/`340 passed`
 > checkpoint immediately below is a
 > preserved earlier causal-scanner snapshot, not the latest foundation state.
-> Latest code validation: `576 passed, 4 skipped, 2 known collection warnings`
-> (`15.12s`). Current journal path:
+> Latest code validation: `580 passed, 4 skipped, 2 known collection warnings`
+> (`14.99s`). Current journal path:
 > `data/runtime/mexc_population_decisions_v5.jsonl`.
 
 ## Earlier causal-scanner checkpoint — 2026-08-03
@@ -1728,3 +1729,55 @@ Next implementation order:
    connect them to single-position v3.
 5. Only after prospective maturation run logistic/rules/random/no-trade
    baselines and then the LightGBM + separate EV shadow candidate.
+
+## Independent Claude audit follow-up — 2026-08-09
+
+The follow-up audit found no remaining P0 or P1 in the reviewed
+StrategySpec/journal-v5 checkpoint. The only code change admitted from that
+review is the test-only compatibility and behavioural lock in:
+
+```text
+258c35f test(strategy): pin v2 behavioral semantics
+```
+
+### P2 disposition
+
+- **P2-1 — closed.** Golden vectors now pin the executable indicator modes,
+  volume-profile levels and one representative `layered_pump_signal_v1`
+  armed-to-confirmed decision/proposal trace (floats normalized to 12 decimal
+  places for its digest). A frozen JSON fixture additionally retains
+  the canonical `mexc_strategy_v2` payload, its exact contract/instance hashes
+  and a full `CycleEnvelope v3` round trip.
+- **P2-2 — no documentation change required.** The durable project topology is
+  the root/Bybit line plus the selected MEXC line. Generated
+  `.claude/worktrees/agent-*` and `context-*` worktrees are ephemeral. The review
+  prompt already requires `git worktree list --porcelain`, says other worktrees
+  may exist, and requires reporting them without modification; pinning generated
+  names would make the handoff stale rather than safer.
+
+### Guard boundaries and remaining caveats
+
+- The frozen v2 fixture is a migration tripwire, not a v3 implementation. A
+  future StrategySpec v3 must add explicit version dispatch/backward reading for
+  existing v2 evidence; updating or regenerating the frozen fixture to make a
+  bump pass would defeat the guard.
+- The golden vectors preserve current behaviour, not the intended physical
+  trading horizon. With the frozen default spec, 45 base bars are still 45 hours
+  on Min60. Any faster hypothesis requires a new version/instance hash and a new
+  chronological evaluation, not an in-place threshold/window rewrite.
+- The tests do not choose a model estimand. Prediction at arm time and prediction
+  after confirmation/proposal answer different causal questions and expose
+  different information. The scoring instant, eligible population, outcome and
+  payoff definition must be frozen before prospective labels or model fitting.
+
+Latest validation at `258c35f`:
+
+```text
+full pytest: 580 passed, 4 skipped, 2 known PytestCollectionWarning (14.99s)
+git diff --check: clean
+```
+
+No exchange/network call, scanner, bot, Telegram, model training, testnet,
+private or live path was run for this follow-up, and `.env` was not read. These
+locks establish compatibility and implementation identity only: they do not
+establish trading edge, validate a model or relax any live-risk boundary.

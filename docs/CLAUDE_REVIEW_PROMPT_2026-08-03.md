@@ -2,7 +2,8 @@
 
 This prompt is intentionally self-contained. It is for a fresh Claude Code
 account reviewing the preserved root/Bybit line and the selected MEXC causal
-research line after the canonical StrategySpec and journal-v5 commits.
+research line after the canonical StrategySpec, journal-v5 and frozen-v2
+behavioral-semantics commits.
 
 The task is an independent audit, not implementation. Do not change files,
 stage, commit, push, switch branches, pull, reset, clean, launch the bot or
@@ -38,13 +39,15 @@ branch: claude/codex-project-review-04581e
 AI foundation anchor: f0b43d6
 earlier Phase 1 hardening tip: e0e4cb4
 canonical StrategySpec commit: bebfd0d
-latest executable code tip: 2d0efcb
+journal-v5 executable commit: 2d0efcb
+latest executable/test-contract tip: 258c35f
 remote branch: origin/claude/codex-project-review-04581e
 ```
 
 The handoff documents may be a later documentation-only descendant of
-`2d0efcb`. Discover the exact current HEAD from Git. Treat `2d0efcb` as the
-latest executable code tip, not necessarily as the final documentation HEAD.
+`258c35f`. Discover the exact current HEAD from Git. Treat `258c35f` as the
+latest executable/test-contract tip, not necessarily as the final documentation
+HEAD.
 
 Other worktrees may exist. Inventory them, report them, and do not modify them.
 Do not transfer MEXC code into root/Bybit without a separate explicit plan.
@@ -73,13 +76,16 @@ git -C $MEXC merge-base --is-ancestor f0b43d6 HEAD
 git -C $MEXC merge-base --is-ancestor e0e4cb4 HEAD
 git -C $MEXC merge-base --is-ancestor bebfd0d HEAD
 git -C $MEXC merge-base --is-ancestor 2d0efcb HEAD
+git -C $MEXC merge-base --is-ancestor 258c35f HEAD
 git -C $MEXC ls-files -- .env
 ```
 
 Expected facts at the published checkpoint:
 
-- the current MEXC HEAD descends from all four listed anchors;
+- the current MEXC HEAD descends from all five listed anchors;
 - `bebfd0d` and `2d0efcb` are consecutive executable commits;
+- `258c35f` follows them and adds frozen v2 behavioral and compatibility
+  evidence without changing thresholds or runtime strategy logic;
 - after publication, local and upstream should match and the MEXC worktree
   should be clean;
 - root and root upstream match at `f01591f`; the three root `.idea/*` changes
@@ -124,6 +130,7 @@ f0b43d6 docs: record AI foundation publication state
 e0e4cb4 fix(strategy): fail closed without benchmark context
 bebfd0d feat(strategy): define canonical MEXC strategy spec
 2d0efcb feat(journal): chain schema-v5 population evidence
+258c35f test(strategy): pin v2 behavioral semantics
 ```
 
 Use `git show --stat <hash>` and targeted `git show <hash> -- <path>`. Explain
@@ -143,6 +150,8 @@ Verify every value from code and the committed YAML:
 | cycle envelope | schema v3 |
 | reversal feature contract | `mexc_reversal_features_v2` |
 | single-position replay | schema v3 with mandatory ReplayEvidence |
+| layered strategy v1 behavioral digest | `d5736beda70ca2826dc4868c2d4d95cb17b1289ac2ba03a2a052d9db69587459` |
+| frozen v2 envelope canonical payload SHA-256 | `87e3f049ca356f9cd7654464a6fa0cbb12ee319979e145de8aa021c858ee0e5e` |
 
 The StrategySpec contract hash pins the declarative field/layout/adapter
 contract. It is not a hash of all Python implementation bytes. The instance
@@ -170,8 +179,15 @@ Confirm from code and tests:
    history and volume-profile parameters are live rather than decorative.
 6. Still-unwired `min_rsi_1h` and `require_confluence` values are accepted only
    at their inert defaults and reject attempted activation.
-7. The committed default preserves previous scanner behavior exactly. This was
-   a configuration/evidence migration, not threshold calibration.
+7. The committed default preserves previous scanner behavior. Commit `258c35f`
+   pins the cumulative VWAP/OBV/CVD modes, volume-profile levels and one stateful
+   arm-to-confirm decision/proposal trace, including the behavioral digest
+   above. Explain what those finite golden vectors prove and what they cannot
+   prove about every possible market path.
+8. The frozen `tests/fixtures/mexc_strategy_v2_cycle_envelope_v3.json` rebuilds
+   with the pinned v2 contract and instance hashes. Confirm that the fixture is
+   canonical and readable; do not infer that a future global version bump will
+   remain compatible without a version-dispatched parser.
 
 The present executable timeframe semantics are explicit:
 
@@ -184,6 +200,13 @@ hours, recent MSB is 6 hours, relative-strength lookback is 24 hours, and the
 12-bar HTF structural anchor is 48 hours. These durations preserve existing
 behavior; they do not establish the intended fast-pump horizon. No Min15 or
 execution-timeframe feed was invented by this refactor.
+
+Do not treat all `*_bars` fields as interchangeable duration fields. Separate
+event horizons (pump, confirmation, recent structure and relative-strength
+lookbacks) from estimator sample counts (RSI/EMA/ATR/bands/ADX), volume-profile
+sample requirements, warm-up/data budgets and fixed-HTF anchors. Equal elapsed
+seconds on Min15 and Min60 do not imply equal features or decisions because the
+sampled paths differ.
 
 ## Journal-v5 and checkpoint threat boundary
 
@@ -259,6 +282,11 @@ The security statement must remain exact:
 
 Inspect at least these tests:
 
+- `tests/v2/test_indicator_golden_vectors_v2.py`
+- `tests/v2/test_volume_profile_golden_vector_v2.py`
+- `tests/v2/test_signal_logic_golden_vector_v2.py`
+- `tests/v2/test_mexc_strategy_v2_compatibility_fixture.py`
+- `tests/fixtures/mexc_strategy_v2_cycle_envelope_v3.json`
 - `tests/v2/test_mexc_strategy_spec_v2.py`
 - `tests/v2/test_mexc_strategy_runtime_integration_v2.py`
 - `tests/v2/test_population_journal_chain_v5.py`
@@ -310,8 +338,17 @@ files:
 
 - StrategySpec missing/unknown/duplicate keys, type confusion, unsupported
   intervals, contract-hash drift and instance-hash drift;
-- exact default behavioral parity for SignalConfig, indicators, volume profile,
-  history gates, benchmark interval and HTF cache;
+- exact default configuration parity for SignalConfig, history gates, benchmark
+  interval and HTF cache, plus numerical golden vectors for cumulative
+  indicators and volume profile and the pinned stateful strategy behavior digest;
+- for the one frozen default arm/confirm fixture, stable trace, action, stop/TP
+  proposal and causal diagnostics are covered by explicit assertions plus a
+  digest after 12-decimal float normalization; wall-clock-only identity remains
+  excluded. Explain why this locks a representative path, not every strategy
+  branch or sub-quantization numerical change;
+- the frozen v2 cycle-envelope fixture must retain its canonical payload digest,
+  rebuild its exact v2 contract/instance hashes and remain readable after any
+  future spec version is introduced;
 - rehashed outcome substitution, forged costs/sizing/timing, false replay-input
   hashes and evidence from a different bar;
 - malformed rows, full-row/provenance edits, incomplete tails, duplicate cycles,
@@ -336,6 +373,16 @@ Rank any additional findings P0/P1/P2. At minimum assess these remaining items:
 
 1. Choose and version the intended physical fast-pump windows. Do not mix that
    research decision with mechanical StrategySpec plumbing or threshold tuning.
+   First decide whether the frozen Min60/45-hour hypothesis remains the active
+   v2 strategy or a distinct v3 hypothesis is required. A physical-duration
+   template resolved for Min60 and Min15 would produce two canonical spec
+   instances; it is not literally one unchanged executable YAML because
+   `base_interval` belongs to spec identity. Declare field-by-field units,
+   divisibility/rounding and bar-boundary rules. Equal duration across different
+   sampling intervals is not behavioral parity and needs a new causal evaluation.
+   Before changing the global current version, add version-dispatched parsing
+   and prove the committed v2 envelope fixture remains readable; the current
+   `MexcStrategySpec`/`CycleEnvelope` validation accepts only the current version.
 2. Add per-symbol base and per-symbol/per-timeframe HTF provenance. Current
    cycle timing is aggregated and delivery latency is not execution proof.
 3. Define typed arm-time, confirmation-time and proposal-time lifecycle without
@@ -380,6 +427,18 @@ only inside train/validation, and Evidently/ONNX/DVC only after an observed need
 Challenge this order only with evidence from this data shape and causal contract,
 not model popularity.
 
+Do not conflate a proposal-independent direction target with the planned
+`tp_first|sl_first|timeout` outcome. Those outcome classes are defined relative
+to a particular stop, target and horizon; if proposal geometry varies, it is a
+causal conditioning input for the outcome classifier as well as the EV head.
+Excluding `FeatureRole.PROPOSAL` is correct only for a separately specified pure
+direction head with a proposal-independent label. Audit the current combined
+`model_feature_specs()` whitelist, but do not silently change its estimand.
+Require each future head to pin an ordered feature list/schema hash, target,
+scoring instant and allowed roles; treat CONTEXT explicitly and always exclude
+POLICY/DIAGNOSTIC from numeric prediction inputs unless a separately versioned
+contract proves otherwise.
+
 ## Safe secrets and runtime metadata checks
 
 These commands inspect only existence, index/history metadata and process names.
@@ -410,10 +469,10 @@ MEXC worktree:
   -m pytest -q
 ```
 
-Recorded result at executable code tip `2d0efcb`:
+Recorded result at executable/test-contract tip `258c35f`:
 
 ```text
-576 passed, 4 skipped, 2 known PytestCollectionWarning (15.12s)
+580 passed, 4 skipped, 2 known PytestCollectionWarning (14.99s)
 ```
 
 The focused StrategySpec/runtime review found no remaining P0/P1. The focused
@@ -429,7 +488,7 @@ credentials, exchange access or Telegram delivery.
 Return one read-only review before proposing any edits:
 
 1. exact root/MEXC worktree, branch, HEAD, upstream and dirty-state facts;
-2. commit-by-commit explanation through executable tip `2d0efcb`, plus any later
+2. commit-by-commit explanation through executable/test-contract tip `258c35f`, plus any later
    documentation-only descendants;
 3. a causal data-flow map from MEXC sources through StrategySpec, universe,
    closed bars, features, rules, population journal/checkpoint, proposal, label,
@@ -446,7 +505,11 @@ Return one read-only review before proposing any edits:
 12. a final operational verdict covering bot state, secret status, edge status,
     model status and the safest next code decision.
 
-Do not make changes during this pass. The immediate next decision should be the
-intended physical pump/confirmation horizons, followed by typed lifecycle and
-per-source provenance. Private execution and live trading remain a separate
-future project and require a reproducible edge plus rotated credentials.
+Do not make changes during this pass. The immediate research decision is whether
+to keep the frozen Min60/45-hour v2 hypothesis or define a separately versioned
+physical-duration hypothesis with explicit field units. Version dispatch and
+continued v2 evidence readability are prerequisites to v3, not outcomes to
+assume. Typed lifecycle, per-source provenance and unconditional market-feature
+plumbing may continue without silently choosing new horizons. Private execution
+and live trading remain a separate future project and require a reproducible
+edge plus rotated credentials.

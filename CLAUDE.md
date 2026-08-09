@@ -19,20 +19,26 @@ API, or giving a strategy verdict:
 4. Verify the worktree, branch, local HEAD and remote HEAD yourself. The
    published AI foundation anchor is `f0b43d6` on
    `claude/codex-project-review-04581e`; the 2026-08-08 StrategySpec/journal-v5
-   code tip is `2d0efcb`, and current HEAD must descend from both anchors.
+   code tip is `2d0efcb`, the behavioral-compatibility tip is `258c35f`, and
+   current HEAD must descend from all three anchors.
 
 ## Current product truth
 
 - Target exchange: MEXC futures.
 - Scope: public-data, signals-only causal research. There is no production MEXC
   private execution adapter in this line.
-- Latest tested tree at the recorded checkpoint: `576 passed, 4 skipped`, with
-  two known pytest collection warnings (`15.12s`).
+- Latest executable tip and test receipt: `258c35f`; `580 passed, 4 skipped`,
+  with two known pytest collection warnings (`14.99s`).
 - Generic pump-fade has not demonstrated stable positive edge after costs. The
   earlier DCA/positive-expectancy claims are retracted hypotheses, not evidence.
 - Phase 0 plus the Phase 1 timing, replay, canonical StrategySpec and evidence
   hardening are complete. Population journal schema v5, CycleEnvelope v3 and
   single-position schema v3 are current; benchmark context fails closed.
+- Focused review found no open P0/P1 in the implemented StrategySpec/runtime
+  scope and no P0/P1/P2 in the journal/checkpoint scope. Its one StrategySpec
+  P2 was the lack of numeric behavioral anchors behind declarative revisions;
+  `258c35f` closes it with tests and a fixture only, without changing runtime
+  algorithms, thresholds, spec version or hashes.
 - The MEXC runtime loads one strict strategy-spec YAML; its canonical committed
   default is `config/mexc_strategy_v2.yaml`, while `--strategy-spec` may select
   another fully validated file. The pinned contract hash is `9c62b88b...e3dd`;
@@ -40,6 +46,20 @@ API, or giving a strategy verdict:
   Min60 and HTF is Hour4. Existing windows deliberately retain fixed-bar
   semantics, so the current 45-bar pump window means 45 hours; choosing a faster
   physical horizon is a later strategy change.
+- Behavioral locks now pin cumulative VWAP/OBV/candle-CVD numbers, exact volume
+  profile levels, and the default armed-HOLD to confirmed-SHORT decision,
+  trace and proposal. A committed CycleEnvelope-v3 fixture also proves that
+  frozen `mexc_strategy_v2` evidence remains readable.
+- Do not implement a future `mexc_strategy_v3` as a naive global version-literal
+  bump. Persisted evidence needs a version-dispatched reader that retains the
+  frozen v2 parser/hashes, while v3 types, config and evidence live in a separate
+  version namespace. The frozen v2 fixture must remain green.
+- For a faster strategy, separate event/state horizons from estimator warm-up
+  and sample budgets. `pump_window` and confirmation timing are not the same kind
+  of parameter as RSI/ATR/EMA/VP history. A Min15 design is a new strategy
+  hypothesis, not a mechanical conversion or override of the frozen Min60 v2.
+  Historical prose coupling “45 bars” to a roughly 20-minute pump is only a clue
+  about earlier intent, not an accepted timeframe decision.
 - The current runtime-population path is
   `data/runtime/mexc_population_decisions_v5.jsonl`; older journal schemas and
   legacy event-conditioned CSV are not accepted by the strict reader.
@@ -59,6 +79,10 @@ API, or giving a strategy verdict:
 
 - First numeric champion candidate: small CPU LightGBM multiclass model plus a
   separate conditional-payoff/EV head.
+- A proposal-conditioned outcome/payoff target retains proposal geometry such
+  as stop/target distances and costs. A pure direction/reversal target is a
+  separate experiment with a separate target and feature set that excludes
+  proposal-derived fields; the two heads must not be described as one task.
 - CatBoost is a tabular challenger; XGBoost AFT is an auxiliary time-to-event
   model; TCN/Chronos are later challengers.
 - Kimi/OpenAI/Gemini-class LLMs may only extract timestamped public text context
