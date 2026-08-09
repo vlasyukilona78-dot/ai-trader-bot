@@ -890,6 +890,15 @@ class FrameRead:
         elif self.evidence.outcome == "no_rows":
             if not isinstance(self.frame, pd.DataFrame) or not self.frame.empty:
                 raise FrameProvenanceError("no_rows_read_requires_empty_frame")
+            # ``no_rows`` means the source truthfully returned the canonical
+            # empty OHLCV shape.  Revalidate reconstructed/public FrameRead
+            # values too; otherwise valid evidence could be paired with a bare
+            # RangeIndex DataFrame and launder malformed input into no_data.
+            _frame_rows(
+                self.frame,
+                timeframe=self.evidence.timeframe,
+                cutoff_ts=self.evidence.expected_closed_boundary_ts,
+            )
         elif self.frame is not None:
             raise FrameProvenanceError("failed_or_skipped_read_must_not_carry_frame")
 

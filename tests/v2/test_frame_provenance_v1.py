@@ -297,6 +297,40 @@ def test_evidence_round_trip_is_exact_and_frame_read_rechecks_hash() -> None:
         FrameRead(frame=mutated, evidence=evidence)
 
 
+def test_frame_read_no_rows_revalidates_empty_frame_contract() -> None:
+    canonical_empty = pd.DataFrame(
+        columns=["open", "high", "low", "close", "volume"],
+        index=pd.DatetimeIndex([], tz="UTC"),
+    )
+    evidence = SourceReadEvidenceV1.from_frame(
+        canonical_empty,
+        source="base_ohlcv",
+        venue="mexc_contract",
+        symbol="BTCUSDT",
+        venue_symbol="BTC_USDT",
+        timeframe="Min60",
+        requested_as_of_ts=_CUTOFF,
+        request_started_at=_CUTOFF + 1.0,
+        received_at=_CUTOFF + 2.0,
+    )
+    FrameRead(frame=canonical_empty.copy(deep=True), evidence=evidence)
+
+    malformed_empty_frames = [
+        pd.DataFrame(),
+        pd.DataFrame(
+            columns=["open", "high", "low", "close", "volume"],
+            index=pd.DatetimeIndex([]),
+        ),
+        pd.DataFrame(
+            columns=["open", "high", "low", "close"],
+            index=pd.DatetimeIndex([], tz="UTC"),
+        ),
+    ]
+    for malformed in malformed_empty_frames:
+        with pytest.raises(FrameProvenanceError):
+            FrameRead(frame=malformed, evidence=evidence)
+
+
 def test_timeframe_alias_is_canonical_before_persistence() -> None:
     frame = _frame(turnover=[1000.0, 1100.0, 1200.0])
     evidence = SourceReadEvidenceV1.from_frame(
