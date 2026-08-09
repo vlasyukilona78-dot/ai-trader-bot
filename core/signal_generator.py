@@ -1,8 +1,10 @@
 ﻿from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import math
+import re
 from typing import Any, Mapping
 
 import numpy as np
@@ -10,6 +12,20 @@ import pandas as pd
 
 from .market_regime import MarketRegime
 from .volume_profile import VolumeProfileLevels
+from trading.signals.lifecycle_contract import (
+    CandidateArmV1,
+    CandidateLifecycleEventV1,
+    CandidateLifecycleState,
+    CandidateSide,
+    ConfirmationObservationV1,
+    LifecycleContractError,
+    ProposalObservationBasis,
+    ProposalObservationStatus,
+    ProposalObservationV1,
+)
+
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass
@@ -165,6 +181,39 @@ class PendingCandidate:
     # structural extreme (a new high means the fade thesis is wrong); a fixed small
     # percentage would just track noise on a low-cap alt.
     invalidate_level: float | None = None
+    # Present only for the explicit lifecycle API. A legacy pending candidate
+    # cannot later acquire an honest arm identity, so typed continuation fails.
+    lifecycle_event: CandidateLifecycleEventV1 | None = None
+    distinct_observation_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _TypedLifecycleBinding:
+    strategy_spec_version: str
+    strategy_spec_contract_hash: str
+    strategy_spec_instance_hash: str
+    raw_input_bundle_hash: str
+    timeframe_seconds: int
+    candle_cutoff_ts: float
+
+    def __post_init__(self) -> None:
+        if type(self.strategy_spec_version) is not str or not self.strategy_spec_version:
+            raise LifecycleContractError("strategy_spec_version_must_be_non_empty")
+        for name in (
+            "strategy_spec_contract_hash",
+            "strategy_spec_instance_hash",
+            "raw_input_bundle_hash",
+        ):
+            value = getattr(self, name)
+            if type(value) is not str or _SHA256_RE.fullmatch(value) is None:
+                raise LifecycleContractError(f"{name}_must_be_lowercase_sha256")
+        if type(self.timeframe_seconds) is not int or self.timeframe_seconds < 1:
+            raise LifecycleContractError("timeframe_seconds_must_be_positive_integer")
+        if type(self.candle_cutoff_ts) not in (int, float) or not math.isfinite(
+            float(self.candle_cutoff_ts)
+        ):
+            raise LifecycleContractError("candle_cutoff_ts_must_be_finite")
+        object.__setattr__(self, "candle_cutoff_ts", float(self.candle_cutoff_ts))
 
 
 class SignalGenerator:
@@ -979,6 +1028,550 @@ class SignalGenerator:
                 "regime": context.regime.value,
             },
         )
+
+    @staticmethod
+    def _bar_open_seconds(value: Any) -> float:
+        try:
+            converted = value.timestamp()
+        except Exception:
+            converted = value
+        if type(converted) not in (int, float) or not math.isfinite(float(converted)):
+            raise LifecycleContractError("bar_open_ts_must_be_finite")
+        return float(converted)
+
+    @classmethod
+    def _lifecycle_json(cls, value: Any) -> Any:
+        """Normalize diagnostics to strict native JSON without dropping values."""
+
+        if value is None or type(value) in (bool, int, str):
+            return value
+        if isinstance(value, np.bool_):
+            return bool(value)
+        if isinstance(value, (np.integer,)):
+            return int(value)
+        if isinstance(value, (float, np.floating)):
+            number = float(value)
+            if not math.isfinite(number):
+                raise LifecycleContractError("lifecycle_trace_contains_non_finite_number")
+            return 0.0 if number == 0.0 else number
+        if isinstance(value, Mapping):
+            result: dict[str, Any] = {}
+            for key, item in value.items():
+                if type(key) is not str or not key:
+                    raise LifecycleContractError("lifecycle_trace_contains_invalid_key")
+                result[key] = cls._lifecycle_json(item)
+            return result
+        if isinstance(value, (list, tuple)):
+            return [cls._lifecycle_json(item) for item in value]
+        raise LifecycleContractError(
+            f"lifecycle_trace_contains_unsupported_type:{type(value).__name__}"
+        )
+
+    def _typed_invalidate_level(
+        self,
+        df: pd.DataFrame,
+        context: SignalContext,
+        side: str,
+    ) -> float | None:
+        if not self.config.pump_window_enabled:
+            return None
+        win_high, win_low = self._window_extremes(df, context.htf_frame)
+        if side == "SHORT":
+            return float(win_high + self._stop_buffer(df, win_high))
+        return float(win_low - self._stop_buffer(df, win_low))
+
+    def _candidate_arm(
+        self,
+        *,
+        df: pd.DataFrame,
+        context: SignalContext,
+        side: str,
+        trace: Mapping[str, Any],
+        invalidate_level: float | None,
+        binding: _TypedLifecycleBinding,
+    ) -> CandidateArmV1:
+        return CandidateArmV1(
+            strategy_spec_version=binding.strategy_spec_version,
+            strategy_spec_contract_hash=binding.strategy_spec_contract_hash,
+            strategy_spec_instance_hash=binding.strategy_spec_instance_hash,
+            raw_input_bundle_hash=binding.raw_input_bundle_hash,
+            symbol=context.symbol,
+            side=CandidateSide(side),
+            timeframe_seconds=binding.timeframe_seconds,
+            arm_bar_open_ts=self._bar_open_seconds(df.index[-1]),
+            arm_candle_cutoff_ts=binding.candle_cutoff_ts,
+            armed_close=float(df.iloc[-1]["close"]),
+            invalidate_level=invalidate_level,
+            arm_trace=self._lifecycle_json(deepcopy(trace)),
+        )
+
+    def _proposal_observation(
+        self,
+        *,
+        arm: CandidateArmV1,
+        state_epoch: int,
+        basis: ProposalObservationBasis,
+        input_bundle_hash: str,
+        reference_bar_open_ts: float,
+        reference_candle_cutoff_ts: float,
+        confirmation_observation_id: str | None,
+        signal: SignalResult | None,
+        trace: Mapping[str, Any],
+    ) -> ProposalObservationV1:
+        layer5 = (
+            trace.get("layers", {})
+            .get("layer5_tp_sl", {})
+            .get("details", {})
+            if isinstance(trace, Mapping)
+            else {}
+        )
+        details = self._lifecycle_json(deepcopy(layer5 if isinstance(layer5, Mapping) else {}))
+        if signal is not None:
+            return ProposalObservationV1(
+                candidate_id=arm.candidate_id,
+                side=arm.side,
+                state_epoch=state_epoch,
+                timeframe_seconds=arm.timeframe_seconds,
+                status=ProposalObservationStatus.CREATED,
+                basis=basis,
+                confirmation_observation_id=confirmation_observation_id,
+                proposal_input_bundle_hash=input_bundle_hash,
+                reference_bar_open_ts=reference_bar_open_ts,
+                reference_candle_cutoff_ts=reference_candle_cutoff_ts,
+                decision_reference_price=float(signal.entry),
+                stop_price=float(signal.sl),
+                take_profit_price=float(signal.tp),
+                details=details,
+                execution_bound=False,
+            )
+        failed_layer = str(trace.get("failed_layer") or "proposal_not_created")
+        if re.fullmatch(r"[a-z][a-z0-9_]{0,127}", failed_layer) is None:
+            failed_layer = "proposal_not_created"
+        return ProposalObservationV1(
+            candidate_id=arm.candidate_id,
+            side=arm.side,
+            state_epoch=state_epoch,
+            timeframe_seconds=arm.timeframe_seconds,
+            status=ProposalObservationStatus.REJECTED,
+            basis=basis,
+            confirmation_observation_id=confirmation_observation_id,
+            proposal_input_bundle_hash=input_bundle_hash,
+            reference_bar_open_ts=reference_bar_open_ts,
+            reference_candle_cutoff_ts=reference_candle_cutoff_ts,
+            rejection_reason=failed_layer,
+            details=details,
+            execution_bound=False,
+        )
+
+    def generate_with_lifecycle(
+        self,
+        context: SignalContext,
+        *,
+        strategy_spec_version: str,
+        strategy_spec_contract_hash: str,
+        strategy_spec_instance_hash: str,
+        raw_input_bundle_hash: str,
+        timeframe_seconds: int,
+        candle_cutoff_ts: float,
+    ) -> tuple[SignalResult | None, CandidateLifecycleEventV1 | None]:
+        """Evaluate once and return typed evidence without changing legacy output.
+
+        This path owns typed pending state. It never upgrades a legacy pending
+        candidate because its arm-time inputs are no longer reconstructible.
+        """
+
+        binding = _TypedLifecycleBinding(
+            strategy_spec_version=strategy_spec_version,
+            strategy_spec_contract_hash=strategy_spec_contract_hash,
+            strategy_spec_instance_hash=strategy_spec_instance_hash,
+            raw_input_bundle_hash=raw_input_bundle_hash,
+            timeframe_seconds=timeframe_seconds,
+            candle_cutoff_ts=candle_cutoff_ts,
+        )
+        df = context.df
+        trace: dict[str, Any] = {
+            "strategy_model": "layered_table_5_softened",
+            "failed_layer": None,
+            "layers": {},
+        }
+        if df.empty or len(df) < self.min_history_bars:
+            trace["failed_layer"] = "layer0_input"
+            trace["layers"]["layer0_input"] = {
+                "passed": False,
+                "details": {"insufficient_history": 1.0},
+            }
+            self.last_diagnostics = trace
+            return None, None
+
+        if not self.config.confirmation_enabled:
+            if context.symbol in self._pending:
+                raise LifecycleContractError("confirmation_mode_changed_with_pending_candidate")
+            gates = self._evaluate_gates(df, context, trace)
+            if gates is None:
+                self.last_diagnostics = trace
+                return None, None
+            side, layer1, layer2, layer3, layer4 = gates
+            invalidate_level = self._typed_invalidate_level(df, context, side)
+            arm = self._candidate_arm(
+                df=df,
+                context=context,
+                side=side,
+                trace=trace,
+                invalidate_level=invalidate_level,
+                binding=binding,
+            )
+            signal = self._finalize_signal(
+                df,
+                context,
+                side,
+                layer1,
+                layer2,
+                layer3,
+                layer4,
+                trace,
+            )
+            proposal = self._proposal_observation(
+                arm=arm,
+                state_epoch=0,
+                basis=ProposalObservationBasis.ARM_BYPASS,
+                input_bundle_hash=binding.raw_input_bundle_hash,
+                reference_bar_open_ts=arm.arm_bar_open_ts,
+                reference_candle_cutoff_ts=arm.arm_candle_cutoff_ts,
+                confirmation_observation_id=None,
+                signal=signal,
+                trace=trace,
+            )
+            return signal, CandidateLifecycleEventV1.bypassed(arm, proposal=proposal)
+
+        return self._generate_with_typed_confirmation(df, context, trace, binding)
+
+    def _generate_with_typed_confirmation(
+        self,
+        df: pd.DataFrame,
+        context: SignalContext,
+        trace: dict[str, Any],
+        binding: _TypedLifecycleBinding,
+    ) -> tuple[SignalResult | None, CandidateLifecycleEventV1 | None]:
+        bar_ts = df.index[-1]
+        bar_open_ts = self._bar_open_seconds(bar_ts)
+        pending = self._pending.get(context.symbol)
+
+        if pending is not None:
+            previous = pending.lifecycle_event
+            if previous is None:
+                raise LifecycleContractError(
+                    "typed_evaluation_cannot_continue_legacy_pending_candidate"
+                )
+            arm = previous.arm
+            if (
+                arm.strategy_spec_version != binding.strategy_spec_version
+                or arm.strategy_spec_contract_hash != binding.strategy_spec_contract_hash
+                or arm.strategy_spec_instance_hash != binding.strategy_spec_instance_hash
+                or arm.timeframe_seconds != binding.timeframe_seconds
+                or arm.symbol != context.symbol
+            ):
+                raise LifecycleContractError("pending_candidate_lifecycle_namespace_mismatch")
+            prior_bar_open_ts = (
+                previous.confirmation.observation_bar_open_ts
+                if previous.confirmation is not None
+                else arm.arm_bar_open_ts
+            )
+            if bar_open_ts < prior_bar_open_ts:
+                raise LifecycleContractError("typed_observation_bar_moved_backward")
+
+            last = df.iloc[-1]
+            close_now = float(last["close"])
+            high_now = float(last.get("high", close_now))
+            low_now = float(last.get("low", close_now))
+            next_epoch = previous.state_epoch + 1
+
+            if bar_ts == pending.last_seen_bar_ts:
+                prior_observation = previous.confirmation
+                expected_input_hash = (
+                    prior_observation.observation_input_bundle_hash
+                    if prior_observation is not None
+                    else arm.raw_input_bundle_hash
+                )
+                expected_cutoff_ts = (
+                    prior_observation.observation_candle_cutoff_ts
+                    if prior_observation is not None
+                    else arm.arm_candle_cutoff_ts
+                )
+                expected_elapsed_bars = (
+                    prior_observation.elapsed_bars
+                    if prior_observation is not None
+                    else 0
+                )
+                if binding.raw_input_bundle_hash != expected_input_hash:
+                    raise LifecycleContractError("same_bar_input_bundle_mismatch")
+                if binding.candle_cutoff_ts != expected_cutoff_ts:
+                    raise LifecycleContractError("same_bar_cutoff_mismatch")
+                trace["failed_layer"] = "layer_confirmation_pending"
+                trace["layers"]["layer_confirmation"] = {
+                    "passed": False,
+                    "details": {
+                        "status": "same_bar",
+                        "bars_waited": float(pending.bars_waited),
+                    },
+                }
+                self.last_diagnostics = trace
+                observation = ConfirmationObservationV1(
+                    candidate_id=arm.candidate_id,
+                    observation_input_bundle_hash=expected_input_hash,
+                    state=CandidateLifecycleState.SAME_BAR,
+                    state_epoch=next_epoch,
+                    timeframe_seconds=arm.timeframe_seconds,
+                    observation_bar_open_ts=bar_open_ts,
+                    observation_candle_cutoff_ts=binding.candle_cutoff_ts,
+                    observed_high=high_now,
+                    observed_low=low_now,
+                    observed_close=close_now,
+                    distinct_observation_count=pending.distinct_observation_count,
+                    elapsed_bars=expected_elapsed_bars,
+                )
+                event = CandidateLifecycleEventV1.transition(
+                    previous,
+                    confirmation=observation,
+                )
+                pending.lifecycle_event = event
+                return None, event
+
+            elapsed_float = (bar_open_ts - arm.arm_bar_open_ts) / float(
+                arm.timeframe_seconds
+            )
+            elapsed_bars = round(elapsed_float)
+            if not math.isclose(
+                elapsed_float,
+                elapsed_bars,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                raise LifecycleContractError("typed_observation_bar_is_off_timeframe")
+            distinct_count = pending.distinct_observation_count + 1
+            pending.last_seen_bar_ts = bar_ts
+            pending.distinct_observation_count = distinct_count
+
+            if pending.side == "LONG":
+                confirmed = close_now > pending.armed_close
+                floor = (
+                    pending.invalidate_level
+                    if pending.invalidate_level is not None
+                    else pending.armed_close
+                    * (1.0 - self.config.confirmation_invalidate_pct)
+                )
+                invalidated = low_now <= floor
+            else:
+                confirmed = close_now < pending.armed_close
+                ceiling = (
+                    pending.invalidate_level
+                    if pending.invalidate_level is not None
+                    else pending.armed_close
+                    * (1.0 + self.config.confirmation_invalidate_pct)
+                )
+                invalidated = high_now >= ceiling
+
+            if invalidated:
+                del self._pending[context.symbol]
+                trace["failed_layer"] = "layer_confirmation_invalidated"
+                trace["layers"]["layer_confirmation"] = {
+                    "passed": False,
+                    "details": {
+                        "status": "invalidated",
+                        "armed_close": float(pending.armed_close),
+                        "close_now": close_now,
+                        "bars_waited": float(pending.bars_waited),
+                    },
+                }
+                self.last_diagnostics = trace
+                observation = ConfirmationObservationV1(
+                    candidate_id=arm.candidate_id,
+                    observation_input_bundle_hash=binding.raw_input_bundle_hash,
+                    state=CandidateLifecycleState.INVALIDATED,
+                    state_epoch=next_epoch,
+                    timeframe_seconds=arm.timeframe_seconds,
+                    observation_bar_open_ts=bar_open_ts,
+                    observation_candle_cutoff_ts=binding.candle_cutoff_ts,
+                    observed_high=high_now,
+                    observed_low=low_now,
+                    observed_close=close_now,
+                    distinct_observation_count=distinct_count,
+                    elapsed_bars=int(elapsed_bars),
+                )
+                event = CandidateLifecycleEventV1.transition(
+                    previous,
+                    confirmation=observation,
+                )
+                return None, event
+
+            if confirmed:
+                del self._pending[context.symbol]
+                side = pending.side
+                layer1 = pending.layer_snapshot["layer1"]
+                layer2 = pending.layer_snapshot["layer2"]
+                layer3 = pending.layer_snapshot["layer3"]
+                layer4 = pending.layer_snapshot["layer4"]
+                trace["layers"]["layer1_pump_detection"] = {
+                    "passed": True,
+                    "side": side,
+                    "details": layer1,
+                }
+                trace["layers"]["layer2_weakness_confirmation"] = {
+                    "passed": True,
+                    "details": layer2,
+                }
+                trace["layers"]["layer3_entry_location"] = {
+                    "passed": True,
+                    "details": layer3,
+                }
+                trace["layers"]["layer4_fake_filter"] = {
+                    "passed": True,
+                    "details": layer4,
+                }
+                trace["layers"]["layer_confirmation"] = {
+                    "passed": True,
+                    "details": {
+                        "status": "confirmed",
+                        "armed_bar_ts": str(pending.armed_bar_ts),
+                        "armed_close": float(pending.armed_close),
+                        "confirmed_bar_ts": str(bar_ts),
+                        "confirmed_close": close_now,
+                        "bars_waited": float(pending.bars_waited),
+                    },
+                }
+                signal = self._finalize_signal(
+                    df,
+                    context,
+                    side,
+                    layer1,
+                    layer2,
+                    layer3,
+                    layer4,
+                    trace,
+                    entry=close_now,
+                )
+                observation = ConfirmationObservationV1(
+                    candidate_id=arm.candidate_id,
+                    observation_input_bundle_hash=binding.raw_input_bundle_hash,
+                    state=CandidateLifecycleState.CONFIRMED,
+                    state_epoch=next_epoch,
+                    timeframe_seconds=arm.timeframe_seconds,
+                    observation_bar_open_ts=bar_open_ts,
+                    observation_candle_cutoff_ts=binding.candle_cutoff_ts,
+                    observed_high=high_now,
+                    observed_low=low_now,
+                    observed_close=close_now,
+                    distinct_observation_count=distinct_count,
+                    elapsed_bars=int(elapsed_bars),
+                )
+                proposal = self._proposal_observation(
+                    arm=arm,
+                    state_epoch=next_epoch,
+                    basis=ProposalObservationBasis.CONFIRMATION,
+                    input_bundle_hash=binding.raw_input_bundle_hash,
+                    reference_bar_open_ts=bar_open_ts,
+                    reference_candle_cutoff_ts=binding.candle_cutoff_ts,
+                    confirmation_observation_id=observation.observation_id,
+                    signal=signal,
+                    trace=trace,
+                )
+                event = CandidateLifecycleEventV1.transition(
+                    previous,
+                    confirmation=observation,
+                    proposal=proposal,
+                )
+                return signal, event
+
+            pending.bars_waited += 1
+            expired = pending.bars_waited >= self.config.confirmation_max_wait_bars
+            state = (
+                CandidateLifecycleState.EXPIRED
+                if expired
+                else CandidateLifecycleState.WAITING
+            )
+            if expired:
+                del self._pending[context.symbol]
+            trace["failed_layer"] = (
+                "layer_confirmation_expired"
+                if expired
+                else "layer_confirmation_pending"
+            )
+            trace["layers"]["layer_confirmation"] = {
+                "passed": False,
+                "details": {
+                    "status": "expired" if expired else "waiting",
+                    "bars_waited": float(pending.bars_waited),
+                },
+            }
+            self.last_diagnostics = trace
+            observation = ConfirmationObservationV1(
+                candidate_id=arm.candidate_id,
+                observation_input_bundle_hash=binding.raw_input_bundle_hash,
+                state=state,
+                state_epoch=next_epoch,
+                timeframe_seconds=arm.timeframe_seconds,
+                observation_bar_open_ts=bar_open_ts,
+                observation_candle_cutoff_ts=binding.candle_cutoff_ts,
+                observed_high=high_now,
+                observed_low=low_now,
+                observed_close=close_now,
+                distinct_observation_count=distinct_count,
+                elapsed_bars=int(elapsed_bars),
+            )
+            event = CandidateLifecycleEventV1.transition(
+                previous,
+                confirmation=observation,
+            )
+            if not expired:
+                pending.lifecycle_event = event
+            return None, event
+
+        gates = self._evaluate_gates(df, context, trace)
+        if gates is None:
+            self.last_diagnostics = trace
+            return None, None
+        side, layer1, layer2, layer3, layer4 = gates
+        armed_close = float(df.iloc[-1]["close"])
+        invalidate_level = self._typed_invalidate_level(df, context, side)
+        arm = self._candidate_arm(
+            df=df,
+            context=context,
+            side=side,
+            trace=trace,
+            invalidate_level=invalidate_level,
+            binding=binding,
+        )
+        event = CandidateLifecycleEventV1.armed(arm)
+        self._pending[context.symbol] = PendingCandidate(
+            symbol=context.symbol,
+            side=side,
+            armed_bar_ts=bar_ts,
+            armed_close=armed_close,
+            last_seen_bar_ts=bar_ts,
+            bars_waited=0,
+            layer_snapshot={
+                "layer1": layer1,
+                "layer2": layer2,
+                "layer3": layer3,
+                "layer4": layer4,
+            },
+            invalidate_level=invalidate_level,
+            lifecycle_event=event,
+            distinct_observation_count=0,
+        )
+        trace["failed_layer"] = "layer_confirmation_pending"
+        trace["layers"]["layer_confirmation"] = {
+            "passed": False,
+            "details": {
+                "status": "armed",
+                "armed_close": armed_close,
+                "invalidate_level": (
+                    float(invalidate_level) if invalidate_level is not None else 0.0
+                ),
+                "bars_waited": 0.0,
+            },
+        }
+        self.last_diagnostics = trace
+        return None, event
 
     def generate(self, context: SignalContext) -> SignalResult | None:
         df = context.df

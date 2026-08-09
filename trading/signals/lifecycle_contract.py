@@ -24,7 +24,7 @@ from typing import Any, Mapping
 
 
 LIFECYCLE_CONTRACT_VERSION = "candidate_lifecycle_v1"
-_PINNED_CONTRACT_HASH = "5d44801eca5728fde2202915fb1e88ea62da4df7246275ee1dbc3d1590b5b129"
+_PINNED_CONTRACT_HASH = "012562854856dcb1145eb93066be00f2c68f291e0d94cd59c59b6a2bfef60c31"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
@@ -334,6 +334,7 @@ def lifecycle_contract_payload() -> dict[str, object]:
             "candidate_identity_binds_strategy_input_symbol_side_and_arm_bar",
             "arm_snapshot_is_immutable_across_transitions",
             "observation_count_is_distinct_from_elapsed_physical_bars",
+            "same_bar_repeats_the_predecessor_observation_identity_and_counts",
             "confirmed_requires_created_or_rejected_proposal_observation",
             "bypassed_is_an_initial_same_arm_bar_proposal_without_confirmation",
             "proposal_observation_is_never_execution_bound",
@@ -565,8 +566,8 @@ class ConfirmationObservationV1:
         )
         elapsed = _strict_int(self.elapsed_bars, field_name="elapsed_bars")
         if self.state is CandidateLifecycleState.SAME_BAR:
-            if distinct != 0 or elapsed != 0:
-                raise LifecycleContractError("same_bar_requires_zero_counts")
+            if distinct > elapsed:
+                raise LifecycleContractError("distinct_observation_count_exceeds_elapsed_bars")
         else:
             if distinct < 1 or elapsed < 1:
                 raise LifecycleContractError("follow_up_bar_requires_positive_counts")
@@ -1078,10 +1079,17 @@ class CandidateLifecycleEventV1:
         if observation.elapsed_bars != int(rounded):
             raise LifecycleContractError("elapsed_bars_disagrees_with_arm_bar")
         if observation.state is CandidateLifecycleState.SAME_BAR:
-            if observation.observation_input_bundle_hash != self.arm.raw_input_bundle_hash:
-                raise LifecycleContractError("same_bar_input_bundle_mismatch")
-            if observation.observation_candle_cutoff_ts != self.arm.arm_candle_cutoff_ts:
-                raise LifecycleContractError("same_bar_cutoff_mismatch")
+            if self.previous_state is CandidateLifecycleState.ARMED:
+                if observation.observation_input_bundle_hash != self.arm.raw_input_bundle_hash:
+                    raise LifecycleContractError("same_bar_input_bundle_mismatch")
+                if observation.observation_bar_open_ts != self.arm.arm_bar_open_ts:
+                    raise LifecycleContractError("same_bar_observation_bar_mismatch")
+                if observation.observation_candle_cutoff_ts != self.arm.arm_candle_cutoff_ts:
+                    raise LifecycleContractError("same_bar_cutoff_mismatch")
+                if observation.distinct_observation_count != 0:
+                    raise LifecycleContractError("same_bar_distinct_count_mismatch")
+                if observation.elapsed_bars != 0:
+                    raise LifecycleContractError("same_bar_elapsed_bars_mismatch")
         elif observation.observation_bar_open_ts <= self.arm.arm_bar_open_ts:
             raise LifecycleContractError("follow_up_observation_must_follow_arm_bar")
 
@@ -1154,6 +1162,30 @@ class CandidateLifecycleEventV1:
             raise LifecycleContractError("transition_candidate_id_mismatch")
         if confirmation.state_epoch != expected_epoch:
             raise LifecycleContractError("transition_state_epoch_mismatch")
+        if confirmation.state is CandidateLifecycleState.SAME_BAR:
+            prior = previous.confirmation
+            if prior is None:
+                expected_input_hash = previous.arm.raw_input_bundle_hash
+                expected_bar_open_ts = previous.arm.arm_bar_open_ts
+                expected_cutoff_ts = previous.arm.arm_candle_cutoff_ts
+                expected_distinct = 0
+                expected_elapsed = 0
+            else:
+                expected_input_hash = prior.observation_input_bundle_hash
+                expected_bar_open_ts = prior.observation_bar_open_ts
+                expected_cutoff_ts = prior.observation_candle_cutoff_ts
+                expected_distinct = prior.distinct_observation_count
+                expected_elapsed = prior.elapsed_bars
+            if confirmation.observation_input_bundle_hash != expected_input_hash:
+                raise LifecycleContractError("same_bar_input_bundle_mismatch")
+            if confirmation.observation_bar_open_ts != expected_bar_open_ts:
+                raise LifecycleContractError("same_bar_observation_bar_mismatch")
+            if confirmation.observation_candle_cutoff_ts != expected_cutoff_ts:
+                raise LifecycleContractError("same_bar_cutoff_mismatch")
+            if confirmation.distinct_observation_count != expected_distinct:
+                raise LifecycleContractError("same_bar_distinct_count_mismatch")
+            if confirmation.elapsed_bars != expected_elapsed:
+                raise LifecycleContractError("same_bar_elapsed_bars_mismatch")
         resolved_proposal = proposal or ProposalObservationV1.not_evaluated(
             candidate_id=previous.arm.candidate_id,
             side=previous.arm.side,
@@ -1185,6 +1217,39 @@ class CandidateLifecycleEventV1:
             raise LifecycleContractError("successor_previous_event_id_mismatch")
         if successor.previous_state is not self.state:
             raise LifecycleContractError("successor_previous_state_mismatch")
+        if (
+            successor.state is CandidateLifecycleState.SAME_BAR
+            and successor.confirmation is not None
+        ):
+            prior = self.confirmation
+            expected_input_hash = (
+                prior.observation_input_bundle_hash
+                if prior is not None
+                else self.arm.raw_input_bundle_hash
+            )
+            expected_bar_open_ts = (
+                prior.observation_bar_open_ts
+                if prior is not None
+                else self.arm.arm_bar_open_ts
+            )
+            expected_cutoff_ts = (
+                prior.observation_candle_cutoff_ts
+                if prior is not None
+                else self.arm.arm_candle_cutoff_ts
+            )
+            expected_distinct = prior.distinct_observation_count if prior is not None else 0
+            expected_elapsed = prior.elapsed_bars if prior is not None else 0
+            observation = successor.confirmation
+            if observation.observation_input_bundle_hash != expected_input_hash:
+                raise LifecycleContractError("same_bar_input_bundle_mismatch")
+            if observation.observation_bar_open_ts != expected_bar_open_ts:
+                raise LifecycleContractError("same_bar_observation_bar_mismatch")
+            if observation.observation_candle_cutoff_ts != expected_cutoff_ts:
+                raise LifecycleContractError("same_bar_cutoff_mismatch")
+            if observation.distinct_observation_count != expected_distinct:
+                raise LifecycleContractError("same_bar_distinct_count_mismatch")
+            if observation.elapsed_bars != expected_elapsed:
+                raise LifecycleContractError("same_bar_elapsed_bars_mismatch")
 
     def as_dict(self) -> dict[str, object]:
         return {

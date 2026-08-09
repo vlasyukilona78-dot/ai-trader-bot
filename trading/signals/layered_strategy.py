@@ -1,5 +1,7 @@
 ﻿from __future__ import annotations
 
+import math
+import re
 import threading
 from copy import deepcopy
 from dataclasses import asdict
@@ -7,9 +9,15 @@ from inspect import signature
 
 from core.indicators import compute_indicators
 from core.market_regime import detect_market_regime
-from core.mexc_strategy_spec import MexcStrategySpec
+import pandas as pd
+
+from core.mexc_strategy_spec import MexcStrategySpec, strategy_spec_identity
 from core.signal_generator import SignalConfig, SignalContext, SignalGenerator
 from core.volume_profile import compute_volume_profile
+from trading.signals.lifecycle_contract import (
+    CandidateLifecycleEventV1,
+    LifecycleContractError,
+)
 from trading.signals.signal_types import IntentAction, StrategyIntent
 from trading.signals.strategy_interface import StrategyContext, StrategyInterface
 from trading.signals.volatility_context import VolatilityContext, VolatilityContextConfig
@@ -26,6 +34,7 @@ def _runtime_defaults(function) -> dict[str, object]:
 
 _DEFAULT_INDICATOR_KWARGS = _runtime_defaults(compute_indicators)
 _DEFAULT_VOLUME_PROFILE_KWARGS = _runtime_defaults(compute_volume_profile)
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class LayeredPumpStrategy(StrategyInterface):
@@ -171,6 +180,171 @@ class LayeredPumpStrategy(StrategyInterface):
             "layer_failed": failed_layer,
         }
 
+    @staticmethod
+    def _intent_from_signal(
+        context: StrategyContext,
+        signal,
+        trace_meta: dict,
+    ) -> StrategyIntent:
+        """Map the legacy numeric result without adding lifecycle evidence."""
+
+        if signal is None:
+            failed_layer = trace_meta.get("layer_failed") or "unknown"
+            return StrategyIntent(
+                symbol=context.symbol,
+                action=IntentAction.HOLD,
+                reason=f"no_signal_{failed_layer}",
+                metadata=trace_meta,
+            )
+
+        if context.synced_state in (
+            TradeState.LONG,
+            TradeState.PENDING_EXIT_LONG,
+        ) and signal.side == "SHORT":
+            return StrategyIntent(
+                symbol=context.symbol,
+                action=IntentAction.EXIT_LONG,
+                reason="opposite_signal_close_long",
+                confidence=float(signal.confidence),
+                metadata={"legacy_signal_id": signal.signal_id, **trace_meta},
+            )
+
+        if context.synced_state in (
+            TradeState.SHORT,
+            TradeState.PENDING_EXIT_SHORT,
+        ) and signal.side == "LONG":
+            return StrategyIntent(
+                symbol=context.symbol,
+                action=IntentAction.EXIT_SHORT,
+                reason="opposite_signal_close_short",
+                confidence=float(signal.confidence),
+                metadata={"legacy_signal_id": signal.signal_id, **trace_meta},
+            )
+
+        if context.synced_state != TradeState.FLAT:
+            return StrategyIntent(
+                symbol=context.symbol,
+                action=IntentAction.HOLD,
+                reason="state_not_flat",
+                metadata=trace_meta,
+            )
+
+        if signal.side == "LONG":
+            return StrategyIntent(
+                symbol=context.symbol,
+                action=IntentAction.LONG_ENTRY,
+                reason="layered_long_entry",
+                stop_loss=float(signal.sl),
+                take_profit=float(signal.tp),
+                confidence=float(signal.confidence),
+                metadata={"legacy_signal_id": signal.signal_id, **trace_meta},
+            )
+
+        return StrategyIntent(
+            symbol=context.symbol,
+            action=IntentAction.SHORT_ENTRY,
+            reason="layered_short_entry",
+            stop_loss=float(signal.sl),
+            take_profit=float(signal.tp),
+            confidence=float(signal.confidence),
+            metadata={"legacy_signal_id": signal.signal_id, **trace_meta},
+        )
+
+    def evaluate_with_lifecycle(
+        self,
+        context: StrategyContext,
+        *,
+        raw_input_bundle_hash: str,
+        htf_frame: pd.DataFrame | None,
+    ) -> tuple[StrategyIntent, CandidateLifecycleEventV1 | None]:
+        """Atomically evaluate a spec-bound input and return typed evidence.
+
+        ``htf_frame`` is intentionally required even when its value is ``None``.
+        This method never consults the mutable higher-timeframe cache, so the
+        caller's raw-input hash covers the exact frame bundle being evaluated.
+        """
+
+        if self._strategy_spec is None:
+            raise LifecycleContractError("typed_evaluation_requires_strategy_spec")
+        if (
+            type(raw_input_bundle_hash) is not str
+            or _SHA256_RE.fullmatch(raw_input_bundle_hash) is None
+        ):
+            raise LifecycleContractError(
+                "raw_input_bundle_hash_must_be_lowercase_sha256"
+            )
+        if htf_frame is not None and not isinstance(htf_frame, pd.DataFrame):
+            raise LifecycleContractError("htf_frame_must_be_dataframe_or_none")
+        cutoff = context.candle_cutoff_ts
+        if type(cutoff) not in (int, float) or not math.isfinite(float(cutoff)):
+            raise LifecycleContractError("typed_evaluation_requires_finite_candle_cutoff")
+        cutoff = float(cutoff)
+        identity = strategy_spec_identity(self._strategy_spec)
+        timeframe_seconds = self._strategy_spec.base_interval_seconds
+
+        df = context.market_ohlcv
+        if not df.empty:
+            if not isinstance(df.index, pd.DatetimeIndex) or df.index.tz is None:
+                raise LifecycleContractError("typed_evaluation_requires_utc_bar_index")
+            bar_open_ts = float(df.index[-1].timestamp())
+            if not math.isclose(
+                cutoff - bar_open_ts,
+                float(timeframe_seconds),
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            ):
+                raise LifecycleContractError(
+                    "typed_evaluation_cutoff_does_not_close_last_base_bar"
+                )
+
+        if df.empty or len(df) < self._minimum_history_bars:
+            intent = StrategyIntent(
+                symbol=context.symbol,
+                action=IntentAction.HOLD,
+                reason="insufficient_history",
+                metadata={"layer_failed": "layer0_input", "layer_trace": {}},
+            )
+            return intent, None
+
+        enriched = df
+        if "rsi" not in enriched.columns:
+            enriched = compute_indicators(df, **self._indicator_kwargs)
+        regime = detect_market_regime(enriched)
+        vp = compute_volume_profile(enriched, **self._volume_profile_kwargs)
+        last = enriched.iloc[-1]
+        close = float(last.get("close") or 0.0)
+        atr = float(last.get("atr") or 0.0)
+
+        with self._state_lock:
+            self.assert_strategy_spec_consistency(self._strategy_spec)
+            benchmark = self._benchmark
+            if close > 0 and atr > 0:
+                self._volatility.observe(context.symbol, atr / close)
+            signal, lifecycle_event = self._generator.generate_with_lifecycle(
+                SignalContext(
+                    symbol=context.symbol,
+                    df=enriched,
+                    volume_profile=vp,
+                    regime=regime,
+                    sentiment_index=context.sentiment_index,
+                    sentiment_source=context.sentiment_source,
+                    funding_rate=context.funding_rate,
+                    long_short_ratio=context.long_short_ratio,
+                    atr_floor=self._volatility.floor(),
+                    benchmark=benchmark,
+                    htf_frame=htf_frame,
+                ),
+                strategy_spec_version=identity.spec_version,
+                strategy_spec_contract_hash=identity.contract_hash,
+                strategy_spec_instance_hash=identity.instance_hash,
+                raw_input_bundle_hash=raw_input_bundle_hash,
+                timeframe_seconds=timeframe_seconds,
+                candle_cutoff_ts=cutoff,
+            )
+            trace_meta = self._trace_meta()
+            intent = self._intent_from_signal(context, signal, trace_meta)
+            return intent, lifecycle_event
+
     def generate(self, context: StrategyContext) -> StrategyIntent:
         df = context.market_ohlcv
         if df.empty or len(df) < self._minimum_history_bars:
@@ -222,58 +396,4 @@ class LayeredPumpStrategy(StrategyInterface):
                 )
             )
             trace_meta = self._trace_meta()
-        if signal is None:
-            failed_layer = trace_meta.get("layer_failed") or "unknown"
-            return StrategyIntent(
-                symbol=context.symbol,
-                action=IntentAction.HOLD,
-                reason=f"no_signal_{failed_layer}",
-                metadata=trace_meta,
-            )
-
-        if context.synced_state in (TradeState.LONG, TradeState.PENDING_EXIT_LONG) and signal.side == "SHORT":
-            return StrategyIntent(
-                symbol=context.symbol,
-                action=IntentAction.EXIT_LONG,
-                reason="opposite_signal_close_long",
-                confidence=float(signal.confidence),
-                metadata={"legacy_signal_id": signal.signal_id, **trace_meta},
-            )
-
-        if context.synced_state in (TradeState.SHORT, TradeState.PENDING_EXIT_SHORT) and signal.side == "LONG":
-            return StrategyIntent(
-                symbol=context.symbol,
-                action=IntentAction.EXIT_SHORT,
-                reason="opposite_signal_close_short",
-                confidence=float(signal.confidence),
-                metadata={"legacy_signal_id": signal.signal_id, **trace_meta},
-            )
-
-        if context.synced_state != TradeState.FLAT:
-            return StrategyIntent(
-                symbol=context.symbol,
-                action=IntentAction.HOLD,
-                reason="state_not_flat",
-                metadata=trace_meta,
-            )
-
-        if signal.side == "LONG":
-            return StrategyIntent(
-                symbol=context.symbol,
-                action=IntentAction.LONG_ENTRY,
-                reason="layered_long_entry",
-                stop_loss=float(signal.sl),
-                take_profit=float(signal.tp),
-                confidence=float(signal.confidence),
-                metadata={"legacy_signal_id": signal.signal_id, **trace_meta},
-            )
-
-        return StrategyIntent(
-            symbol=context.symbol,
-            action=IntentAction.SHORT_ENTRY,
-            reason="layered_short_entry",
-            stop_loss=float(signal.sl),
-            take_profit=float(signal.tp),
-            confidence=float(signal.confidence),
-            metadata={"legacy_signal_id": signal.signal_id, **trace_meta},
-        )
+        return self._intent_from_signal(context, signal, trace_meta)

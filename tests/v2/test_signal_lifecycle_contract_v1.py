@@ -30,7 +30,7 @@ _CONFIRM_INPUT_HASH = "4" * 64
 
 # Replacing this literal requires a new contract version. It is intentionally
 # filled from the final declarative schema, not updated to make a drift pass.
-_PINNED_CONTRACT_HASH = "5d44801eca5728fde2202915fb1e88ea62da4df7246275ee1dbc3d1590b5b129"
+_PINNED_CONTRACT_HASH = "012562854856dcb1145eb93066be00f2c68f291e0d94cd59c59b6a2bfef60c31"
 
 
 def _arm(**overrides) -> CandidateArmV1:
@@ -317,7 +317,6 @@ def test_confirmation_semantic_id_binds_input_state_bar_prices_and_both_counts()
         {"state_epoch": True},
         {"distinct_observation_count": True},
         {"distinct_observation_count": 2, "elapsed_bars": 1},
-        {"state": CandidateLifecycleState.SAME_BAR, "elapsed_bars": 1},
     ],
 )
 def test_confirmation_rejects_invalid_numbers_counts_and_types(change) -> None:
@@ -353,6 +352,48 @@ def test_same_bar_requires_same_candidate_input_bundle_and_cutoff() -> None:
     wrong_bundle = replace(same, observation_input_bundle_hash="d" * 64)
     with pytest.raises(LifecycleContractError, match="same_bar_input_bundle_mismatch"):
         CandidateLifecycleEventV1.transition(armed, confirmation=wrong_bundle)
+
+
+def test_same_bar_after_waiting_repeats_predecessor_identity_and_counts() -> None:
+    arm = _arm()
+    armed = CandidateLifecycleEventV1.armed(arm)
+    first = _observation(arm, state=CandidateLifecycleState.WAITING)
+    waiting = CandidateLifecycleEventV1.transition(armed, confirmation=first)
+    repeated_observation = replace(
+        first,
+        state=CandidateLifecycleState.SAME_BAR,
+        state_epoch=2,
+    )
+    repeated = CandidateLifecycleEventV1.transition(
+        waiting,
+        confirmation=repeated_observation,
+    )
+    next_observation = _observation(
+        arm,
+        state=CandidateLifecycleState.WAITING,
+        state_epoch=3,
+        elapsed_bars=2,
+        distinct_observation_count=2,
+    )
+    next_waiting = CandidateLifecycleEventV1.transition(
+        repeated,
+        confirmation=next_observation,
+    )
+
+    assert repeated.state is CandidateLifecycleState.SAME_BAR
+    assert repeated.confirmation is not None
+    assert repeated.confirmation.observation_bar_open_ts == first.observation_bar_open_ts
+    assert repeated.confirmation.observation_input_bundle_hash == first.observation_input_bundle_hash
+    assert repeated.confirmation.distinct_observation_count == 1
+    assert repeated.confirmation.elapsed_bars == 1
+    assert next_waiting.state is CandidateLifecycleState.WAITING
+    assert next_waiting.confirmation is not None
+    assert next_waiting.confirmation.distinct_observation_count == 2
+    assert next_waiting.confirmation.elapsed_bars == 2
+
+    wrong_count = replace(repeated_observation, distinct_observation_count=0)
+    with pytest.raises(LifecycleContractError, match="same_bar_distinct_count_mismatch"):
+        CandidateLifecycleEventV1.transition(waiting, confirmation=wrong_count)
 
 
 def test_arm_wait_confirm_chain_preserves_arm_and_links_every_transition() -> None:
