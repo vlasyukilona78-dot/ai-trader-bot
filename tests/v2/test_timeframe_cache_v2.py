@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import threading
 import unittest
 from dataclasses import dataclass
 
@@ -8,6 +10,7 @@ import pandas as pd
 
 from core.signal_generator import SignalConfig, SignalGenerator
 from trading.market_data.bar_contract import interval_seconds
+from trading.market_data.mexc_client import MexcOhlcvRequestError
 from trading.market_data.timeframe_cache import HigherTimeframeCache, TimeframeCacheConfig
 
 
@@ -26,13 +29,20 @@ class _FakeFeed:
         self.calls += 1
         self.as_of.append(as_of)
         if self.fail:
-            raise RuntimeError("network down")
+            raise MexcOhlcvRequestError("network down")
         boundary = pd.Timestamp(float(as_of), unit="s", tz="UTC")
         delta = pd.Timedelta(seconds=interval_seconds(timeframe))
         index = pd.DatetimeIndex([boundary - (3 * delta), boundary - (2 * delta), boundary - delta])
         return _Frame(
             pd.DataFrame(
-                {"close": [1.0, 2.0, 3.0], "symbol": [symbol] * 3},
+                {
+                    "open": [1.0, 2.0, 3.0],
+                    "high": [1.1, 2.1, 3.1],
+                    "low": [0.9, 1.9, 2.9],
+                    "close": [1.0, 2.0, 3.0],
+                    "volume": [10.0, 20.0, 30.0],
+                    "symbol": [symbol] * 3,
+                },
                 index=index,
             )
         )
@@ -45,7 +55,68 @@ class _LegacyFeed:
     def fetch_frame(self, symbol: str, timeframe: str, candles: int):
         self.limits.append(candles)
         index = pd.date_range("2026-01-01T10:00:00Z", periods=4, freq="h")
-        return _Frame(pd.DataFrame({"close": [1.0, 2.0, 3.0, 4.0]}, index=index))
+        close = [1.0, 2.0, 3.0, 4.0]
+        return _Frame(
+            pd.DataFrame(
+                {
+                    "open": close,
+                    "high": [value + 0.1 for value in close],
+                    "low": [value - 0.1 for value in close],
+                    "close": close,
+                    "volume": [10.0] * 4,
+                },
+                index=index,
+            )
+        )
+
+
+class _StaleFeed(_FakeFeed):
+    def fetch_closed_frame(self, symbol: str, timeframe: str, candles: int, *, as_of):
+        self.calls += 1
+        self.as_of.append(as_of)
+        boundary = pd.Timestamp(float(as_of), unit="s", tz="UTC")
+        delta = pd.Timedelta(seconds=interval_seconds(timeframe))
+        index = pd.DatetimeIndex(
+            [boundary - (4 * delta), boundary - (3 * delta), boundary - (2 * delta)]
+        )
+        close = [1.0, 2.0, 3.0]
+        return _Frame(
+            pd.DataFrame(
+                {
+                    "open": close,
+                    "high": [value + 0.1 for value in close],
+                    "low": [value - 0.1 for value in close],
+                    "close": close,
+                    "volume": [10.0] * 3,
+                },
+                index=index,
+            )
+        )
+
+
+class _EmptyFeed:
+    def fetch_closed_frame(self, symbol: str, timeframe: str, candles: int, *, as_of):
+        frame = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        frame.index = pd.DatetimeIndex([], tz="UTC")
+        return _Frame(frame)
+
+
+class _BuggyFeed:
+    def fetch_closed_frame(self, symbol: str, timeframe: str, candles: int, *, as_of):
+        raise RuntimeError("programming bug")
+
+
+class _BlockingFeed(_FakeFeed):
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def fetch_closed_frame(self, symbol: str, timeframe: str, candles: int, *, as_of):
+        self.entered.set()
+        if not self.release.wait(timeout=5.0):
+            raise AssertionError("test did not release blocked feed")
+        return super().fetch_closed_frame(symbol, timeframe, candles, as_of=as_of)
 
 
 class HigherTimeframeCacheV2Tests(unittest.TestCase):
@@ -100,7 +171,7 @@ class HigherTimeframeCacheV2Tests(unittest.TestCase):
         self.assertTrue(fallback["cache_hit"])
         self.assertEqual(fallback["source_ts"], fresh["source_ts"])
         self.assertIsNotNone(fallback["cache_age_sec"])
-        self.assertEqual(fallback["error_code"], "RuntimeError")
+        self.assertEqual(fallback["error_code"], "MexcOhlcvRequestError")
 
     def test_failed_fetch_at_new_boundary_does_not_serve_previous_frame(self):
         feed = _FakeFeed()
@@ -150,6 +221,145 @@ class HigherTimeframeCacheV2Tests(unittest.TestCase):
         frame = cache.get("BTCUSDT", as_of=self._BAR_1230, now=1000.0)
         self.assertEqual(feed.limits, [4])
         self.assertEqual(list(frame.index.hour), [10, 11])
+
+    def test_get_with_provenance_returns_exact_symbol_timeframe_and_frame_hash(self):
+        cache = HigherTimeframeCache(_FakeFeed(), self._config(ttl_sec=600))
+        read = cache.get_with_provenance("BTCUSDT", as_of=self._BAR_1230, now=1000.0)
+
+        self.assertIsNotNone(read.frame)
+        self.assertEqual(read.evidence.symbol, "BTCUSDT")
+        self.assertEqual(read.evidence.timeframe, "Min60")
+        self.assertEqual(read.evidence.outcome, "fresh")
+        self.assertRegex(read.evidence.frame_hash or "", r"^[0-9a-f]{64}$")
+
+    def test_cache_hit_keeps_content_hash_but_records_new_call_timing(self):
+        cache = HigherTimeframeCache(_FakeFeed(), self._config(ttl_sec=600))
+        first = cache.get_with_provenance("BTCUSDT", as_of=self._BAR_1230, now=1000.0)
+        second = cache.get_with_provenance("BTCUSDT", as_of=self._BAR_1255, now=1001.0)
+
+        self.assertEqual(first.evidence.frame_hash, second.evidence.frame_hash)
+        self.assertFalse(first.evidence.cache_hit)
+        self.assertTrue(second.evidence.cache_hit)
+        self.assertEqual(first.evidence.source_ts, second.evidence.source_ts)
+        self.assertNotEqual(
+            first.evidence.requested_as_of_ts,
+            second.evidence.requested_as_of_ts,
+        )
+
+    def test_successful_but_lagging_frame_reports_actual_data_through(self):
+        cache = HigherTimeframeCache(_StaleFeed(), self._config(ttl_sec=600))
+        read = cache.get_with_provenance("BTCUSDT", as_of=self._BAR_1230, now=1000.0)
+        timing = cache.drain_timings()[0]
+
+        self.assertIsNotNone(read.frame)  # behavior is deliberately preserved
+        self.assertEqual(read.evidence.outcome, "stale")
+        self.assertLess(
+            read.evidence.data_through_ts,
+            read.evidence.expected_closed_boundary_ts,
+        )
+        self.assertEqual(timing["source_as_of"], read.evidence.data_through_ts)
+        self.assertEqual(timing["symbol"], "BTCUSDT")
+        self.assertEqual(timing["timeframe"], "Min60")
+
+    def test_mutating_config_interval_cannot_reuse_other_timeframe_cache(self):
+        feed = _FakeFeed()
+        cache = HigherTimeframeCache(feed, self._config(ttl_sec=600))
+        first = cache.get_with_provenance("BTCUSDT", as_of=self._BAR_1230, now=1000.0)
+        cache.config.interval = "Hour4"
+        second = cache.get_with_provenance("BTCUSDT", as_of=self._BAR_1230, now=1001.0)
+
+        self.assertEqual(feed.calls, 2)
+        self.assertEqual(first.evidence.timeframe, "Min60")
+        self.assertEqual(second.evidence.timeframe, "Hour4")
+        self.assertEqual(cache.cached_symbols, 2)
+
+    def test_mutating_requested_window_cannot_reuse_shorter_cached_frame(self):
+        feed = _FakeFeed()
+        cache = HigherTimeframeCache(
+            feed, self._config(ttl_sec=600, candles=2)
+        )
+        cache.get_with_provenance("BTCUSDT", as_of=self._BAR_1230, now=1000.0)
+        cache.config.candles = 3
+        cache.get_with_provenance("BTCUSDT", as_of=self._BAR_1230, now=1001.0)
+
+        self.assertEqual(feed.calls, 2)
+        self.assertEqual(cache.cached_symbols, 2)
+
+    def test_request_failure_and_true_empty_are_distinct_evidence(self):
+        failed = HigherTimeframeCache(_FakeFeed(fail=True), self._config()).get_with_provenance(
+            "BTCUSDT", as_of=self._BAR_1230, now=1000.0
+        )
+        empty = HigherTimeframeCache(_EmptyFeed(), self._config()).get_with_provenance(
+            "BTCUSDT", as_of=self._BAR_1230, now=1000.0
+        )
+
+        self.assertIsNone(failed.frame)
+        self.assertEqual(failed.evidence.outcome, "request_failed")
+        self.assertEqual(failed.evidence.error_code, "MexcOhlcvRequestError")
+        self.assertIsNotNone(empty.frame)
+        self.assertTrue(empty.frame.empty)
+        self.assertEqual(empty.evidence.outcome, "no_rows")
+        self.assertIsNone(empty.evidence.error_code)
+
+    def test_programming_exception_is_not_disguised_as_request_failure(self):
+        cache = HigherTimeframeCache(_BuggyFeed(), self._config())
+        with self.assertRaisesRegex(RuntimeError, "programming bug"):
+            cache.get_with_provenance(
+                "BTCUSDT", as_of=self._BAR_1230, now=1000.0
+            )
+
+    def test_same_key_concurrent_miss_is_single_flight(self):
+        feed = _BlockingFeed()
+        cache = HigherTimeframeCache(feed, self._config(ttl_sec=600))
+        start = threading.Barrier(3)
+
+        def read_once():
+            start.wait(timeout=5.0)
+            return cache.get_with_provenance(
+                "BTCUSDT", as_of=self._BAR_1230, now=1000.0
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(read_once)
+            second = pool.submit(read_once)
+            start.wait(timeout=5.0)
+            self.assertTrue(feed.entered.wait(timeout=5.0))
+            feed.release.set()
+            reads = [first.result(timeout=5.0), second.result(timeout=5.0)]
+
+        self.assertEqual(feed.calls, 1)
+        self.assertEqual(reads[0].evidence.frame_hash, reads[1].evidence.frame_hash)
+        self.assertEqual(sum(read.evidence.cache_hit for read in reads), 1)
+
+    def test_later_stale_refresh_cannot_downgrade_same_boundary_fresh_cache(self):
+        fresh_feed = _FakeFeed()
+        cache = HigherTimeframeCache(fresh_feed, self._config(ttl_sec=1))
+        first = cache.get_with_provenance(
+            "BTCUSDT", as_of=self._BAR_1230, now=1000.0
+        )
+        cache.feed = _StaleFeed()
+        second = cache.get_with_provenance(
+            "BTCUSDT", as_of=self._BAR_1255, now=2000.0
+        )
+
+        self.assertEqual(first.evidence.frame_hash, second.evidence.frame_hash)
+        self.assertEqual(second.evidence.outcome, "stale")
+        self.assertTrue(second.evidence.cache_hit)
+        self.assertEqual(second.evidence.error_code, "HigherTimeframeDataLag")
+        self.assertEqual(
+            second.evidence.data_through_ts,
+            second.evidence.expected_closed_boundary_ts,
+        )
+
+    def test_legacy_get_returns_stale_rows_but_timing_exposes_staleness(self):
+        cache = HigherTimeframeCache(_StaleFeed(), self._config(ttl_sec=600))
+        frame = cache.get("BTCUSDT", as_of=self._BAR_1230, now=1000.0)
+        timing = cache.drain_timings()[0]
+
+        self.assertIsNotNone(frame)
+        self.assertFalse(frame.empty)
+        self.assertEqual(timing["outcome"], "stale")
+        self.assertLess(timing["data_through_ts"], timing["expected_closed_boundary_ts"])
 
 
 class HigherTimeframeGateV2Tests(unittest.TestCase):

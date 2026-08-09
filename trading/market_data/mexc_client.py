@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import threading
 import time
 from typing import Any
@@ -31,6 +32,26 @@ _EMPTY_OHLCV = ["time", "open", "high", "low", "close", "volume"]
 # overstates turnover ~10,000x, on CHILLGUY (contractSize 10) it understates it
 # 10x. Anything comparing liquidity across symbols must use `amount`.
 _TURNOVER_COLUMN = "turnover"
+
+
+class MexcOhlcvError(RuntimeError):
+    """Base class for typed public-kline failures."""
+
+
+class MexcOhlcvRequestError(MexcOhlcvError):
+    """The HTTP request did not complete successfully after retries."""
+
+
+class MexcOhlcvJsonError(MexcOhlcvError):
+    """The public endpoint returned a body that was not valid JSON."""
+
+
+class MexcOhlcvApiError(MexcOhlcvError):
+    """The JSON envelope did not declare a successful MEXC response."""
+
+
+class MexcOhlcvPayloadError(MexcOhlcvError):
+    """A successful response did not contain a coherent kline payload."""
 
 
 def _empty_ohlcv_frame() -> pd.DataFrame:
@@ -78,6 +99,8 @@ class MexcContractClient:
 
     Only public endpoints are used - no API key is required.
     """
+
+    venue = "mexc_contract"
 
     def __init__(
         self,
@@ -142,6 +165,54 @@ class MexcContractClient:
                 time.sleep(delay)
                 delay *= 2
         return None
+
+    def _request_public_ohlcv(
+        self, path: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Strict request path used only by OHLCV.
+
+        Universe/ticker wrappers intentionally retain their stale-cache behavior.
+        Klines have no such fallback, so converting every transport/HTTP/JSON
+        failure into an empty frame made a failed request indistinguishable from
+        a truthful empty response.
+        """
+
+        url = f"{self.base_url}{path}"
+        delay = 0.5
+        attempts = max(1, self.max_retries)
+        last_error: MexcOhlcvError | None = None
+        for attempt in range(attempts):
+            try:
+                self._limiter.acquire()
+                response = self._session.get(url, params=params, timeout=self.timeout)
+            except requests.RequestException as exc:
+                last_error = MexcOhlcvRequestError("mexc_ohlcv_request_failed")
+                if attempt >= attempts - 1:
+                    raise last_error from exc
+            else:
+                try:
+                    response.raise_for_status()
+                except requests.RequestException as exc:
+                    last_error = MexcOhlcvRequestError("mexc_ohlcv_http_failed")
+                    if attempt >= attempts - 1:
+                        raise last_error from exc
+                else:
+                    try:
+                        payload = response.json()
+                    except (TypeError, ValueError) as exc:
+                        last_error = MexcOhlcvJsonError("mexc_ohlcv_json_failed")
+                        if attempt >= attempts - 1:
+                            raise last_error from exc
+                    else:
+                        if not isinstance(payload, dict) or payload.get("success") is not True:
+                            raise MexcOhlcvApiError("mexc_ohlcv_api_rejected_request")
+                        return payload
+            if attempt < attempts - 1:
+                time.sleep(delay)
+                delay *= 2
+        # The loop always returns or raises, but keep the failure typed if an
+        # exotic response/session implementation violates that assumption.
+        raise last_error or MexcOhlcvRequestError("mexc_ohlcv_request_failed")
 
     def fetch_all_tickers_with_provenance(
         self, force: bool = False
@@ -332,32 +403,47 @@ class MexcContractClient:
             # Ask only for the window we need instead of the 2000-bar maximum.
             params["start"] = int(time.time()) - seconds_per_bar * (limit + 2)
 
-        payload = self._request_public(f"/api/v1/contract/kline/{mexc_symbol}", params=params)
-        data = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(data, dict) or not data.get("time"):
+        payload = self._request_public_ohlcv(
+            f"/api/v1/contract/kline/{mexc_symbol}", params=params
+        )
+        data = payload.get("data")
+        required = ("time", "open", "high", "low", "close", "vol", "amount")
+        if not isinstance(data, dict) or any(
+            key not in data or not isinstance(data[key], list) for key in required
+        ):
+            raise MexcOhlcvPayloadError("mexc_ohlcv_payload_schema_invalid")
+        lengths = {len(data[key]) for key in required}
+        if len(lengths) != 1:
+            raise MexcOhlcvPayloadError("mexc_ohlcv_payload_lengths_differ")
+        if lengths == {0}:
             return _empty_ohlcv_frame()
 
-        try:
-            df = pd.DataFrame(
-                {
-                    # MEXC returns epoch seconds; convert to ms to match the Bybit client.
-                    "time": pd.to_numeric(pd.Series(data["time"]), errors="coerce") * 1000,
-                    "open": pd.to_numeric(pd.Series(data["open"]), errors="coerce"),
-                    "high": pd.to_numeric(pd.Series(data["high"]), errors="coerce"),
-                    "low": pd.to_numeric(pd.Series(data["low"]), errors="coerce"),
-                    "close": pd.to_numeric(pd.Series(data["close"]), errors="coerce"),
-                    "volume": pd.to_numeric(pd.Series(data["vol"]), errors="coerce"),
-                    # exact quote turnover; see _TURNOVER_COLUMN note above
-                    _TURNOVER_COLUMN: pd.to_numeric(pd.Series(data.get("amount", [])), errors="coerce"),
-                }
-            )
-        except (KeyError, ValueError):
-            return _empty_ohlcv_frame()
-
-        df = df.dropna(subset=_EMPTY_OHLCV)
+        # Parse strictly. Silently dropping malformed rows can turn a failed or
+        # corrupted response into a plausible-looking short/empty history.
+        parsed = {
+            "time": pd.to_numeric(pd.Series(data["time"]), errors="coerce") * 1000,
+            "open": pd.to_numeric(pd.Series(data["open"]), errors="coerce"),
+            "high": pd.to_numeric(pd.Series(data["high"]), errors="coerce"),
+            "low": pd.to_numeric(pd.Series(data["low"]), errors="coerce"),
+            "close": pd.to_numeric(pd.Series(data["close"]), errors="coerce"),
+            "volume": pd.to_numeric(pd.Series(data["vol"]), errors="coerce"),
+            # exact quote turnover; see _TURNOVER_COLUMN note above
+            _TURNOVER_COLUMN: pd.to_numeric(
+                pd.Series(data["amount"]), errors="coerce"
+            ),
+        }
+        if any(
+            series.isna().any()
+            or not all(math.isfinite(float(value)) for value in series)
+            for series in parsed.values()
+        ):
+            raise MexcOhlcvPayloadError("mexc_ohlcv_payload_contains_invalid_numbers")
+        df = pd.DataFrame(parsed)
         df = df.sort_values("time").reset_index(drop=True)
         df["datetime"] = pd.to_datetime(df["time"], unit="ms", utc=True, errors="coerce")
-        df = df.dropna(subset=["datetime"]).set_index("datetime")
+        if df["datetime"].isna().any():
+            raise MexcOhlcvPayloadError("mexc_ohlcv_payload_contains_invalid_time")
+        df = df.set_index("datetime")
         return df.tail(limit)
 
     @staticmethod

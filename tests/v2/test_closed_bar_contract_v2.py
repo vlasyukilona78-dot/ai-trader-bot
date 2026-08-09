@@ -131,7 +131,14 @@ class ClosedMarketFrameV2Tests(unittest.TestCase):
 
     def test_empty_mexc_response_keeps_timezone_aware_bar_index(self):
         client = MexcContractClient()
-        with patch.object(client, "_request_public", return_value={"data": {}}):
+        empty = {
+            "success": True,
+            "data": {
+                "time": [], "open": [], "high": [], "low": [],
+                "close": [], "vol": [], "amount": [],
+            },
+        }
+        with patch.object(client, "_request_public_ohlcv", return_value=empty):
             frame = client.fetch_ohlcv("BTCUSDT", "60", 10)
         client.close()
 
