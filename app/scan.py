@@ -35,7 +35,7 @@ from core.mexc_strategy_spec import (
     DEFAULT_MEXC_STRATEGY_SPEC_PATH,
     MexcStrategySpec,
     load_mexc_strategy_spec,
-    strategy_spec_contract_hash,
+    strategy_spec_identity,
 )
 from trading.market_data.bar_contract import (
     BarContractError,
@@ -178,7 +178,10 @@ def _resolve_scan_spec(
         resolved = strategy_spec or bound_spec
     if not isinstance(resolved, MexcStrategySpec):
         raise TypeError("strategy_spec_must_be_mexc_strategy_spec")
-    if bound_spec is not None and bound_spec.instance_hash != resolved.instance_hash:
+    if (
+        bound_spec is not None
+        and strategy_spec_identity(bound_spec) != strategy_spec_identity(resolved)
+    ):
         raise ValueError("strategy_and_scanner_specs_do_not_match")
     assert_consistent = getattr(strategy, "assert_strategy_spec_consistency", None)
     if callable(assert_consistent):
@@ -641,9 +644,10 @@ def scan_once(
     # than the cycle's own start, which is both a false provenance claim and an
     # envelope-invariant crash.
     candle_cutoff_ts = closed_boundary_ts(cycle_started_at, timeframe)
-    strategy_spec_version = resolved_spec.spec_version
-    strategy_contract_hash = strategy_spec_contract_hash()
-    strategy_instance_hash = resolved_spec.instance_hash
+    strategy_identity = strategy_spec_identity(resolved_spec)
+    strategy_spec_version = strategy_identity.spec_version
+    strategy_contract_hash = strategy_identity.contract_hash
+    strategy_instance_hash = strategy_identity.instance_hash
     strategy_spec_payload = resolved_spec.to_mapping()
     universe_policy_hash = configuration_hash(
         getattr(universe, "config", None),

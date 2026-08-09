@@ -114,12 +114,24 @@ class PopulationJournalTrustState:
 @dataclass
 class _ReaderState:
     journal_id: str | None = None
+    strategy_spec_identity: tuple[str, str, str] | None = None
     last_sequence_no: int = -1
     last_cycle_id: str | None = None
     last_cycle_commit: str | None = None
     checkpoint_seen: bool = False
     cycle_ids: list[str] = field(default_factory=list)
     cycle_commits: list[str] = field(default_factory=list)
+
+    def bind_strategy_spec(self, envelope: CycleEnvelope) -> None:
+        identity = (
+            envelope.strategy_spec_version,
+            envelope.strategy_spec_contract_hash,
+            envelope.strategy_spec_instance_hash,
+        )
+        if self.strategy_spec_identity is None:
+            self.strategy_spec_identity = identity
+        elif identity != self.strategy_spec_identity:
+            raise PopulationDatasetError("mixed_strategy_spec_identities")
 
     def trust_state(
         self,
@@ -532,6 +544,7 @@ def _parse_population_cycles(
                 envelope = _rebuild_envelope(
                     _mapping(payload.get("envelope"), field="envelope")
                 )
+                state.bind_strategy_spec(envelope)
                 current_header = payload
                 if envelope.cycle_id != payload.get("cycle_id"):
                     raise PopulationDatasetError("cycle_header_id_mismatch")
@@ -858,29 +871,39 @@ def model_input_records(
     trusted_checkpoint: JournalCheckpointReceipt | Mapping[str, object] | None = None,
     allow_unanchored: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return whitelist-only model inputs from an anchored prefix by default."""
+    """Return whitelist-only features plus non-predictive evidence identity."""
 
     if trusted_checkpoint is None and not allow_unanchored:
         raise PopulationDatasetError("trusted_checkpoint_required_for_model_inputs")
 
     names = model_feature_names()
     records: list[dict[str, Any]] = []
-    for row in iter_population_feature_rows(
+    for envelope, rows in iter_population_cycles(
         path,
         trusted_checkpoint=trusted_checkpoint,
         anchored_only=trusted_checkpoint is not None,
     ):
-        records.append(
-            {
-                "snapshot_id": row.snapshot_id,
-                "cycle_id": row.cycle_id,
-                "symbol": row.symbol,
-                "bar_cutoff_ts": row.bar_cutoff_ts,
-                "envelope_hash": row.envelope_hash,
-                "market_feature_hash": row.market_feature_hash,
-                "feature_names": names,
-                "features": {name: row.features[name] for name in names},
-                "observed": {name: row.observed[name] for name in names},
-            }
-        )
+        for row in rows:
+            records.append(
+                {
+                    "snapshot_id": row.snapshot_id,
+                    "cycle_id": row.cycle_id,
+                    "symbol": row.symbol,
+                    "bar_cutoff_ts": row.bar_cutoff_ts,
+                    "envelope_hash": row.envelope_hash,
+                    "market_feature_hash": row.market_feature_hash,
+                    # Evidence/partition metadata only. These fields deliberately
+                    # remain outside ``features`` and must never become predictors.
+                    "strategy_spec_version": envelope.strategy_spec_version,
+                    "strategy_spec_contract_hash": (
+                        envelope.strategy_spec_contract_hash
+                    ),
+                    "strategy_spec_instance_hash": (
+                        envelope.strategy_spec_instance_hash
+                    ),
+                    "feature_names": names,
+                    "features": {name: row.features[name] for name in names},
+                    "observed": {name: row.observed[name] for name in names},
+                }
+            )
     return records

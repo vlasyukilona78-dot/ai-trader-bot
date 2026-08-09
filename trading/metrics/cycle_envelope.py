@@ -20,10 +20,9 @@ from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from core.mexc_strategy_spec import (
-    MEXC_STRATEGY_SPEC_VERSION,
-    MexcStrategySpec,
     MexcStrategySpecError,
-    strategy_spec_contract_hash,
+    decode_mexc_strategy_spec_evidence,
+    strategy_spec_identity,
 )
 from trading.market_data.bar_contract import (
     interval_seconds,
@@ -122,8 +121,6 @@ class CycleEnvelope:
             raise CycleEnvelopeError("unsupported_timing_basis")
         if not isinstance(self.cycle_id, str) or not _HASH_RE.fullmatch(self.cycle_id):
             raise CycleEnvelopeError("cycle_id_must_be_a_sha256_digest")
-        if self.strategy_spec_version != MEXC_STRATEGY_SPEC_VERSION:
-            raise CycleEnvelopeError("unsupported_strategy_spec_version")
         for name in (
             "strategy_spec_contract_hash",
             "strategy_spec_instance_hash",
@@ -135,20 +132,24 @@ class CycleEnvelope:
         if not isinstance(self.strategy_spec_payload, Mapping):
             raise CycleEnvelopeError("strategy_spec_payload_must_be_a_mapping")
         try:
-            rebuilt_spec = MexcStrategySpec.from_mapping(self.strategy_spec_payload)
+            rebuilt_spec = decode_mexc_strategy_spec_evidence(
+                self.strategy_spec_payload,
+                expected_version=self.strategy_spec_version,
+            )
         except (MexcStrategySpecError, RuntimeError, TypeError, ValueError) as exc:
             raise CycleEnvelopeError("invalid_strategy_spec_payload") from exc
         canonical_spec_payload = rebuilt_spec.to_mapping()
         if _thaw_json(self.strategy_spec_payload) != canonical_spec_payload:
             raise CycleEnvelopeError("strategy_spec_payload_must_be_canonical")
         try:
-            expected_contract_hash = strategy_spec_contract_hash()
-            expected_instance_hash = rebuilt_spec.instance_hash
+            identity = strategy_spec_identity(rebuilt_spec)
         except (RuntimeError, TypeError, ValueError) as exc:
             raise CycleEnvelopeError("invalid_strategy_spec_identity") from exc
-        if self.strategy_spec_contract_hash != expected_contract_hash:
+        if identity.spec_version != self.strategy_spec_version:
+            raise CycleEnvelopeError("strategy_spec_version_mismatch")
+        if self.strategy_spec_contract_hash != identity.contract_hash:
             raise CycleEnvelopeError("strategy_spec_contract_hash_mismatch")
-        if self.strategy_spec_instance_hash != expected_instance_hash:
+        if self.strategy_spec_instance_hash != identity.instance_hash:
             raise CycleEnvelopeError("strategy_spec_instance_hash_mismatch")
         if interval_seconds(self.timeframe) != rebuilt_spec.base_interval_seconds:
             raise CycleEnvelopeError("timeframe_disagrees_with_strategy_spec")

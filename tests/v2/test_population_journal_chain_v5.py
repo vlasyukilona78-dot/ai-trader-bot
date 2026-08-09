@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import os
 
@@ -14,6 +15,8 @@ from ai.reversal.population_dataset import (
     population_feature_records,
     verify_population_journal,
 )
+from core.mexc_strategy_spec import parse_mexc_strategy_spec, strategy_spec_identity
+from trading.metrics.cycle_envelope import CycleEnvelope
 from trading.metrics.population_journal import (
     JournalCheckpointReceipt,
     PopulationJournal,
@@ -65,6 +68,18 @@ def _rehash_cycle(lines: list[dict], *, header_index: int) -> str:
     return footer["cycle_commit"]
 
 
+def _with_alternate_strategy_identity(envelope: CycleEnvelope) -> CycleEnvelope:
+    payload = deepcopy(envelope.as_dict())
+    strategy_payload = payload["strategy_spec_payload"]
+    strategy_payload["signal"]["rsi_high"] = 76.0
+    spec = parse_mexc_strategy_spec(strategy_payload)
+    identity = strategy_spec_identity(spec)
+    payload["strategy_spec_version"] = identity.spec_version
+    payload["strategy_spec_contract_hash"] = identity.contract_hash
+    payload["strategy_spec_instance_hash"] = identity.instance_hash
+    return CycleEnvelope.from_dict(payload)
+
+
 def test_writer_builds_one_contiguous_domain_separated_chain(tmp_path) -> None:
     path = tmp_path / "population.jsonl"
     journal = PopulationJournal(path)
@@ -89,6 +104,70 @@ def test_writer_builds_one_contiguous_domain_separated_chain(tmp_path) -> None:
     assert state.integrity == "internally_consistent_unanchored"
     assert state.last_sequence_no == 1
     assert state.last_cycle_commit == footers[1]["cycle_commit"]
+
+
+def test_writer_rejects_a_second_strategy_identity_without_touching_the_file(
+    tmp_path,
+) -> None:
+    path = tmp_path / "population.jsonl"
+    journal = PopulationJournal(path)
+    journal.append_cycle(_records(), envelope=_envelope())
+    before = path.read_bytes()
+    alternate = _with_alternate_strategy_identity(
+        _envelope(universe_symbols=(), status="empty_universe")
+    )
+
+    with pytest.raises(
+        PopulationJournalError,
+        match="population journal mixes strategy identities",
+    ):
+        journal.append_cycle((), envelope=alternate)
+
+    assert path.read_bytes() == before
+    PopulationJournal(path)
+
+
+def test_restart_reader_and_model_export_reject_a_coherently_mixed_identity_file(
+    tmp_path,
+) -> None:
+    path = tmp_path / "population.jsonl"
+    journal = PopulationJournal(path)
+    journal.append_cycle(_records(), envelope=_envelope())
+    journal.append_cycle(
+        (),
+        envelope=_envelope(universe_symbols=(), status="empty_universe"),
+    )
+
+    lines = _lines(path)
+    second_header = next(
+        index
+        for index, line in enumerate(lines)
+        if index > 0 and line.get("record_type") == "cycle_header"
+    )
+    second_footer = next(
+        index
+        for index in range(second_header + 1, len(lines))
+        if lines[index].get("record_type") == "cycle_footer"
+    )
+    alternate = _with_alternate_strategy_identity(
+        CycleEnvelope.from_dict(lines[second_header]["envelope"])
+    )
+    alternate_hash = alternate.envelope_hash()
+    lines[second_header]["envelope"] = alternate.as_dict()
+    lines[second_header]["envelope_hash"] = alternate_hash
+    lines[second_footer]["envelope_hash"] = alternate_hash
+    _rehash_cycle(lines, header_index=second_header)
+    _rewrite(path, lines)
+
+    with pytest.raises(
+        PopulationJournalError,
+        match="population journal mixes strategy identities",
+    ):
+        PopulationJournal(path)
+    with pytest.raises(PopulationDatasetError, match="mixed_strategy_spec_identities"):
+        verify_population_journal(path)
+    with pytest.raises(PopulationDatasetError, match="mixed_strategy_spec_identities"):
+        model_input_records(path, allow_unanchored=True)
 
 
 def test_explicit_checkpoint_anchors_only_its_prefix_by_default(tmp_path) -> None:

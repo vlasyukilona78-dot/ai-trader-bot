@@ -11,12 +11,19 @@ import core.mexc_strategy_spec as strategy_spec_module
 from core.indicators import compute_indicators
 from core.mexc_strategy_spec import (
     DEFAULT_MEXC_STRATEGY_SPEC_PATH,
+    DEFAULT_MEXC_STRATEGY_V2_SPEC_PATH,
+    MEXC_STRATEGY_SPEC_V2_VERSION,
     MEXC_STRATEGY_SPEC_VERSION,
+    SUPPORTED_MEXC_STRATEGY_SPEC_VERSIONS,
     MexcStrategySpec,
     MexcStrategySpecError,
+    StrategySpecIdentity,
+    decode_mexc_strategy_spec_evidence,
     load_mexc_strategy_spec,
+    parse_mexc_strategy_spec,
     strategy_spec_contract_hash,
     strategy_spec_hash,
+    strategy_spec_identity,
 )
 from core.signal_generator import SignalConfig
 from core.volume_profile import compute_volume_profile
@@ -37,6 +44,7 @@ def test_default_yaml_is_the_actual_mexc_runtime_configuration() -> None:
     signal = SignalConfig()
 
     assert DEFAULT_MEXC_STRATEGY_SPEC_PATH.is_file()
+    assert DEFAULT_MEXC_STRATEGY_SPEC_PATH == DEFAULT_MEXC_STRATEGY_V2_SPEC_PATH
     assert spec.spec_version == MEXC_STRATEGY_SPEC_VERSION
     assert spec.to_signal_config() == signal
     assert spec.to_volatility_context_config() == VolatilityContextConfig(
@@ -115,8 +123,152 @@ def test_contract_and_default_instance_hashes_are_pinned() -> None:
     spec = load_mexc_strategy_spec()
 
     assert strategy_spec_contract_hash() == PINNED_CONTRACT_HASH
+    assert (
+        strategy_spec_contract_hash(MEXC_STRATEGY_SPEC_V2_VERSION)
+        == PINNED_CONTRACT_HASH
+    )
     assert strategy_spec_hash(spec) == PINNED_DEFAULT_INSTANCE_HASH
     assert spec.instance_hash == PINNED_DEFAULT_INSTANCE_HASH
+    assert strategy_spec_identity(spec) == StrategySpecIdentity(
+        spec_version=MEXC_STRATEGY_SPEC_V2_VERSION,
+        contract_hash=PINNED_CONTRACT_HASH,
+        instance_hash=PINNED_DEFAULT_INSTANCE_HASH,
+    )
+
+
+def test_instance_hash_retains_the_v2_wrong_type_error() -> None:
+    class PretendV2Spec:
+        spec_version = MEXC_STRATEGY_SPEC_V2_VERSION
+
+    with pytest.raises(TypeError, match="spec must be a MexcStrategySpec"):
+        strategy_spec_hash(PretendV2Spec())  # type: ignore[arg-type]
+
+
+def test_immutable_registry_dispatches_persisted_v2_by_its_own_version() -> None:
+    payload = _mapping()
+
+    dispatched = parse_mexc_strategy_spec(payload)
+
+    assert dispatched == MexcStrategySpec.from_mapping(payload)
+    assert tuple(strategy_spec_module._STRATEGY_SPEC_VERSION_REGISTRY) == (
+        MEXC_STRATEGY_SPEC_V2_VERSION,
+    )
+    assert SUPPORTED_MEXC_STRATEGY_SPEC_VERSIONS == (
+        MEXC_STRATEGY_SPEC_V2_VERSION,
+    )
+    with pytest.raises(TypeError):
+        strategy_spec_module._STRATEGY_SPEC_VERSION_REGISTRY[
+            "mexc_strategy_future"
+        ] = object()  # type: ignore[index]
+    with pytest.raises(FrozenInstanceError):
+        strategy_spec_module._STRATEGY_SPEC_VERSION_REGISTRY[
+            MEXC_STRATEGY_SPEC_V2_VERSION
+        ].spec_version = "mexc_strategy_future"  # type: ignore[misc]
+
+
+def test_version_dispatch_and_contract_hash_fail_closed_on_unknown_version() -> None:
+    payload = _mapping()
+    payload["spec_version"] = "mexc_strategy_unknown"
+
+    with pytest.raises(
+        MexcStrategySpecError,
+        match="strategy_spec_version_unsupported:mexc_strategy_unknown",
+    ):
+        parse_mexc_strategy_spec(payload)
+    with pytest.raises(
+        MexcStrategySpecError,
+        match="strategy_spec_version_unsupported:mexc_strategy_unknown",
+    ):
+        strategy_spec_contract_hash("mexc_strategy_unknown")
+
+
+def test_evidence_decoder_binds_outer_version_to_embedded_version() -> None:
+    payload = _mapping()
+
+    assert decode_mexc_strategy_spec_evidence(
+        payload,
+        expected_version=MEXC_STRATEGY_SPEC_V2_VERSION,
+    ) == load_mexc_strategy_spec()
+
+    payload["spec_version"] = "mexc_strategy_unknown"
+    with pytest.raises(
+        MexcStrategySpecError,
+        match="strategy_spec_evidence_version_mismatch",
+    ):
+        decode_mexc_strategy_spec_evidence(
+            payload,
+            expected_version=MEXC_STRATEGY_SPEC_V2_VERSION,
+        )
+
+    with pytest.raises(
+        MexcStrategySpecError,
+        match="strategy_spec_version_unsupported:mexc_strategy_unknown",
+    ):
+        decode_mexc_strategy_spec_evidence(
+            payload,
+            expected_version="mexc_strategy_unknown",
+        )
+
+
+def test_direct_v2_parser_retains_its_version_specific_error() -> None:
+    payload = _mapping()
+    payload["spec_version"] = "mexc_strategy_unknown"
+
+    with pytest.raises(
+        MexcStrategySpecError,
+        match="spec_version_must_equal:mexc_strategy_v2",
+    ):
+        MexcStrategySpec.from_mapping(payload)
+
+
+def test_v2_parser_and_instance_hash_do_not_depend_on_the_current_version_alias(
+    monkeypatch,
+) -> None:
+    payload = _mapping()
+    expected = load_mexc_strategy_spec()
+
+    monkeypatch.setattr(
+        strategy_spec_module,
+        "MEXC_STRATEGY_SPEC_VERSION",
+        "mexc_strategy_future",
+    )
+
+    rebuilt = MexcStrategySpec.from_mapping(payload)
+    dispatched = parse_mexc_strategy_spec(payload)
+    assert rebuilt == expected
+    assert dispatched == expected
+    assert strategy_spec_hash(rebuilt) == PINNED_DEFAULT_INSTANCE_HASH
+    assert (
+        strategy_spec_contract_hash(MEXC_STRATEGY_SPEC_V2_VERSION)
+        == PINNED_CONTRACT_HASH
+    )
+    assert load_mexc_strategy_spec() == expected
+
+
+def test_instance_hash_requests_the_specs_own_registered_contract(monkeypatch) -> None:
+    spec = load_mexc_strategy_spec()
+    requested_versions: list[str] = []
+    original = strategy_spec_contract_hash
+
+    def tracked_contract_hash(spec_version: str = MEXC_STRATEGY_SPEC_VERSION) -> str:
+        requested_versions.append(spec_version)
+        return original(spec_version)
+
+    monkeypatch.setattr(
+        strategy_spec_module,
+        "strategy_spec_contract_hash",
+        tracked_contract_hash,
+    )
+
+    assert strategy_spec_hash(spec) == PINNED_DEFAULT_INSTANCE_HASH
+    assert requested_versions == [MEXC_STRATEGY_SPEC_V2_VERSION]
+
+    requested_versions.clear()
+    assert strategy_spec_identity(spec).instance_hash == PINNED_DEFAULT_INSTANCE_HASH
+    assert requested_versions == [
+        MEXC_STRATEGY_SPEC_V2_VERSION,
+        MEXC_STRATEGY_SPEC_V2_VERSION,
+    ]
 
 
 def test_mapping_order_and_interval_aliases_do_not_change_identity() -> None:

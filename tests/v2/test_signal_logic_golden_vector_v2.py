@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from hashlib import sha256
 import json
+from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from core.mexc_strategy_spec import load_mexc_strategy_spec
+from core.mexc_strategy_spec import decode_mexc_strategy_spec_evidence
 from trading.exchange.schemas import AccountSnapshot
 from trading.market_data.reconciliation import ExchangeSnapshot
 from trading.signals.layered_strategy import LayeredPumpStrategy
@@ -18,6 +19,19 @@ from trading.state.models import TradeState
 PINNED_LAYERED_PUMP_SIGNAL_V1_DIGEST = (
     "d5736beda70ca2826dc4868c2d4d95cb17b1289ac2ba03a2a052d9db69587459"
 )
+_V2_EVIDENCE_FIXTURE = (
+    Path(__file__).resolve().parents[1]
+    / "fixtures"
+    / "mexc_strategy_v2_cycle_envelope_v3.json"
+)
+
+
+def _frozen_v2_spec():
+    envelope = json.loads(_V2_EVIDENCE_FIXTURE.read_text(encoding="utf-8"))
+    return decode_mexc_strategy_spec_evidence(
+        envelope["strategy_spec_payload"],
+        expected_version=envelope["strategy_spec_version"],
+    )
 
 
 def _pump_frame() -> pd.DataFrame:
@@ -159,7 +173,7 @@ def _behavior_digest(*intents: StrategyIntent) -> str:
 
 
 def test_layered_pump_signal_v1_matches_the_frozen_decision_trace_and_proposal() -> None:
-    spec = load_mexc_strategy_spec()
+    spec = _frozen_v2_spec()
     assert spec.runtime_semantics.logic_revision == "layered_pump_signal_v1"
 
     frame = _pump_frame()

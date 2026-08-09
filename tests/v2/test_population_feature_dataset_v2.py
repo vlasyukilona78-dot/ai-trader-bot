@@ -8,6 +8,7 @@ from core.mexc_strategy_spec import (
     MEXC_STRATEGY_SPEC_VERSION,
     load_mexc_strategy_spec,
     strategy_spec_contract_hash,
+    strategy_spec_identity,
 )
 from ai.reversal.feature_contract import build_runtime_feature_snapshot, market_feature_hash
 from ai.reversal.population_dataset import (
@@ -175,6 +176,7 @@ def test_reader_preserves_complete_population_and_real_missingness(tmp_path) -> 
     assert flat[0]["market_feature_hash"] == rows[0].market_feature_hash
 
     model_rows = model_input_records(path, allow_unanchored=True)
+    identity = strategy_spec_identity(_STRATEGY_SPEC)
     assert "action" not in model_rows[0]
     assert "status" not in model_rows[0]
     assert "open_interest" not in model_rows[0]["features"]
@@ -182,6 +184,18 @@ def test_reader_preserves_complete_population_and_real_missingness(tmp_path) -> 
     assert "funding_rate" in model_rows[0]["features"]
     assert model_rows[0]["envelope_hash"] == rows[0].envelope_hash
     assert model_rows[0]["market_feature_hash"] == rows[0].market_feature_hash
+    assert model_rows[0]["strategy_spec_version"] == identity.spec_version
+    assert model_rows[0]["strategy_spec_contract_hash"] == identity.contract_hash
+    assert model_rows[0]["strategy_spec_instance_hash"] == identity.instance_hash
+    assert set(model_rows[0]["features"]) == set(model_rows[0]["feature_names"])
+    assert set(model_rows[0]["observed"]) == set(model_rows[0]["feature_names"])
+    for identity_field in (
+        "strategy_spec_version",
+        "strategy_spec_contract_hash",
+        "strategy_spec_instance_hash",
+    ):
+        assert identity_field not in model_rows[0]["features"]
+        assert identity_field not in model_rows[0]["observed"]
 
 
 def test_reader_round_trips_all_scanner_cache_provenance(tmp_path) -> None:

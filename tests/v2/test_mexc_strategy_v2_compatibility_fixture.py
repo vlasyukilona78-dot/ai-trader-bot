@@ -4,7 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from core.mexc_strategy_spec import MexcStrategySpec
+from core.mexc_strategy_spec import decode_mexc_strategy_spec_evidence
 from trading.metrics.cycle_envelope import CycleEnvelope
 
 
@@ -41,7 +41,10 @@ def test_frozen_v2_evidence_remains_readable_after_future_spec_bumps() -> None:
     assert payload["strategy_spec_instance_hash"] == V2_INSTANCE_HASH
 
     spec_payload = payload["strategy_spec_payload"]
-    spec = MexcStrategySpec.from_mapping(spec_payload)
+    spec = decode_mexc_strategy_spec_evidence(
+        spec_payload,
+        expected_version=payload["strategy_spec_version"],
+    )
     assert spec.spec_version == "mexc_strategy_v2"
     assert spec.to_mapping() == spec_payload
     assert spec.instance_hash == V2_INSTANCE_HASH

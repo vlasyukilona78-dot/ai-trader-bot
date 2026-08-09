@@ -12,7 +12,7 @@ from core.mexc_strategy_spec import (
     MEXC_STRATEGY_SPEC_VERSION,
     MexcStrategySpec,
     load_mexc_strategy_spec,
-    strategy_spec_contract_hash,
+    strategy_spec_identity,
 )
 from core.signal_generator import SignalConfig
 from trading.market_data.source_timing import SourceTiming
@@ -49,6 +49,7 @@ def _envelope(
         status="ok",
     )
     resolved_timeframe = timeframe or spec.market_data.base_interval
+    identity = strategy_spec_identity(spec)
     return CycleEnvelope.build(
         cycle_id=make_cycle_id(
             timeframe=resolved_timeframe,
@@ -63,9 +64,9 @@ def _envelope(
         universe_symbols=symbols,
         universe_timing=universe_timing,
         source_timings=(universe_timing,),
-        strategy_spec_version=spec.spec_version,
-        strategy_spec_contract_hash=strategy_spec_contract_hash(),
-        strategy_spec_instance_hash=spec.instance_hash,
+        strategy_spec_version=identity.spec_version,
+        strategy_spec_contract_hash=identity.contract_hash,
+        strategy_spec_instance_hash=identity.instance_hash,
         strategy_spec_payload=spec.to_mapping(),
         universe_policy_hash="a" * 64,
         ranking_ready_ts=cutoff + 2.0,
@@ -75,13 +76,14 @@ def _envelope(
 
 def test_cycle_envelope_v3_round_trip_rebuilds_the_resolved_strategy_spec() -> None:
     spec = load_mexc_strategy_spec()
+    identity = strategy_spec_identity(spec)
     envelope = _envelope(spec)
 
     assert CYCLE_ENVELOPE_SCHEMA_VERSION == 3
     assert envelope.strategy_spec_version == MEXC_STRATEGY_SPEC_VERSION
-    assert envelope.strategy_spec_contract_hash == strategy_spec_contract_hash()
-    assert envelope.strategy_spec_instance_hash == spec.instance_hash
-    assert envelope.strategy_config_hash == spec.instance_hash
+    assert envelope.strategy_spec_contract_hash == identity.contract_hash
+    assert envelope.strategy_spec_instance_hash == identity.instance_hash
+    assert envelope.strategy_config_hash == identity.instance_hash
     assert envelope.as_dict()["strategy_spec_payload"] == spec.to_mapping()
     assert CycleEnvelope.from_dict(envelope.as_dict()).as_dict() == envelope.as_dict()
 
@@ -120,6 +122,19 @@ def test_cycle_envelope_rejects_strategy_spec_tampering(mutate, message) -> None
         CycleEnvelope.from_dict(payload)
     assert isinstance(caught.value.__cause__, CycleEnvelopeError)
     assert message in str(caught.value.__cause__)
+
+
+def test_cycle_envelope_binds_outer_and_embedded_strategy_versions() -> None:
+    payload = deepcopy(_envelope(load_mexc_strategy_spec()).as_dict())
+    payload["strategy_spec_payload"]["spec_version"] = "mexc_strategy_unknown"
+
+    with pytest.raises(CycleEnvelopeError, match="invalid_cycle_envelope") as caught:
+        CycleEnvelope.from_dict(payload)
+
+    envelope_error = caught.value.__cause__
+    assert isinstance(envelope_error, CycleEnvelopeError)
+    assert str(envelope_error) == "invalid_strategy_spec_payload"
+    assert "strategy_spec_evidence_version_mismatch" in str(envelope_error.__cause__)
 
 
 def test_scanner_uses_one_bound_spec_for_market_data_strategy_and_evidence() -> None:

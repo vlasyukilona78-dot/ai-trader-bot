@@ -17,7 +17,8 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Any, Mapping
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
 
 from core.signal_generator import SignalConfig
 from trading.market_data.bar_contract import BarContractError, interval_seconds
@@ -30,15 +31,19 @@ except Exception:  # pragma: no cover - the loader reports this explicitly
     yaml = None
 
 
-MEXC_STRATEGY_SPEC_VERSION = "mexc_strategy_v2"
-DEFAULT_MEXC_STRATEGY_SPEC_PATH = (
+MEXC_STRATEGY_SPEC_V2_VERSION = "mexc_strategy_v2"
+# The production-facing current version remains an explicit alias.  Historical
+# readers and hashes must use the version carried by their own payload instead.
+MEXC_STRATEGY_SPEC_VERSION = MEXC_STRATEGY_SPEC_V2_VERSION
+DEFAULT_MEXC_STRATEGY_V2_SPEC_PATH = (
     Path(__file__).resolve().parents[1] / "config" / "mexc_strategy_v2.yaml"
 )
+DEFAULT_MEXC_STRATEGY_SPEC_PATH = DEFAULT_MEXC_STRATEGY_V2_SPEC_PATH
 
 _PINNED_CONTRACT_HASHES = {
     # Filled with the digest of the declarative schema below.  A field/layout or
     # adapter-semantics change requires a new MEXC_STRATEGY_SPEC_VERSION.
-    MEXC_STRATEGY_SPEC_VERSION: "9c62b88b7804e9663bae6f0eb429c58c541680b61d307c4f16032cb0b62fe3dd",
+    MEXC_STRATEGY_SPEC_V2_VERSION: "9c62b88b7804e9663bae6f0eb429c58c541680b61d307c4f16032cb0b62fe3dd",
 }
 
 _CANONICAL_INTERVAL_BY_SECONDS = {
@@ -573,7 +578,7 @@ class MexcStrategySpec:
             spec_version=_strict_literal(
                 payload["spec_version"],
                 path="spec_version",
-                expected=MEXC_STRATEGY_SPEC_VERSION,
+                expected=MEXC_STRATEGY_SPEC_V2_VERSION,
             ),
             market_data=MarketDataParameters.from_mapping(payload["market_data"]),
             runtime_semantics=RuntimeSemantics.from_mapping(
@@ -589,12 +594,12 @@ class MexcStrategySpec:
         spec._validate_cross_section()
         # Construction is also the fail-closed boundary for an unversioned schema
         # edit, rather than deferring that failure until a caller asks for a hash.
-        strategy_spec_contract_hash()
+        strategy_spec_contract_hash(MEXC_STRATEGY_SPEC_V2_VERSION)
         return spec
 
     @classmethod
     def from_yaml(
-        cls, path: str | Path = DEFAULT_MEXC_STRATEGY_SPEC_PATH
+        cls, path: str | Path = DEFAULT_MEXC_STRATEGY_V2_SPEC_PATH
     ) -> "MexcStrategySpec":
         return cls.from_mapping(_load_unique_yaml(path))
 
@@ -721,6 +726,8 @@ def _load_unique_yaml(path: str | Path) -> Mapping[str, Any]:
 def load_mexc_strategy_spec(
     path: str | Path = DEFAULT_MEXC_STRATEGY_SPEC_PATH,
 ) -> MexcStrategySpec:
+    # Production remains an explicit current-version entrypoint.  Persisted
+    # evidence uses the version-dispatched decoder below instead.
     return MexcStrategySpec.from_yaml(path)
 
 
@@ -731,9 +738,9 @@ def _field_layout(cls) -> list[dict[str, str]]:
     ]
 
 
-def _contract_payload() -> dict[str, Any]:
+def _v2_contract_payload() -> dict[str, Any]:
     return {
-        "spec_version": MEXC_STRATEGY_SPEC_VERSION,
+        "spec_version": MEXC_STRATEGY_SPEC_V2_VERSION,
         "validation_revision": "strict_mapping_types_ranges_v1",
         "interval_canonicalization_revision": "fixed_mexc_aliases_v1",
         "layouts": {
@@ -787,31 +794,38 @@ def _contract_payload() -> dict[str, Any]:
     }
 
 
-def _contract_digest() -> str:
-    encoded = json.dumps(
-        _contract_payload(),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+@dataclass(frozen=True, slots=True)
+class _StrategySpecVersionRegistration:
+    spec_version: str
+    spec_type: type[Any]
+    parse_mapping: Callable[[Any], Any]
+    contract_payload: Callable[[], dict[str, Any]]
+    hash_instance: Callable[[Any], str]
 
 
-@lru_cache(maxsize=1)
-def strategy_spec_contract_hash() -> str:
-    digest = _contract_digest()
-    if _PINNED_CONTRACT_HASHES.get(MEXC_STRATEGY_SPEC_VERSION) != digest:
-        raise RuntimeError("mexc_strategy_spec_changed_without_version_bump")
-    return digest
+@dataclass(frozen=True, slots=True)
+class StrategySpecIdentity:
+    """Version-bound identity of one validated strategy specification."""
+
+    spec_version: str
+    contract_hash: str
+    instance_hash: str
 
 
-def strategy_spec_hash(spec: MexcStrategySpec) -> str:
+def _parse_mexc_strategy_spec_v2(value: Any) -> MexcStrategySpec:
+    return MexcStrategySpec.from_mapping(value)
+
+
+def _strategy_spec_hash_v2(spec: Any) -> str:
+    """Frozen v2 instance-identity serialization; do not generalize in place."""
+
     if not isinstance(spec, MexcStrategySpec):
         raise TypeError("spec must be a MexcStrategySpec")
     encoded = json.dumps(
         {
-            "contract_hash": strategy_spec_contract_hash(),
+            "contract_hash": strategy_spec_contract_hash(
+                MEXC_STRATEGY_SPEC_V2_VERSION
+            ),
             "spec": spec.to_mapping(),
         },
         ensure_ascii=False,
@@ -822,9 +836,137 @@ def strategy_spec_hash(spec: MexcStrategySpec) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+_STRATEGY_SPEC_VERSION_REGISTRY: Mapping[
+    str, _StrategySpecVersionRegistration
+] = MappingProxyType(
+    {
+        MEXC_STRATEGY_SPEC_V2_VERSION: _StrategySpecVersionRegistration(
+            spec_version=MEXC_STRATEGY_SPEC_V2_VERSION,
+            spec_type=MexcStrategySpec,
+            parse_mapping=_parse_mexc_strategy_spec_v2,
+            contract_payload=_v2_contract_payload,
+            hash_instance=_strategy_spec_hash_v2,
+        ),
+    }
+)
+
+SUPPORTED_MEXC_STRATEGY_SPEC_VERSIONS = tuple(_STRATEGY_SPEC_VERSION_REGISTRY)
+
+
+def _strategy_spec_version_registration(
+    spec_version: Any,
+) -> _StrategySpecVersionRegistration:
+    if type(spec_version) is not str or not spec_version:
+        raise MexcStrategySpecError("spec_version_must_be_non_empty_string")
+    registration = _STRATEGY_SPEC_VERSION_REGISTRY.get(spec_version)
+    if registration is None:
+        raise MexcStrategySpecError(
+            f"strategy_spec_version_unsupported:{spec_version}"
+        )
+    return registration
+
+
+def parse_mexc_strategy_spec(value: Any) -> MexcStrategySpec:
+    """Parse persisted evidence with the immutable parser for its own version."""
+
+    payload = _as_mapping(value, path="strategy_spec")
+    if "spec_version" not in payload:
+        raise MexcStrategySpecError("strategy_spec_missing_keys:spec_version")
+    payload_version = payload["spec_version"]
+    registration = _strategy_spec_version_registration(payload_version)
+    parsed = registration.parse_mapping(payload)
+    if not isinstance(parsed, registration.spec_type):
+        raise RuntimeError("strategy_spec_registry_parser_type_mismatch")
+    if getattr(parsed, "spec_version", None) != registration.spec_version:
+        raise RuntimeError("strategy_spec_registry_parser_version_mismatch")
+    return parsed
+
+
+def decode_mexc_strategy_spec_evidence(
+    value: Any,
+    *,
+    expected_version: str,
+) -> MexcStrategySpec:
+    """Decode evidence only when its outer and embedded versions agree."""
+
+    _strategy_spec_version_registration(expected_version)
+    payload = _as_mapping(value, path="strategy_spec")
+    if "spec_version" not in payload:
+        raise MexcStrategySpecError("strategy_spec_missing_keys:spec_version")
+    payload_version = payload["spec_version"]
+    if type(payload_version) is not str or not payload_version:
+        raise MexcStrategySpecError("spec_version_must_be_non_empty_string")
+    if payload_version != expected_version:
+        raise MexcStrategySpecError("strategy_spec_evidence_version_mismatch")
+    return parse_mexc_strategy_spec(payload)
+
+
+def _contract_payload(
+    spec_version: str = MEXC_STRATEGY_SPEC_VERSION,
+) -> dict[str, Any]:
+    registration = _strategy_spec_version_registration(spec_version)
+    return registration.contract_payload()
+
+
+def _contract_digest(
+    spec_version: str = MEXC_STRATEGY_SPEC_VERSION,
+) -> str:
+    encoded = json.dumps(
+        _contract_payload(spec_version),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+@lru_cache(maxsize=None)
+def strategy_spec_contract_hash(
+    spec_version: str = MEXC_STRATEGY_SPEC_VERSION,
+) -> str:
+    digest = _contract_digest(spec_version)
+    if _PINNED_CONTRACT_HASHES.get(spec_version) != digest:
+        raise RuntimeError("mexc_strategy_spec_changed_without_version_bump")
+    return digest
+
+
+def _strategy_spec_registration_for_instance(
+    spec: Any,
+) -> _StrategySpecVersionRegistration:
+    if not any(
+        isinstance(spec, registration.spec_type)
+        for registration in _STRATEGY_SPEC_VERSION_REGISTRY.values()
+    ):
+        raise TypeError("spec must be a MexcStrategySpec")
+    registration = _strategy_spec_version_registration(spec.spec_version)
+    if not isinstance(spec, registration.spec_type):
+        if spec.spec_version == MEXC_STRATEGY_SPEC_V2_VERSION:
+            raise TypeError("spec must be a MexcStrategySpec")
+        raise TypeError("spec type does not match its registered version")
+    return registration
+
+
+def strategy_spec_hash(spec: MexcStrategySpec) -> str:
+    registration = _strategy_spec_registration_for_instance(spec)
+    return registration.hash_instance(spec)
+
+
+def strategy_spec_identity(spec: MexcStrategySpec) -> StrategySpecIdentity:
+    registration = _strategy_spec_registration_for_instance(spec)
+    return StrategySpecIdentity(
+        spec_version=registration.spec_version,
+        contract_hash=strategy_spec_contract_hash(registration.spec_version),
+        instance_hash=registration.hash_instance(spec),
+    )
+
+
 __all__ = [
     "DEFAULT_MEXC_STRATEGY_SPEC_PATH",
+    "DEFAULT_MEXC_STRATEGY_V2_SPEC_PATH",
+    "MEXC_STRATEGY_SPEC_V2_VERSION",
     "MEXC_STRATEGY_SPEC_VERSION",
+    "SUPPORTED_MEXC_STRATEGY_SPEC_VERSIONS",
     "HigherTimeframeParameters",
     "IndicatorParameters",
     "MarketDataParameters",
@@ -832,10 +974,14 @@ __all__ = [
     "MexcStrategySpecError",
     "RuntimeSemantics",
     "SignalParameters",
+    "StrategySpecIdentity",
     "VolatilityParameters",
     "VolumeProfileParameters",
     "canonical_mexc_interval",
+    "decode_mexc_strategy_spec_evidence",
     "load_mexc_strategy_spec",
+    "parse_mexc_strategy_spec",
     "strategy_spec_contract_hash",
     "strategy_spec_hash",
+    "strategy_spec_identity",
 ]

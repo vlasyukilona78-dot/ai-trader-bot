@@ -797,6 +797,16 @@ def _validated_envelope(payload: object) -> CycleEnvelope:
     return envelope
 
 
+def _envelope_strategy_identity(envelope: CycleEnvelope) -> tuple[str, str, str]:
+    """Return the exact strategy namespace shared by every cycle in one file."""
+
+    return (
+        envelope.strategy_spec_version,
+        envelope.strategy_spec_contract_hash,
+        envelope.strategy_spec_instance_hash,
+    )
+
+
 def _validate_cycle_body(
     envelope: CycleEnvelope,
     *,
@@ -1023,6 +1033,7 @@ class JournalCheckpointReceipt:
 @dataclass(frozen=True)
 class _JournalInspection:
     journal_id: str | None
+    strategy_spec_identity: tuple[str, str, str] | None
     cycle_ids: tuple[str, ...]
     cycle_commits: tuple[str, ...]
     prefix_lengths: tuple[int, ...]
@@ -1064,6 +1075,7 @@ class PopulationJournal:
                     )
         else:
             self._journal_id = None
+            self._strategy_spec_identity = None
             self._last_cycle_id = None
             self._cycle_ids: set[str] = set()
             self._cycle_ids_ordered: tuple[str, ...] = ()
@@ -1074,6 +1086,7 @@ class PopulationJournal:
 
     def _adopt_inspection(self, inspection: _JournalInspection) -> None:
         self._journal_id = inspection.journal_id
+        self._strategy_spec_identity = inspection.strategy_spec_identity
         self._last_cycle_id = inspection.last_cycle_id
         self._cycle_ids = set(inspection.cycle_ids)
         self._cycle_ids_ordered = inspection.cycle_ids
@@ -1122,7 +1135,15 @@ class PopulationJournal:
         """
 
         if not self._path.exists() or self._path.stat().st_size == 0:
-            return _JournalInspection(None, (), (), (), (), hashlib.sha256())
+            return _JournalInspection(
+                journal_id=None,
+                strategy_spec_identity=None,
+                cycle_ids=(),
+                cycle_commits=(),
+                prefix_lengths=(),
+                prefix_sha256s=(),
+                tail_digest=hashlib.sha256(),
+            )
         try:
             with self._path.open("rb") as handle:
                 handle.seek(-1, os.SEEK_END)
@@ -1160,6 +1181,7 @@ class PopulationJournal:
         journal_id: str | None = None
         file_digest = hashlib.sha256()
         prefix_length = 0
+        strategy_spec_identity: tuple[str, str, str] | None = None
 
         try:
             handle = self._path.open("rb")
@@ -1188,6 +1210,15 @@ class PopulationJournal:
                             "population journal starts a new cycle before closing the previous one"
                         )
                     current_envelope = _validated_envelope(payload.get("envelope"))
+                    current_strategy_identity = _envelope_strategy_identity(
+                        current_envelope
+                    )
+                    if strategy_spec_identity is None:
+                        strategy_spec_identity = current_strategy_identity
+                    elif current_strategy_identity != strategy_spec_identity:
+                        raise PopulationJournalError(
+                            "population journal mixes strategy identities"
+                        )
                     current_header = payload
                     current_cycle_id = current_envelope.cycle_id
                     if payload.get("cycle_id") != current_cycle_id:
@@ -1333,6 +1364,7 @@ class PopulationJournal:
             raise PopulationJournalError("population journal contains no complete cycles")
         return _JournalInspection(
             journal_id=journal_id,
+            strategy_spec_identity=strategy_spec_identity,
             cycle_ids=tuple(completed_cycle_ids),
             cycle_commits=tuple(completed_commits),
             prefix_lengths=tuple(prefix_lengths),
@@ -1396,6 +1428,7 @@ class PopulationJournal:
         except (AttributeError, TypeError, ValueError) as exc:
             raise PopulationJournalError("cycle envelope cannot be serialized") from exc
         validated_envelope = _validated_envelope(envelope_payload)
+        incoming_strategy_identity = _envelope_strategy_identity(validated_envelope)
         cycle_id = envelope_payload.get("cycle_id")
         if not isinstance(cycle_id, str) or not re.fullmatch(r"[0-9a-f]{64}", cycle_id):
             raise PopulationJournalError("cycle envelope has an invalid cycle ID")
@@ -1436,6 +1469,13 @@ class PopulationJournal:
             # constructed.  A cheap file fingerprint makes unchanged appends
             # O(1), while any external change is fully validated before use.
             self._refresh_if_changed()
+            if (
+                self._strategy_spec_identity is not None
+                and incoming_strategy_identity != self._strategy_spec_identity
+            ):
+                raise PopulationJournalError(
+                    "population journal mixes strategy identities"
+                )
             if cycle_id in self._cycle_ids:
                 return False
             journal_id = self._journal_id or secrets.token_hex(32)
@@ -1488,6 +1528,7 @@ class PopulationJournal:
             previous_length = self._prefix_lengths[-1] if self._prefix_lengths else 0
             next_length = previous_length + len(batch)
             self._journal_id = journal_id
+            self._strategy_spec_identity = incoming_strategy_identity
             self._last_cycle_id = cycle_id
             self._cycle_ids.add(cycle_id)
             self._cycle_ids_ordered = (*self._cycle_ids_ordered, cycle_id)
