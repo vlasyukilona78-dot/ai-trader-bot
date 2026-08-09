@@ -73,9 +73,9 @@ volatility:
   min_observations: 20
   fallback_floor: 0.046
 
-# The current indicator function exposes only keltner_mult as an argument.  The
-# remaining hard-coded periods and cumulative modes are captured here so a code
-# change cannot masquerade as the same strategy revision.
+# The periods and multipliers below are executable compute_indicators inputs.
+# Mode literals name fixed, non-switchable cumulative semantics; their numerical
+# behavior is pinned by tests/v2/test_indicator_golden_vectors_v2.py.
 indicators:
   revision: core_indicators_v1
   rsi_period_bars: 14
