@@ -21,7 +21,7 @@ from trading.metrics.cycle_envelope import (
     CycleEnvelope,
     CycleEnvelopeError,
 )
-from trading.metrics.population_journal import SCHEMA_VERSION, make_cycle_id
+from trading.metrics.population_journal import CYCLE_IDENTITY_VERSION, make_cycle_id
 from trading.signals.layered_strategy import LayeredPumpStrategy
 from trading.signals.signal_types import IntentAction
 from v2.test_scan_v2 import (
@@ -56,7 +56,7 @@ def _envelope(
             candle_cutoff_ts=cutoff,
             universe_received_at=received_at,
             universe_symbols=symbols,
-            schema_version=SCHEMA_VERSION,
+            schema_version=CYCLE_IDENTITY_VERSION,
         ),
         timeframe=resolved_timeframe,
         cycle_started_at=cutoff + 1.0,

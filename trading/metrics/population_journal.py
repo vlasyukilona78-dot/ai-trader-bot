@@ -34,6 +34,13 @@ from trading.metrics.cycle_envelope import CycleEnvelope, CycleEnvelopeError
 # makes every later cycle depend on the exact canonical bytes of its prefix.
 SCHEMA_VERSION = 5
 
+# Cycle identity is a causal cohort contract, not a serialization detail of the
+# journal that happens to carry it. The original identity algorithm shipped
+# while journal schema v5 was current and included that literal in its hash
+# payload. Keep the value pinned independently so a future journal-format bump
+# cannot silently rename otherwise identical cohorts.
+CYCLE_IDENTITY_VERSION = 5
+
 RECORD_TYPE_HEADER = "cycle_header"
 RECORD_TYPE_DECISION = "decision"
 RECORD_TYPE_FOOTER = "cycle_footer"
@@ -403,7 +410,7 @@ def make_cycle_id(
     candle_cutoff_ts: float,
     universe_received_at: float,
     universe_symbols: Sequence[str],
-    schema_version: int = SCHEMA_VERSION,
+    schema_version: int = CYCLE_IDENTITY_VERSION,
 ) -> str:
     """Return a stable ID for one point-in-time universe evaluation cycle.
 
@@ -413,7 +420,11 @@ def make_cycle_id(
     change with thread scheduling.
     """
 
-    if isinstance(schema_version, bool) or not isinstance(schema_version, Integral) or schema_version < 1:
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, Integral)
+        or schema_version < 1
+    ):
         raise PopulationJournalError("schema_version must be a positive integer")
     clean_symbols = [_bounded_string(symbol, name="universe symbol", max_length=64) for symbol in universe_symbols]
     if len(clean_symbols) > 10_000:
@@ -422,6 +433,9 @@ def make_cycle_id(
         raise PopulationJournalError("universe symbols must be unique")
     return _sha256_id(
         {
+            # Preserve the originally published canonical payload key. Renaming
+            # the key would rename every existing cycle even though its meaning
+            # is now correctly owned by CYCLE_IDENTITY_VERSION.
             "schema_version": int(schema_version),
             "timeframe_seconds": interval_seconds(
                 _bounded_string(timeframe, name="timeframe", max_length=32)
@@ -790,7 +804,7 @@ def _validated_envelope(payload: object) -> CycleEnvelope:
         candle_cutoff_ts=envelope.candle_cutoff_ts,
         universe_received_at=envelope.universe_timing.received_at,
         universe_symbols=envelope.universe_symbols,
-        schema_version=SCHEMA_VERSION,
+        schema_version=CYCLE_IDENTITY_VERSION,
     )
     if envelope.cycle_id != expected_cycle_id:
         raise PopulationJournalError("cycle envelope ID does not match its ordered universe")

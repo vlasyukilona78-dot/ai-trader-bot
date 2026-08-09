@@ -6,6 +6,7 @@ from pathlib import Path
 
 from core.mexc_strategy_spec import decode_mexc_strategy_spec_evidence
 from trading.metrics.cycle_envelope import CycleEnvelope
+from trading.metrics.population_journal import CYCLE_IDENTITY_VERSION, make_cycle_id
 
 
 FIXTURE_PATH = (
@@ -16,6 +17,7 @@ FIXTURE_PATH = (
 V2_CONTRACT_HASH = "9c62b88b7804e9663bae6f0eb429c58c541680b61d307c4f16032cb0b62fe3dd"
 V2_INSTANCE_HASH = "9f0b2d7035c2a82ab1b6d8595245b8c3a7a8b9faad17bea8c57f6fcacb189466"
 FIXTURE_CANONICAL_SHA256 = "87e3f049ca356f9cd7654464a6fa0cbb12ee319979e145de8aa021c858ee0e5e"
+V2_FIXTURE_CYCLE_ID = "b7f8d578c3b0077aca95817af6f913dbf71ab1801932c1528e5014dcc2beaa7b"
 
 
 def _canonical_sha256(payload: object) -> str:
@@ -39,6 +41,14 @@ def test_frozen_v2_evidence_remains_readable_after_future_spec_bumps() -> None:
     assert payload["strategy_spec_version"] == "mexc_strategy_v2"
     assert payload["strategy_spec_contract_hash"] == V2_CONTRACT_HASH
     assert payload["strategy_spec_instance_hash"] == V2_INSTANCE_HASH
+    assert payload["cycle_id"] == V2_FIXTURE_CYCLE_ID
+    assert make_cycle_id(
+        timeframe=payload["timeframe"],
+        candle_cutoff_ts=payload["candle_cutoff_ts"],
+        universe_received_at=payload["universe_timing"]["received_at"],
+        universe_symbols=payload["universe_symbols"],
+        schema_version=CYCLE_IDENTITY_VERSION,
+    ) == V2_FIXTURE_CYCLE_ID
 
     spec_payload = payload["strategy_spec_payload"]
     spec = decode_mexc_strategy_spec_evidence(

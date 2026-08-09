@@ -18,6 +18,7 @@ from typing import Any, Iterator, Mapping
 from trading.market_data.bar_contract import interval_seconds
 from trading.metrics.cycle_envelope import CycleEnvelope, CycleEnvelopeError
 from trading.metrics.population_journal import (
+    CYCLE_IDENTITY_VERSION,
     FEATURE_PROVENANCE_KEYS,
     FOOTER_CORE_KEYS,
     FOOTER_KEYS,
@@ -553,7 +554,7 @@ def _parse_population_cycles(
                     candle_cutoff_ts=envelope.candle_cutoff_ts,
                     universe_received_at=envelope.universe_timing.received_at,
                     universe_symbols=envelope.universe_symbols,
-                    schema_version=SCHEMA_VERSION,
+                    schema_version=CYCLE_IDENTITY_VERSION,
                 )
                 if expected_cycle_id != envelope.cycle_id:
                     raise PopulationDatasetError("population_cycle_id_mismatch")

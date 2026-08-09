@@ -1,0 +1,11 @@
+{
+  "cycle_commit": "48df017be8e99d822e60f6e4cc3264ee431d4c3137ec02559686d0487ee1c785",
+  "cycle_id": "b7f8d578c3b0077aca95817af6f913dbf71ab1801932c1528e5014dcc2beaa7b",
+  "journal_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "journal_schema_version": 5,
+  "prefix_length_bytes": 10247,
+  "prefix_sha256": "2b782e76d668f9d90efde3229cdf3b9287c1b7fd688947d4ab1066c8a07a1529",
+  "record_type": "population_journal_checkpoint",
+  "receipt_schema_version": 1,
+  "sequence_no": 0
+}

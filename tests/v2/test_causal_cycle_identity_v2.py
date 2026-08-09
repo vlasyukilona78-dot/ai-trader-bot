@@ -29,7 +29,12 @@ from trading.market_data.bar_contract import interval_seconds, is_bar_aligned, n
 from trading.market_data.source_timing import SourceTiming, SourceTimingError
 from trading.market_data.universe import SymbolUniverse, UniverseConfig
 from trading.metrics.cycle_envelope import CycleEnvelope, CycleEnvelopeError
-from trading.metrics.population_journal import PopulationJournalError, make_cycle_id
+from trading.metrics.population_journal import (
+    CYCLE_IDENTITY_VERSION,
+    SCHEMA_VERSION,
+    PopulationJournalError,
+    make_cycle_id,
+)
 
 from v2.test_scan_v2 import _CaptureJournal, _FakeFeed, _FakeStrategy, _FakeUniverse, _Logger, _ohlcv
 from v2.test_single_position_contract_v2 import _ENTRY_BAR_OPEN_TS, _bars, _contract, _plan
@@ -120,6 +125,33 @@ def test_cycle_id_ignores_everything_a_worker_could_influence() -> None:
     assert make_cycle_id(**base) == make_cycle_id(**base)
     reordered = dict(base, universe_symbols=["BBBUSDT", "AAAUSDT"])
     assert make_cycle_id(**reordered) != make_cycle_id(**base)
+
+
+def test_cycle_identity_is_pinned_independently_from_journal_serialization(
+    monkeypatch,
+) -> None:
+    assert CYCLE_IDENTITY_VERSION == 5
+    assert SCHEMA_VERSION == 5
+    values = {
+        "timeframe": "60",
+        "candle_cutoff_ts": 1_700_002_800.0,
+        "universe_received_at": 1_700_000_001.0,
+        "universe_symbols": ["AAAUSDT", "BBBUSDT"],
+    }
+    expected = make_cycle_id(**values)
+    assert expected == make_cycle_id(
+        **values,
+        schema_version=CYCLE_IDENTITY_VERSION,
+    )
+    monkeypatch.setattr(
+        "trading.metrics.population_journal.SCHEMA_VERSION",
+        SCHEMA_VERSION + 1,
+    )
+    assert make_cycle_id(**values) == expected
+    assert make_cycle_id(
+        **values,
+        schema_version=CYCLE_IDENTITY_VERSION + 1,
+    ) != expected
 
 
 # --------------------------------------------------------------------------

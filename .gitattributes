@@ -1,0 +1,5 @@
+# These two fixtures are cryptographic byte receipts, not ordinary text. Git
+# must not rewrite LF framing on Windows or their committed checkpoint ceases to
+# authenticate the journal that the compatibility reader opens.
+tests/fixtures/mexc_population_journal_v5_minimal.jsonl -text
+tests/fixtures/mexc_population_journal_v5_minimal_receipt.json -text
