@@ -88,6 +88,19 @@ def _thaw_json(value: Any) -> Any:
     return value
 
 
+def _canonical_bytes(value: Mapping[str, Any]) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise CycleEnvelopeError("cycle_envelope_is_not_canonical_json") from exc
+
+
 @dataclass(frozen=True)
 class CycleEnvelope:
     """One scan cycle's identity, provenance and executable timing."""
@@ -349,7 +362,7 @@ class CycleEnvelope:
 
         # This comparison catches omitted cache fields, unknown fields, a stale
         # schema/timing basis, and callers that attempted to coerce JSON types.
-        if rebuilt.as_dict() != dict(payload):
+        if _canonical_bytes(rebuilt.as_dict()) != _canonical_bytes(dict(payload)):
             raise CycleEnvelopeError("cycle_envelope_source_mismatch")
         return rebuilt
 

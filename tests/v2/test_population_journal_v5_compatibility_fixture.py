@@ -7,7 +7,10 @@ import json
 from pathlib import Path
 import shutil
 
+import pytest
+
 from ai.reversal.population_dataset import (
+    PopulationDatasetError,
     iter_population_cycles,
     model_input_records,
     verify_population_journal,
@@ -141,9 +144,19 @@ def test_frozen_v5_receipt_anchors_the_exact_current_reader_view(tmp_path) -> No
     assert rows[0].snapshot_id == SNAPSHOT_ID
     assert rows[0].market_feature_hash == MARKET_FEATURE_HASH
 
-    model_rows = model_input_records(JOURNAL_PATH, trusted_checkpoint=receipt)
+    with pytest.raises(
+        PopulationDatasetError,
+        match="legacy_v5_model_export_requires_explicit_opt_in",
+    ):
+        model_input_records(JOURNAL_PATH, trusted_checkpoint=receipt)
+    model_rows = model_input_records(
+        JOURNAL_PATH,
+        trusted_checkpoint=receipt,
+        allow_legacy_v5=True,
+    )
     assert len(model_rows) == 1
     assert model_rows[0]["snapshot_id"] == SNAPSHOT_ID
+    assert model_rows[0]["typed_evidence_status"] == "legacy_missing"
 
     # The append-side v5 reader uses an advisory sidecar, so validate it against
     # an exact temporary copy and leave the committed evidence directory inert.

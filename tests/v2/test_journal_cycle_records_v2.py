@@ -19,6 +19,7 @@ from ai.reversal.population_dataset import (
     iter_population_cycles,
     iter_population_feature_rows,
 )
+from trading.market_data.frame_provenance import SourceReadEvidenceV1
 from trading.metrics.population_journal import (
     SCHEMA_VERSION,
     PopulationJournal,
@@ -27,6 +28,7 @@ from trading.metrics.population_journal import (
     genesis_cycle_commit,
     rows_checksum,
 )
+from trading.signals.lifecycle_contract import CandidateLifecycleEventV1
 
 from v2.test_population_feature_dataset_v2 import (
     _envelope,
@@ -49,6 +51,33 @@ def _append_empty_cycle_after_release(path, ready, release, results) -> None:
         results.put(("ok", journal.append_cycle((), envelope=envelope)))
     except BaseException as exc:  # pragma: no cover - returned to the parent
         results.put(("error", type(exc).__name__, str(exc)))
+
+
+def _record_from_payload(template, payload: dict, *, rederive: bool = False):
+    values = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"record_type", "timeframe_seconds"}
+    }
+    values["base_source_evidence"] = SourceReadEvidenceV1.from_dict(
+        values["base_source_evidence"]
+    )
+    values["higher_timeframe_source_evidence"] = SourceReadEvidenceV1.from_dict(
+        values["higher_timeframe_source_evidence"]
+    )
+    raw_lifecycle = values.get("lifecycle_event")
+    values["lifecycle_event"] = (
+        CandidateLifecycleEventV1.from_dict(raw_lifecycle)
+        if raw_lifecycle is not None
+        else None
+    )
+    values["benchmark_source_evidence"] = template.benchmark_source_evidence
+    if rederive:
+        values.pop("input_hash")
+        values.pop("snapshot_id")
+        values.pop("raw_frame_bundle_hash")
+        return template.__class__.create(**values)
+    return template.__class__(**values)
 
 
 def test_a_three_hundred_symbol_error_envelope_writes_the_universe_once(tmp_path) -> None:
@@ -185,12 +214,9 @@ def test_a_truncated_tail_is_not_concatenated_into_one_line(tmp_path) -> None:
 
 def test_a_batch_may_not_mix_schema_versions(tmp_path) -> None:
     records = _records()
-    stale = records[0].__class__(
-        **{**records[0].__dict__, "schema_version": SCHEMA_VERSION - 1}
-    )
-    with pytest.raises(PopulationJournalError, match="mixes journal schema versions"):
-        PopulationJournal(tmp_path / "p.jsonl").append_cycle(
-            [stale, records[1]], envelope=_envelope()
+    with pytest.raises(PopulationJournalError, match="requires journal schema 6"):
+        records[0].__class__(
+            **{**records[0].__dict__, "schema_version": SCHEMA_VERSION}
         )
 
 
@@ -249,7 +275,7 @@ def test_reader_rejects_a_row_that_disagrees_with_the_envelope(tmp_path) -> None
 
     with pytest.raises(
         PopulationDatasetError,
-        match="feature_provenance_universe_received_at_mismatch",
+        match="invalid_v6_decision_evidence",
     ):
         list(iter_population_feature_rows(path))
 
@@ -325,13 +351,7 @@ def test_writer_rejects_unbound_feature_provenance(tmp_path, field, message) -> 
     records = _records()
     payload = records[0].as_dict()
     payload["metadata"]["feature_provenance"][field] = "0" * 64
-    bad = records[0].__class__(
-        **{
-            key: value
-            for key, value in payload.items()
-            if key not in {"record_type", "timeframe_seconds"}
-        }
-    )
+    bad = _record_from_payload(records[0], payload, rederive=True)
 
     with pytest.raises(PopulationJournalError, match=message):
         PopulationJournal(tmp_path / "population.jsonl").append_cycle(
@@ -354,13 +374,7 @@ def test_writer_rejects_drifted_feature_provenance(
     records = _records()
     payload = records[0].as_dict()
     payload["metadata"]["feature_provenance"][field] = value
-    bad = records[0].__class__(
-        **{
-            key: item
-            for key, item in payload.items()
-            if key not in {"record_type", "timeframe_seconds"}
-        }
-    )
+    bad = _record_from_payload(records[0], payload, rederive=True)
 
     with pytest.raises(PopulationJournalError, match=message):
         PopulationJournal(tmp_path / "population.jsonl").append_cycle(
@@ -378,19 +392,7 @@ def test_writer_rejects_self_consistent_snapshot_substitution(tmp_path) -> None:
     payload["metadata"]["feature_provenance"]["market_feature_hash"] = (
         market_feature_hash(snapshot, symbol=payload["symbol"], timeframe_seconds=3600)
     )
-    bad = records[0].__class__.create(
-        **{
-            key: value
-            for key, value in payload.items()
-            if key
-            not in {
-                "record_type",
-                "timeframe_seconds",
-                "input_hash",
-                "snapshot_id",
-            }
-        }
-    )
+    bad = _record_from_payload(records[0], payload, rederive=True)
 
     with pytest.raises(PopulationJournalError, match="does not match its source metadata"):
         PopulationJournal(tmp_path / "population.jsonl").append_cycle(
@@ -476,7 +478,7 @@ def test_stale_instance_rebuilds_rows_after_an_external_change(tmp_path) -> None
     _rewrite(path, rows)
     size_before = path.stat().st_size
 
-    with pytest.raises(PopulationJournalError, match="does not rebuild exactly"):
+    with pytest.raises(PopulationJournalError, match="invalid decision row"):
         stale.append_cycle(
             (),
             envelope=_envelope(universe_symbols=(), status="empty_universe"),
@@ -495,19 +497,7 @@ def test_restart_rejects_semantically_substituted_feature_snapshot(tmp_path) -> 
     payload["metadata"]["feature_provenance"]["market_feature_hash"] = (
         market_feature_hash(snapshot, symbol=payload["symbol"], timeframe_seconds=3600)
     )
-    replacement = _records()[0].__class__.create(
-        **{
-            key: value
-            for key, value in payload.items()
-            if key
-            not in {
-                "record_type",
-                "timeframe_seconds",
-                "input_hash",
-                "snapshot_id",
-            }
-        }
-    )
+    replacement = _record_from_payload(_records()[0], payload, rederive=True)
     rows[1] = replacement.as_dict()
     _rewrite(path, rows)
 

@@ -13,6 +13,7 @@ Nothing here can place, modify or cancel an order.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from functools import lru_cache
 import math
 import os
@@ -20,7 +21,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from numbers import Integral, Real
-from threading import Lock
 from typing import Literal, Mapping, Sequence
 
 import pandas as pd
@@ -30,7 +30,6 @@ from ai.reversal.feature_contract import (
     configuration_hash,
     market_feature_hash,
 )
-from core.indicators import compute_indicators
 from core.mexc_strategy_spec import (
     DEFAULT_MEXC_STRATEGY_SPEC_PATH,
     MexcStrategySpec,
@@ -44,6 +43,15 @@ from trading.market_data.bar_contract import (
     last_bar_times,
 )
 from trading.market_data.feed import MarketDataFeed
+from trading.market_data.frame_provenance import (
+    FrameProvenanceError,
+    FrameQualityError,
+    FrameRead,
+    SourceReadEvidenceV1,
+    aggregate_source_timing_from_evidence,
+    raw_frame_bundle_hash,
+    source_timing_from_evidence,
+)
 from trading.market_data.mexc_client import MexcContractClient
 from trading.market_data.source_timing import SourceTiming
 from trading.market_data.timeframe_cache import HigherTimeframeCache
@@ -51,12 +59,13 @@ from trading.market_data.universe import SymbolUniverse, UniverseConfig
 from trading.metrics.cycle_envelope import CycleEnvelope
 from trading.metrics.logging import setup_logging
 from trading.metrics.population_journal import (
-    PopulationDecision,
+    PopulationDecisionV6,
     PopulationJournal,
     make_cycle_id,
     safe_error_code,
 )
 from trading.signals.layered_strategy import LayeredPumpStrategy
+from trading.signals.lifecycle_contract import CandidateLifecycleEventV1
 from trading.signals.signal_types import IntentAction, StrategyIntent
 from trading.signals.strategy_interface import StrategyContext
 from trading.state.models import TradeState
@@ -90,12 +99,16 @@ class _ScanEvaluation:
     decision_ts: float
     base_bar_open_ts: float | None
     base_bar_close_ts: float | None
+    base_source_evidence: SourceReadEvidenceV1
+    higher_timeframe_source_evidence: SourceReadEvidenceV1
+    raw_frame_bundle_hash: str
     bar_count: int = 0
     mark_price: float = 0.0
     intent: StrategyIntent | None = None
     frame: pd.DataFrame | None = None
     stage: str = ""
     error_code: str | None = None
+    lifecycle_event: CandidateLifecycleEventV1 | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -131,7 +144,7 @@ def parse_args() -> argparse.Namespace:
                    help="How long each signal is followed after delivery")
     p.add_argument(
         "--population-journal",
-        default="data/runtime/mexc_population_decisions_v5.jsonl",
+        default="data/runtime/mexc_population_decisions_v6.jsonl",
         help="Append one causal decision row for every point-in-time universe symbol",
     )
     p.add_argument(
@@ -244,9 +257,6 @@ def _fetch_closed_frame(*, feed, symbol: str, timeframe: str, candles: int, cuto
         raise BarContractError("last bar close metadata differs from the OHLCV frame")
     if actual_close_ts > cutoff:
         raise BarContractError("closed frame contains a bar beyond the scan cutoff")
-    if not math.isclose(actual_close_ts, cutoff, rel_tol=0.0, abs_tol=1e-6):
-        raise MarketDataQualityError("last closed bar is stale at the scan cutoff")
-
     numeric = ohlcv.loc[:, sorted(_REQUIRED_OHLCV_COLUMNS)].apply(
         pd.to_numeric,
         errors="coerce",
@@ -274,6 +284,80 @@ def _fetch_closed_frame(*, feed, symbol: str, timeframe: str, candles: int, cuto
     if mark_price <= 0:
         raise BarContractError("last closed close must be positive")
     return ohlcv, actual_open_ts, actual_close_ts, mark_price
+
+
+def _mexc_venue_symbol(symbol: str) -> str:
+    """Return the public-contract identity used by the MEXC-only scanner."""
+
+    return str(MexcContractClient.normalize_symbol(symbol)).upper()
+
+
+def _frame_source_evidence(
+    frame: pd.DataFrame,
+    *,
+    source: str,
+    symbol: str,
+    timeframe: str,
+    requested_as_of_ts: float,
+    request_started_at: float,
+    received_at: float,
+) -> SourceReadEvidenceV1:
+    return SourceReadEvidenceV1.from_frame(
+        frame,
+        source=source,
+        venue="mexc_contract",
+        symbol=str(symbol).upper(),
+        venue_symbol=_mexc_venue_symbol(symbol),
+        timeframe=timeframe,
+        requested_as_of_ts=requested_as_of_ts,
+        request_started_at=request_started_at,
+        received_at=received_at,
+        source_ts=received_at,
+        cache_hit=False,
+        cache_age_sec=0.0,
+    )
+
+
+def _failed_source_evidence(
+    *,
+    source: str,
+    symbol: str,
+    timeframe: str,
+    requested_as_of_ts: float,
+    request_started_at: float,
+    received_at: float,
+    error: BaseException,
+) -> SourceReadEvidenceV1:
+    return SourceReadEvidenceV1.request_failed(
+        source=source,
+        venue="mexc_contract",
+        symbol=str(symbol).upper(),
+        venue_symbol=_mexc_venue_symbol(symbol),
+        timeframe=timeframe,
+        requested_as_of_ts=requested_as_of_ts,
+        request_started_at=request_started_at,
+        received_at=received_at,
+        error_code=safe_error_code(error),
+    )
+
+
+def _not_requested_source_evidence(
+    *,
+    source: str,
+    symbol: str,
+    timeframe: str,
+    requested_as_of_ts: float,
+    reason: str,
+) -> SourceReadEvidenceV1:
+    return SourceReadEvidenceV1.not_requested(
+        source=source,
+        venue="mexc_contract",
+        symbol=str(symbol).upper(),
+        venue_symbol=_mexc_venue_symbol(symbol),
+        timeframe=timeframe,
+        requested_as_of_ts=requested_as_of_ts,
+        reason=reason,
+    )
 
 
 def _validate_intent(intent, *, symbol: str) -> StrategyIntent:
@@ -528,9 +612,10 @@ def _population_record(
     scan_observed_at: float,
     universe_meta: Mapping[str, object],
     benchmark_status: str,
+    benchmark_source_evidence: SourceReadEvidenceV1,
     cycle_ordinal: int,
     cycle_size: int,
-) -> PopulationDecision:
+) -> PopulationDecisionV6:
     metadata: dict[str, object] = {
         "universe": dict(universe_meta),
         "base": {
@@ -539,8 +624,9 @@ def _population_record(
         },
         "benchmark_status": benchmark_status,
         "provenance": {
-            # Kept under the v4 row-field name until the feature-row schema is
-            # bumped; the v5 envelope contains and validates the complete spec.
+            # Kept under the historical row-field name until the feature
+            # contract itself is versioned again; the cycle envelope carries
+            # and validates the complete StrategySpec identity.
             "strategy_config_hash": envelope.strategy_spec_instance_hash,
             "universe_policy_hash": envelope.universe_policy_hash,
         },
@@ -588,7 +674,7 @@ def _population_record(
         ),
     }
 
-    return PopulationDecision.create(
+    record = PopulationDecisionV6.create(
         cycle_id=envelope.cycle_id,
         universe_refreshed_at=universe_refreshed_at,
         universe_request_started_at=envelope.universe_timing.request_started_at,
@@ -610,13 +696,20 @@ def _population_record(
         reason=reason,
         confidence=confidence,
         metadata=metadata,
+        base_source_evidence=result.base_source_evidence,
+        higher_timeframe_source_evidence=result.higher_timeframe_source_evidence,
+        benchmark_source_evidence=benchmark_source_evidence,
+        lifecycle_event=result.lifecycle_event,
         cycle_ordinal=cycle_ordinal,
         cycle_size=cycle_size,
         error_code=result.error_code,
     )
+    if record.raw_frame_bundle_hash != result.raw_frame_bundle_hash:
+        raise InvalidStrategyIntentError("raw frame bundle changed before journalling")
+    return record
 
 
-def scan_once(
+def _scan_once_unlocked(
     *,
     universe,
     feed,
@@ -653,6 +746,15 @@ def scan_once(
         getattr(universe, "config", None),
         component="mexc_universe_policy",
     )
+
+    def benchmark_not_requested(reason: str) -> SourceReadEvidenceV1:
+        return _not_requested_source_evidence(
+            source="benchmark_ohlcv",
+            symbol="BTCUSDT",
+            timeframe=resolved_spec.resolved_benchmark_interval,
+            requested_as_of_ts=candle_cutoff_ts,
+            reason=reason,
+        )
 
     universe_attempt_started = time.time()
     try:
@@ -694,7 +796,13 @@ def scan_once(
         )
         if population_journal is not None and getattr(population_journal, "enabled", True):
             try:
-                population_journal.append_cycle((), envelope=error_envelope)
+                population_journal.append_cycle(
+                    (),
+                    envelope=error_envelope,
+                    benchmark_source_evidence=benchmark_not_requested(
+                        "universe_refresh_failed"
+                    ),
+                )
             except Exception as journal_exc:
                 logger.error(
                     "universe_error_cycle_journal_failed=%s",
@@ -754,7 +862,11 @@ def scan_once(
         # told apart from a scan that never ran.
         if population_journal is not None and getattr(population_journal, "enabled", True):
             try:
-                population_journal.append_cycle((), envelope=empty_envelope)
+                population_journal.append_cycle(
+                    (),
+                    envelope=empty_envelope,
+                    benchmark_source_evidence=benchmark_not_requested("empty_universe"),
+                )
             except Exception as exc:
                 logger.error(
                     "empty_cycle_journal_failed=%s",
@@ -784,12 +896,20 @@ def scan_once(
         universe_received_at=universe_timing.received_at,
         universe_symbols=symbols,
     )
+    if population_journal is not None and getattr(population_journal, "enabled", True):
+        contains_cycle = getattr(population_journal, "contains_cycle", None)
+        if not callable(contains_cycle):
+            raise TypeError("population journal does not implement contains_cycle")
+        if contains_cycle(cycle_id):
+            logger.info(
+                "duplicate_population_cycle_preflight=%s",
+                cycle_id,
+                extra={"event": "scan"},
+            )
+            return []
     universe_metadata = _universe_metadata(snapshot)
 
     htf_cache = getattr(strategy, "_htf_cache", None)
-    # A prior interrupted cycle must not donate its spans to this envelope.
-    if hasattr(htf_cache, "drain_timings"):
-        htf_cache.drain_timings()
     # Freeze the volatility distribution before evaluating anyone, so a
     # candidate's fate does not depend on its position in the scan order.
     if hasattr(strategy, "begin_sweep"):
@@ -804,51 +924,138 @@ def scan_once(
             candles=candles,
             cutoff=candle_cutoff_ts,
         )
-        strategy.set_benchmark(btc if not btc.empty else None)
-        benchmark_status = "available" if not btc.empty else "no_data"
-        benchmark_timing = _timed_source(
-            "benchmark",
+        benchmark_received_at = time.time()
+        benchmark_source_evidence = _frame_source_evidence(
+            btc,
+            source="benchmark_ohlcv",
+            symbol="BTCUSDT",
+            timeframe=resolved_spec.resolved_benchmark_interval,
+            requested_as_of_ts=candle_cutoff_ts,
             request_started_at=benchmark_started_at,
-            received_at=time.time(),
-            source_as_of=candle_cutoff_ts,
+            received_at=benchmark_received_at,
         )
+        benchmark_read = FrameRead(frame=btc, evidence=benchmark_source_evidence)
+        benchmark_frame = (
+            btc if benchmark_source_evidence.outcome == "fresh" else None
+        )
+        benchmark_status = "available" if benchmark_frame is not None else "no_data"
     except Exception as exc:
-        strategy.set_benchmark(None)
-        benchmark_status = f"error:{safe_error_code(exc)}"
-        # A source that failed still consumed time the cycle waited for.
-        benchmark_timing = _timed_source(
-            "benchmark",
+        benchmark_received_at = time.time()
+        benchmark_source_evidence = _failed_source_evidence(
+            source="benchmark_ohlcv",
+            symbol="BTCUSDT",
+            timeframe=resolved_spec.resolved_benchmark_interval,
+            requested_as_of_ts=candle_cutoff_ts,
             request_started_at=benchmark_started_at,
-            received_at=time.time(),
-            source_as_of=candle_cutoff_ts,
+            received_at=benchmark_received_at,
             error=exc,
         )
+        benchmark_read = FrameRead(frame=None, evidence=benchmark_source_evidence)
+        benchmark_frame = None
+        benchmark_status = f"error:{safe_error_code(exc)}"
         logger.warning(
             "benchmark_unavailable=%s",
             safe_error_code(exc),
             extra={"event": "scan"},
         )
+    # The typed path receives this exact FrameRead explicitly and never consults
+    # mutable strategy benchmark state.  Keep benchmark_frame only for the
+    # operator-facing availability label.
+    benchmark_timing = source_timing_from_evidence(
+        benchmark_source_evidence,
+        source="benchmark",
+    )
+    assert benchmark_timing is not None
 
     def decision_time() -> float:
         # A clock correction must not place the recorded decision before the
         # already-observed causal cutoff.
         return max(time.time(), scan_observed_at, candle_cutoff_ts)
 
-    base_spans: list[dict[str, object]] = []
-    base_spans_lock = Lock()
+    higher_timeframe = resolved_spec.market_data.higher_timeframe.interval
 
-    def record_base_span(
-        *, started_at: float, status: str, error_code: str | None = None
-    ) -> None:
-        with base_spans_lock:
-            base_spans.append(
-                {
-                    "request_started_at": started_at,
-                    "received_at": time.time(),
-                    "status": status,
-                    "error_code": error_code,
-                }
+    def skipped_htf(symbol: str, reason: str) -> SourceReadEvidenceV1:
+        return _not_requested_source_evidence(
+            source="higher_timeframe_ohlcv",
+            symbol=symbol,
+            timeframe=higher_timeframe,
+            requested_as_of_ts=candle_cutoff_ts,
+            reason=reason,
+        )
+
+    def finish_evaluation(
+        *,
+        symbol: str,
+        status: _PopulationStatus,
+        base_source_evidence: SourceReadEvidenceV1,
+        higher_timeframe_source_evidence: SourceReadEvidenceV1,
+        decision_ts: float,
+        base_bar_open_ts: float | None,
+        base_bar_close_ts: float | None,
+        bar_count: int = 0,
+        mark_price: float = 0.0,
+        intent: StrategyIntent | None = None,
+        frame: pd.DataFrame | None = None,
+        stage: str = "",
+        error_code: str | None = None,
+        lifecycle_event: CandidateLifecycleEventV1 | None = None,
+    ) -> _ScanEvaluation:
+        bundle_hash = raw_frame_bundle_hash(
+            (
+                benchmark_source_evidence,
+                base_source_evidence,
+                higher_timeframe_source_evidence,
             )
+        )
+        return _ScanEvaluation(
+            symbol=symbol,
+            status=status,
+            decision_ts=decision_ts,
+            base_bar_open_ts=base_bar_open_ts,
+            base_bar_close_ts=base_bar_close_ts,
+            base_source_evidence=base_source_evidence,
+            higher_timeframe_source_evidence=higher_timeframe_source_evidence,
+            raw_frame_bundle_hash=bundle_hash,
+            bar_count=bar_count,
+            mark_price=mark_price,
+            intent=intent,
+            frame=frame,
+            stage=stage,
+            error_code=error_code,
+            lifecycle_event=lifecycle_event,
+        )
+
+    def failed_base_result(
+        symbol: str,
+        *,
+        status: _PopulationStatus,
+        stage: str,
+        error: BaseException,
+        fetch_started_at: float,
+    ) -> _ScanEvaluation:
+        received_at = time.time()
+        base_evidence = _failed_source_evidence(
+            source="base_ohlcv",
+            symbol=symbol,
+            timeframe=timeframe,
+            requested_as_of_ts=candle_cutoff_ts,
+            request_started_at=fetch_started_at,
+            received_at=received_at,
+            error=error,
+        )
+        return finish_evaluation(
+            symbol=symbol,
+            status=status,
+            base_source_evidence=base_evidence,
+            higher_timeframe_source_evidence=skipped_htf(
+                symbol, f"base_{status}"
+            ),
+            decision_ts=decision_time(),
+            base_bar_open_ts=None,
+            base_bar_close_ts=None,
+            stage=stage,
+            error_code=safe_error_code(error),
+        )
 
     def evaluate(symbol: str) -> _ScanEvaluation:
         fetch_started_at = time.time()
@@ -860,66 +1067,80 @@ def scan_once(
                 candles=candles,
                 cutoff=candle_cutoff_ts,
             )
-            record_base_span(started_at=fetch_started_at, status="ok")
-        except MarketDataQualityError as exc:
-            record_base_span(
-                started_at=fetch_started_at,
-                status="error",
-                error_code=safe_error_code(exc),
-            )
-            return _ScanEvaluation(
+            base_received_at = time.time()
+            base_evidence = _frame_source_evidence(
+                raw,
+                source="base_ohlcv",
                 symbol=symbol,
+                timeframe=timeframe,
+                requested_as_of_ts=candle_cutoff_ts,
+                request_started_at=fetch_started_at,
+                received_at=base_received_at,
+            )
+            base_read = FrameRead(frame=raw, evidence=base_evidence)
+        except (MarketDataQualityError, FrameProvenanceError) as exc:
+            return failed_base_result(
+                symbol,
                 status="data_quality_error",
-                decision_ts=decision_time(),
-                base_bar_open_ts=None,
-                base_bar_close_ts=None,
                 stage="market_data",
-                error_code=safe_error_code(exc),
+                error=exc,
+                fetch_started_at=fetch_started_at,
             )
         except BarContractError as exc:
-            record_base_span(
-                started_at=fetch_started_at,
-                status="error",
-                error_code=safe_error_code(exc),
-            )
-            return _ScanEvaluation(
-                symbol=symbol,
+            return failed_base_result(
+                symbol,
                 status="invalid_bar_contract",
-                decision_ts=decision_time(),
-                base_bar_open_ts=None,
-                base_bar_close_ts=None,
                 stage="market_data",
-                error_code=safe_error_code(exc),
+                error=exc,
+                fetch_started_at=fetch_started_at,
             )
         except Exception as exc:
-            record_base_span(
-                started_at=fetch_started_at,
-                status="error",
-                error_code=safe_error_code(exc),
-            )
-            return _ScanEvaluation(
-                symbol=symbol,
+            return failed_base_result(
+                symbol,
                 status="data_error",
+                stage="market_data",
+                error=exc,
+                fetch_started_at=fetch_started_at,
+            )
+
+        if base_evidence.outcome == "stale":
+            # Preserve the exact stale frame range/hash in source evidence, but
+            # never project it as this cycle's decision bar or expose it to the
+            # strategy, tracker, or feature snapshot.
+            return finish_evaluation(
+                symbol=symbol,
+                status="data_quality_error",
+                base_source_evidence=base_evidence,
+                higher_timeframe_source_evidence=skipped_htf(
+                    symbol, "stale_base_frame"
+                ),
                 decision_ts=decision_time(),
                 base_bar_open_ts=None,
                 base_bar_close_ts=None,
+                bar_count=len(raw),
                 stage="market_data",
-                error_code=safe_error_code(exc),
+                error_code="MarketDataQualityError",
             )
 
         if raw.empty:
-            return _ScanEvaluation(
+            return finish_evaluation(
                 symbol=symbol,
                 status="no_data",
+                base_source_evidence=base_evidence,
+                higher_timeframe_source_evidence=skipped_htf(symbol, "base_no_rows"),
                 decision_ts=decision_time(),
                 base_bar_open_ts=bar_open_ts,
                 base_bar_close_ts=bar_close_ts,
                 stage="market_data",
             )
         if len(raw) < resolved_spec.runtime_semantics.layered_min_history_bars:
-            return _ScanEvaluation(
+            return finish_evaluation(
                 symbol=symbol,
                 status="short_history",
+                base_source_evidence=base_evidence,
+                higher_timeframe_source_evidence=skipped_htf(
+                    symbol, "insufficient_base_history"
+                ),
                 decision_ts=decision_time(),
                 base_bar_open_ts=bar_open_ts,
                 base_bar_close_ts=bar_close_ts,
@@ -929,48 +1150,120 @@ def scan_once(
                 stage="market_data",
             )
 
+        if htf_cache is None:
+            htf_evidence = skipped_htf(symbol, "higher_timeframe_provider_unavailable")
+            htf_read = FrameRead(frame=None, evidence=htf_evidence)
+        else:
+            get_with_provenance = getattr(htf_cache, "get_with_provenance", None)
+            if not callable(get_with_provenance):
+                htf_evidence = skipped_htf(
+                    symbol, "higher_timeframe_provenance_api_unavailable"
+                )
+                htf_read = FrameRead(frame=None, evidence=htf_evidence)
+            else:
+                htf_started_at = time.time()
+                try:
+                    htf_read = get_with_provenance(
+                        symbol,
+                        as_of=candle_cutoff_ts,
+                    )
+                    if not isinstance(htf_read, FrameRead):
+                        raise FrameQualityError(
+                            "higher_timeframe_read_must_be_frame_read"
+                        )
+                    htf_evidence = htf_read.evidence
+                except Exception as exc:
+                    htf_evidence = _failed_source_evidence(
+                        source="higher_timeframe_ohlcv",
+                        symbol=symbol,
+                        timeframe=higher_timeframe,
+                        requested_as_of_ts=candle_cutoff_ts,
+                        request_started_at=htf_started_at,
+                        received_at=time.time(),
+                        error=exc,
+                    )
+                    return finish_evaluation(
+                        symbol=symbol,
+                        status="strategy_error",
+                        base_source_evidence=base_evidence,
+                        higher_timeframe_source_evidence=htf_evidence,
+                        decision_ts=decision_time(),
+                        base_bar_open_ts=bar_open_ts,
+                        base_bar_close_ts=bar_close_ts,
+                        bar_count=len(raw),
+                        mark_price=mark_price,
+                        frame=raw,
+                        stage="higher_timeframe",
+                        error_code=safe_error_code(exc),
+                    )
+
+        bundle_hash = raw_frame_bundle_hash(
+            (benchmark_source_evidence, base_evidence, htf_evidence)
+        )
         try:
-            enriched = compute_indicators(raw, **resolved_spec.compute_indicators_kwargs())
+            typed_evaluate = getattr(strategy, "evaluate_with_lifecycle", None)
+            if not callable(typed_evaluate):
+                raise InvalidStrategyIntentError(
+                    "strategy does not implement typed lifecycle evaluation"
+                )
             symbol_universe_meta = universe_metadata.get(symbol, {})
             funding_rate = _optional_finite(symbol_universe_meta.get("funding_rate"))
-            intent = _validate_intent(
-                strategy.generate(
-                    StrategyContext(
-                        symbol=symbol,
-                        market_ohlcv=enriched,
-                        # Signals are decided at the closed-bar cutoff. A live
-                        # ticker would reintroduce data that did not exist at it.
-                        mark_price=mark_price,
-                        exchange=None,
-                        # No position is held by the bot; every symbol is evaluated flat.
-                        synced_state=TradeState.FLAT,
-                        sentiment_index=50.0,
-                        sentiment_source="fallback_neutral_50",
-                        # This is the same frozen point-in-time snapshot already
-                        # journalled for the cycle, not a later per-symbol fetch.
-                        funding_rate=funding_rate,
-                        candle_cutoff_ts=candle_cutoff_ts,
-                    )
+            evaluated = typed_evaluate(
+                StrategyContext(
+                    symbol=symbol,
+                    # The typed strategy revalidates and enriches an owned copy
+                    # of this exact raw frame; it cannot consume drifted caller
+                    # indicator columns.
+                    market_ohlcv=raw,
+                    # Signals are decided at the closed-bar cutoff. A live
+                    # ticker would reintroduce data that did not exist at it.
+                    mark_price=mark_price,
+                    exchange=None,
+                    # No position is held by the bot; every symbol is evaluated flat.
+                    synced_state=TradeState.FLAT,
+                    sentiment_index=50.0,
+                    sentiment_source="fallback_neutral_50",
+                    # This is the same frozen point-in-time snapshot already
+                    # journalled for the cycle, not a later per-symbol fetch.
+                    funding_rate=funding_rate,
+                    candle_cutoff_ts=candle_cutoff_ts,
                 ),
-                symbol=symbol,
+                base_read=base_read,
+                benchmark_read=benchmark_read,
+                higher_timeframe_read=htf_read,
             )
+            if not isinstance(evaluated, tuple) or len(evaluated) != 2:
+                raise InvalidStrategyIntentError(
+                    "typed strategy must return intent and lifecycle evidence"
+                )
+            raw_intent, lifecycle_event = evaluated
+            intent = _validate_intent(raw_intent, symbol=symbol)
+            if lifecycle_event is not None and not isinstance(
+                lifecycle_event, CandidateLifecycleEventV1
+            ):
+                raise InvalidStrategyIntentError("strategy lifecycle evidence is invalid")
             generated_at = decision_time()
-            return _ScanEvaluation(
+            return finish_evaluation(
                 symbol=symbol,
                 status="evaluated",
+                base_source_evidence=base_evidence,
+                higher_timeframe_source_evidence=htf_evidence,
                 decision_ts=generated_at,
                 base_bar_open_ts=bar_open_ts,
                 base_bar_close_ts=bar_close_ts,
-                bar_count=len(enriched),
+                bar_count=len(raw),
                 mark_price=mark_price,
                 intent=intent,
-                frame=enriched,
+                frame=raw,
                 stage="strategy",
+                lifecycle_event=lifecycle_event,
             )
         except Exception as exc:
-            return _ScanEvaluation(
+            return finish_evaluation(
                 symbol=symbol,
                 status="strategy_error",
+                base_source_evidence=base_evidence,
+                higher_timeframe_source_evidence=htf_evidence,
                 decision_ts=decision_time(),
                 base_bar_open_ts=bar_open_ts,
                 base_bar_close_ts=bar_close_ts,
@@ -984,41 +1277,20 @@ def scan_once(
     started = time.time()
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         results = list(pool.map(evaluate, symbols))
-    pass_finished_at = time.time()
-    # Base OHLCV and the higher-timeframe cache are separate sources with separate
-    # clocks; reporting one span for both hid which of them a cycle waited on.
-    base_started = min(
-        (float(span["request_started_at"]) for span in base_spans),
-        default=started,
-    )
-    base_received = max(
-        (float(span["received_at"]) for span in base_spans),
-        default=pass_finished_at,
-    )
-    failed_base_spans = [span for span in base_spans if span["status"] != "ok"]
-    market_data_timing = SourceTiming(
+    market_data_timing = aggregate_source_timing_from_evidence(
+        [result.base_source_evidence for result in results],
         source="base_ohlcv",
-        request_started_at=base_started,
-        received_at=base_received,
-        source_as_of=(
-            candle_cutoff_ts
-            if len(failed_base_spans) < len(base_spans)
-            else None
-        ),
-        status="error" if failed_base_spans else "ok",
-        error_code=(
-            "BaseOhlcvUnavailable"
-            if failed_base_spans and len(failed_base_spans) == len(base_spans)
-            else "BaseOhlcvPartialFailure" if failed_base_spans else None
-        ),
     )
+    assert market_data_timing is not None
     source_timings = [universe_timing, benchmark_timing, market_data_timing]
     details_timing = _details_timing(snapshot)
     if details_timing is not None:
         source_timings.append(details_timing)
 
-    htf_spans = htf_cache.drain_timings() if hasattr(htf_cache, "drain_timings") else []
-    htf_timing = _aggregate_htf_timing(htf_spans)
+    htf_timing = aggregate_source_timing_from_evidence(
+        [result.higher_timeframe_source_evidence for result in results],
+        source="higher_timeframe",
+    )
     if htf_timing is not None:
         source_timings.append(htf_timing)
 
@@ -1030,7 +1302,7 @@ def scan_once(
     # outstanding, and which of the two lands later depends on scheduling.
     ranking_ready_ts = max(
         max(result.decision_ts for result in results),
-        market_data_timing.received_at,
+        max(timing.received_at for timing in source_timings),
     )
     cycle_completed_ts = max(time.time(), ranking_ready_ts)
     envelope = CycleEnvelope.build(
@@ -1059,6 +1331,7 @@ def scan_once(
             scan_observed_at=scan_observed_at,
             universe_meta=universe_metadata.get(result.symbol, {}),
             benchmark_status=benchmark_status,
+            benchmark_source_evidence=benchmark_source_evidence,
             cycle_ordinal=ordinal,
             cycle_size=cycle_size,
         )
@@ -1066,7 +1339,11 @@ def scan_once(
     ]
     duplicate_cycle = False
     if population_journal is not None and getattr(population_journal, "enabled", True):
-        duplicate_cycle = population_journal.append_cycle(records, envelope=envelope) is False
+        duplicate_cycle = population_journal.append_cycle(
+            records,
+            envelope=envelope,
+            benchmark_source_evidence=benchmark_source_evidence,
+        ) is False
         if duplicate_cycle:
             logger.info(
                 "duplicate_population_cycle_suppressed=%s",
@@ -1189,6 +1466,42 @@ def scan_once(
     return signals
 
 
+def scan_once(
+    *,
+    universe,
+    feed,
+    strategy,
+    logger,
+    timeframe: str | None = None,
+    candles: int | None = None,
+    workers: int = 8,
+    tracker=None,
+    alerters=(),
+    population_journal=None,
+    strategy_spec: MexcStrategySpec | None = None,
+) -> list:
+    """Run one sweep while protecting stateful arm/confirmation transitions."""
+
+    kwargs = {
+        "universe": universe,
+        "feed": feed,
+        "strategy": strategy,
+        "logger": logger,
+        "timeframe": timeframe,
+        "candles": candles,
+        "workers": workers,
+        "tracker": tracker,
+        "alerters": alerters,
+        "population_journal": population_journal,
+        "strategy_spec": strategy_spec,
+    }
+    scan_session = getattr(strategy, "scan_session", None)
+    if callable(scan_session):
+        with scan_session():
+            return _scan_once_unlocked(**kwargs)
+    return _scan_once_unlocked(**kwargs)
+
+
 def describe(symbol: str, intent) -> str:
     meta = intent.metadata if isinstance(intent.metadata, dict) else {}
     layer5 = (meta.get("layer_trace", {}).get("layers", {}).get("layer5_tp_sl", {}).get("details", {}))
@@ -1296,7 +1609,9 @@ def main() -> int:
             extra={"event": "startup"},
         )
 
+    runtime_stack = ExitStack()
     try:
+        runtime_stack.enter_context(population_journal.runtime_session())
         while True:
             signals = scan_once(universe=universe, feed=feed, strategy=strategy, logger=logger,
                                 workers=args.workers, tracker=tracker, alerters=alerters,
@@ -1355,6 +1670,7 @@ def main() -> int:
                 break
             time.sleep(max(30, args.interval_sec))
     finally:
+        runtime_stack.close()
         feed.close()
         client.close()
     return 0

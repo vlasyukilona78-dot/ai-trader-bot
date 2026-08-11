@@ -18,6 +18,7 @@ from ai.reversal.population_dataset import (
 from core.mexc_strategy_spec import parse_mexc_strategy_spec, strategy_spec_identity
 from trading.metrics.cycle_envelope import CycleEnvelope
 from trading.metrics.population_journal import (
+    CURRENT_WRITE_SCHEMA,
     JournalCheckpointReceipt,
     PopulationJournal,
     PopulationJournalError,
@@ -95,7 +96,7 @@ def test_writer_builds_one_contiguous_domain_separated_chain(tmp_path) -> None:
     assert [header["sequence_no"] for header in headers] == [0, 1]
     assert headers[0]["journal_id"] == headers[1]["journal_id"]
     assert headers[0]["prev_cycle_commit"] == genesis_cycle_commit(
-        headers[0]["journal_id"]
+        headers[0]["journal_id"], schema_version=CURRENT_WRITE_SCHEMA
     )
     assert headers[1]["prev_cycle_commit"] == footers[0]["cycle_commit"]
     assert footers[1]["prev_cycle_commit"] == footers[0]["cycle_commit"]

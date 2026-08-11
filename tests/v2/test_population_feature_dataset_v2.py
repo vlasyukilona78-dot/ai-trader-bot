@@ -18,9 +18,19 @@ from ai.reversal.population_dataset import (
     model_input_records,
     population_feature_records,
 )
+from trading.market_data.bar_contract import closed_boundary_ts, interval_seconds
+from trading.market_data.frame_provenance import (
+    SourceReadEvidenceV1,
+    aggregate_source_timing_from_evidence,
+    source_timing_from_evidence,
+)
 from trading.market_data.source_timing import SourceTiming
 from trading.metrics.cycle_envelope import CycleEnvelope
-from trading.metrics.population_journal import PopulationDecision, PopulationJournal, make_cycle_id
+from trading.metrics.population_journal import (
+    PopulationDecisionV6,
+    PopulationJournal,
+    make_cycle_id,
+)
 
 
 _UNIVERSE_TIMING = SourceTiming(
@@ -43,7 +53,7 @@ def _envelope(**overrides) -> CycleEnvelope:
         candle_cutoff_ts=1_700_002_800.0,
         universe_symbols=("AAAUSDT", "BBBUSDT"),
         universe_timing=_UNIVERSE_TIMING,
-        source_timings=(_UNIVERSE_TIMING,),
+        source_timings=(),
         strategy_spec_version=MEXC_STRATEGY_SPEC_VERSION,
         strategy_spec_contract_hash=strategy_spec_contract_hash(),
         strategy_spec_instance_hash=_STRATEGY_SPEC.instance_hash,
@@ -53,6 +63,39 @@ def _envelope(**overrides) -> CycleEnvelope:
         cycle_completed_ts=1_700_002_805.0,
     )
     values.update(overrides)
+    if "source_timings" not in overrides and values.get("status", "completed") != "completed":
+        values["source_timings"] = (values["universe_timing"],)
+    elif "source_timings" not in overrides:
+        cutoff = values["candle_cutoff_ts"]
+        timeframe = values["timeframe"]
+        symbols = values["universe_symbols"]
+        benchmark = _benchmark_evidence(cutoff=cutoff)
+        per_symbol = [
+            _symbol_evidence(symbol, cutoff=cutoff, timeframe=timeframe)
+            for symbol in symbols
+        ]
+        benchmark_timing = source_timing_from_evidence(
+            benchmark,
+            source="benchmark",
+        )
+        base_timing = aggregate_source_timing_from_evidence(
+            [base for base, _ in per_symbol],
+            source="base_ohlcv",
+        )
+        htf_timing = aggregate_source_timing_from_evidence(
+            [htf for _, htf in per_symbol],
+            source="higher_timeframe",
+        )
+        values["source_timings"] = tuple(
+            timing
+            for timing in (
+                values["universe_timing"],
+                benchmark_timing,
+                base_timing,
+                htf_timing,
+            )
+            if timing is not None
+        )
     if "cycle_id" not in overrides:
         values["cycle_id"] = make_cycle_id(
             timeframe=values["timeframe"],
@@ -119,14 +162,90 @@ def _metadata(*, funding: float | None, symbol: str = "AAAUSDT") -> dict:
     return metadata
 
 
-def _records() -> list[PopulationDecision]:
+def _benchmark_evidence(
+    *, cutoff: float = 1_700_002_800.0
+) -> SourceReadEvidenceV1:
+    timeframe = _STRATEGY_SPEC.resolved_benchmark_interval
+    seconds = interval_seconds(timeframe)
+    return SourceReadEvidenceV1(
+        source="benchmark_ohlcv",
+        venue="mexc_contract",
+        symbol="BTCUSDT",
+        venue_symbol="BTC_USDT",
+        timeframe=timeframe,
+        requested_as_of_ts=cutoff,
+        expected_closed_boundary_ts=float(closed_boundary_ts(cutoff, timeframe)),
+        request_started_at=cutoff + 1.0,
+        received_at=cutoff + 1.5,
+        source_ts=cutoff + 1.4,
+        cache_hit=False,
+        cache_age_sec=0.0,
+        outcome="fresh",
+        error_code=None,
+        missing_reason=None,
+        first_bar_open_ts=cutoff - 320 * seconds,
+        last_bar_open_ts=cutoff - seconds,
+        last_bar_close_ts=cutoff,
+        data_through_ts=cutoff,
+        bar_count=320,
+        frame_hash="1" * 64,
+    )
+
+
+def _symbol_evidence(
+    symbol: str,
+    *,
+    cutoff: float = 1_700_002_800.0,
+    timeframe: str = "60",
+) -> tuple[SourceReadEvidenceV1, SourceReadEvidenceV1]:
+    base_seconds = interval_seconds(timeframe)
+    htf = _STRATEGY_SPEC.market_data.higher_timeframe.interval
+    venue_symbol = symbol[:-4] + "_USDT"
+    return (
+        SourceReadEvidenceV1(
+            source="base_ohlcv",
+            venue="mexc_contract",
+            symbol=symbol,
+            venue_symbol=venue_symbol,
+            timeframe=timeframe,
+            requested_as_of_ts=cutoff,
+            expected_closed_boundary_ts=cutoff,
+            request_started_at=cutoff + 1.0,
+            received_at=cutoff + 1.5,
+            source_ts=cutoff + 1.4,
+            cache_hit=False,
+            cache_age_sec=0.0,
+            outcome="fresh",
+            error_code=None,
+            missing_reason=None,
+            first_bar_open_ts=cutoff - 320 * base_seconds,
+            last_bar_open_ts=cutoff - base_seconds,
+            last_bar_close_ts=cutoff,
+            data_through_ts=cutoff,
+            bar_count=320,
+            frame_hash=("2" if symbol == "AAAUSDT" else "3") * 64,
+        ),
+        SourceReadEvidenceV1.not_requested(
+            source="higher_timeframe_ohlcv",
+            venue="mexc_contract",
+            symbol=symbol,
+            venue_symbol=venue_symbol,
+            timeframe=htf,
+            requested_as_of_ts=cutoff,
+            reason="not_used",
+        ),
+    )
+
+
+def _records() -> list[PopulationDecisionV6]:
     cycle_id = _cycle_id()
     out = []
     # Per-symbol decision clocks differ inside one cycle; the cycle-level timing
     # below is identical on every row, which is what makes them one cohort.
     for ordinal, (symbol, funding) in enumerate((("AAAUSDT", 0.0), ("BBBUSDT", None))):
+        base_evidence, htf_evidence = _symbol_evidence(symbol)
         out.append(
-            PopulationDecision.create(
+            PopulationDecisionV6.create(
                 cycle_id=cycle_id,
                 universe_refreshed_at=1_700_000_000.0,
                 universe_request_started_at=1_700_000_000.0,
@@ -148,6 +267,9 @@ def _records() -> list[PopulationDecision]:
                 reason="test",
                 confidence=0.0,
                 metadata=_metadata(funding=funding, symbol=symbol),
+                base_source_evidence=base_evidence,
+                higher_timeframe_source_evidence=htf_evidence,
+                benchmark_source_evidence=_benchmark_evidence(),
                 cycle_ordinal=ordinal,
                 cycle_size=2,
             )

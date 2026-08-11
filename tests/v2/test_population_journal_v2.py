@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 
 import pytest
 
@@ -10,10 +11,16 @@ from core.mexc_strategy_spec import (
     load_mexc_strategy_spec,
     strategy_spec_contract_hash,
 )
+from trading.market_data.bar_contract import closed_boundary_ts, interval_seconds
+from trading.market_data.frame_provenance import (
+    SourceReadEvidenceV1,
+    aggregate_source_timing_from_evidence,
+    source_timing_from_evidence,
+)
 from trading.market_data.source_timing import SourceTiming
 from trading.metrics.cycle_envelope import CycleEnvelope
 from trading.metrics.population_journal import (
-    PopulationDecision,
+    PopulationDecisionV6,
     PopulationJournal,
     PopulationJournalError,
     make_cycle_id,
@@ -39,7 +46,7 @@ def _envelope(**overrides) -> CycleEnvelope:
         candle_cutoff_ts=1_700_000_100.0,
         universe_symbols=("AAA_USDT", "BBB_USDT"),
         universe_timing=_UNIVERSE_TIMING,
-        source_timings=(_UNIVERSE_TIMING,),
+        source_timings=(),
         strategy_spec_version=MEXC_STRATEGY_SPEC_VERSION,
         strategy_spec_contract_hash=strategy_spec_contract_hash(),
         strategy_spec_instance_hash=_STRATEGY_SPEC.instance_hash,
@@ -49,6 +56,42 @@ def _envelope(**overrides) -> CycleEnvelope:
         cycle_completed_ts=1_700_000_104.0,
     )
     values.update(overrides)
+    if "source_timings" not in overrides and values.get("status", "completed") != "completed":
+        values["source_timings"] = (values["universe_timing"],)
+    elif "source_timings" not in overrides:
+        cutoff = float(values["candle_cutoff_ts"])
+        timeframe = str(values["timeframe"])
+        reads = [
+            _source_evidence(
+                symbol=symbol,
+                timeframe=timeframe,
+                cutoff=cutoff,
+                status="evaluated",
+            )
+            for symbol in values["universe_symbols"]
+        ]
+        benchmark_timing = source_timing_from_evidence(
+            reads[0][2],
+            source="benchmark",
+        )
+        base_timing = aggregate_source_timing_from_evidence(
+            [base for base, _, _ in reads],
+            source="base_ohlcv",
+        )
+        htf_timing = aggregate_source_timing_from_evidence(
+            [htf for _, htf, _ in reads],
+            source="higher_timeframe",
+        )
+        values["source_timings"] = tuple(
+            timing
+            for timing in (
+                values["universe_timing"],
+                benchmark_timing,
+                base_timing,
+                htf_timing,
+            )
+            if timing is not None
+        )
     return CycleEnvelope.build(**values)
 
 
@@ -61,7 +104,93 @@ def _cycle_id() -> str:
     )
 
 
-def _record(**overrides: object) -> PopulationDecision:
+def _source_evidence(
+    *, symbol: str, timeframe: str, cutoff: float, status: str
+) -> tuple[SourceReadEvidenceV1, SourceReadEvidenceV1, SourceReadEvidenceV1]:
+    venue_symbol = symbol if "_" in symbol else symbol[:-4] + "_USDT"
+    base_seconds = interval_seconds(timeframe)
+    common = dict(
+        venue="mexc_contract",
+        symbol=symbol,
+        venue_symbol=venue_symbol,
+        timeframe=timeframe,
+        requested_as_of_ts=cutoff,
+        expected_closed_boundary_ts=float(closed_boundary_ts(cutoff, timeframe)),
+        request_started_at=cutoff + 1.0,
+        received_at=cutoff + 1.5,
+        source_ts=cutoff + 1.4,
+        cache_hit=False,
+        cache_age_sec=0.0,
+    )
+    if status == "no_data":
+        base = SourceReadEvidenceV1(
+            source="base_ohlcv",
+            outcome="no_rows",
+            error_code=None,
+            missing_reason="no_rows",
+            first_bar_open_ts=None,
+            last_bar_open_ts=None,
+            last_bar_close_ts=None,
+            data_through_ts=None,
+            bar_count=0,
+            frame_hash=None,
+            **common,
+        )
+    else:
+        base = SourceReadEvidenceV1(
+            source="base_ohlcv",
+            outcome="fresh",
+            error_code=None,
+            missing_reason=None,
+            first_bar_open_ts=cutoff - 20 * base_seconds,
+            last_bar_open_ts=cutoff - base_seconds,
+            last_bar_close_ts=cutoff,
+            data_through_ts=cutoff,
+            bar_count=20,
+            frame_hash=hashlib.sha256(symbol.encode()).hexdigest(),
+            **common,
+        )
+    htf_name = _STRATEGY_SPEC.market_data.higher_timeframe.interval
+    htf = SourceReadEvidenceV1.not_requested(
+        source="higher_timeframe_ohlcv",
+        venue="mexc_contract",
+        symbol=symbol,
+        venue_symbol=venue_symbol,
+        timeframe=htf_name,
+        requested_as_of_ts=cutoff,
+        reason="not_used",
+    )
+    benchmark_timeframe = _STRATEGY_SPEC.resolved_benchmark_interval
+    benchmark_seconds = interval_seconds(benchmark_timeframe)
+    benchmark = SourceReadEvidenceV1(
+        source="benchmark_ohlcv",
+        venue="mexc_contract",
+        symbol="BTCUSDT",
+        venue_symbol="BTC_USDT",
+        timeframe=benchmark_timeframe,
+        requested_as_of_ts=cutoff,
+        expected_closed_boundary_ts=float(
+            closed_boundary_ts(cutoff, benchmark_timeframe)
+        ),
+        request_started_at=cutoff + 1.0,
+        received_at=cutoff + 1.5,
+        source_ts=cutoff + 1.4,
+        cache_hit=False,
+        cache_age_sec=0.0,
+        outcome="fresh",
+        error_code=None,
+        missing_reason=None,
+        first_bar_open_ts=cutoff - 20 * benchmark_seconds,
+        last_bar_open_ts=cutoff - benchmark_seconds,
+        last_bar_close_ts=cutoff,
+        data_through_ts=cutoff,
+        bar_count=20,
+        frame_hash="b" * 64,
+    )
+    return base, htf, benchmark
+
+
+def _record(**overrides: object) -> PopulationDecisionV6:
     values: dict[str, object] = {
         "cycle_id": _cycle_id(),
         "universe_refreshed_at": 1_699_999_999.0,
@@ -87,7 +216,27 @@ def _record(**overrides: object) -> PopulationDecision:
         "metadata": {"features": {"z": 2.0, "a": 1.0}},
     }
     values.update(overrides)
-    return PopulationDecision.create(**values)  # type: ignore[arg-type]
+    metadata = dict(values["metadata"])
+    metadata.setdefault(
+        "provenance",
+        {
+            "strategy_config_hash": _STRATEGY_SPEC.instance_hash,
+            "universe_policy_hash": "b" * 64,
+        },
+    )
+    values["metadata"] = metadata
+    base, htf, benchmark = _source_evidence(
+        symbol=str(values["symbol"]),
+        timeframe=str(values["timeframe"]),
+        cutoff=float(values["candle_cutoff_ts"]),
+        status=str(values["status"]),
+    )
+    values.update(
+        base_source_evidence=base,
+        higher_timeframe_source_evidence=htf,
+        benchmark_source_evidence=benchmark,
+    )
+    return PopulationDecisionV6.create(**values)  # type: ignore[arg-type]
 
 
 def test_ids_are_stable_for_different_mapping_key_order() -> None:

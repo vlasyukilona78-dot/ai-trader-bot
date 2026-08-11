@@ -31,6 +31,8 @@ _CARRIED = (
     "candle_cutoff_ts", "base_bar_open_ts", "base_bar_close_ts", "cycle_ordinal",
     "cycle_size", "universe_refreshed_at", "universe_request_started_at",
     "universe_received_at", "scan_observed_at",
+    "error_code", "base_source_evidence", "higher_timeframe_source_evidence",
+    "benchmark_source_evidence", "lifecycle_event",
 )
 
 

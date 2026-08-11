@@ -16,23 +16,42 @@ import re
 from typing import Any, Iterator, Mapping
 
 from trading.market_data.bar_contract import interval_seconds
+from trading.market_data.frame_provenance import SourceReadEvidenceV1
 from trading.metrics.cycle_envelope import CycleEnvelope, CycleEnvelopeError
+from trading.signals.lifecycle_contract import (
+    CandidateLifecycleEventV1,
+    LifecycleContractError,
+)
 from trading.metrics.population_journal import (
     CYCLE_IDENTITY_VERSION,
+    CURRENT_WRITE_SCHEMA,
+    EVIDENCE_CONTRACT_KEYS,
     FEATURE_PROVENANCE_KEYS,
     FOOTER_CORE_KEYS,
     FOOTER_KEYS,
     HEADER_KEYS,
+    HEADER_KEYS_V5,
+    HEADER_KEYS_V6,
     RECORD_TYPE_DECISION,
     RECORD_TYPE_FOOTER,
     RECORD_TYPE_HEADER,
     SCHEMA_VERSION,
     JournalCheckpointReceipt,
     PopulationDecision,
+    PopulationDecisionV6,
     PopulationJournalError,
     _causal_metadata,
+    _LifecycleChainState,
+    _validate_benchmark_source_evidence,
+    _validate_cycle_source_timings,
+    _validate_record_against_envelope,
+    _validate_v6_decision_evidence,
+    _validated_decision_record,
+    _validated_evidence_contracts,
+    _validated_source_evidence,
     compute_cycle_commit,
     genesis_cycle_commit,
+    header_keys_for_schema,
     make_cycle_id,
     update_rows_checksum,
 )
@@ -69,6 +88,7 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class PopulationFeatureRow:
+    journal_schema_version: int
     schema_version: int
     snapshot_id: str
     cycle_id: str
@@ -98,6 +118,13 @@ class PopulationFeatureRow:
     features: Mapping[str, float | None]
     observed: Mapping[str, int]
     availability_reason: Mapping[str, str]
+    evidence_contracts: Mapping[str, str] | None = None
+    benchmark_source_evidence: Mapping[str, object] | None = None
+    base_source_evidence: Mapping[str, object] | None = None
+    higher_timeframe_source_evidence: Mapping[str, object] | None = None
+    raw_frame_bundle_hash: str | None = None
+    lifecycle_event: Mapping[str, object] | None = None
+    typed_evidence_status: str = "legacy_missing"
 
 
 @dataclass(frozen=True)
@@ -105,6 +132,7 @@ class PopulationJournalTrustState:
     """Integrity boundary proven by one complete reader pass."""
 
     integrity: str
+    journal_schema_version: int
     journal_id: str
     last_sequence_no: int
     last_cycle_id: str
@@ -114,14 +142,36 @@ class PopulationJournalTrustState:
 
 @dataclass
 class _ReaderState:
+    journal_schema_version: int | None = None
     journal_id: str | None = None
     strategy_spec_identity: tuple[str, str, str] | None = None
+    evidence_contracts: Mapping[str, str] | None = None
     last_sequence_no: int = -1
     last_cycle_id: str | None = None
     last_cycle_commit: str | None = None
     checkpoint_seen: bool = False
     cycle_ids: list[str] = field(default_factory=list)
     cycle_commits: list[str] = field(default_factory=list)
+
+    def bind_schema(self, schema_version: int) -> None:
+        if schema_version not in {SCHEMA_VERSION, CURRENT_WRITE_SCHEMA}:
+            raise PopulationDatasetError("unsupported_population_schema_version")
+        if self.journal_schema_version is None:
+            self.journal_schema_version = schema_version
+        elif schema_version != self.journal_schema_version:
+            raise PopulationDatasetError("mixed_population_schema_versions")
+
+    def bind_evidence_contracts(self, payload: Mapping[str, str] | None) -> None:
+        if self.journal_schema_version == SCHEMA_VERSION:
+            if payload is not None:
+                raise PopulationDatasetError("legacy_v5_must_not_claim_typed_evidence")
+            return
+        if payload is None:
+            raise PopulationDatasetError("v6_evidence_contracts_missing")
+        if self.evidence_contracts is None:
+            self.evidence_contracts = dict(payload)
+        elif dict(payload) != dict(self.evidence_contracts):
+            raise PopulationDatasetError("mixed_evidence_contract_identities")
 
     def bind_strategy_spec(self, envelope: CycleEnvelope) -> None:
         identity = (
@@ -140,6 +190,7 @@ class _ReaderState:
     ) -> PopulationJournalTrustState:
         if (
             self.journal_id is None
+            or self.journal_schema_version is None
             or self.last_cycle_id is None
             or self.last_cycle_commit is None
             or self.last_sequence_no < 0
@@ -154,6 +205,7 @@ class _ReaderState:
                 if anchored is not None
                 else "internally_consistent_unanchored"
             ),
+            journal_schema_version=self.journal_schema_version,
             journal_id=self.journal_id,
             last_sequence_no=self.last_sequence_no,
             last_cycle_id=self.last_cycle_id,
@@ -186,50 +238,64 @@ def _mapping(value: Any, *, field: str) -> Mapping[str, Any]:
     return value
 
 
-def _parse_feature_row(payload: Mapping[str, Any]) -> PopulationFeatureRow:
+def _parse_feature_row(
+    payload: Mapping[str, Any],
+    *,
+    schema_version: int,
+    envelope: CycleEnvelope,
+    evidence_contracts: Mapping[str, str] | None,
+    benchmark_source_evidence: SourceReadEvidenceV1 | None,
+) -> PopulationFeatureRow:
     metadata = _mapping(payload.get("metadata"), field="metadata")
     # Fail closed rather than reinterpret. A v1 row dated its universe data with a
     # timestamp taken before the request, and it carries no entry timing at all;
     # silently reading it as v2 would invent both.
-    if payload.get("schema_version") != SCHEMA_VERSION:
-        raise PopulationDatasetError(
-            f"unsupported_population_schema_version:expected_{SCHEMA_VERSION}"
-        )
+    if payload.get("schema_version") != schema_version:
+        raise PopulationDatasetError("population_row_schema_version_mismatch")
+    # Diagnose the semantic feature contract before the row-level digest.  A
+    # stale input_hash still fails closed, but callers get the actual schema or
+    # source-drift reason instead of an opaque reconstruction wrapper.
+    pre_snapshot = _mapping(
+        metadata.get("feature_snapshot"), field="feature_snapshot"
+    )
+    if pre_snapshot.get("contract_version") != FEATURE_CONTRACT_VERSION:
+        raise PopulationDatasetError("feature_contract_version_mismatch")
+    if pre_snapshot.get("contract_hash") != feature_contract_hash():
+        raise PopulationDatasetError("feature_contract_hash_mismatch")
     try:
-        record = PopulationDecision(
-            schema_version=payload.get("schema_version"),
-            cycle_id=payload.get("cycle_id"),
-            snapshot_id=payload.get("snapshot_id"),
-            input_hash=payload.get("input_hash"),
-            universe_refreshed_at=payload.get("universe_refreshed_at"),
-            universe_request_started_at=payload.get("universe_request_started_at"),
-            universe_received_at=payload.get("universe_received_at"),
-            scan_observed_at=payload.get("scan_observed_at"),
-            candle_cutoff_ts=payload.get("candle_cutoff_ts"),
-            decision_ts=payload.get("decision_ts"),
-            ranking_ready_ts=payload.get("ranking_ready_ts"),
-            cycle_completed_ts=payload.get("cycle_completed_ts"),
-            actionable_ts=payload.get("actionable_ts"),
-            entry_eligible_ts=payload.get("entry_eligible_ts"),
-            entry_bar_open_ts=payload.get("entry_bar_open_ts"),
-            symbol=payload.get("symbol"),
-            timeframe=payload.get("timeframe"),
-            status=payload.get("status"),
-            base_bar_open_ts=payload.get("base_bar_open_ts"),
-            base_bar_close_ts=payload.get("base_bar_close_ts"),
-            action=payload.get("action"),
-            reason=payload.get("reason"),
-            confidence=payload.get("confidence"),
-            metadata=metadata,
-            cycle_ordinal=payload.get("cycle_ordinal"),
-            cycle_size=payload.get("cycle_size"),
-            error_code=payload.get("error_code"),
+        pre_rebuilt_snapshot = build_runtime_feature_snapshot(
+            metadata,
+            bar_cutoff_ts=_finite_number(
+                payload.get("candle_cutoff_ts"), field="candle_cutoff_ts"
+            ),
+        )
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise PopulationDatasetError("feature_snapshot_cannot_be_rebuilt") from exc
+    if pre_snapshot != pre_rebuilt_snapshot:
+        raise PopulationDatasetError("feature_snapshot_source_mismatch")
+    try:
+        record = _validated_decision_record(
+            payload,
+            schema_version=schema_version,
         )
     except (PopulationJournalError, TypeError, ValueError) as exc:
         raise PopulationDatasetError("invalid_population_record") from exc
-
-    if record.as_dict() != dict(payload):
-        raise PopulationDatasetError("population_record_source_mismatch")
+    if schema_version == CURRENT_WRITE_SCHEMA:
+        if (
+            not isinstance(record, PopulationDecisionV6)
+            or evidence_contracts is None
+            or benchmark_source_evidence is None
+        ):
+            raise PopulationDatasetError("v6_typed_evidence_context_missing")
+        try:
+            _validate_record_against_envelope(record, envelope=envelope)
+            _validate_v6_decision_evidence(
+                record,
+                envelope=envelope,
+                benchmark_source_evidence=benchmark_source_evidence,
+            )
+        except PopulationJournalError as exc:
+            raise PopulationDatasetError("invalid_v6_decision_evidence") from exc
 
     encoded_timeframe_seconds = _integer(
         payload.get("timeframe_seconds"), field="timeframe_seconds"
@@ -326,50 +392,8 @@ def _parse_feature_row(payload: Mapping[str, Any]) -> PopulationFeatureRow:
             continue
         features[name] = _finite_number(raw_values[name], field=f"feature:{name}")
 
-    input_hash = record.input_hash
-    causal_payload = {
-        "schema_version": record.schema_version,
-        "cycle_id": record.cycle_id,
-        "symbol": record.symbol,
-        "timeframe_seconds": encoded_timeframe_seconds,
-        "status": record.status,
-        "candle_cutoff_ts": record.candle_cutoff_ts,
-        "base_bar_open_ts": record.base_bar_open_ts,
-        "base_bar_close_ts": record.base_bar_close_ts,
-        "action": record.action,
-        "reason": record.reason,
-        "confidence": record.confidence,
-        "metadata": _causal_metadata(metadata),
-        "error_code": record.error_code,
-    }
-    encoded = json.dumps(
-        causal_payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    expected_input_hash = hashlib.sha256(encoded).hexdigest()
-    if input_hash != expected_input_hash:
-        raise PopulationDatasetError("population_input_hash_mismatch")
-    expected_snapshot_id = hashlib.sha256(
-        json.dumps(
-            {
-                "schema_version": record.schema_version,
-                "cycle_id": record.cycle_id,
-                "symbol": record.symbol,
-                "input_hash": input_hash,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
-    if record.snapshot_id != expected_snapshot_id:
-        raise PopulationDatasetError("population_snapshot_id_mismatch")
-
     return PopulationFeatureRow(
+        journal_schema_version=schema_version,
         schema_version=record.schema_version,
         snapshot_id=record.snapshot_id,
         cycle_id=record.cycle_id,
@@ -399,6 +423,40 @@ def _parse_feature_row(payload: Mapping[str, Any]) -> PopulationFeatureRow:
         features=features,
         observed=observed,
         availability_reason=availability_reason,
+        evidence_contracts=(
+            dict(evidence_contracts) if evidence_contracts is not None else None
+        ),
+        benchmark_source_evidence=(
+            benchmark_source_evidence.as_dict()
+            if benchmark_source_evidence is not None
+            else None
+        ),
+        base_source_evidence=(
+            record.base_source_evidence.as_dict()
+            if isinstance(record, PopulationDecisionV6)
+            and record.base_source_evidence is not None
+            else None
+        ),
+        higher_timeframe_source_evidence=(
+            record.higher_timeframe_source_evidence.as_dict()
+            if isinstance(record, PopulationDecisionV6)
+            and record.higher_timeframe_source_evidence is not None
+            else None
+        ),
+        raw_frame_bundle_hash=(
+            record.raw_frame_bundle_hash
+            if isinstance(record, PopulationDecisionV6)
+            else None
+        ),
+        lifecycle_event=(
+            record.lifecycle_event.as_dict()
+            if isinstance(record, PopulationDecisionV6)
+            and record.lifecycle_event is not None
+            else None
+        ),
+        typed_evidence_status=(
+            "typed_v6" if schema_version == CURRENT_WRITE_SCHEMA else "legacy_missing"
+        ),
     )
 
 
@@ -498,6 +556,9 @@ def _parse_population_cycles(
     current_journal_id: str | None = None
     current_sequence_no: int | None = None
     current_prev_commit: str | None = None
+    current_schema_version: int | None = None
+    current_evidence_contracts: Mapping[str, str] | None = None
+    current_benchmark_source_evidence: SourceReadEvidenceV1 | None = None
     declared_rows = 0
     declared_envelope_hash: str | None = None
     cycle_rows: list[PopulationFeatureRow] = []
@@ -510,6 +571,9 @@ def _parse_population_cycles(
     file_digest = hashlib.sha256()
     prefix_length = 0
     saw_any = False
+    lifecycle_chain = _LifecycleChainState()
+    cycle_base_source_evidences: list[SourceReadEvidenceV1] = []
+    cycle_higher_timeframe_source_evidences: list[SourceReadEvidenceV1] = []
 
     with handle:
         for line_number, raw in enumerate(handle, start=1):
@@ -531,14 +595,17 @@ def _parse_population_cycles(
             except (json.JSONDecodeError, ValueError) as exc:
                 raise PopulationDatasetError(f"invalid_json_line:{line_number}") from exc
             payload = _mapping(decoded, field="journal_row")
-            if payload.get("schema_version") != SCHEMA_VERSION:
-                raise PopulationDatasetError(
-                    f"unsupported_population_schema_version:expected_{SCHEMA_VERSION}"
-                )
+            raw_schema_version = payload.get("schema_version")
+            if isinstance(raw_schema_version, bool) or not isinstance(
+                raw_schema_version, int
+            ):
+                raise PopulationDatasetError("invalid_population_schema_version")
+            schema_version = int(raw_schema_version)
+            state.bind_schema(schema_version)
             record_type = payload.get("record_type")
 
             if record_type == RECORD_TYPE_HEADER:
-                if set(payload) != HEADER_KEYS:
+                if set(payload) != header_keys_for_schema(schema_version):
                     raise PopulationDatasetError("cycle_header_schema_mismatch")
                 if envelope is not None:
                     raise PopulationDatasetError("new_cycle_before_previous_cycle_completed")
@@ -546,6 +613,31 @@ def _parse_population_cycles(
                     _mapping(payload.get("envelope"), field="envelope")
                 )
                 state.bind_strategy_spec(envelope)
+                current_schema_version = schema_version
+                if schema_version == CURRENT_WRITE_SCHEMA:
+                    try:
+                        current_evidence_contracts = _validated_evidence_contracts(
+                            payload.get("evidence_contracts")
+                        )
+                        current_benchmark_source_evidence = (
+                            _validated_source_evidence(
+                                payload.get("benchmark_source_evidence"),
+                                field="benchmark source evidence",
+                            )
+                        )
+                        _validate_benchmark_source_evidence(
+                            current_benchmark_source_evidence,
+                            envelope=envelope,
+                        )
+                    except PopulationJournalError as exc:
+                        raise PopulationDatasetError(
+                            "invalid_v6_cycle_evidence_header"
+                        ) from exc
+                    state.bind_evidence_contracts(current_evidence_contracts)
+                else:
+                    current_evidence_contracts = None
+                    current_benchmark_source_evidence = None
+                    state.bind_evidence_contracts(None)
                 current_header = payload
                 if envelope.cycle_id != payload.get("cycle_id"):
                     raise PopulationDatasetError("cycle_header_id_mismatch")
@@ -577,7 +669,10 @@ def _parse_population_cycles(
                 if current_sequence_no != len(completed_commits):
                     raise PopulationDatasetError("non_contiguous_cycle_sequence")
                 expected_prev = (
-                    genesis_cycle_commit(journal_id)
+                    genesis_cycle_commit(
+                        journal_id,
+                        schema_version=schema_version,
+                    )
                     if not completed_commits
                     else completed_commits[-1]
                 )
@@ -596,6 +691,8 @@ def _parse_population_cycles(
                 rows_digest = hashlib.sha256()
                 seen_symbols = set()
                 seen_snapshots = set()
+                cycle_base_source_evidences = []
+                cycle_higher_timeframe_source_evidences = []
                 saw_any = True
                 continue
 
@@ -603,7 +700,15 @@ def _parse_population_cycles(
                 raise PopulationDatasetError("journal_row_before_its_cycle_header")
 
             if record_type == RECORD_TYPE_DECISION:
-                row = _parse_feature_row(payload)
+                if current_schema_version is None:
+                    raise PopulationDatasetError("cycle_header_schema_state_missing")
+                row = _parse_feature_row(
+                    payload,
+                    schema_version=current_schema_version,
+                    envelope=envelope,
+                    evidence_contracts=current_evidence_contracts,
+                    benchmark_source_evidence=current_benchmark_source_evidence,
+                )
                 if row.cycle_ordinal != len(cycle_rows) or row.cycle_size != declared_rows:
                     raise PopulationDatasetError("incomplete_or_unordered_cycle")
                 if row.symbol in seen_symbols or row.snapshot_id in seen_snapshots:
@@ -611,6 +716,41 @@ def _parse_population_cycles(
                 seen_symbols.add(row.symbol)
                 seen_snapshots.add(row.snapshot_id)
                 _check_row_against_envelope(row, envelope)
+                if schema_version == CURRENT_WRITE_SCHEMA:
+                    try:
+                        if (
+                            row.base_source_evidence is None
+                            or row.higher_timeframe_source_evidence is None
+                        ):
+                            raise PopulationJournalError(
+                                "v6 row lacks typed source evidence"
+                            )
+                        cycle_base_source_evidences.append(
+                            _validated_source_evidence(
+                                row.base_source_evidence,
+                                field="base source evidence",
+                            )
+                        )
+                        cycle_higher_timeframe_source_evidences.append(
+                            _validated_source_evidence(
+                                row.higher_timeframe_source_evidence,
+                                field="higher-timeframe source evidence",
+                            )
+                        )
+                        lifecycle_chain.observe(
+                            symbol=row.symbol,
+                            event=(
+                                CandidateLifecycleEventV1.from_dict(
+                                    row.lifecycle_event
+                                )
+                                if row.lifecycle_event is not None
+                                else None
+                            ),
+                        )
+                    except (PopulationJournalError, LifecycleContractError) as exc:
+                        raise PopulationDatasetError(
+                            "invalid_cross_cycle_lifecycle_chain"
+                        ) from exc
                 cycle_rows.append(row)
                 row_payloads.append(payload)
                 update_rows_checksum(rows_digest, payload)
@@ -662,8 +802,33 @@ def _parse_population_cycles(
                     raise PopulationDatasetError(
                         f"{envelope.status}_cycle_must_not_contain_decision_rows"
                     )
+                if current_schema_version == CURRENT_WRITE_SCHEMA:
+                    if current_benchmark_source_evidence is None:
+                        raise PopulationDatasetError(
+                            "v6_benchmark_source_evidence_missing"
+                        )
+                    try:
+                        _validate_cycle_source_timings(
+                            envelope=envelope,
+                            benchmark_source_evidence=(
+                                current_benchmark_source_evidence
+                            ),
+                            base_source_evidences=cycle_base_source_evidences,
+                            higher_timeframe_source_evidences=(
+                                cycle_higher_timeframe_source_evidences
+                            ),
+                        )
+                    except PopulationJournalError as exc:
+                        raise PopulationDatasetError(
+                            "cycle_source_timing_evidence_mismatch"
+                        ) from exc
+                    lifecycle_chain.finish_cycle(envelope)
 
                 if trusted_checkpoint is not None and current_sequence_no == trusted_checkpoint.sequence_no:
+                    if trusted_checkpoint.journal_schema_version != current_schema_version:
+                        raise PopulationDatasetError(
+                            "trusted_checkpoint_journal_schema_mismatch"
+                        )
                     if trusted_checkpoint.cycle_id != envelope.cycle_id:
                         raise PopulationDatasetError("trusted_checkpoint_cycle_id_mismatch")
                     if trusted_checkpoint.cycle_commit != expected_commit:
@@ -687,6 +852,9 @@ def _parse_population_cycles(
                 current_journal_id = None
                 current_sequence_no = None
                 current_prev_commit = None
+                current_schema_version = None
+                current_evidence_contracts = None
+                current_benchmark_source_evidence = None
                 declared_rows = 0
                 declared_envelope_hash = None
                 cycle_rows = []
@@ -694,6 +862,8 @@ def _parse_population_cycles(
                 rows_digest = hashlib.sha256()
                 seen_symbols = set()
                 seen_snapshots = set()
+                cycle_base_source_evidences = []
+                cycle_higher_timeframe_source_evidences = []
                 continue
 
             raise PopulationDatasetError(f"unknown_journal_record_type:{record_type!r}")
@@ -832,6 +1002,7 @@ def population_feature_records(
         record: dict[str, Any] = {
             "snapshot_id": row.snapshot_id,
             "schema_version": row.schema_version,
+            "journal_schema_version": row.journal_schema_version,
             "cycle_id": row.cycle_id,
             "cycle_ordinal": row.cycle_ordinal,
             "cycle_size": row.cycle_size,
@@ -856,6 +1027,17 @@ def population_feature_records(
             "feature_contract_hash": row.feature_contract_hash,
             "envelope_hash": row.envelope_hash,
             "market_feature_hash": row.market_feature_hash,
+            # Typed evidence remains nested, top-level metadata.  It is never
+            # flattened into the numeric feature namespace below.
+            "typed_evidence_status": row.typed_evidence_status,
+            "evidence_contracts": row.evidence_contracts,
+            "benchmark_source_evidence": row.benchmark_source_evidence,
+            "base_source_evidence": row.base_source_evidence,
+            "higher_timeframe_source_evidence": (
+                row.higher_timeframe_source_evidence
+            ),
+            "raw_frame_bundle_hash": row.raw_frame_bundle_hash,
+            "lifecycle_event": row.lifecycle_event,
         }
         record.update(row.features)
         record.update({f"{name}__observed": value for name, value in row.observed.items()})
@@ -871,11 +1053,21 @@ def model_input_records(
     *,
     trusted_checkpoint: JournalCheckpointReceipt | Mapping[str, object] | None = None,
     allow_unanchored: bool = False,
+    allow_legacy_v5: bool = False,
 ) -> list[dict[str, Any]]:
     """Return whitelist-only features plus non-predictive evidence identity."""
 
     if trusted_checkpoint is None and not allow_unanchored:
         raise PopulationDatasetError("trusted_checkpoint_required_for_model_inputs")
+
+    trust = verify_population_journal(
+        path,
+        trusted_checkpoint=trusted_checkpoint,
+    )
+    if trust.journal_schema_version == SCHEMA_VERSION and not allow_legacy_v5:
+        raise PopulationDatasetError(
+            "legacy_v5_model_export_requires_explicit_opt_in"
+        )
 
     names = model_feature_names()
     records: list[dict[str, Any]] = []
@@ -893,6 +1085,16 @@ def model_input_records(
                     "bar_cutoff_ts": row.bar_cutoff_ts,
                     "envelope_hash": row.envelope_hash,
                     "market_feature_hash": row.market_feature_hash,
+                    "journal_schema_version": row.journal_schema_version,
+                    "typed_evidence_status": row.typed_evidence_status,
+                    "evidence_contracts": row.evidence_contracts,
+                    "benchmark_source_evidence": row.benchmark_source_evidence,
+                    "base_source_evidence": row.base_source_evidence,
+                    "higher_timeframe_source_evidence": (
+                        row.higher_timeframe_source_evidence
+                    ),
+                    "raw_frame_bundle_hash": row.raw_frame_bundle_hash,
+                    "lifecycle_event": row.lifecycle_event,
                     # Evidence/partition metadata only. These fields deliberately
                     # remain outside ``features`` and must never become predictors.
                     "strategy_spec_version": envelope.strategy_spec_version,

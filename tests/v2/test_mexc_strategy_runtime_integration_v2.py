@@ -262,11 +262,11 @@ def test_legacy_offline_scan_call_gets_a_canonical_generated_spec() -> None:
     assert resolved.instance_hash != load_mexc_strategy_spec().instance_hash
 
 
-def test_cli_defaults_to_dedicated_spec_and_journal_v5() -> None:
+def test_cli_defaults_to_dedicated_spec_and_journal_v6() -> None:
     with patch.object(sys, "argv", ["scan"]):
         args = parse_args()
 
     assert args.strategy_spec.endswith("config\\mexc_strategy_v2.yaml")
     assert args.timeframe is None
     assert args.candles is None
-    assert args.population_journal == "data/runtime/mexc_population_decisions_v5.jsonl"
+    assert args.population_journal == "data/runtime/mexc_population_decisions_v6.jsonl"

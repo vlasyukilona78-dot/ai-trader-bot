@@ -1,4 +1,4 @@
-"""Offline proof that scanner output survives the real schema-v4 journal path.
+"""Offline proof that scanner output survives the real schema-v6 journal path.
 
 The unit boundaries around scanning, journalling and dataset parsing are useful,
 but they can all be green while their serialized contracts disagree.  These
@@ -18,9 +18,9 @@ from ai.reversal.population_dataset import (
 )
 from app.scan import scan_once
 from trading.market_data.universe import SymbolUniverse, UniverseConfig
-from trading.metrics.population_journal import PopulationJournal, SCHEMA_VERSION
+from trading.metrics.population_journal import CURRENT_WRITE_SCHEMA, PopulationJournal
 
-from v2.test_scan_v2 import _FakeFeed, _FakeStrategy, _Logger, _ohlcv
+from v2.test_scan_v2 import _FakeFeed, _FakeStrategy, _Logger, _StaleData, _ohlcv
 
 
 def _ticker() -> dict[str, object]:
@@ -107,8 +107,8 @@ def _scan(universe: SymbolUniverse, journal: PopulationJournal) -> None:
 def test_scan_journal_reader_round_trip_preserves_fresh_stale_and_error_cycles(
     tmp_path,
 ) -> None:
-    assert SCHEMA_VERSION == 5
-    journal_path = tmp_path / "population-v5.jsonl"
+    assert CURRENT_WRITE_SCHEMA == 6
+    journal_path = tmp_path / "population-v6.jsonl"
     journal = PopulationJournal(journal_path)
 
     reused_universe = _universe(_TickerSequence(["fresh", "stale_cache"]))
@@ -121,7 +121,7 @@ def test_scan_journal_reader_round_trip_preserves_fresh_stale_and_error_cycles(
 
     raw_records = [json.loads(line) for line in journal_path.read_text().splitlines()]
     assert raw_records
-    assert {record["schema_version"] for record in raw_records} == {5}
+    assert {record["schema_version"] for record in raw_records} == {6}
 
     cycles = list(iter_population_cycles(journal_path))
     assert len(cycles) == 3
@@ -160,3 +160,40 @@ def test_scan_journal_reader_round_trip_preserves_fresh_stale_and_error_cycles(
         fresh_rows[0].snapshot_id,
         stale_rows[0].snapshot_id,
     ]
+
+
+def test_stale_base_frame_round_trip_preserves_range_without_decision_bar(
+    tmp_path,
+) -> None:
+    journal_path = tmp_path / "stale-base-v6.jsonl"
+    journal = PopulationJournal(journal_path)
+    scan_once(
+        universe=_universe(_TickerSequence(["fresh"])),
+        feed=_FakeFeed(
+            {"BTCUSDT": _ohlcv(), "AAAUSDT": _StaleData(_ohlcv())}
+        ),
+        strategy=_FakeStrategy(),
+        logger=_Logger(),
+        timeframe="60",
+        candles=320,
+        workers=1,
+        population_journal=journal,
+    )
+
+    cycles = list(iter_population_cycles(journal_path))
+    assert len(cycles) == 1
+    _, rows = cycles[0]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.status == "data_quality_error"
+    assert row.base_source_evidence is not None
+    assert row.base_source_evidence["outcome"] == "stale"
+    assert row.base_source_evidence["last_bar_close_ts"] is not None
+    assert row.base_source_evidence["frame_hash"] is not None
+    decision = next(
+        json.loads(line)
+        for line in journal_path.read_text().splitlines()
+        if json.loads(line)["record_type"] == "decision"
+    )
+    assert decision["base_bar_open_ts"] is None
+    assert decision["base_bar_close_ts"] is None

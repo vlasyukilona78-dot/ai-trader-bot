@@ -4,6 +4,7 @@ import json
 import sys
 import time
 import unittest
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from unittest.mock import patch
@@ -12,6 +13,7 @@ import pandas as pd
 
 from app.scan import describe, parse_args, scan_once
 from trading.market_data.bar_contract import interval_seconds, last_bar_times
+from trading.market_data.frame_provenance import raw_frame_bundle_hash
 from trading.market_data.mexc_client import _RateLimiter
 from trading.market_data.universe import UniverseEntry, UniverseSnapshot
 from trading.signals.signal_types import IntentAction, StrategyIntent
@@ -139,6 +141,9 @@ class _FakeStrategy:
         self.benchmark = "unset"
         self.errors = set(errors)
         self.contexts = []
+        self.htf_frames = []
+        self.raw_input_bundle_hashes = []
+        self.typed_evaluation_count = 0
 
     def set_benchmark(self, frame):
         self.benchmark = frame
@@ -162,22 +167,70 @@ class _FakeStrategy:
             },
         )
 
+    def evaluate_with_lifecycle(
+        self,
+        ctx,
+        *,
+        base_read,
+        benchmark_read,
+        higher_timeframe_read,
+    ):
+        self.typed_evaluation_count += 1
+        self.benchmark = benchmark_read.frame
+        self.htf_frames.append(higher_timeframe_read.frame)
+        self.raw_input_bundle_hashes.append(
+            raw_frame_bundle_hash(
+                (
+                    base_read.evidence,
+                    benchmark_read.evidence,
+                    higher_timeframe_read.evidence,
+                )
+            )
+        )
+        return self.generate(ctx), None
+
+
+class _GuardedStrategy(_FakeStrategy):
+    def __init__(self, action=IntentAction.HOLD, *, errors=()):
+        super().__init__(action, errors=errors)
+        self.session_active = False
+
+    @contextmanager
+    def scan_session(self):
+        self.session_active = True
+        try:
+            yield
+        finally:
+            self.session_active = False
+
 
 class _CaptureJournal:
     def __init__(self):
         self.cycles = []
         self.envelopes = []
+        self.benchmark_evidence = []
+        self._cycle_ids = set()
 
-    def append_cycle(self, records, *, envelope):
+    def contains_cycle(self, cycle_id):
+        return cycle_id in self._cycle_ids
+
+    def append_cycle(self, records, *, envelope, benchmark_source_evidence):
         self.cycles.append(list(records))
         self.envelopes.append(envelope)
+        self.benchmark_evidence.append(benchmark_source_evidence)
+        self._cycle_ids.add(envelope.cycle_id)
+        return True
 
 
 class _DuplicateJournal(_CaptureJournal):
     enabled = True
 
-    def append_cycle(self, records, *, envelope):
-        super().append_cycle(records, envelope=envelope)
+    def append_cycle(self, records, *, envelope, benchmark_source_evidence):
+        super().append_cycle(
+            records,
+            envelope=envelope,
+            benchmark_source_evidence=benchmark_source_evidence,
+        )
         return False
 
 
@@ -245,7 +298,7 @@ class ScanOnceV2Tests(unittest.TestCase):
 
     def test_low_coverage_raises_a_warning(self):
         frames = {"BTCUSDT": _ohlcv(), "AUSDT": _ohlcv()}
-        frames["BUSDT"] = pd.DataFrame()
+        frames["BUSDT"] = _ohlcv(0)
         _, logger, _ = self._run(frames, ["AUSDT", "BUSDT"], IntentAction.SHORT_ENTRY)
         self.assertTrue(any("coverage_low" in str(w) for w in logger.warnings))
 
@@ -487,6 +540,36 @@ class ScanOnceV2Tests(unittest.TestCase):
         self.assertEqual(by_symbol["STALEUSDT"].status, "data_quality_error")
         self.assertEqual(by_symbol["GAPUSDT"].status, "data_quality_error")
         self.assertIsNone(by_symbol["STALEUSDT"].base_bar_open_ts)
+        self.assertEqual(
+            by_symbol["STALEUSDT"].base_source_evidence.outcome,
+            "stale",
+        )
+        self.assertIsNotNone(
+            by_symbol["STALEUSDT"].base_source_evidence.frame_hash
+        )
+        self.assertEqual(
+            by_symbol["GAPUSDT"].base_source_evidence.outcome,
+            "request_failed",
+        )
+
+    def test_scan_once_enters_strategy_session_before_universe_refresh(self):
+        strategy = _GuardedStrategy()
+
+        class GuardedUniverse(_FakeUniverse):
+            def refresh(self_inner):
+                self.assertTrue(strategy.session_active)
+                return super().refresh()
+
+        scan_once(
+            universe=GuardedUniverse([]),
+            feed=_FakeFeed({}),
+            strategy=strategy,
+            logger=_Logger(),
+            timeframe="60",
+            candles=320,
+            population_journal=_CaptureJournal(),
+        )
+        self.assertFalse(strategy.session_active)
 
     def test_duplicate_population_cycle_suppresses_repeated_signal(self):
         frames = {"BTCUSDT": _ohlcv(), "AUSDT": _ohlcv()}
@@ -529,7 +612,7 @@ class ScanCliV2Tests(unittest.TestCase):
             defaults = parse_args()
         self.assertEqual(
             defaults.population_journal,
-            "data/runtime/mexc_population_decisions_v5.jsonl",
+            "data/runtime/mexc_population_decisions_v6.jsonl",
         )
         self.assertFalse(defaults.disable_population_journal)
 

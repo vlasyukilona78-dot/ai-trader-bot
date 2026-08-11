@@ -64,7 +64,7 @@ def _evidence(frame: pd.DataFrame, *, started: float, received: float):
 
 def test_contract_hash_is_pinned() -> None:
     assert frame_provenance_contract_hash() == (
-        "48a785998f236f1486ecbe0908ac6b6b1a2819c1787c270e6049654e150a14ce"
+        "f4004ac933cc1725b2560e93ffbe278c826910424e350059ad29420ed3665dbf"
     )
 
 

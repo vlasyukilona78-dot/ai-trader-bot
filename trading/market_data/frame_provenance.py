@@ -22,6 +22,7 @@ from typing import Any, Mapping, Sequence
 import pandas as pd
 
 from trading.market_data.bar_contract import closed_boundary_ts, interval_seconds
+from trading.market_data.source_timing import SourceTiming, SourceTimingError
 
 
 FRAME_PROVENANCE_CONTRACT_VERSION = "mexc_closed_frame_provenance_v1"
@@ -29,7 +30,7 @@ FRAME_HASH_CONTRACT_VERSION = "mexc_closed_ohlcv_hash_v1"
 RAW_BUNDLE_HASH_CONTRACT_VERSION = "mexc_raw_frame_bundle_hash_v1"
 
 _PINNED_CONTRACT_HASH = (
-    "48a785998f236f1486ecbe0908ac6b6b1a2819c1787c270e6049654e150a14ce"
+    "f4004ac933cc1725b2560e93ffbe278c826910424e350059ad29420ed3665dbf"
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -181,6 +182,20 @@ _CONTRACT_SCHEMA = {
     "market_identity_available_frame": (
         "frame_hash_and_actual_bar_coverage_excluding_cache_refresh_outcome"
     ),
+    "source_timing_projection": {
+        "not_requested": "omitted_from_cycle_source_timings",
+        "request_started_at": "minimum_attempt_start",
+        "received_at": "maximum_attempt_receipt",
+        "source_as_of": "minimum_available_data_through",
+        "source_ts": "minimum_available_source_timestamp",
+        "cache_hit": "true_if_any_attempt_used_cache",
+        "cache_age_sec": "maximum_coherent_age_at_aggregate_receipt",
+        "status": (
+            "ok_if_all_fresh_else_stale_cache_if_every_attempt_has_current_data_"
+            "else_error"
+        ),
+        "error_code": "deterministic_safe_code_for_aggregate_outcome",
+    },
 }
 
 
@@ -841,9 +856,158 @@ class SourceReadEvidenceV1:
             )
         except (FrameProvenanceError, TypeError, ValueError) as exc:
             raise FrameProvenanceError("invalid_source_read_evidence") from exc
-        if evidence.as_dict() != dict(payload):
+        if _canonical_bytes(evidence.as_dict()) != _canonical_bytes(dict(payload)):
             raise FrameProvenanceError("source_read_evidence_is_not_canonical")
         return evidence
+
+
+def _source_error_prefix(source: str) -> str:
+    _safe_string(source, field="source_timing_source", pattern=_IDENTIFIER_RE)
+    return "".join(piece.capitalize() for piece in source.split("_"))
+
+
+def source_timing_from_evidence(
+    evidence: SourceReadEvidenceV1,
+    *,
+    source: str,
+) -> SourceTiming | None:
+    """Project one exact read into the cycle-level timing contract.
+
+    ``not_requested`` is absence of a read, not a zero-duration read, and is
+    therefore omitted.  Every attempted outcome keeps its real request/receipt
+    boundary.  Error codes are deterministic, safe identifiers; exchange or
+    exception text never enters the envelope.
+    """
+
+    if not isinstance(evidence, SourceReadEvidenceV1):
+        raise FrameProvenanceError("source_timing_requires_source_read_evidence")
+    prefix = _source_error_prefix(source)
+    if evidence.outcome == "not_requested":
+        return None
+    if evidence.request_started_at is None or evidence.received_at is None:
+        raise FrameProvenanceError("attempted_evidence_lacks_source_timing")
+
+    if evidence.outcome == "fresh":
+        status, error_code = "ok", None
+    elif (
+        evidence.outcome == "stale"
+        and evidence.data_through_ts == evidence.expected_closed_boundary_ts
+    ):
+        status = "stale_cache"
+        error_code = evidence.error_code or f"{prefix}RefreshFailed"
+    elif evidence.outcome == "stale":
+        status = "error"
+        error_code = evidence.error_code or f"{prefix}DataLag"
+    elif evidence.outcome == "no_rows":
+        status, error_code = "error", f"{prefix}NoRows"
+    else:
+        status = "error"
+        error_code = evidence.error_code or f"{prefix}Unavailable"
+
+    try:
+        return SourceTiming(
+            source=source,
+            request_started_at=evidence.request_started_at,
+            received_at=evidence.received_at,
+            source_as_of=evidence.data_through_ts,
+            status=status,
+            error_code=error_code,
+            cache_hit=evidence.cache_hit,
+            cache_age_sec=evidence.cache_age_sec,
+            source_ts=evidence.source_ts,
+        )
+    except SourceTimingError as exc:
+        raise FrameProvenanceError("evidence_cannot_project_to_source_timing") from exc
+
+
+def aggregate_source_timing_from_evidence(
+    evidences: Sequence[SourceReadEvidenceV1],
+    *,
+    source: str,
+) -> SourceTiming | None:
+    """Conservatively summarize an ordered population of exact reads.
+
+    Scheduling may change which worker starts or finishes first, so the
+    aggregate spans the earliest request and latest receipt.  Data/source
+    timestamps use the oldest available value: an aggregate must never look
+    fresher than any input it represents.  Missing attempts remain visible in
+    the aggregate error status rather than being silently dropped.
+    """
+
+    if isinstance(evidences, (str, bytes)):
+        raise FrameProvenanceError("source_timing_aggregate_requires_sequence")
+    attempted: list[SourceReadEvidenceV1] = []
+    for evidence in evidences:
+        if not isinstance(evidence, SourceReadEvidenceV1):
+            raise FrameProvenanceError(
+                "source_timing_aggregate_contains_invalid_evidence"
+            )
+        if evidence.outcome != "not_requested":
+            attempted.append(evidence)
+    if not attempted:
+        return None
+
+    timings = [
+        source_timing_from_evidence(evidence, source=source)
+        for evidence in attempted
+    ]
+    if any(timing is None for timing in timings):  # guarded by attempted
+        raise FrameProvenanceError("attempted_evidence_was_not_projected")
+    projected = [timing for timing in timings if timing is not None]
+    started = min(timing.request_started_at for timing in projected)
+    received = max(timing.received_at for timing in projected)
+    current = [
+        evidence.bar_count > 0
+        and evidence.data_through_ts == evidence.expected_closed_boundary_ts
+        for evidence in attempted
+    ]
+    prefix = _source_error_prefix(source)
+    if all(timing.status == "ok" for timing in projected):
+        status, error_code = "ok", None
+    elif all(current):
+        status, error_code = "stale_cache", f"{prefix}StaleCache"
+    else:
+        status = "error"
+        error_code = (
+            f"{prefix}PartialFailure" if any(current) else f"{prefix}Unavailable"
+        )
+
+    source_as_of_values = [
+        float(evidence.data_through_ts)
+        for evidence in attempted
+        if evidence.data_through_ts is not None
+    ]
+    source_ts_values = [
+        float(evidence.source_ts)
+        for evidence in attempted
+        if evidence.source_ts is not None
+    ]
+    source_as_of = min(source_as_of_values) if source_as_of_values else None
+    source_ts = min(source_ts_values) if source_ts_values else None
+    cache_hit = any(evidence.cache_hit for evidence in attempted)
+    cache_age = (
+        max(0.0, received - source_ts)
+        if cache_hit and source_ts is not None
+        else 0.0
+        if source_ts is not None
+        else None
+    )
+    try:
+        return SourceTiming(
+            source=source,
+            request_started_at=started,
+            received_at=received,
+            source_as_of=source_as_of,
+            status=status,
+            error_code=error_code,
+            cache_hit=cache_hit,
+            cache_age_sec=cache_age,
+            source_ts=source_ts,
+        )
+    except SourceTimingError as exc:
+        raise FrameProvenanceError(
+            "evidence_population_cannot_project_to_source_timing"
+        ) from exc
 
 
 def parse_source_read_evidence(
@@ -946,9 +1110,11 @@ __all__ = [
     "FrameQualityError",
     "FrameRead",
     "SourceReadEvidenceV1",
+    "aggregate_source_timing_from_evidence",
     "canonical_closed_frame_hash",
     "canonical_frame_timeframe",
     "frame_provenance_contract_hash",
     "parse_source_read_evidence",
     "raw_frame_bundle_hash",
+    "source_timing_from_evidence",
 ]

@@ -234,8 +234,8 @@ def test_refresh_exception_is_journalled_as_a_typed_error_cycle() -> None:
 class _FailingJournal:
     enabled = True
 
-    def append_cycle(self, records, *, envelope):
-        del records, envelope
+    def append_cycle(self, records, *, envelope, benchmark_source_evidence):
+        del records, envelope, benchmark_source_evidence
         raise OSError("disk path and private details must not be logged")
 
 

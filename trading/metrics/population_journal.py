@@ -9,15 +9,36 @@ import re
 import secrets
 import threading
 import time
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from numbers import Integral, Real
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 from weakref import WeakValueDictionary
 
-from trading.market_data.bar_contract import interval_seconds, is_bar_aligned
+from core.mexc_strategy_spec import decode_mexc_strategy_spec_evidence
+from trading.market_data.bar_contract import closed_boundary_ts, interval_seconds, is_bar_aligned
+from trading.market_data.frame_provenance import (
+    FRAME_PROVENANCE_CONTRACT_VERSION,
+    RAW_BUNDLE_HASH_CONTRACT_VERSION,
+    FrameProvenanceError,
+    SourceReadEvidenceV1,
+    aggregate_source_timing_from_evidence,
+    frame_provenance_contract_hash,
+    raw_frame_bundle_hash,
+    source_timing_from_evidence,
+)
 from trading.metrics.cycle_envelope import CycleEnvelope, CycleEnvelopeError
+from trading.signals.lifecycle_contract import (
+    LIFECYCLE_CONTRACT_VERSION,
+    CandidateLifecycleEventV1,
+    CandidateLifecycleState,
+    CandidateSide,
+    LifecycleContractError,
+    ProposalObservationStatus,
+    lifecycle_contract_hash,
+)
 
 
 # v2 added explicit source-response and cycle-completion timing plus the first
@@ -33,6 +54,12 @@ from trading.metrics.cycle_envelope import CycleEnvelope, CycleEnvelopeError
 # authenticate itself (a trusted checkpoint is still required for that), but it
 # makes every later cycle depend on the exact canonical bytes of its prefix.
 SCHEMA_VERSION = 5
+
+# ``SCHEMA_VERSION`` remains the public compatibility alias for the immutable
+# v5 evidence already on disk.  It must never be repointed at a newer writer:
+# callers use it to rebuild the frozen v5 commitment domains and fixtures.
+CURRENT_WRITE_SCHEMA = 6
+SUPPORTED_JOURNAL_SCHEMAS = frozenset({SCHEMA_VERSION, CURRENT_WRITE_SCHEMA})
 
 # Cycle identity is a causal cohort contract, not a serialization detail of the
 # journal that happens to carry it. The original identity algorithm shipped
@@ -65,6 +92,7 @@ _ERROR_CODE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.]{0,127}$")
 _FORBIDDEN_METADATA_KEYS = frozenset(
     {"exception", "exception_message", "traceback", "stacktrace", "error_message"}
 )
+V6_ACTIONS = frozenset({"HOLD", "SHORT_ENTRY", "LONG_ENTRY"})
 _MAX_JOURNAL_LINE_BYTES = 2_000_000
 FEATURE_PROVENANCE_KEYS = frozenset(
     {
@@ -78,11 +106,13 @@ FEATURE_PROVENANCE_KEYS = frozenset(
 _LOCK_ACQUIRE_TIMEOUT_SEC = 60.0
 _LOCK_RETRY_INTERVAL_SEC = 0.05
 _JOURNAL_ID_RE = re.compile(r"^[0-9a-f]{64}$")
-_GENESIS_DOMAIN = b"KOTEIKA_POPULATION_GENESIS_V5\x00"
-_CYCLE_COMMIT_DOMAIN = b"KOTEIKA_POPULATION_CYCLE_V5\x00"
+_GENESIS_DOMAIN_V5 = b"KOTEIKA_POPULATION_GENESIS_V5\x00"
+_CYCLE_COMMIT_DOMAIN_V5 = b"KOTEIKA_POPULATION_CYCLE_V5\x00"
+_GENESIS_DOMAIN_V6 = b"KOTEIKA_POPULATION_GENESIS_V6\x00"
+_CYCLE_COMMIT_DOMAIN_V6 = b"KOTEIKA_POPULATION_CYCLE_V6\x00"
 CHECKPOINT_RECEIPT_SCHEMA_VERSION = 1
 
-HEADER_KEYS = frozenset(
+HEADER_KEYS_V5 = frozenset(
     {
         "record_type",
         "schema_version",
@@ -95,6 +125,21 @@ HEADER_KEYS = frozenset(
         "envelope",
     }
 )
+EVIDENCE_CONTRACT_KEYS = frozenset(
+    {
+        "frame_provenance_contract_version",
+        "frame_provenance_contract_hash",
+        "raw_frame_bundle_hash_contract_version",
+        "lifecycle_contract_version",
+        "lifecycle_contract_hash",
+    }
+)
+HEADER_KEYS_V6 = HEADER_KEYS_V5 | {
+    "evidence_contracts",
+    "benchmark_source_evidence",
+}
+# Historical import retained for code/tests that intentionally inspect v5.
+HEADER_KEYS = HEADER_KEYS_V5
 FOOTER_CORE_KEYS = frozenset(
     {
         "record_type",
@@ -109,6 +154,35 @@ FOOTER_CORE_KEYS = frozenset(
     }
 )
 FOOTER_KEYS = FOOTER_CORE_KEYS | {"cycle_commit"}
+
+
+def header_keys_for_schema(schema_version: int) -> frozenset[str]:
+    if schema_version == SCHEMA_VERSION:
+        return HEADER_KEYS_V5
+    if schema_version == CURRENT_WRITE_SCHEMA:
+        return HEADER_KEYS_V6
+    raise PopulationJournalError("unsupported population journal schema")
+
+
+def evidence_contracts_payload() -> dict[str, str]:
+    """Return the exact executable identities required by journal v6."""
+
+    return {
+        "frame_provenance_contract_version": FRAME_PROVENANCE_CONTRACT_VERSION,
+        "frame_provenance_contract_hash": frame_provenance_contract_hash(),
+        "raw_frame_bundle_hash_contract_version": RAW_BUNDLE_HASH_CONTRACT_VERSION,
+        "lifecycle_contract_version": LIFECYCLE_CONTRACT_VERSION,
+        "lifecycle_contract_hash": lifecycle_contract_hash(),
+    }
+
+
+def _validated_evidence_contracts(payload: object) -> Mapping[str, str]:
+    if not isinstance(payload, Mapping) or set(payload) != EVIDENCE_CONTRACT_KEYS:
+        raise PopulationJournalError("evidence contracts schema mismatch")
+    expected = evidence_contracts_payload()
+    if dict(payload) != expected:
+        raise PopulationJournalError("evidence contracts identity mismatch")
+    return MappingProxyType(dict(expected))
 
 
 # File locks alone do not provide portable thread exclusion: POSIX and Windows
@@ -143,8 +217,11 @@ class _InterProcessPathLock:
     remain on disk.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, timeout_sec: float = _LOCK_ACQUIRE_TIMEOUT_SEC) -> None:
         self._path = path
+        if isinstance(timeout_sec, bool) or not isinstance(timeout_sec, Real):
+            raise PopulationJournalError("population journal lock timeout must be numeric")
+        self._timeout_sec = max(0.0, float(timeout_sec))
         self._handle: Any | None = None
         self._locked = False
 
@@ -179,7 +256,7 @@ class _InterProcessPathLock:
 
     def _acquire(self) -> None:
         assert self._handle is not None
-        deadline = time.monotonic() + _LOCK_ACQUIRE_TIMEOUT_SEC
+        deadline = time.monotonic() + self._timeout_sec
         while True:
             try:
                 self._handle.seek(0)
@@ -359,18 +436,31 @@ def _sha256_id(payload: Mapping[str, object]) -> str:
     return hashlib.sha256(_canonical_bytes(payload)).hexdigest()
 
 
-def genesis_cycle_commit(journal_id: str) -> str:
+def _commit_domains(schema_version: int) -> tuple[bytes, bytes]:
+    if schema_version == SCHEMA_VERSION:
+        return _GENESIS_DOMAIN_V5, _CYCLE_COMMIT_DOMAIN_V5
+    if schema_version == CURRENT_WRITE_SCHEMA:
+        return _GENESIS_DOMAIN_V6, _CYCLE_COMMIT_DOMAIN_V6
+    raise PopulationJournalError("unsupported population journal schema")
+
+
+def genesis_cycle_commit(
+    journal_id: str,
+    *,
+    schema_version: int = SCHEMA_VERSION,
+) -> str:
     """Return the domain-separated predecessor for the first cycle."""
 
     if not isinstance(journal_id, str) or not _JOURNAL_ID_RE.fullmatch(journal_id):
         raise PopulationJournalError("journal_id must be a lowercase SHA-256 hex digest")
     digest = hashlib.sha256()
-    digest.update(_GENESIS_DOMAIN)
+    genesis_domain, _ = _commit_domains(schema_version)
+    digest.update(genesis_domain)
     digest.update(
         _framed_payload(
             {
                 "journal_id": journal_id,
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": schema_version,
             }
         )
     )
@@ -389,12 +479,19 @@ def compute_cycle_commit(
     self-reference; exact key sets make that omission explicit and fail closed.
     """
 
-    if set(header) != HEADER_KEYS:
+    schema_version = header.get("schema_version")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, Integral):
+        raise PopulationJournalError("cycle commitment schema version is invalid")
+    schema_version = int(schema_version)
+    if set(header) != header_keys_for_schema(schema_version):
         raise PopulationJournalError("cycle commitment header schema mismatch")
     if set(footer_core) != FOOTER_CORE_KEYS:
         raise PopulationJournalError("cycle commitment footer schema mismatch")
+    if footer_core.get("schema_version") != schema_version:
+        raise PopulationJournalError("cycle commitment mixes journal schemas")
+    _, cycle_domain = _commit_domains(schema_version)
     digest = hashlib.sha256()
-    digest.update(_CYCLE_COMMIT_DOMAIN)
+    digest.update(cycle_domain)
     digest.update(_framed_payload(header))
     for row in rows:
         if not isinstance(row, Mapping):
@@ -847,6 +944,127 @@ def _validate_cycle_body(
         raise PopulationJournalError("declared cycle row count differs from its body")
 
 
+def _validate_record_against_envelope(
+    record: PopulationDecisionV6,
+    *,
+    envelope: CycleEnvelope,
+) -> None:
+    """Bind every cycle-owned v6 row fact to the authoritative envelope."""
+
+    if not isinstance(record, PopulationDecisionV6):
+        raise PopulationJournalError("cycle-envelope validation requires a v6 row")
+    for record_field, envelope_field in (
+        ("cycle_id", "cycle_id"),
+        ("timeframe", "timeframe"),
+        ("candle_cutoff_ts", "candle_cutoff_ts"),
+        ("ranking_ready_ts", "ranking_ready_ts"),
+        ("cycle_completed_ts", "cycle_completed_ts"),
+        ("actionable_ts", "actionable_ts"),
+        ("entry_eligible_ts", "entry_eligible_ts"),
+        ("entry_bar_open_ts", "entry_bar_open_ts"),
+    ):
+        if getattr(record, record_field) != getattr(envelope, envelope_field):
+            raise PopulationJournalError(
+                f"decision row disagrees with cycle envelope: {record_field}"
+            )
+    if (
+        record.universe_request_started_at
+        != envelope.universe_timing.request_started_at
+    ):
+        raise PopulationJournalError(
+            "decision row disagrees with cycle envelope: universe_request_started_at"
+        )
+    if record.universe_received_at != envelope.universe_timing.received_at:
+        raise PopulationJournalError(
+            "decision row disagrees with cycle envelope: universe_received_at"
+        )
+
+    metadata = _thaw_json_value(record.metadata)
+    provenance = metadata.get("provenance") if isinstance(metadata, Mapping) else None
+    expected_keys = {"strategy_config_hash", "universe_policy_hash"}
+    if not isinstance(provenance, Mapping) or set(provenance) != expected_keys:
+        raise PopulationJournalError("decision row provenance schema mismatch")
+    if provenance.get("strategy_config_hash") != envelope.strategy_spec_instance_hash:
+        raise PopulationJournalError(
+            "decision row strategy identity differs from cycle envelope"
+        )
+    if provenance.get("universe_policy_hash") != envelope.universe_policy_hash:
+        raise PopulationJournalError(
+            "decision row universe policy differs from cycle envelope"
+        )
+
+
+def _validate_cycle_source_timings(
+    *,
+    envelope: CycleEnvelope,
+    benchmark_source_evidence: SourceReadEvidenceV1,
+    base_source_evidences: Sequence[SourceReadEvidenceV1],
+    higher_timeframe_source_evidences: Sequence[SourceReadEvidenceV1],
+) -> None:
+    """Require envelope aggregates to exactly derive from persisted evidence."""
+
+    timings_by_source: dict[str, object] = {}
+    for timing in envelope.source_timings:
+        if timing.source in timings_by_source:
+            raise PopulationJournalError(
+                "cycle envelope contains duplicate source timing identities"
+            )
+        timings_by_source[timing.source] = timing
+    allowed_sources = {
+        envelope.universe_timing.source,
+        "contract_details",
+        "benchmark",
+        "base_ohlcv",
+        "higher_timeframe",
+    }
+    unexpected_sources = set(timings_by_source).difference(allowed_sources)
+    if unexpected_sources:
+        raise PopulationJournalError(
+            "cycle envelope contains an unsupported source timing identity"
+        )
+    try:
+        expected = {
+            "benchmark": source_timing_from_evidence(
+                benchmark_source_evidence,
+                source="benchmark",
+            ),
+            "base_ohlcv": aggregate_source_timing_from_evidence(
+                base_source_evidences,
+                source="base_ohlcv",
+            ),
+            "higher_timeframe": aggregate_source_timing_from_evidence(
+                higher_timeframe_source_evidences,
+                source="higher_timeframe",
+            ),
+        }
+    except FrameProvenanceError as exc:
+        raise PopulationJournalError(
+            "source evidence cannot rebuild cycle source timings"
+        ) from exc
+
+    if envelope.status == "completed":
+        if expected["benchmark"] is None or expected["base_ohlcv"] is None:
+            raise PopulationJournalError(
+                "completed cycle lacks attempted benchmark or base evidence"
+            )
+    elif any(value is not None for value in expected.values()):
+        raise PopulationJournalError(
+            f"{envelope.status} cycle must not contain attempted market evidence"
+        )
+
+    for source, projected in expected.items():
+        actual = timings_by_source.get(source)
+        if projected is None:
+            if actual is not None:
+                raise PopulationJournalError(
+                    f"cycle envelope carries unexpected {source} timing"
+                )
+        elif actual != projected:
+            raise PopulationJournalError(
+                f"cycle envelope {source} timing differs from typed evidence"
+            )
+
+
 def _validate_feature_provenance(
     record: PopulationDecision,
     *,
@@ -915,15 +1133,360 @@ def _validate_feature_provenance(
         raise PopulationJournalError("feature provenance market feature hash mismatch")
 
 
-def _validated_decision_record(payload: Mapping[str, Any]) -> PopulationDecision:
+def _validated_source_evidence(payload: object, *, field: str) -> SourceReadEvidenceV1:
+    if not isinstance(payload, Mapping):
+        raise PopulationJournalError(f"{field} is not an object")
+    try:
+        return SourceReadEvidenceV1.from_dict(payload)
+    except (FrameProvenanceError, TypeError, ValueError) as exc:
+        raise PopulationJournalError(f"{field} is invalid") from exc
+
+
+def _source_cutoff_matches_cycle(
+    evidence: SourceReadEvidenceV1,
+    *,
+    envelope: CycleEnvelope,
+) -> bool:
+    expected = float(closed_boundary_ts(envelope.candle_cutoff_ts, evidence.timeframe))
+    return (
+        math.isclose(
+            evidence.requested_as_of_ts,
+            envelope.candle_cutoff_ts,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+        and math.isclose(
+            evidence.expected_closed_boundary_ts,
+            expected,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+    )
+
+
+def _validate_benchmark_source_evidence(
+    evidence: SourceReadEvidenceV1,
+    *,
+    envelope: CycleEnvelope,
+) -> None:
+    try:
+        spec = decode_mexc_strategy_spec_evidence(
+            envelope.strategy_spec_payload,
+            expected_version=envelope.strategy_spec_version,
+        )
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise PopulationJournalError("strategy spec cannot validate source evidence") from exc
+    if evidence.source != "benchmark_ohlcv":
+        raise PopulationJournalError("benchmark source identity mismatch")
+    if evidence.venue != "mexc_contract":
+        raise PopulationJournalError("benchmark venue identity mismatch")
+    if evidence.symbol.replace("_", "") != "BTCUSDT":
+        raise PopulationJournalError("benchmark symbol identity mismatch")
+    if evidence.venue_symbol != "BTC_USDT":
+        raise PopulationJournalError("benchmark venue symbol identity mismatch")
+    if interval_seconds(evidence.timeframe) != interval_seconds(
+        spec.resolved_benchmark_interval
+    ):
+        raise PopulationJournalError("benchmark timeframe identity mismatch")
+    if not _source_cutoff_matches_cycle(evidence, envelope=envelope):
+        raise PopulationJournalError("benchmark cutoff identity mismatch")
+    if envelope.status == "completed":
+        if evidence.outcome == "not_requested":
+            raise PopulationJournalError("completed cycle did not request its benchmark")
+    elif evidence.outcome != "not_requested":
+        raise PopulationJournalError(
+            f"{envelope.status} cycle must not request its benchmark"
+        )
+
+
+def _validate_lifecycle_projection(
+    record: PopulationDecisionV6,
+    *,
+    envelope: CycleEnvelope,
+) -> None:
+    event = record.lifecycle_event
+    if event is None:
+        if record.action in {"SHORT_ENTRY", "LONG_ENTRY"}:
+            raise PopulationJournalError(
+                "entry action requires typed lifecycle evidence"
+            )
+        return
+    arm = event.arm
+    if arm.symbol != record.symbol:
+        raise PopulationJournalError("lifecycle symbol differs from decision row")
+    if arm.timeframe_seconds != interval_seconds(record.timeframe):
+        raise PopulationJournalError("lifecycle timeframe differs from decision row")
+    if (
+        arm.strategy_spec_version,
+        arm.strategy_spec_contract_hash,
+        arm.strategy_spec_instance_hash,
+    ) != _envelope_strategy_identity(envelope):
+        raise PopulationJournalError("lifecycle strategy identity mismatch")
+
+    if event.confirmation is None:
+        current_bundle = arm.raw_input_bundle_hash
+        current_open = arm.arm_bar_open_ts
+        current_cutoff = arm.arm_candle_cutoff_ts
+    else:
+        current_bundle = event.confirmation.observation_input_bundle_hash
+        current_open = event.confirmation.observation_bar_open_ts
+        current_cutoff = event.confirmation.observation_candle_cutoff_ts
+    if current_bundle != record.raw_frame_bundle_hash:
+        raise PopulationJournalError("lifecycle raw bundle differs from decision row")
+    if record.base_bar_open_ts is None or record.base_bar_close_ts is None:
+        raise PopulationJournalError("lifecycle event requires a real base bar")
+    if not math.isclose(current_open, record.base_bar_open_ts, rel_tol=0.0, abs_tol=1e-6):
+        raise PopulationJournalError("lifecycle reference bar differs from decision row")
+    if not math.isclose(
+        current_cutoff,
+        record.candle_cutoff_ts,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        raise PopulationJournalError("lifecycle cutoff differs from decision row")
+    if record.status != "evaluated":
+        raise PopulationJournalError("lifecycle event requires evaluated status")
+
+    proposal = event.proposal
+    expected_action = (
+        "SHORT_ENTRY" if proposal.side is CandidateSide.SHORT else "LONG_ENTRY"
+    )
+    metadata = _thaw_json_value(record.metadata)
+    if proposal.status is ProposalObservationStatus.CREATED:
+        if record.action != expected_action:
+            raise PopulationJournalError("created proposal does not project to row action")
+        if metadata.get("stop_loss") != proposal.stop_price:
+            raise PopulationJournalError("proposal stop differs from decision row")
+        if metadata.get("take_profit") != proposal.take_profit_price:
+            raise PopulationJournalError("proposal target differs from decision row")
+    elif record.action != "HOLD":
+        raise PopulationJournalError("non-created proposal must project to HOLD")
+
+
+def _validate_v6_decision_evidence(
+    record: PopulationDecisionV6,
+    *,
+    envelope: CycleEnvelope,
+    benchmark_source_evidence: SourceReadEvidenceV1,
+) -> None:
+    assert record.base_source_evidence is not None
+    assert record.higher_timeframe_source_evidence is not None
+    base = record.base_source_evidence
+    htf = record.higher_timeframe_source_evidence
+    try:
+        spec = decode_mexc_strategy_spec_evidence(
+            envelope.strategy_spec_payload,
+            expected_version=envelope.strategy_spec_version,
+        )
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise PopulationJournalError("strategy spec cannot validate source evidence") from exc
+
+    if base.source != "base_ohlcv" or htf.source != "higher_timeframe_ohlcv":
+        raise PopulationJournalError("per-symbol source identity mismatch")
+    if base.venue != "mexc_contract" or htf.venue != "mexc_contract":
+        raise PopulationJournalError("per-symbol venue identity mismatch")
+    if benchmark_source_evidence.venue != base.venue or htf.venue != base.venue:
+        raise PopulationJournalError("source evidence mixes venues")
+    if base.symbol != record.symbol or htf.symbol != record.symbol:
+        raise PopulationJournalError("source evidence symbol differs from decision row")
+    compact_symbol = record.symbol.replace("_", "")
+    if base.venue_symbol != htf.venue_symbol or (
+        base.venue_symbol.replace("_", "") != compact_symbol
+    ):
+        raise PopulationJournalError(
+            "per-symbol venue symbol differs from decision row"
+        )
+    if interval_seconds(base.timeframe) != interval_seconds(record.timeframe):
+        raise PopulationJournalError("base source timeframe differs from decision row")
+    if interval_seconds(htf.timeframe) != spec.higher_timeframe_interval_seconds:
+        raise PopulationJournalError("higher-timeframe source identity mismatch")
+    if not _source_cutoff_matches_cycle(base, envelope=envelope):
+        raise PopulationJournalError("base source cutoff identity mismatch")
+    if not _source_cutoff_matches_cycle(htf, envelope=envelope):
+        raise PopulationJournalError("higher-timeframe cutoff identity mismatch")
+
+    expected_bundle = raw_frame_bundle_hash(
+        (benchmark_source_evidence, base, htf)
+    )
+    if record.raw_frame_bundle_hash != expected_bundle:
+        raise PopulationJournalError("raw frame bundle hash mismatch")
+
+    if record.status in {"evaluated", "short_history", "strategy_error"} and base.outcome != "fresh":
+        raise PopulationJournalError("decision status requires fresh base evidence")
+    if record.status == "no_data" and base.outcome != "no_rows":
+        raise PopulationJournalError("no_data status requires no_rows base evidence")
+    if record.status == "data_error" and base.outcome != "request_failed":
+        raise PopulationJournalError("data_error status requires failed base evidence")
+    if record.status == "invalid_bar_contract" and base.outcome != "request_failed":
+        raise PopulationJournalError(
+            "invalid_bar_contract requires failed base evidence"
+        )
+    if record.status == "data_quality_error" and base.outcome not in {
+        "request_failed",
+        "stale",
+    }:
+        raise PopulationJournalError(
+            "data_quality_error requires stale or failed base evidence"
+        )
+    if base.outcome == "fresh":
+        if record.base_bar_open_ts != base.last_bar_open_ts:
+            raise PopulationJournalError("base bar open differs from source evidence")
+        if record.base_bar_close_ts != base.last_bar_close_ts:
+            raise PopulationJournalError("base bar close differs from source evidence")
+    elif record.base_bar_open_ts is not None or record.base_bar_close_ts is not None:
+        raise PopulationJournalError("missing base evidence must not project a base bar")
+    for evidence in (base, htf, benchmark_source_evidence):
+        if (
+            evidence.received_at is not None
+            and evidence.received_at > record.decision_ts
+        ):
+            raise PopulationJournalError("source evidence arrives after decision completion")
+    if record.action in {"SHORT_ENTRY", "LONG_ENTRY"}:
+        for name, evidence in (
+            ("benchmark", benchmark_source_evidence),
+            ("higher-timeframe", htf),
+        ):
+            if (
+                evidence.data_through_ts is None
+                or not math.isclose(
+                    evidence.data_through_ts,
+                    evidence.expected_closed_boundary_ts,
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                )
+            ):
+                raise PopulationJournalError(
+                    f"entry action requires current {name} evidence"
+                )
+    _validate_lifecycle_projection(record, envelope=envelope)
+
+
+@dataclass
+class _LifecycleChainState:
+    """Validate witnessed candidate transitions across ordered journal cycles.
+
+    Rows without an event do not invent a state transition. A fresh initial
+    event for the same symbol explicitly right-censors an older candidate. A
+    follow-up can only name the exact latest event for its candidate, which
+    rejects orphans, forks and fabricated predecessor IDs without pretending
+    that process-local pending state was rehydrated after a restart.
+    """
+
+    active_candidate_by_symbol: dict[str, str] = field(default_factory=dict)
+    latest_by_candidate: dict[str, CandidateLifecycleEventV1] = field(default_factory=dict)
+    seen_candidate_ids: set[str] = field(default_factory=set)
+    seen_event_ids: set[str] = field(default_factory=set)
+
+    def clone(self) -> "_LifecycleChainState":
+        return _LifecycleChainState(
+            active_candidate_by_symbol=dict(self.active_candidate_by_symbol),
+            latest_by_candidate=dict(self.latest_by_candidate),
+            seen_candidate_ids=set(self.seen_candidate_ids),
+            seen_event_ids=set(self.seen_event_ids),
+        )
+
+    def observe(
+        self,
+        *,
+        symbol: str,
+        event: CandidateLifecycleEventV1 | None,
+    ) -> None:
+        if event is None:
+            return
+        if event.event_id in self.seen_event_ids:
+            raise PopulationJournalError("lifecycle event is duplicated")
+        if event.state in {
+            CandidateLifecycleState.ARMED,
+            CandidateLifecycleState.BYPASSED,
+        }:
+            if event.arm.candidate_id in self.seen_candidate_ids:
+                raise PopulationJournalError("lifecycle candidate is duplicated")
+            # A new initial event is an explicit right-censor boundary for any
+            # older nonterminal candidate on this symbol.
+            old_candidate = self.active_candidate_by_symbol.pop(symbol, None)
+            if old_candidate is not None:
+                self.latest_by_candidate.pop(old_candidate, None)
+            self.seen_candidate_ids.add(event.arm.candidate_id)
+            if event.state is CandidateLifecycleState.ARMED:
+                self.active_candidate_by_symbol[symbol] = event.arm.candidate_id
+                self.latest_by_candidate[event.arm.candidate_id] = event
+        else:
+            previous = self.latest_by_candidate.get(event.arm.candidate_id)
+            if previous is None:
+                raise PopulationJournalError(
+                    "lifecycle follow-up has no witnessed predecessor"
+                )
+            try:
+                previous.validate_successor(event)
+            except LifecycleContractError as exc:
+                raise PopulationJournalError(
+                    "lifecycle follow-up does not match witnessed predecessor"
+                ) from exc
+            if event.state in {
+                CandidateLifecycleState.CONFIRMED,
+                CandidateLifecycleState.INVALIDATED,
+                CandidateLifecycleState.EXPIRED,
+            }:
+                if (
+                    self.active_candidate_by_symbol.get(symbol)
+                    == event.arm.candidate_id
+                ):
+                    self.active_candidate_by_symbol.pop(symbol, None)
+                self.latest_by_candidate[event.arm.candidate_id] = event
+            else:
+                self.active_candidate_by_symbol[symbol] = event.arm.candidate_id
+                self.latest_by_candidate[event.arm.candidate_id] = event
+        self.seen_event_ids.add(event.event_id)
+
+    def finish_cycle(self, envelope: CycleEnvelope) -> None:
+        # The absence of a row/event is not a witnessed state transition.
+        # Right-censoring occurs only when a later initial event explicitly
+        # replaces the candidate for the same symbol.
+        del envelope
+
+
+def _validated_decision_record(
+    payload: Mapping[str, Any],
+    *,
+    schema_version: int,
+) -> PopulationDecision:
     """Rebuild one serialized row and re-derive both of its causal digests."""
 
     metadata = payload.get("metadata")
     if not isinstance(metadata, Mapping):
         raise PopulationJournalError("cycle decision row metadata is not an object")
     try:
-        record = PopulationDecision.create(
-            schema_version=payload.get("schema_version"),
+        extra: dict[str, object] = {}
+        if schema_version == CURRENT_WRITE_SCHEMA:
+            base_evidence = _validated_source_evidence(
+                payload.get("base_source_evidence"), field="base source evidence"
+            )
+            htf_evidence = _validated_source_evidence(
+                payload.get("higher_timeframe_source_evidence"),
+                field="higher-timeframe source evidence",
+            )
+            lifecycle_payload = payload.get("lifecycle_event")
+            if lifecycle_payload is None:
+                lifecycle_event = None
+            elif isinstance(lifecycle_payload, Mapping):
+                try:
+                    lifecycle_event = CandidateLifecycleEventV1.from_dict(
+                        lifecycle_payload
+                    )
+                except (LifecycleContractError, TypeError, ValueError) as exc:
+                    raise PopulationJournalError("lifecycle event is invalid") from exc
+            else:
+                raise PopulationJournalError("lifecycle event is not an object or null")
+            extra = {
+                "base_source_evidence": base_evidence,
+                "higher_timeframe_source_evidence": htf_evidence,
+                # The cycle-scoped benchmark is not available in this row-only
+                # decoder.  Construct directly below and re-derive the hashes
+                # independently from the serialized causal payload.
+                "raw_frame_bundle_hash": payload.get("raw_frame_bundle_hash"),
+                "lifecycle_event": lifecycle_event,
+            }
+        common = dict(
             cycle_id=payload.get("cycle_id"),
             universe_refreshed_at=payload.get("universe_refreshed_at"),
             universe_request_started_at=payload.get("universe_request_started_at"),
@@ -949,6 +1512,21 @@ def _validated_decision_record(payload: Mapping[str, Any]) -> PopulationDecision
             cycle_size=payload.get("cycle_size"),
             error_code=payload.get("error_code"),
         )
+        if schema_version == SCHEMA_VERSION:
+            record = PopulationDecision.create(
+                schema_version=SCHEMA_VERSION,
+                **common,
+            )
+        elif schema_version == CURRENT_WRITE_SCHEMA:
+            record = PopulationDecisionV6(
+                schema_version=CURRENT_WRITE_SCHEMA,
+                snapshot_id=payload.get("snapshot_id"),
+                input_hash=payload.get("input_hash"),
+                **common,
+                **extra,
+            )
+        else:
+            raise PopulationJournalError("unsupported population journal schema")
     except (PopulationJournalError, TypeError, ValueError) as exc:
         raise PopulationJournalError("population journal contains an invalid decision row") from exc
     # Canonical byte equality catches unknown/missing fields and JSON type drift
@@ -956,6 +1534,41 @@ def _validated_decision_record(payload: Mapping[str, Any]) -> PopulationDecision
     # snapshot_id rather than trusting either serialized digest.
     if _canonical_bytes(record.as_dict()) != _canonical_bytes(payload):
         raise PopulationJournalError("population journal decision row does not rebuild exactly")
+    if schema_version == CURRENT_WRITE_SCHEMA:
+        assert isinstance(record, PopulationDecisionV6)
+        causal_payload = {
+            "schema_version": CURRENT_WRITE_SCHEMA,
+            "cycle_id": record.cycle_id,
+            "symbol": record.symbol,
+            "timeframe_seconds": interval_seconds(record.timeframe),
+            "status": record.status,
+            "candle_cutoff_ts": record.candle_cutoff_ts,
+            "base_bar_open_ts": record.base_bar_open_ts,
+            "base_bar_close_ts": record.base_bar_close_ts,
+            "action": record.action,
+            "reason": record.reason,
+            "confidence": record.confidence,
+            "metadata": _causal_metadata(_thaw_json_value(record.metadata)),
+            "error_code": record.error_code,
+            "raw_frame_bundle_hash": record.raw_frame_bundle_hash,
+            "lifecycle_event_id": (
+                record.lifecycle_event.event_id
+                if record.lifecycle_event is not None
+                else None
+            ),
+        }
+        if record.input_hash != _sha256_id(causal_payload):
+            raise PopulationJournalError("population journal v6 input hash mismatch")
+        expected_snapshot = _sha256_id(
+            {
+                "schema_version": CURRENT_WRITE_SCHEMA,
+                "cycle_id": record.cycle_id,
+                "symbol": record.symbol,
+                "input_hash": record.input_hash,
+            }
+        )
+        if record.snapshot_id != expected_snapshot:
+            raise PopulationJournalError("population journal v6 snapshot ID mismatch")
     return record
 
 
@@ -982,10 +1595,14 @@ class JournalCheckpointReceipt:
     def __post_init__(self) -> None:
         if self.record_type != RECORD_TYPE_CHECKPOINT:
             raise PopulationJournalError("unsupported checkpoint receipt record type")
-        if self.receipt_schema_version != CHECKPOINT_RECEIPT_SCHEMA_VERSION:
+        if type(self.receipt_schema_version) is not int or (
+            self.receipt_schema_version != CHECKPOINT_RECEIPT_SCHEMA_VERSION
+        ):
             raise PopulationJournalError("unsupported checkpoint receipt schema")
-        if self.journal_schema_version != SCHEMA_VERSION:
-            raise PopulationJournalError("checkpoint targets another journal schema")
+        if type(self.journal_schema_version) is not int or (
+            self.journal_schema_version not in SUPPORTED_JOURNAL_SCHEMAS
+        ):
+            raise PopulationJournalError("checkpoint targets an unsupported journal schema")
         for name in ("journal_id", "cycle_id", "cycle_commit", "prefix_sha256"):
             value = getattr(self, name)
             if not isinstance(value, str) or not _JOURNAL_ID_RE.fullmatch(value):
@@ -1044,10 +1661,271 @@ class JournalCheckpointReceipt:
         }
 
 
+def _v6_causal_ids(
+    *,
+    cycle_id: str,
+    symbol: str,
+    timeframe: str,
+    status: str,
+    candle_cutoff_ts: float,
+    base_bar_open_ts: float | None,
+    base_bar_close_ts: float | None,
+    action: str,
+    reason: str,
+    confidence: float,
+    metadata: Mapping[str, object],
+    error_code: str | None,
+    raw_frame_bundle_hash_value: str,
+    lifecycle_event: CandidateLifecycleEventV1 | None,
+) -> tuple[str, str]:
+    """Re-derive schema-v6 row identity from its complete causal payload."""
+
+    causal_payload: dict[str, object] = {
+        "schema_version": CURRENT_WRITE_SCHEMA,
+        "cycle_id": cycle_id,
+        "symbol": symbol,
+        "timeframe_seconds": interval_seconds(timeframe),
+        "status": status,
+        "candle_cutoff_ts": _finite_float(
+            candle_cutoff_ts, name="candle_cutoff_ts"
+        ),
+        "base_bar_open_ts": (
+            _finite_float(base_bar_open_ts, name="base_bar_open_ts")
+            if base_bar_open_ts is not None
+            else None
+        ),
+        "base_bar_close_ts": (
+            _finite_float(base_bar_close_ts, name="base_bar_close_ts")
+            if base_bar_close_ts is not None
+            else None
+        ),
+        "action": action,
+        "reason": reason,
+        "confidence": _finite_float(confidence, name="confidence"),
+        "metadata": _causal_metadata(_thaw_json_value(metadata)),
+        "error_code": error_code,
+        "raw_frame_bundle_hash": raw_frame_bundle_hash_value,
+        "lifecycle_event_id": (
+            lifecycle_event.event_id if lifecycle_event is not None else None
+        ),
+    }
+    input_hash = _sha256_id(causal_payload)
+    snapshot_id = _sha256_id(
+        {
+            "schema_version": CURRENT_WRITE_SCHEMA,
+            "cycle_id": cycle_id,
+            "symbol": symbol,
+            "input_hash": input_hash,
+        }
+    )
+    return input_hash, snapshot_id
+
+
+@dataclass(frozen=True)
+class PopulationDecisionV6(PopulationDecision):
+    """Schema-v6 row with typed, non-predictive market/lifecycle evidence.
+
+    The benchmark read is cycle-scoped and therefore lives on the header.  It
+    is accepted by :meth:`create` solely to derive the latency-free raw bundle
+    commitment; strict append/read validation recomputes that commitment from
+    all three persisted source records.
+    """
+
+    base_source_evidence: SourceReadEvidenceV1 | None = None
+    higher_timeframe_source_evidence: SourceReadEvidenceV1 | None = None
+    raw_frame_bundle_hash: str = ""
+    lifecycle_event: CandidateLifecycleEventV1 | None = None
+    benchmark_source_evidence: SourceReadEvidenceV1 | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.schema_version != CURRENT_WRITE_SCHEMA:
+            raise PopulationJournalError("v6 decision requires journal schema 6")
+        if self.action not in V6_ACTIONS:
+            raise PopulationJournalError("v6 decision action is unsupported")
+        if not isinstance(self.base_source_evidence, SourceReadEvidenceV1):
+            raise PopulationJournalError("v6 decision requires base source evidence")
+        if not isinstance(
+            self.higher_timeframe_source_evidence, SourceReadEvidenceV1
+        ):
+            raise PopulationJournalError(
+                "v6 decision requires higher-timeframe source evidence"
+            )
+        if not isinstance(self.raw_frame_bundle_hash, str) or not _JOURNAL_ID_RE.fullmatch(
+            self.raw_frame_bundle_hash
+        ):
+            raise PopulationJournalError("raw_frame_bundle_hash must be a SHA-256 digest")
+        if self.lifecycle_event is not None and not isinstance(
+            self.lifecycle_event, CandidateLifecycleEventV1
+        ):
+            raise PopulationJournalError(
+                "lifecycle_event must be CandidateLifecycleEventV1 or null"
+            )
+        if self.benchmark_source_evidence is not None and not isinstance(
+            self.benchmark_source_evidence, SourceReadEvidenceV1
+        ):
+            raise PopulationJournalError("benchmark_source_evidence is invalid")
+        expected_input_hash, expected_snapshot_id = _v6_causal_ids(
+            cycle_id=self.cycle_id,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            status=self.status,
+            candle_cutoff_ts=self.candle_cutoff_ts,
+            base_bar_open_ts=self.base_bar_open_ts,
+            base_bar_close_ts=self.base_bar_close_ts,
+            action=self.action,
+            reason=self.reason,
+            confidence=self.confidence,
+            metadata=self.metadata,
+            error_code=self.error_code,
+            raw_frame_bundle_hash_value=self.raw_frame_bundle_hash,
+            lifecycle_event=self.lifecycle_event,
+        )
+        if self.input_hash != expected_input_hash:
+            raise PopulationJournalError("population journal v6 input hash mismatch")
+        if self.snapshot_id != expected_snapshot_id:
+            raise PopulationJournalError("population journal v6 snapshot ID mismatch")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        cycle_id: str,
+        universe_refreshed_at: float,
+        universe_request_started_at: float,
+        universe_received_at: float,
+        scan_observed_at: float,
+        candle_cutoff_ts: float,
+        decision_ts: float,
+        ranking_ready_ts: float,
+        cycle_completed_ts: float,
+        actionable_ts: float,
+        entry_eligible_ts: float,
+        entry_bar_open_ts: float,
+        symbol: str,
+        timeframe: str,
+        status: str,
+        base_bar_open_ts: float | None,
+        base_bar_close_ts: float | None,
+        action: str,
+        reason: str,
+        confidence: float,
+        metadata: Mapping[str, object],
+        base_source_evidence: SourceReadEvidenceV1,
+        higher_timeframe_source_evidence: SourceReadEvidenceV1,
+        benchmark_source_evidence: SourceReadEvidenceV1,
+        lifecycle_event: CandidateLifecycleEventV1 | None = None,
+        cycle_ordinal: int = 0,
+        cycle_size: int = 1,
+        error_code: str | None = None,
+        schema_version: int = CURRENT_WRITE_SCHEMA,
+    ) -> "PopulationDecisionV6":
+        if schema_version != CURRENT_WRITE_SCHEMA:
+            raise PopulationJournalError("v6 decision requires journal schema 6")
+        for name, evidence in (
+            ("base_source_evidence", base_source_evidence),
+            ("higher_timeframe_source_evidence", higher_timeframe_source_evidence),
+            ("benchmark_source_evidence", benchmark_source_evidence),
+        ):
+            if not isinstance(evidence, SourceReadEvidenceV1):
+                raise PopulationJournalError(f"{name} is invalid")
+        if lifecycle_event is not None and not isinstance(
+            lifecycle_event, CandidateLifecycleEventV1
+        ):
+            raise PopulationJournalError("lifecycle_event is invalid")
+        if not isinstance(metadata, Mapping):
+            raise PopulationJournalError("metadata must be a mapping")
+        frozen_metadata = _freeze_json_value(metadata, path="metadata")
+        bundle_hash = raw_frame_bundle_hash(
+            (
+                benchmark_source_evidence,
+                base_source_evidence,
+                higher_timeframe_source_evidence,
+            )
+        )
+        input_hash, snapshot_id = _v6_causal_ids(
+            cycle_id=cycle_id,
+            symbol=symbol,
+            timeframe=timeframe,
+            status=status,
+            candle_cutoff_ts=candle_cutoff_ts,
+            base_bar_open_ts=base_bar_open_ts,
+            base_bar_close_ts=base_bar_close_ts,
+            action=action,
+            reason=reason,
+            confidence=confidence,
+            metadata=frozen_metadata,
+            error_code=error_code,
+            raw_frame_bundle_hash_value=bundle_hash,
+            lifecycle_event=lifecycle_event,
+        )
+        return cls(
+            schema_version=CURRENT_WRITE_SCHEMA,
+            cycle_id=cycle_id,
+            snapshot_id=snapshot_id,
+            input_hash=input_hash,
+            universe_refreshed_at=universe_refreshed_at,
+            universe_request_started_at=universe_request_started_at,
+            universe_received_at=universe_received_at,
+            scan_observed_at=scan_observed_at,
+            candle_cutoff_ts=candle_cutoff_ts,
+            decision_ts=decision_ts,
+            ranking_ready_ts=ranking_ready_ts,
+            cycle_completed_ts=cycle_completed_ts,
+            actionable_ts=actionable_ts,
+            entry_eligible_ts=entry_eligible_ts,
+            entry_bar_open_ts=entry_bar_open_ts,
+            symbol=symbol,
+            timeframe=timeframe,
+            status=status,
+            base_bar_open_ts=base_bar_open_ts,
+            base_bar_close_ts=base_bar_close_ts,
+            action=action,
+            reason=reason,
+            confidence=confidence,
+            metadata=frozen_metadata,
+            cycle_ordinal=cycle_ordinal,
+            cycle_size=cycle_size,
+            error_code=error_code,
+            base_source_evidence=base_source_evidence,
+            higher_timeframe_source_evidence=higher_timeframe_source_evidence,
+            raw_frame_bundle_hash=bundle_hash,
+            lifecycle_event=lifecycle_event,
+            benchmark_source_evidence=benchmark_source_evidence,
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        payload = super().as_dict()
+        assert self.base_source_evidence is not None
+        assert self.higher_timeframe_source_evidence is not None
+        payload.update(
+            {
+                "base_source_evidence": self.base_source_evidence.as_dict(),
+                "higher_timeframe_source_evidence": (
+                    self.higher_timeframe_source_evidence.as_dict()
+                ),
+                "raw_frame_bundle_hash": self.raw_frame_bundle_hash,
+                "lifecycle_event": (
+                    self.lifecycle_event.as_dict()
+                    if self.lifecycle_event is not None
+                    else None
+                ),
+            }
+        )
+        return payload
+
+
 @dataclass(frozen=True)
 class _JournalInspection:
+    journal_schema_version: int | None
     journal_id: str | None
     strategy_spec_identity: tuple[str, str, str] | None
+    evidence_contracts: Mapping[str, str] | None
+    lifecycle_chain: _LifecycleChainState
     cycle_ids: tuple[str, ...]
     cycle_commits: tuple[str, ...]
     prefix_lengths: tuple[int, ...]
@@ -1073,6 +1951,10 @@ class PopulationJournal:
         self._lock = threading.Lock()
         self._path_lock = _process_path_lock(self._path)
         self._lock_path = self._path.with_name(f".{self._path.name}.lock")
+        self._runtime_lock_path = self._path.with_name(
+            f".{self._path.name}.runtime.lock"
+        )
+        self._runtime_path_lock = _process_path_lock(self._runtime_lock_path)
         self._file_state: tuple[int, int, int, int, int] | None = None
         if self._enabled:
             # Initialization participates in the same critical section as an
@@ -1088,8 +1970,10 @@ class PopulationJournal:
                         "population journal changed while it was being validated"
                     )
         else:
+            self._journal_schema_version = None
             self._journal_id = None
             self._strategy_spec_identity = None
+            self._evidence_contracts = None
             self._last_cycle_id = None
             self._cycle_ids: set[str] = set()
             self._cycle_ids_ordered: tuple[str, ...] = ()
@@ -1097,10 +1981,16 @@ class PopulationJournal:
             self._prefix_lengths: tuple[int, ...] = ()
             self._prefix_sha256s: tuple[str, ...] = ()
             self._tail_digest = hashlib.sha256()
+            self._lifecycle_chain = _LifecycleChainState()
 
     def _adopt_inspection(self, inspection: _JournalInspection) -> None:
+        self._journal_schema_version = inspection.journal_schema_version
         self._journal_id = inspection.journal_id
         self._strategy_spec_identity = inspection.strategy_spec_identity
+        self._evidence_contracts = inspection.evidence_contracts
+        # This is evidence-validation state, not strategy runtime state.  The
+        # scanner still does not rehydrate a pending candidate on restart.
+        self._lifecycle_chain = inspection.lifecycle_chain.clone()
         self._last_cycle_id = inspection.last_cycle_id
         self._cycle_ids = set(inspection.cycle_ids)
         self._cycle_ids_ordered = inspection.cycle_ids
@@ -1125,8 +2015,12 @@ class PopulationJournal:
             )
         old_count = len(self._cycle_commits)
         if old_count:
+            if inspection.journal_schema_version != self._journal_schema_version:
+                raise PopulationJournalError("population journal schema was replaced")
             if inspection.journal_id != self._journal_id:
                 raise PopulationJournalError("population journal identity was replaced")
+            if inspection.evidence_contracts != self._evidence_contracts:
+                raise PopulationJournalError("population journal evidence identity was replaced")
             if len(inspection.cycle_commits) < old_count:
                 raise PopulationJournalError("population journal history was rolled back")
             if inspection.cycle_commits[:old_count] != self._cycle_commits:
@@ -1150,8 +2044,11 @@ class PopulationJournal:
 
         if not self._path.exists() or self._path.stat().st_size == 0:
             return _JournalInspection(
+                journal_schema_version=None,
                 journal_id=None,
                 strategy_spec_identity=None,
+                evidence_contracts=None,
+                lifecycle_chain=_LifecycleChainState(),
                 cycle_ids=(),
                 cycle_commits=(),
                 prefix_lengths=(),
@@ -1181,9 +2078,12 @@ class PopulationJournal:
         current_journal_id: str | None = None
         current_sequence_no: int | None = None
         current_prev_commit: str | None = None
+        current_benchmark_evidence: SourceReadEvidenceV1 | None = None
         declared_rows = 0
         row_symbols: list[str] = []
         row_payloads: list[Mapping[str, object]] = []
+        base_source_evidences: list[SourceReadEvidenceV1] = []
+        higher_timeframe_source_evidences: list[SourceReadEvidenceV1] = []
         rows_digest = hashlib.sha256()
         seen_symbols: set[str] = set()
         seen_snapshots: set[str] = set()
@@ -1196,6 +2096,9 @@ class PopulationJournal:
         file_digest = hashlib.sha256()
         prefix_length = 0
         strategy_spec_identity: tuple[str, str, str] | None = None
+        journal_schema_version: int | None = None
+        evidence_contracts: Mapping[str, str] | None = None
+        lifecycle_chain = _LifecycleChainState()
 
         try:
             handle = self._path.open("rb")
@@ -1209,15 +2112,24 @@ class PopulationJournal:
                     raise PopulationJournalError("population journal contains a blank line")
                 payload = _decode_journal_record(raw, line_number=line_number)
                 existing_version = payload.get("schema_version")
-                if existing_version != SCHEMA_VERSION:
+                if (
+                    isinstance(existing_version, bool)
+                    or not isinstance(existing_version, Integral)
+                    or int(existing_version) not in SUPPORTED_JOURNAL_SCHEMAS
+                ):
                     raise PopulationJournalError(
                         f"population journal was written by schema {existing_version!r}, "
-                        f"this build writes {SCHEMA_VERSION}. Use a separate file per schema."
+                        f"supported schemas are {sorted(SUPPORTED_JOURNAL_SCHEMAS)}"
                     )
+                existing_version = int(existing_version)
+                if journal_schema_version is None:
+                    journal_schema_version = existing_version
+                elif existing_version != journal_schema_version:
+                    raise PopulationJournalError("population journal mixes schema versions")
                 record_type = payload.get("record_type")
 
                 if record_type == RECORD_TYPE_HEADER:
-                    if set(payload) != HEADER_KEYS:
+                    if set(payload) != header_keys_for_schema(existing_version):
                         raise PopulationJournalError("cycle header schema mismatch")
                     if current_envelope is not None:
                         raise PopulationJournalError(
@@ -1234,6 +2146,26 @@ class PopulationJournal:
                             "population journal mixes strategy identities"
                         )
                     current_header = payload
+                    if existing_version == CURRENT_WRITE_SCHEMA:
+                        current_contracts = _validated_evidence_contracts(
+                            payload.get("evidence_contracts")
+                        )
+                        if evidence_contracts is None:
+                            evidence_contracts = current_contracts
+                        elif dict(current_contracts) != dict(evidence_contracts):
+                            raise PopulationJournalError(
+                                "population journal mixes evidence contract identities"
+                            )
+                        current_benchmark_evidence = _validated_source_evidence(
+                            payload.get("benchmark_source_evidence"),
+                            field="benchmark source evidence",
+                        )
+                        _validate_benchmark_source_evidence(
+                            current_benchmark_evidence,
+                            envelope=current_envelope,
+                        )
+                    else:
+                        current_benchmark_evidence = None
                     current_cycle_id = current_envelope.cycle_id
                     if payload.get("cycle_id") != current_cycle_id:
                         raise PopulationJournalError("cycle header ID differs from its envelope")
@@ -1256,7 +2188,10 @@ class PopulationJournal:
                     if current_sequence_no != len(completed_commits):
                         raise PopulationJournalError("population journal sequence is not contiguous")
                     expected_prev = (
-                        genesis_cycle_commit(raw_journal_id)
+                        genesis_cycle_commit(
+                            raw_journal_id,
+                            schema_version=existing_version,
+                        )
                         if not completed_commits
                         else completed_commits[-1]
                     )
@@ -1274,6 +2209,8 @@ class PopulationJournal:
                         raise PopulationJournalError("cycle header envelope hash mismatch")
                     row_symbols = []
                     row_payloads = []
+                    base_source_evidences = []
+                    higher_timeframe_source_evidences = []
                     rows_digest = hashlib.sha256()
                     seen_symbols = set()
                     seen_snapshots = set()
@@ -1283,7 +2220,10 @@ class PopulationJournal:
                     raise PopulationJournalError("population journal row precedes its cycle header")
 
                 if record_type == RECORD_TYPE_DECISION:
-                    record = _validated_decision_record(payload)
+                    record = _validated_decision_record(
+                        payload,
+                        schema_version=existing_version,
+                    )
                     if record.cycle_id != current_cycle_id:
                         raise PopulationJournalError("decision row belongs to another cycle")
                     if (
@@ -1297,6 +2237,32 @@ class PopulationJournal:
                         record,
                         envelope=current_envelope,
                     )
+                    if existing_version == CURRENT_WRITE_SCHEMA:
+                        if not isinstance(record, PopulationDecisionV6):
+                            raise PopulationJournalError("v6 row decoder returned wrong type")
+                        if current_benchmark_evidence is None:
+                            raise PopulationJournalError(
+                                "v6 cycle header lacks benchmark evidence"
+                            )
+                        _validate_record_against_envelope(
+                            record,
+                            envelope=current_envelope,
+                        )
+                        _validate_v6_decision_evidence(
+                            record,
+                            envelope=current_envelope,
+                            benchmark_source_evidence=current_benchmark_evidence,
+                        )
+                        lifecycle_chain.observe(
+                            symbol=record.symbol,
+                            event=record.lifecycle_event,
+                        )
+                        assert record.base_source_evidence is not None
+                        assert record.higher_timeframe_source_evidence is not None
+                        base_source_evidences.append(record.base_source_evidence)
+                        higher_timeframe_source_evidences.append(
+                            record.higher_timeframe_source_evidence
+                        )
                     symbol = record.symbol
                     snapshot_id = record.snapshot_id
                     if symbol in seen_symbols or snapshot_id in seen_snapshots:
@@ -1350,6 +2316,20 @@ class PopulationJournal:
                         declared_rows=declared_rows,
                         row_symbols=row_symbols,
                     )
+                    if journal_schema_version == CURRENT_WRITE_SCHEMA:
+                        if current_benchmark_evidence is None:
+                            raise PopulationJournalError(
+                                "v6 cycle header lacks benchmark evidence"
+                            )
+                        _validate_cycle_source_timings(
+                            envelope=current_envelope,
+                            benchmark_source_evidence=current_benchmark_evidence,
+                            base_source_evidences=base_source_evidences,
+                            higher_timeframe_source_evidences=(
+                                higher_timeframe_source_evidences
+                            ),
+                        )
+                    lifecycle_chain.finish_cycle(current_envelope)
                     completed_ids.add(current_cycle_id)
                     completed_cycle_ids.append(current_cycle_id)
                     completed_commits.append(expected_commit)
@@ -1362,9 +2342,12 @@ class PopulationJournal:
                     current_journal_id = None
                     current_sequence_no = None
                     current_prev_commit = None
+                    current_benchmark_evidence = None
                     declared_rows = 0
                     row_symbols = []
                     row_payloads = []
+                    base_source_evidences = []
+                    higher_timeframe_source_evidences = []
                     rows_digest = hashlib.sha256()
                     continue
 
@@ -1377,8 +2360,11 @@ class PopulationJournal:
         if not completed_ids:
             raise PopulationJournalError("population journal contains no complete cycles")
         return _JournalInspection(
+            journal_schema_version=journal_schema_version,
             journal_id=journal_id,
             strategy_spec_identity=strategy_spec_identity,
+            evidence_contracts=evidence_contracts,
+            lifecycle_chain=lifecycle_chain,
             cycle_ids=tuple(completed_cycle_ids),
             cycle_commits=tuple(completed_commits),
             prefix_lengths=tuple(prefix_lengths),
@@ -1389,6 +2375,47 @@ class PopulationJournal:
     @property
     def enabled(self) -> bool:
         return self._enabled
+
+    @contextmanager
+    def runtime_session(self) -> Iterator[None]:
+        """Exclusively own this scanner runtime across threads and processes.
+
+        The journal's append lock protects bytes but cannot roll back strategy
+        lifecycle state changed before a losing duplicate append. This separate
+        non-blocking lifetime lock makes a second scanner fail before its first
+        market request. The sidecar may remain, but its OS byte lock is released
+        automatically when the owner exits or crashes.
+        """
+
+        if not self._runtime_path_lock.acquire(blocking=False):
+            raise PopulationJournalError("population scanner runtime is already active")
+        os_lock = _InterProcessPathLock(self._runtime_lock_path, timeout_sec=0.0)
+        try:
+            try:
+                os_lock.__enter__()
+            except PopulationJournalError as exc:
+                if "timed out waiting" in str(exc):
+                    raise PopulationJournalError(
+                        "population scanner runtime is already active"
+                    ) from exc
+                raise
+            try:
+                yield
+            finally:
+                os_lock.__exit__(None, None, None)
+        finally:
+            self._runtime_path_lock.release()
+
+    def contains_cycle(self, cycle_id: str) -> bool:
+        """Return membership from a fully refreshed, lock-protected view."""
+
+        if not isinstance(cycle_id, str) or not _JOURNAL_ID_RE.fullmatch(cycle_id):
+            raise PopulationJournalError("cycle_id must be a lowercase SHA-256 digest")
+        if not self._enabled:
+            return False
+        with self._lock, self._path_lock, _InterProcessPathLock(self._lock_path):
+            self._refresh_if_changed()
+            return cycle_id in self._cycle_ids
 
     def checkpoint_receipt(self) -> JournalCheckpointReceipt:
         """Describe the latest fsynced prefix for external anchoring.
@@ -1404,13 +2431,14 @@ class PopulationJournal:
             self._refresh_if_changed()
             if (
                 self._journal_id is None
+                or self._journal_schema_version is None
                 or not self._cycle_commits
                 or not self._cycle_ids_ordered
             ):
                 raise PopulationJournalError("empty journal has no checkpoint")
             return JournalCheckpointReceipt(
                 receipt_schema_version=CHECKPOINT_RECEIPT_SCHEMA_VERSION,
-                journal_schema_version=SCHEMA_VERSION,
+                journal_schema_version=self._journal_schema_version,
                 journal_id=self._journal_id,
                 sequence_no=len(self._cycle_commits) - 1,
                 cycle_id=self._cycle_ids_ordered[-1],
@@ -1421,9 +2449,10 @@ class PopulationJournal:
 
     def append_cycle(
         self,
-        records: Sequence[PopulationDecision],
+        records: Sequence[PopulationDecisionV6],
         *,
         envelope: object,
+        benchmark_source_evidence: SourceReadEvidenceV1 | None = None,
     ) -> bool:
         """Write one complete cycle: header, ordered rows, footer.
 
@@ -1436,6 +2465,15 @@ class PopulationJournal:
             return False
         if envelope is None:
             raise PopulationJournalError("a cycle requires its envelope")
+        records = tuple(records)
+        # A schema-v5 journal is a frozen historical evidence file.  Reject an
+        # append before interpreting any schema-v6 arguments; callers must not
+        # be able to get a misleading v6 validation error from a read-only v5
+        # target.  The same guard is repeated after refresh under the OS lock.
+        if self._journal_schema_version == SCHEMA_VERSION:
+            raise PopulationJournalError(
+                "population journal schema v5 is frozen read-only; use a separate v6 file"
+            )
 
         try:
             envelope_payload = envelope.as_dict()
@@ -1443,6 +2481,42 @@ class PopulationJournal:
             raise PopulationJournalError("cycle envelope cannot be serialized") from exc
         validated_envelope = _validated_envelope(envelope_payload)
         incoming_strategy_identity = _envelope_strategy_identity(validated_envelope)
+        if validated_envelope.status == "completed" and not records:
+            raise PopulationJournalError("completed cycle must contain decision rows")
+        if benchmark_source_evidence is None and records:
+            inferred = {
+                record.benchmark_source_evidence
+                for record in records
+                if isinstance(record, PopulationDecisionV6)
+            }
+            if len(inferred) == 1:
+                benchmark_source_evidence = inferred.pop()
+        if benchmark_source_evidence is None and validated_envelope.status in {
+            "empty_universe",
+            "error",
+        }:
+            spec = decode_mexc_strategy_spec_evidence(
+                validated_envelope.strategy_spec_payload,
+                expected_version=validated_envelope.strategy_spec_version,
+            )
+            benchmark_source_evidence = SourceReadEvidenceV1.not_requested(
+                source="benchmark_ohlcv",
+                venue="mexc_contract",
+                symbol="BTCUSDT",
+                venue_symbol="BTC_USDT",
+                timeframe=spec.resolved_benchmark_interval,
+                requested_as_of_ts=validated_envelope.candle_cutoff_ts,
+                reason="cycle_not_completed",
+            )
+        if not isinstance(benchmark_source_evidence, SourceReadEvidenceV1):
+            raise PopulationJournalError("v6 cycle requires benchmark source evidence")
+        _validate_benchmark_source_evidence(
+            benchmark_source_evidence,
+            envelope=validated_envelope,
+        )
+        incoming_evidence_contracts = _validated_evidence_contracts(
+            evidence_contracts_payload()
+        )
         cycle_id = envelope_payload.get("cycle_id")
         if not isinstance(cycle_id, str) or not re.fullmatch(r"[0-9a-f]{64}", cycle_id):
             raise PopulationJournalError("cycle envelope has an invalid cycle ID")
@@ -1451,13 +2525,21 @@ class PopulationJournal:
         rows: list[bytes] = []
         row_payloads: list[Mapping[str, object]] = []
         for record in records:
-            if not isinstance(record, PopulationDecision):
-                raise PopulationJournalError("records must contain PopulationDecision instances")
-            if record.schema_version != SCHEMA_VERSION:
+            if not isinstance(record, PopulationDecisionV6):
+                raise PopulationJournalError(
+                    "records must contain PopulationDecisionV6 instances"
+                )
+            if record.schema_version != CURRENT_WRITE_SCHEMA:
                 raise PopulationJournalError("append batch mixes journal schema versions")
             if record.cycle_id != cycle_id:
                 raise PopulationJournalError("decision row does not belong to the envelope cycle")
+            _validate_record_against_envelope(record, envelope=validated_envelope)
             _validate_feature_provenance(record, envelope=validated_envelope)
+            _validate_v6_decision_evidence(
+                record,
+                envelope=validated_envelope,
+                benchmark_source_evidence=benchmark_source_evidence,
+            )
             row_payload = record.as_dict()
             row_payloads.append(row_payload)
             rows.append(_canonical_bytes(row_payload) + b"\n")
@@ -1477,12 +2559,30 @@ class PopulationJournal:
             declared_rows=expected_size,
             row_symbols=[record.symbol for record in records],
         )
+        _validate_cycle_source_timings(
+            envelope=validated_envelope,
+            benchmark_source_evidence=benchmark_source_evidence,
+            base_source_evidences=[
+                record.base_source_evidence for record in records
+                if record.base_source_evidence is not None
+            ],
+            higher_timeframe_source_evidences=[
+                record.higher_timeframe_source_evidence for record in records
+                if record.higher_timeframe_source_evidence is not None
+            ],
+        )
 
         with self._lock, self._path_lock, _InterProcessPathLock(self._lock_path):
             # Another object/process may have appended since this instance was
             # constructed.  A cheap file fingerprint makes unchanged appends
             # O(1), while any external change is fully validated before use.
             self._refresh_if_changed()
+            if self._journal_schema_version == SCHEMA_VERSION:
+                raise PopulationJournalError(
+                    "population journal schema v5 is frozen read-only; use a separate v6 file"
+                )
+            if self._journal_schema_version not in (None, CURRENT_WRITE_SCHEMA):
+                raise PopulationJournalError("population journal uses another schema")
             if (
                 self._strategy_spec_identity is not None
                 and incoming_strategy_identity != self._strategy_spec_identity
@@ -1490,18 +2590,34 @@ class PopulationJournal:
                 raise PopulationJournalError(
                     "population journal mixes strategy identities"
                 )
+            if self._evidence_contracts is not None and dict(
+                incoming_evidence_contracts
+            ) != dict(self._evidence_contracts):
+                raise PopulationJournalError(
+                    "population journal mixes evidence contract identities"
+                )
             if cycle_id in self._cycle_ids:
                 return False
+            next_lifecycle_chain = self._lifecycle_chain.clone()
+            for record in records:
+                next_lifecycle_chain.observe(
+                    symbol=record.symbol,
+                    event=record.lifecycle_event,
+                )
+            next_lifecycle_chain.finish_cycle(validated_envelope)
             journal_id = self._journal_id or secrets.token_hex(32)
             sequence_no = len(self._cycle_commits)
             prev_cycle_commit = (
                 self._cycle_commits[-1]
                 if self._cycle_commits
-                else genesis_cycle_commit(journal_id)
+                else genesis_cycle_commit(
+                    journal_id,
+                    schema_version=CURRENT_WRITE_SCHEMA,
+                )
             )
             header_payload: dict[str, object] = {
                 "record_type": RECORD_TYPE_HEADER,
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": CURRENT_WRITE_SCHEMA,
                 "journal_id": journal_id,
                 "sequence_no": sequence_no,
                 "prev_cycle_commit": prev_cycle_commit,
@@ -1509,10 +2625,12 @@ class PopulationJournal:
                 "row_count": expected_size,
                 "envelope_hash": envelope_hash,
                 "envelope": envelope_payload,
+                "evidence_contracts": dict(incoming_evidence_contracts),
+                "benchmark_source_evidence": benchmark_source_evidence.as_dict(),
             }
             footer_core: dict[str, object] = {
                 "record_type": RECORD_TYPE_FOOTER,
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": CURRENT_WRITE_SCHEMA,
                 "journal_id": journal_id,
                 "sequence_no": sequence_no,
                 "prev_cycle_commit": prev_cycle_commit,
@@ -1542,7 +2660,9 @@ class PopulationJournal:
             previous_length = self._prefix_lengths[-1] if self._prefix_lengths else 0
             next_length = previous_length + len(batch)
             self._journal_id = journal_id
+            self._journal_schema_version = CURRENT_WRITE_SCHEMA
             self._strategy_spec_identity = incoming_strategy_identity
+            self._evidence_contracts = incoming_evidence_contracts
             self._last_cycle_id = cycle_id
             self._cycle_ids.add(cycle_id)
             self._cycle_ids_ordered = (*self._cycle_ids_ordered, cycle_id)
@@ -1550,5 +2670,6 @@ class PopulationJournal:
             self._prefix_lengths = (*self._prefix_lengths, next_length)
             self._prefix_sha256s = (*self._prefix_sha256s, next_digest.hexdigest())
             self._tail_digest = next_digest
+            self._lifecycle_chain = next_lifecycle_chain
             self._file_state = _journal_file_state(self._path)
         return True
