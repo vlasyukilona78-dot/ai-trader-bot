@@ -1,61 +1,61 @@
-# Claude Code re-entry and independent read-only review prompt
+# Claude Code re-entry: independent read-only audit of MEXC evidence schema v6
 
 This prompt is intentionally self-contained. It is for a fresh Claude Code
 account reviewing the preserved root/Bybit line and the selected MEXC causal
-research line after the canonical StrategySpec, journal-v5, frozen-v2
-behavioral-semantics and version-dispatched evidence-compatibility commits.
+research line after typed lifecycle, exact per-symbol closed-frame provenance and
+population-journal schema v6 were committed.
 
-The task is an independent audit, not implementation. Do not change files,
-stage, commit, push, switch branches, pull, reset, clean, launch the bot or
-scanner, contact any external service, or inspect secret contents.
+This task is an **independent read-only audit, not implementation**. Do not edit
+files, stage, commit, push, pull, switch branches, reset, clean, repair journals,
+launch the bot/scanner, train a model, contact MEXC/Telegram or inspect secret
+contents. Return findings and a corrected plan only.
 
-## Non-negotiable project status
+## Non-negotiable status
 
-- MEXC is the selected target exchange.
-- The root/Bybit and MEXC lines are intentionally unmerged.
-- The bot and scanner are stopped. MEXC private execution does not exist in the
-  selected line.
+- MEXC futures is the selected target exchange.
+- Root/Bybit and MEXC are intentionally separate lines.
+- Bot and scanner are stopped; the selected MEXC line has no private execution.
 - No stable generic pump-fade edge has been established after costs.
-- No model has been fitted, promoted or enabled in the causal admission path.
-- Current work is causal research and signals-only. Testnet, private API and
-  live execution remain forbidden.
-- Current ignored `.env` files may exist locally. Historical credentials were
-  committed in older history and have not been confirmed rotated. Never read or
-  print current or historical secret values.
-- Accept a repeat no-edge result. Do not tune thresholds, windows or models in
-  this review.
+- No causal model has been fitted, promoted or enabled.
+- Current scope is signals-only causal research. Private API, Telegram, testnet
+  and live remain forbidden.
+- Ignored `.env` files may exist. Credentials occurred in reachable older Git
+  history and rotation is not confirmed. Never read or print present or historical
+  values.
+- Accept repeat no-edge. Do not tune thresholds, windows or models during review.
+- The frozen `mexc_strategy_v2` remains Min60/45-hour behavior. No v3 timeframe,
+  window or threshold has been selected.
+- Gate-conditioned feature missingness still blocks model training. A typed
+  lifecycle is not an unconditional market snapshot.
 
 ## Exact repository orientation
 
 ```text
-Project root / preserved Bybit-runtime line:
+Root / preserved Bybit-runtime line:
 C:\Users\vlasy\PycharmProjects\koteika_Ultra
 branch: feat/phase2-layer1-pump-runtime-alignment
-verified root tip: f01591f2e2872d5af6341580b6d8d44b298cd244
+known root tip: f01591f2e2872d5af6341580b6d8d44b298cd244
 
 Selected MEXC causal research line:
 C:\Users\vlasy\PycharmProjects\koteika_Ultra\.claude\worktrees\codex-project-review-04581e
 branch: claude/codex-project-review-04581e
+remote: origin/claude/codex-project-review-04581e
 AI foundation anchor: f0b43d6
-earlier Phase 1 hardening tip: e0e4cb4
-canonical StrategySpec commit: bebfd0d
-journal-v5 executable commit: 2d0efcb
-frozen-v2 behavioral checkpoint: 258c35f
-latest executable/evidence-compatibility tip: 1971b77
-remote branch: origin/claude/codex-project-review-04581e
+StrategySpec/journal-v5 anchors: bebfd0d / 2d0efcb
+frozen behavior anchor: 258c35f
+versioned-evidence anchor: 1971b77
+frozen-v5 evidence boundary: eb238b2
+typed-lifecycle hardening tip: 9ef6b4f
+current executable journal-v6 tip: bb1ca13
 ```
 
-The handoff documents may be a later documentation-only descendant of
-`1971b77`. Discover the exact current HEAD from Git. Treat `1971b77` as the
-latest executable tip at this checkpoint, not necessarily as the final
-documentation HEAD.
+Documentation may be committed after `bb1ca13`. Discover exact current HEAD and
+upstream. Treat `bb1ca13` as the executable tip under review, not automatically
+as final documentation HEAD. Inventory every worktree and modify none.
 
-Other worktrees may exist. Inventory them, report them, and do not modify them.
-Do not transfer MEXC code into root/Bybit without a separate explicit plan.
+## Mandatory read-only orientation
 
-## Mandatory read-only Git orientation
-
-Run these commands from PowerShell:
+Run from PowerShell:
 
 ```powershell
 $ROOT = 'C:\Users\vlasy\PycharmProjects\koteika_Ultra'
@@ -65,71 +65,56 @@ git -C $ROOT status --short --branch
 git -C $ROOT worktree list --porcelain
 git -C $ROOT rev-parse HEAD
 git -C $ROOT rev-parse '@{upstream}'
-git -C $ROOT log -5 --oneline --decorate
 
 git -C $MEXC status --short --branch
 git -C $MEXC rev-parse HEAD
 git -C $MEXC rev-parse '@{upstream}'
-git -C $MEXC log -12 --oneline --decorate
-git -C $MEXC diff --stat 1e91ce0..HEAD
-git -C $MEXC diff --check 1e91ce0..HEAD
+git -C $MEXC log -18 --oneline --decorate
+git -C $MEXC diff --stat 1971b77..bb1ca13
+git -C $MEXC diff --check 1971b77..bb1ca13
+
 git -C $MEXC merge-base --is-ancestor f0b43d6 HEAD
-git -C $MEXC merge-base --is-ancestor e0e4cb4 HEAD
 git -C $MEXC merge-base --is-ancestor bebfd0d HEAD
 git -C $MEXC merge-base --is-ancestor 2d0efcb HEAD
 git -C $MEXC merge-base --is-ancestor 258c35f HEAD
 git -C $MEXC merge-base --is-ancestor 1971b77 HEAD
+git -C $MEXC merge-base --is-ancestor eb238b2 HEAD
+git -C $MEXC merge-base --is-ancestor 9ef6b4f HEAD
+git -C $MEXC merge-base --is-ancestor bb1ca13 HEAD
 git -C $MEXC ls-files -- .env
 ```
 
-Expected facts at the published checkpoint:
+Expected published checkpoint:
 
-- the current MEXC HEAD descends from all six listed anchors;
-- `bebfd0d` and `2d0efcb` are consecutive executable commits;
-- `258c35f` follows them and adds frozen v2 behavioral and compatibility
-  evidence without changing thresholds or runtime strategy logic;
-- `1971b77` adds version-dispatched historical evidence decoding and exact
-  StrategySpec identity guards for journal/dataset/model export without choosing
-  a v3 timeframe, thresholds or changing v2 runtime decisions;
-- after publication, local and upstream should match and the MEXC worktree
-  should be clean;
-- root and root upstream match at `f01591f`; the three root `.idea/*` changes
-  are user-owned noise and must remain untouched;
-- current `.env` is not tracked in either selected tip, but older reachable
-  history contained it;
-- no Python bot/scanner process should be running;
-- no positive edge or live-readiness claim should appear.
+- MEXC descends from every anchor above; executable tip is `bb1ca13`;
+- root remains at/upstream `f01591f`; three root `.idea/*` changes, if still
+  present, are user-owned and must remain untouched;
+- MEXC should be clean and equal to upstream after documentation publication;
+- `.env` is not tracked at either selected tip but existed in older history;
+- no Python bot/scanner process runs;
+- no edge, model-readiness or live-readiness claim exists.
 
-If reality differs, report the exact discrepancy before interpreting code. Do
-not repair, discard or conceal it.
+Report any discrepancy before interpreting code. Do not repair it.
 
 ## Required reading order
 
-Read every listed file in full unless a section is named explicitly:
+Read in full:
 
 1. Root `AGENTS.md` and root `CLAUDE.md`.
 2. MEXC `CLAUDE.md`.
-3. MEXC `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` as the authoritative
-   strategy/AI plan.
-4. MEXC `docs/AI_HANDOFF.md`, especially:
-   - `Canonical StrategySpec and anchored journal v5 - 2026-08-08`;
-   - `Phase 1 evidence hardening - 2026-08-08`;
-   - `Current authoritative checkpoint - 2026-08-03`;
-   - `Claude no-edge finding - 2026-07-26`;
-   - `Codex independent review of Claude's nine follow-up commits`;
-   - `Unified strategy/AI contract foundation - 2026-08-03`.
+3. MEXC `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` (authoritative plan).
+4. MEXC `docs/AI_HANDOFF.md`, especially its newest v6/lifecycle checkpoint and
+   the earlier no-edge, StrategySpec, journal-v5 and independent-audit sections.
 5. Root `docs/CURRENT_STATE_AND_AI_PLAN_2026-08-03.md` and
-   `docs/PROJECT_HANDOFF_FOR_CLAUDE.md` for preservation and historical system
-   context. Where they disagree with the MEXC master plan, the MEXC plan wins.
-6. The executable code and tests listed below.
+   `docs/PROJECT_HANDOFF_FOR_CLAUDE.md` for historical/preservation context. If
+   they conflict with the MEXC master plan, report it and use the MEXC plan.
+6. Executable code and tests listed below.
 
 ## Commits to inspect individually
 
 ```text
 0b010e8 fix(backtest): prevent hindsight cohort substitution
 3ff8de0 feat(ai): add causal MEXC feature contract
-29536f1 docs: unify MEXC strategy and AI roadmap
-f0b43d6 docs: record AI foundation publication state
 32e8fbe fix(journal): harden causal population evidence
 0c32047 fix(backtest): bind replay outcomes to schema-v3 evidence
 e0e4cb4 fix(strategy): fail closed without benchmark context
@@ -137,336 +122,269 @@ bebfd0d feat(strategy): define canonical MEXC strategy spec
 2d0efcb feat(journal): chain schema-v5 population evidence
 258c35f test(strategy): pin v2 behavioral semantics
 1971b77 feat(strategy): preserve versioned evidence compatibility
+eb238b2 test(journal): freeze schema v5 evidence boundary
+c541eea feat(evidence): define candidate lifecycle contract
+a604668 feat(evidence): bind exact closed-frame provenance
+8569471 fix(evidence): reject malformed empty frame reads
+cf6bc01 feat(strategy): emit typed candidate lifecycle evidence
+9ef6b4f fix(evidence): finalize typed lifecycle semantics
+bb1ca13 feat(journal): persist typed population evidence in schema v6
 ```
 
-Use `git show --stat <hash>` and targeted `git show <hash> -- <path>`. Explain
-what each commit actually changes. Documentation is not proof of correctness.
+Use `git show --stat` and targeted `git show <hash> -- <path>`. Explain actual
+behavioral/schema changes. Documentation is not proof.
 
-## Current version and identity matrix
+## Expected version and identity matrix
 
-Verify every value from code and the committed YAML:
+Verify every value from executable code, config and fixtures:
 
 | Boundary | Expected identity |
 |---|---|
-| MEXC strategy specification | `mexc_strategy_v2` |
-| registered evidence versions | only `mexc_strategy_v2` at this checkpoint |
-| canonical MEXC source | `config/mexc_strategy_v2.yaml` |
+| MEXC strategy spec | `mexc_strategy_v2` |
+| canonical config | `config/mexc_strategy_v2.yaml` |
 | StrategySpec contract hash | `9c62b88b7804e9663bae6f0eb429c58c541680b61d307c4f16032cb0b62fe3dd` |
-| committed default instance hash | `9f0b2d7035c2a82ab1b6d8595245b8c3a7a8b9faad17bea8c57f6fcacb189466` |
-| population journal | schema v5, `data/runtime/mexc_population_decisions_v5.jsonl` |
+| default StrategySpec instance hash | `9f0b2d7035c2a82ab1b6d8595245b8c3a7a8b9faad17bea8c57f6fcacb189466` |
+| current population writer | schema v6 |
+| default runtime path | `data/runtime/mexc_population_decisions_v6.jsonl` |
+| historical journal | frozen schema v5, readable but read-only |
 | cycle envelope | schema v3 |
-| reversal feature contract | `mexc_reversal_features_v2` |
-| single-position replay | schema v3 with mandatory ReplayEvidence |
-| layered strategy v1 behavioral digest | `d5736beda70ca2826dc4868c2d4d95cb17b1289ac2ba03a2a052d9db69587459` |
-| frozen v2 envelope canonical payload SHA-256 | `87e3f049ca356f9cd7654464a6fa0cbb12ee319979e145de8aa021c858ee0e5e` |
+| cycle identity | version v5 (unchanged by writer-v6 migration) |
+| reversal features | `mexc_reversal_features_v2` |
+| reversal feature contract hash | `20f9f61d4e2d787c5ad05f54ee3ccd8b7f8ea3a99fe09bc38bbefe09872c496c` |
+| lifecycle contract | `candidate_lifecycle_v1` |
+| lifecycle contract pin | `cc75c871b7097aa215f9ac88c736b6572e2443318cb0cf9f8bdaf1b0c8cc8551` |
+| frame provenance contract | `mexc_closed_frame_provenance_v1` |
+| frame provenance pin | `f4004ac933cc1725b2560e93ffbe278c826910424e350059ad29420ed3665dbf` |
+| frame hash / bundle contracts | `mexc_closed_ohlcv_hash_v1` / `mexc_raw_frame_bundle_hash_v1` |
+| single-position replay | schema v3 with mandatory `ReplayEvidence` |
+| frozen strategy behavioral digest | `d5736beda70ca2826dc4868c2d4d95cb17b1289ac2ba03a2a052d9db69587459` |
 
-The StrategySpec contract hash pins the declarative field/layout/adapter
-contract. It is not a hash of all Python implementation bytes. The instance
-hash identifies the complete canonical YAML payload.
+The StrategySpec hash pins its declarative contract, not all Python bytes. The
+instance hash identifies canonical YAML. Lifecycle/provenance pins similarly pin
+declared canonical semantics, not external origin authenticity. Verify that the
+frozen v5 fixture is byte/semantic evidence for compatibility and that v6 does
+not rewrite or append it.
 
-Commit `1971b77` makes the v2 evidence codec version-specific and dispatched by
-the persisted version. This is a code-enforced compatibility/regression boundary,
-not a claim that local code or evidence files are absolutely immutable or that
-their origin is externally authenticated. The detached checkpoint trust boundary
-described below remains unchanged.
+## Core implementation claims to verify
 
-The legacy root `config/config.yaml` is not the MEXC source of truth and contains
-different Bybit-era values. Confirm that the MEXC scanner loads the dedicated
-YAML once and treats legacy CLI timeframe/candle arguments as assertions, not
-unhashed runtime overrides.
+### Typed lifecycle
 
-## StrategySpec facts that must be verified
+Verify from `trading/signals/lifecycle_contract.py`,
+`core/signal_generator.py` and `trading/signals/layered_strategy.py`:
 
-Confirm from code and tests:
+1. Arm, observation, proposal and terminal event identities are semantic and do
+   not include processing wall clock.
+2. `CandidateArmV1` binds arm OHLC, effective invalidation, confirmation policy,
+   StrategySpec and raw-frame bundle identity.
+3. SAME_BAR repeats the exact predecessor/arm market state and counters; later
+   observations advance monotonically and exactly once per physical elapsed bar.
+4. Invalidation/confirmation/expiry priority is deterministic; terminal events
+   cannot acquire successors.
+5. Proposal entry binds the correct arm or confirmed observation reference price;
+   rejected/not-evaluated proposal states cannot masquerade as executable entry.
+6. State mutation is transactional: an evidence/Layer5 failure does not partially
+   advance pending lifecycle.
+7. Public `evaluate_with_lifecycle(...)` owns exact base, benchmark and HTF
+   `FrameRead`, revalidates each, recomputes base indicators from raw base bars and
+   does not reread mutable benchmark/cache state.
+8. Legacy `generate()` behavior and frozen digest remain compatible; typed API
+   hardening did not silently choose new thresholds/timeframes.
 
-1. `MexcStrategySpec` uses strict exact-key parsing, canonical interval aliases,
-   pinned contract identity and a deterministic canonical instance hash.
-2. Strategy, volatility context, base/benchmark requests, HTF cache, indicator
-   parameters, volume profile and both history gates are built from the same
-   resolved specification.
-3. `CycleEnvelope` stores the full canonical payload plus contract/instance
-   hashes, dispatches decoding by its persisted spec version, rebuilds it
-   strictly, and rejects an unsupported/mismatched version or a timeframe
-   inconsistent with the spec.
-4. Unknown, missing, duplicate or mistyped YAML values fail closed.
-5. Every declared numeric indicator field executes on both base and HTF paths;
-   history and volume-profile parameters are live rather than decorative.
-6. Still-unwired `min_rsi_1h` and `require_confluence` values are accepted only
-   at their inert defaults and reject attempted activation.
-7. The committed default preserves previous scanner behavior. Commit `258c35f`
-   pins the cumulative VWAP/OBV/CVD modes, volume-profile levels and one stateful
-   arm-to-confirm decision/proposal trace, including the behavioral digest
-   above. Explain what those finite golden vectors prove and what they cannot
-   prove about every possible market path.
-8. The frozen `tests/fixtures/mexc_strategy_v2_cycle_envelope_v3.json` rebuilds
-   through the version-dispatched v2 path with the pinned v2 contract and
-   instance hashes. Confirm that it is canonical and that its hashes remain
-   unchanged from `258c35f`.
-9. Journal append/restart inspection, strict dataset reading and model export
-   require one exact `(spec version, contract hash, instance hash)` identity per
-   file. Model records expose that identity as metadata outside the predictive
-   feature whitelist.
+### Exact closed-frame provenance
 
-A future `mexc_strategy_v3` is not implemented. It must add new types, config,
-parser, hash implementation and a separate evidence namespace. No v3 timeframe,
-window or threshold has been selected.
+Verify from `trading/market_data/frame_provenance.py`, feed/cache and scanner:
 
-The present executable timeframe semantics are explicit:
+1. Frame identity binds venue, symbol, canonical timeframe, cutoff, exact bar
+   range/count, canonical OHLCV(+turnover availability) and hash.
+2. Operational request latency is outside market-frame identity but preserved in
+   source evidence; evidence is causal (`request_started_at <= received_at <=`
+   decision/cycle receipt boundary).
+3. `fresh`, `stale`, `no_rows`, `request_failed` and `not_requested` are distinct.
+   Malformed HTTP/JSON/API payload is never laundered into empty/no-data.
+4. A failed refresh may retain a hashed stale frame only as stale evidence. It
+   cannot become current/fresh, and stale base data cannot produce an entry.
+5. Base, benchmark and HTF evidence exist per symbol/read; raw bundle hash binds
+   their latency-free market/frame identities, while request/receipt/cache facts
+   remain in separately persisted operational evidence. Cycle `SourceTiming`
+   entries for the
+   benchmark/base/HTF bar sources are deterministic projections of that evidence,
+   not second free-form claims. Universe and allowed contract-details timings are
+   separate cycle-level provenance and are not `FrameRead` objects.
+6. Terminal pre-evaluation/empty cycles encode benchmark `not_requested` and do
+   not invent a market request.
 
-- base and BTC benchmark: Min60, 320 closed bars;
-- HTF: Hour4, 120 closed bars, 1800-second request TTL;
-- windows remain fixed counts of their source bars.
+### Journal schema v6 and reader
 
-Therefore the current 45-bar pump window is 45 hours, confirmation wait is 3
-hours, recent MSB is 6 hours, relative-strength lookback is 24 hours, and the
-12-bar HTF structural anchor is 48 hours. These durations preserve existing
-behavior; they do not establish the intended fast-pump horizon. No Min15 or
-execution-timeframe feed was invented by this refactor.
+Verify from `trading/metrics/population_journal.py`,
+`trading/metrics/cycle_envelope.py`, `app/scan.py` and
+`ai/reversal/population_dataset.py`:
 
-Do not treat all `*_bars` fields as interchangeable duration fields. Separate
-event horizons (pump, confirmation, recent structure and relative-strength
-lookbacks) from estimator sample counts (RSI/EMA/ATR/bands/ADX), volume-profile
-sample requirements, warm-up/data budgets and fixed-HTF anchors. Equal elapsed
-seconds on Min15 and Min60 do not imply equal features or decisions because the
-sampled paths differ.
+1. `SCHEMA_VERSION=5` is the frozen compatibility alias;
+   `CURRENT_WRITE_SCHEMA=6`; `CYCLE_IDENTITY_VERSION=5` remains separate.
+2. A new writer emits v6 only. Existing v5 opens read-only and cannot be appended
+   or silently migrated. Legacy v5 model export needs explicit opt-in in addition
+   to normal checkpoint policy.
+3. V6 header pins evidence contract identities and benchmark evidence. Each row
+   carries exact base/HTF evidence, raw bundle identity and optional lifecycle.
+4. Entry action vocabulary is strict. An entry requires current data and a typed
+   lifecycle/proposal consistent with row action; HOLD/error semantics fail closed.
+5. Every row is exactly bound to envelope venue/symbol/cycle/spec/timing and its
+   source receipt is no later than decision/cycle completion.
+6. Benchmark/base/HTF bar-source timings are exactly re-derived from evidence;
+   universe and allowed contract-details timings keep their separate validators.
+   Unsupported extra sources or a terminal benchmark that was allegedly requested
+   are rejected.
+7. Input/snapshot IDs are re-derived rather than trusted. Canonical numeric and
+   integer types cannot drift through `1`, `1.0`, bool or non-finite ambiguity.
+8. Cross-cycle pending lifecycle chain is validated. A coherently rehashed forged
+   predecessor/epoch still fails.
+9. `contains_cycle()` refreshes under lock and scanner checks it before strategy
+   mutation. `runtime_session()` is a non-blocking process/thread lifetime lock;
+   a second scanner owner fails before its first market request and a crash/error
+   releases the OS lock.
+10. Strict reader validates the complete file before yielding; evidence remains
+    top-level metadata and never enters the numeric feature whitelist.
 
-## Journal-v5 and checkpoint threat boundary
+## Exact trust boundary: journal v5 and v6
 
-Inspect and explain the precise boundary, without calling the journal generally
-"tamper-proof" or "tamper-evident" without qualification.
+Do not call either journal generically “tamper-proof.” Verify and state exactly:
 
-Expected implementation:
+1. The unkeyed chain detects accidental corruption, torn/incomplete writes,
+   splicing, partial edits and an earlier-cycle change with an unchanged successor.
+2. Restart/stale-writer guards reject rollback, fork or rewrite relative to the
+   writer's cached observed prefix.
+3. A fresh unanchored reader can accept a different complete internally valid
+   chain, including clean suffix deletion or a coordinated whole-file rewrite.
+4. `JournalCheckpointReceipt` is unsigned. A copy beside the writable journal is
+   not independently trusted. It becomes an anchor only when preserved or
+   authenticated outside the journal writer's rewrite domain and later supplied
+   explicitly.
+5. A trusted receipt authenticates only its exact covered prefix (journal ID,
+   sequence/tip, byte length and prefix SHA-256), not later tail cycles.
+6. Default anchored reading yields the covered prefix. Explicit unanchored-tail
+   inclusion may expose validated but unauthenticated later cycles.
+7. `model_input_records()` requires a trusted external receipt by default;
+   unanchored research needs explicit `allow_unanchored=True`. Frozen v5 needs
+   explicit `allow_legacy_v5` as well.
+8. Neither pins, chain nor test fixtures authenticate MEXC responses or establish
+   trading edge. They enforce internal evidence contracts.
 
-- each new journal receives a random 256-bit `journal_id`;
-- cycles use contiguous `sequence_no`, a domain-separated genesis,
-  `prev_cycle_commit`, and a footer `cycle_commit` over the canonical header,
-  every complete ordered decision row, and footer core;
-- restart validates the entire chain and population membership;
-- cooperating writers share process-local and OS sidecar locks;
-- a stale writer may adopt only an exact extension of its observed prefix and
-  rejects rollback, fork or rewrite relative to that cached state;
-- `PopulationJournal.checkpoint_receipt()` returns an unsigned detached receipt
-  containing journal/cycle identity, sequence, cycle commit, exact prefix byte
-  length and prefix SHA-256;
-- `verify_population_journal()` exposes whether the file is only internally
-  consistent or externally anchored through a supplied receipt;
-- the reader validates the complete file first, then checks every second-pass
-  cycle ID/commit against the first pass before yielding;
-- file stability includes device, inode, size, mtime and ctime.
-
-The security statement must remain exact:
-
-1. The unkeyed v5 chain detects accidental corruption, partial edits, torn or
-   incomplete writes, splicing and a changed earlier cycle with an unchanged
-   successor.
-2. A fresh unanchored reader accepts any complete internally valid prefix. Clean
-   suffix deletion/rollback is detectable only relative to a stale writer's
-   cached prefix or a trusted receipt that covered the removed cycles.
-3. An actor able to coherently rebuild an entire unanchored file can produce a
-   different but internally consistent chain.
-4. A receipt stored beside the writable journal is not independently trusted.
-   It becomes an anchor only after being preserved/authenticated outside the
-   journal writer's trust domain and explicitly supplied later.
-5. A trusted earlier receipt detects a rewrite of its covered prefix. It does
-   not authenticate later tail cycles.
-6. With a receipt and default reader behavior, only the anchored prefix is
-   yielded. `anchored_only=False` explicitly includes the validated but
-   unanchored tail.
-7. Without a receipt, the neutral generic reader provides integrity-only access.
-   Explicit `anchored_only=True` must fail with
-   `trusted_checkpoint_required_for_anchored_read`.
-8. `model_input_records()` requires a trusted receipt by default. Unanchored
-   model input is available only through the explicit research override
-   `allow_unanchored=True`.
-
-## Executable paths that must be inspected
+## Executable paths to inspect
 
 - `config/mexc_strategy_v2.yaml`
 - `core/mexc_strategy_spec.py`
 - `core/signal_generator.py`
 - `core/indicators.py`
 - `core/volume_profile.py`
+- `trading/signals/lifecycle_contract.py`
 - `trading/signals/layered_strategy.py`
 - `trading/signals/strategy_interface.py`
-- `trading/market_data/universe.py`
+- `trading/market_data/frame_provenance.py`
+- `trading/market_data/source_timing.py`
 - `trading/market_data/bar_contract.py`
 - `trading/market_data/feed.py`
-- `trading/market_data/mexc_client.py`
 - `trading/market_data/timeframe_cache.py`
+- `trading/market_data/universe.py`
 - `trading/metrics/cycle_envelope.py`
 - `trading/metrics/population_journal.py`
 - `ai/reversal/feature_contract.py`
 - `ai/reversal/population_dataset.py`
 - `backtesting/single_position.py`
 - `app/scan.py`
-- `trading/alerts/telegram.py`
-- `ai/train.py` only to explain why it is legacy and excluded
+- `ai/train.py` only to explain why it is legacy/excluded
 
-Inspect at least these tests:
+Inspect at least:
 
+- `tests/v2/test_signal_lifecycle_contract_v1.py`
+- `tests/v2/test_strategy_lifecycle_integration_v1.py`
+- `tests/v2/test_frame_provenance_v1.py`
+- `tests/v2/test_population_journal_v6.py`
+- `tests/v2/test_population_journal_v5_compatibility_fixture.py`
+- `tests/fixtures/mexc_population_journal_v5_minimal.jsonl`
+- `tests/v2/test_population_journal_chain_v5.py`
+- `tests/v2/test_scan_v2.py`
+- `tests/v2/test_scan_source_provenance_v2.py`
+- `tests/v2/test_scan_journal_reader_e2e_v2.py`
+- `tests/v2/test_population_feature_dataset_v2.py`
+- `tests/v2/test_reversal_feature_contract_v2.py`
+- `tests/v2/test_journal_cycle_records_v2.py`
+- `tests/v2/test_mexc_strategy_runtime_integration_v2.py`
+- `tests/v2/test_mexc_strategy_v2_compatibility_fixture.py`
 - `tests/v2/test_indicator_golden_vectors_v2.py`
 - `tests/v2/test_volume_profile_golden_vector_v2.py`
 - `tests/v2/test_signal_logic_golden_vector_v2.py`
-- `tests/v2/test_mexc_strategy_v2_compatibility_fixture.py`
-- `tests/fixtures/mexc_strategy_v2_cycle_envelope_v3.json`
-- `tests/v2/test_mexc_strategy_spec_v2.py`
-- `tests/v2/test_mexc_strategy_runtime_integration_v2.py`
-- `tests/v2/test_population_journal_chain_v5.py`
-- `tests/v2/test_reversal_feature_contract_v2.py`
-- `tests/v2/test_population_feature_dataset_v2.py`
-- `tests/v2/test_journal_cycle_records_v2.py`
-- `tests/v2/test_population_journal_v2.py`
-- `tests/v2/test_scan_journal_reader_e2e_v2.py`
-- `tests/v2/test_scan_source_provenance_v2.py`
-- `tests/v2/test_causal_cycle_identity_v2.py`
 - `tests/v2/test_single_position_contract_v2.py`
 - `tests/v2/test_single_position_schema_v3.py`
-- `tests/v2/test_single_position_result_invariants_v2.py`
-- `tests/v2/test_layered_strategy_thread_safety_v2.py`
-- `tests/v2/test_market_context_gate_v2.py`
-- `tests/v2/test_timeframe_cache_v2.py`
-- `tests/v2/test_closed_bar_contract_v2.py`
-- `tests/v2/test_turnover_units_v2.py`
-- `tests/v2/test_telegram_alerter_v2.py`
-- `tests/test_strategy_dry_run.py`
+- `tests/v2/test_causal_cycle_identity_v2.py`
 
-## Causal-path claims to prove from code
+## Required adversarial audit
 
-1. The single-position selector ranks the causal cohort before future fill data,
-   never retrospectively promotes a filled runner-up, groups by `cycle_id`, and
-   rejects outcomes whose mandatory ReplayEvidence does not rebuild exactly.
-2. The closed-bar contract excludes forming candles and records source timing.
-3. The feature contract is versioned, has a pinned schema hash, separates
-   MODEL/PROPOSAL/POLICY/CONTEXT/DIAGNOSTIC roles, and distinguishes observed
-   zero from missing/unavailable.
-4. Every population member, including HOLD/error states, gets the same captured
-   feature schema.
-5. Frozen-universe funding reaches `StrategyContext`; live ticker data is not
-   reintroduced into the closed-bar decision.
-6. Strategy/universe hashes and snapshot/cycle/input/envelope/market-feature
-   identities are rebuilt rather than trusted; the StrategySpec evidence decoder
-   is selected by persisted version and each journal is homogeneous in the exact
-   version/contract/instance triple.
-7. Empty-universe and pre-evaluation failures leave durable zero-row cycles.
-8. The strict reader rejects malformed, incomplete, reordered, mixed-schema or
-   drifting cycles before an export can partially consume them.
-9. Model input exposes only the model whitelist, carries exact StrategySpec
-   identity as non-feature metadata, and obeys the checkpoint rules above.
-10. Legacy event-conditioned CSV and `ai/train.py` cannot be mistaken for the
-    new population admission path.
+Confirm tests or independently reason through:
 
-## Required adversarial checks
+- lifecycle IDs change for every semantic arm/predecessor/price/policy change;
+- SAME_BAR with changed OHLC/input/counter fails; backward or skipped physical bar
+  transitions fail; invalidation beats same-bar confirmation;
+- legacy pending state cannot fabricate a typed predecessor; a failed Layer5 or
+  evidence check leaves pending state unchanged;
+- public typed API rejects mismatched symbol/timeframe/cutoff/raw bundle and never
+  falls back to mutable cached benchmark/HTF;
+- reordered/non-finite/gapped bars, invalid high/low, malformed HTTP/JSON/API and
+  fake empty data fail; stale refresh remains distinctly stale;
+- v6 rejects forged `input_hash`/`snapshot_id`, arbitrary action, wrong venue or
+  symbol, cycle-owned field drift, late evidence, source-timing drift, unsupported
+  extra source timing, invalid terminal benchmark policy, noncanonical integer/
+  numeric types and cross-cycle lifecycle substitution;
+- entry without typed lifecycle/proposal, or entry on stale base evidence, fails;
+- `contains_cycle()` observes an external append; second runtime owner is rejected;
+- v5 fixture reads exactly, refuses append/migration and requires explicit legacy
+  model-export opt-in;
+- coordinated whole-file rewrite can remain internally consistent without an
+  external receipt but is rejected when it changes an externally anchored prefix;
+- evidence/checkpoint metadata is not part of numeric predictive features.
 
-Reproduce or inspect tests for all of the following without modifying tracked
-files:
+Passing tests prove only their specified invariants. They do not prove every
+market path, external authenticity, exchange availability, execution latency,
+profitability or model value.
 
-- StrategySpec missing/unknown/duplicate keys, type confusion, unsupported
-  intervals, contract-hash drift and instance-hash drift;
-- exact default configuration parity for SignalConfig, history gates, benchmark
-  interval and HTF cache, plus numerical golden vectors for cumulative
-  indicators and volume profile and the pinned stateful strategy behavior digest;
-- for the one frozen default arm/confirm fixture, stable trace, action, stop/TP
-  proposal and causal diagnostics are covered by explicit assertions plus a
-  digest after 12-decimal float normalization; wall-clock-only identity remains
-  excluded. Explain why this locks a representative path, not every strategy
-  branch or sub-quantization numerical change;
-- the frozen v2 cycle-envelope fixture must retain its canonical payload digest,
-  rebuild its exact v2 contract/instance hashes through the v2 dispatch path;
-  unknown or outer/payload-mismatched versions must fail closed;
-- a journal or model-input export must reject a second exact StrategySpec
-  identity, including a coherently rehashed different instance under the same v2
-  contract, before treating the file as one population;
-- rehashed outcome substitution, forged costs/sizing/timing, false replay-input
-  hashes and evidence from a different bar;
-- malformed rows, full-row/provenance edits, incomplete tails, duplicate cycles,
-  wrong ordering and concurrent stale writers;
-- changing and rehashing an earlier v5 cycle while leaving its successor
-  unchanged;
-- a coordinated whole-file rewrite that remains internally consistent but is
-  rejected by an earlier trusted external receipt;
-- forged receipt journal ID, cycle commit, exact byte length or prefix SHA-256;
-- a same-size/same-mtime file replacement between validation passes: no changed
-  row may be yielded before rejection;
-- explicit anchored reading without a receipt must fail;
-- model input without a receipt must fail unless the explicit unsafe research
-  override is supplied.
+## Remaining work to assess, in this order
 
-Do not weaken a finding because the current tests pass. State exactly what each
-test proves and what it cannot prove.
+Typed lifecycle and per-symbol base/benchmark/HTF provenance are **completed
+claims to verify**, not the next implementation request.
 
-## Open work and decisions, not completed claims
+1. Decide and test restart semantics: append an explicit right-censor before a
+   new arm hypothesis or deterministically rehydrate pending state only from an
+   externally anchored v6 prefix. Silent continuation is forbidden.
+2. Separate persisted identities for `MarketFeatureSnapshot`, `RuleEvaluation`,
+   `StrategyProposal` and `ShadowPrediction`; add point-in-time instrument spec
+   (contract size, quantity step, minimums, leverage/rounding rules, timestamp,
+   content hash).
+3. Compute a complete gate-independent causal snapshot and raw-universe ledger
+   before rule filtering. Until late-feature missingness no longer encodes the
+   rule path, model training is forbidden.
+4. Bind versioned proposal to executable single-position labels and exact costs:
+   one entry, one SL, one TP, sizing, fees, spread, slippage, funding, horizon and
+   concurrency one.
+5. Only then collect prospective runtime population with external checkpoint/
+   manifest publication and wait for labels to mature.
+6. Build purged chronological evaluation with embargo and untouched test;
+   rules/no-trade/matched-random/constant-logistic baselines precede LightGBM
+   multiclass + separate conditional-payoff/EV head. CatBoost/XGBoost-AFT then
+   sequence/forecast challengers only after evidence warrants them.
 
-Rank any additional findings P0/P1/P2. At minimum assess these remaining items:
+Separately assess future causal feature parity (1h RSI, overhead/Fibonacci,
+weakness/confluence/liquidation proxy, OI notional and relative VP levels) and a
+raw point-in-time contract ledger. Do not merge this with threshold calibration.
+Any fast-pump timeframe is a separately versioned v3 hypothesis; frozen v2 is the
+control.
 
-The mechanical version-dispatch prerequisite is complete in `1971b77`; do not
-report it as open. The next ordered slice is lifecycle plus provenance:
+LLM roles are unchanged: Kimi/OpenAI/Gemini-class models may only transform
+timestamped public text into strict offline JSON context or assist audit/research.
+They must never own numeric action, sizing, stop/TP, leverage, private credentials
+or live execution.
 
-1. Define typed arm-time, scoring-time, confirmation-time and proposal-time
-   states without overwriting earlier evidence. Add per-symbol base and
-   per-symbol/per-timeframe HTF provenance; current cycle timing is aggregated
-   and delivery latency is not execution proof. This slice must not change v2
-   timeframe, windows or thresholds.
-2. Separate durable identities for MarketFeatureSnapshot, RuleEvaluation,
-   TradeProposal, OutcomeLabel and ShadowPrediction.
-3. Add point-in-time instrument specifications: contract size, quantity step,
-   minimums, leverage rules, source timestamp and content hash.
-4. Build a point-in-time ledger of every MEXC USDT contract with explicit
-   inclusion/exclusion reasons, not only the filtered scan universe.
-5. Compute the complete causal feature snapshot before rule gates so missingness
-   cannot encode the rule path.
-6. Implement causal Fibonacci/overhead, weakness, confluence, 1h RSI and
-   liquidation context in the runtime decision path rather than merely declaring
-   them offline/planned.
-7. Normalize OI to notional and price-relative POC/VAH/VAL distances; raw
-   cross-symbol levels remain diagnostic.
-8. Connect population cycles to executable single-position labels with exact
-   fees, spread, slippage, funding, stop/TP geometry and concurrency.
-9. Only after that plumbing, define and compare a separately versioned intended
-   fast-pump time hypothesis. Frozen Min60/45-hour v2 remains the control. Future
-   v3 requires new types/config/parser/hash/evidence namespace; no timeframe,
-   field value or threshold has been selected. Equal elapsed duration at Min15
-   and Min60 is not behavioral parity.
-10. Define a real external checkpoint publication/retention workflow. The
-    detached receipt API alone does not create an external trust domain.
-11. Build forward-data manifests and only then purged chronological evaluation,
-    embargo, untouched test data, symbol/time-clustered uncertainty and matched
-    random/rules/no-trade baselines.
-12. Keep legacy event-conditioned datasets, old calibration claims and
-    `ai/train.py` outside the causal admission path.
+## Safe secret/runtime metadata checks
 
-## Model and tooling architecture to challenge
-
-The current proposed order is:
-
-1. constant/logistic, rules, matched random and no-trade baselines;
-2. small LightGBM multiclass candidate plus a separate conditional-payoff/EV
-   head after prospective labels mature;
-3. CatBoost challenger and XGBoost AFT auxiliary time-to-event model;
-4. TCN/Chronos only after tabular evidence;
-5. Kimi/OpenAI/Gemini-class LLMs only for timestamped public-text extraction to
-   strict JSON, never as the numeric trading, sizing or risk engine.
-
-Tooling is staged: Parquet + DuckDB first, local MLflow second, bounded Optuna
-only inside train/validation, and Evidently/ONNX/DVC only after an observed need.
-Challenge this order only with evidence from this data shape and causal contract,
-not model popularity.
-
-Do not conflate a proposal-independent direction target with the planned
-`tp_first|sl_first|timeout` outcome. Those outcome classes are defined relative
-to a particular stop, target and horizon; if proposal geometry varies, it is a
-causal conditioning input for the outcome classifier as well as the EV head.
-Excluding `FeatureRole.PROPOSAL` is correct only for a separately specified pure
-direction head with a proposal-independent label. Audit the current combined
-`model_feature_specs()` whitelist, but do not silently change its estimand.
-Require each future head to pin an ordered feature list/schema hash, target,
-scoring instant and allowed roles; treat CONTEXT explicitly and always exclude
-POLICY/DIAGNOSTIC from numeric prediction inputs unless a separately versioned
-contract proves otherwise.
-
-## Safe secrets and runtime metadata checks
-
-These commands inspect only existence, index/history metadata and process names.
-Never open `.env`, print it, or show historical blob contents.
+Never open `.env` or historical blobs. Only metadata:
 
 ```powershell
 Test-Path -LiteralPath (Join-Path $ROOT '.env')
@@ -479,63 +397,48 @@ git -C $ROOT log --all --format='%H %cs' -- .env
 Get-Process -Name python,pythonw -ErrorAction SilentlyContinue
 ```
 
-Report separately whether `.env` exists, is tracked now, existed in reachable
-history, and has been rotated. Do not infer rotation merely because it is now
-ignored/untracked.
+Report existence, current tracked state, reachable-history presence and confirmed
+rotation separately. Ignored/untracked does not imply rotated.
 
 ## Only allowed executable validation
-
-The only approved Python execution is the local synthetic test suite from the
-MEXC worktree:
 
 ```powershell
 & 'C:\Users\vlasy\PycharmProjects\koteika_Ultra\.venv\Scripts\python.exe' `
   -m pytest -q
 ```
 
-Recorded result at executable/evidence-compatibility tip `1971b77`:
+Recorded full result at executable tip `bb1ca13`:
 
 ```text
-590 passed, 4 skipped, 2 known PytestCollectionWarning (18.95s)
+723 passed, 4 skipped, 2 known PytestCollectionWarning (17.80s)
 ```
 
-The focused StrategySpec/runtime review found no remaining P0/P1. The focused
-journal/checkpoint red-team found no remaining P0/P1/P2 after the two-pass
-replacement and anchored-reader fixes. Re-audit those conclusions; do not repeat
-them merely because they are written here. Also re-audit the new version dispatch,
-exact journal identity latch and model-export identity metadata; passing tests do
-not establish external evidence authenticity.
+Re-run only this local synthetic suite if needed. Do not run scanner, bot, network
+scripts, model training, exchange access or Telegram delivery.
 
-Do not run the scanner, bot, ad-hoc network scripts or tests requiring private
-credentials, exchange access or Telegram delivery.
+## Required response
 
-## Required response format
+Return one read-only report before proposing any edit:
 
-Return one read-only review before proposing any edits:
+1. exact root/MEXC paths, worktrees, branch, HEAD, upstream and dirty state;
+2. commit-by-commit explanation through `bb1ca13` and later docs-only commits;
+3. causal data-flow map from sources → FrameRead/provenance → lifecycle/rules →
+   journal/checkpoint → future identities/proposal/label/model/replay;
+4. independently verified version/hash/pin/path matrix;
+5. implemented vs partial vs planned, explicitly treating lifecycle/provenance/v6
+   as completed claims and gate-independent snapshot as open;
+6. adversarial lifecycle, stale-evidence and journal-v6/v5-compatibility analysis;
+7. exact v5/v6 trust boundary, with no unqualified “tamper-proof” claim;
+8. contradictions among docs, code and tests;
+9. leakage/look-ahead/population/timing/execution/reproducibility risks ranked
+   P0/P1/P2 with file/line evidence;
+10. exact test evidence and what it cannot prove;
+11. assessment of baseline → LightGBM+EV → challenger and restricted-LLM order;
+12. corrected ordered plan with measurable acceptance criteria;
+13. operational verdict: bot/secret/edge/model/network/live state and safest next
+   code slice.
 
-1. exact root/MEXC worktree, branch, HEAD, upstream and dirty-state facts;
-2. commit-by-commit explanation through executable tip `1971b77`, plus any later
-   documentation-only descendants;
-3. a causal data-flow map from MEXC sources through StrategySpec, universe,
-   closed bars, features, rules, population journal/checkpoint, proposal, label,
-   model and single-position replay;
-4. the version/hash matrix independently verified from code;
-5. what is implemented, partially implemented and only planned;
-6. an adversarial analysis of StrategySpec parity and journal-v5 trust boundary;
-7. contradictions among documentation, implementation and tests;
-8. leakage, look-ahead, population-selection, timing, execution and
-   reproducibility risks ranked P0/P1/P2 with file/line evidence;
-9. exact test evidence and the limits of that evidence;
-10. an assessment of the baseline/LightGBM+EV/challenger/LLM architecture;
-11. a corrected next-step plan with measurable acceptance criteria;
-12. a final operational verdict covering bot state, secret status, edge status,
-    model status and the safest next code decision.
-
-Do not make changes during this pass. Version dispatch and continued v2 evidence
-readability are now implemented claims to verify, not prerequisites still waiting
-for code. The immediate next code slice is typed arm/confirm/proposal lifecycle
-plus per-symbol/per-timeframe provenance, without changing the frozen
-Min60/45-hour v2 hypothesis. A future physical-duration v3 requires its own
-types/config/parser/hash/evidence namespace; no timeframe, window or threshold has
-been chosen. Private execution and live trading remain a separate future project
-and require a reproducible edge plus rotated credentials.
+Do not implement fixes in this pass. Do not request permission to implement. The
+purpose is a fresh independent audit of the committed v6 evidence boundary and a
+precise next plan. Private execution/live remain a separate future project after
+rotated credentials and reproducible prospective edge.

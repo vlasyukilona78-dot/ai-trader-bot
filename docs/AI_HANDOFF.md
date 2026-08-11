@@ -1,21 +1,23 @@
 # AI collaboration handoff
 
-Updated: 2026-08-09, Europe/Moscow
+Updated: 2026-08-11, Europe/Moscow
 
 > [!IMPORTANT]
 > Fresh-session entrypoint: read `CLAUDE.md` and
 > `docs/CLAUDE_REVIEW_PROMPT_2026-08-03.md`, then treat
 > `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` as the current MEXC plan. The
 > published AI foundation anchor is `f0b43d6`; the StrategySpec/journal-v5
-> foundation tip is `2d0efcb`, the frozen-behavior tip is `258c35f`, and the
-> latest executable code tip is `1971b77`.
+> foundation tip is `2d0efcb`, the frozen-behavior tip is `258c35f`, the
+> versioned StrategySpec evidence tip is `1971b77`, the finalized typed
+> lifecycle tip is `9ef6b4f`, and the latest executable code tip is `bb1ca13`.
 > Discover any later documentation-only descendant with `git log`. The
 > `98217df`/`340 passed`
 > checkpoint immediately below is a
 > preserved earlier causal-scanner snapshot, not the latest foundation state.
-> Latest code validation: `590 passed, 4 skipped, 2 known collection warnings`
-> (`18.95s`). Current journal path:
-> `data/runtime/mexc_population_decisions_v5.jsonl`.
+> Latest code validation: `723 passed, 4 skipped, 2 known collection warnings`
+> (`17.80s`). Current writer/default path: journal schema v6 at
+> `data/runtime/mexc_population_decisions_v6.jsonl`. Schema v5 remains frozen,
+> fixture-backed and read-only; it is not the current append target.
 
 ## Earlier causal-scanner checkpoint — 2026-08-03
 
@@ -1850,3 +1852,195 @@ Next implementation order remains:
 7. Only after prospective labels mature, run simple baselines and then the
    LightGBM proposal-conditioned outcome plus separate EV candidate, with
    CatBoost as challenger.
+
+## Typed lifecycle and journal-v6 evidence checkpoint — 2026-08-11
+
+This append-only checkpoint is the authoritative executable state after the
+version-dispatched StrategySpec section above. It supersedes earlier statements
+that per-symbol base/HTF provenance and typed arm/confirmation lifecycle were
+still entirely missing. It does not supersede the no-edge verdict, the model
+training prohibition or any live-risk boundary.
+
+### Executable commits and validation receipt
+
+The complete evidence series descends from `1971b77` and includes:
+
+```text
+eb238b2 test(journal): freeze schema v5 evidence boundary
+c541eea feat(evidence): define candidate lifecycle contract
+a604668 feat(evidence): bind exact closed-frame provenance
+8569471 fix(evidence): reject malformed empty frame reads
+cf6bc01 feat(strategy): emit typed candidate lifecycle evidence
+9ef6b4f fix(evidence): finalize typed lifecycle semantics
+bb1ca13 feat(journal): persist typed population evidence in schema v6
+```
+
+`bb1ca13` is the latest executable code tip for this checkpoint. Validation on
+that committed source tree:
+
+```text
+full pytest: 723 passed, 4 skipped, 2 known PytestCollectionWarning (17.80s)
+git diff --check before documentation update: clean
+```
+
+The two warnings are the existing collection warnings; no new warning class was
+introduced by this series.
+
+### Current version and identity matrix
+
+| Boundary | Current version / identity |
+|---|---|
+| MEXC StrategySpec | frozen `mexc_strategy_v2` control |
+| CycleEnvelope | schema v3 |
+| causal cycle identity | version v5, unchanged by the journal-format bump |
+| population journal writer | schema v6 |
+| default population path | `data/runtime/mexc_population_decisions_v6.jsonl` |
+| frozen population compatibility | schema v5, read-only, exact fixtures retained |
+| reversal feature contract | `mexc_reversal_features_v2`; `20f9f61d4e2d787c5ad05f54ee3ccd8b7f8ea3a99fe09bc38bbefe09872c496c` |
+| frame provenance | v1; `f4004ac933cc1725b2560e93ffbe278c826910424e350059ad29420ed3665dbf` |
+| candidate lifecycle | `candidate_lifecycle_v1`; `cc75c871b7097aa215f9ac88c736b6572e2443318cb0cf9f8bdaf1b0c8cc8551` |
+| single-position replay | schema v3, still offline and not yet connected to population labels |
+
+`SCHEMA_VERSION` deliberately remains the public alias for immutable journal
+v5 evidence, while `CURRENT_WRITE_SCHEMA` is 6. `CYCLE_IDENTITY_VERSION` remains
+5, so moving the serialization format to v6 does not silently rename an
+otherwise identical causal cohort. Existing v5 fixture bytes, commitment
+domains and readers remain pinned. A v5 file can be verified and read, but any
+attempt to append fails closed and directs the caller to a separate v6 file.
+Model export from v5 additionally requires explicit `allow_legacy_v5=True`;
+legacy evidence is never silently treated as typed v6 evidence.
+
+### Exact closed-frame evidence consumed by the strategy
+
+The typed strategy entrypoint now receives three explicit `FrameRead` objects:
+base OHLCV for the candidate symbol, the BTC benchmark frame and the candidate
+symbol's higher-timeframe frame. It no longer obtains benchmark or HTF input
+from mutable shared strategy/cache state. After taking owned frame copies it
+revalidates the exact source evidence and recomputes base indicators from the
+raw base frame used by the decision.
+
+Each `SourceReadEvidenceV1` binds the source and venue identities, canonical
+venue symbol, timeframe, requested cutoff, request/receipt timing, expected
+closed boundary, row count, first/last bar boundaries and canonical frame hash.
+The latency-free market/frame identities of the three items are bound again by
+one canonical raw-frame-bundle hash; request, receipt and cache facts remain in
+their separately persisted operational evidence. The benchmark/base/HTF
+bar-source timings in the CycleEnvelope are derived from that evidence rather
+than accepted as an unrelated caller assertion. Universe and
+allowed contract-details timings remain separate cycle-level provenance and are
+not represented as `FrameRead` objects. Receipt times later than the decision
+and row/envelope symbol, venue, timeframe or cutoff drift fail closed.
+
+The evidence vocabulary distinguishes `fresh`, `stale`, `no_rows`,
+`request_failed` and `not_requested`. A stale frame keeps its exact range/hash
+and safe reason instead of becoming a fresh observation. An `evaluated` row
+requires fresh base evidence; an entry action additionally requires benchmark
+and HTF data through their expected closed boundaries. Empty, failed and stale
+reads therefore remain auditable without being promoted into executable entry
+evidence.
+
+### Typed arm, confirmation and proposal evidence
+
+`CandidateArmV1` binds the exact StrategySpec identity, raw input bundle,
+symbol/side/timeframe, arm bar and cutoff, observed high/low/close, effective
+invalidation level, confirmation policy and immutable arm trace. Its semantic
+candidate ID excludes scheduling, persistence and delivery wall clocks.
+
+Follow-up events use the explicit states `same_bar`, `waiting`, `confirmed`,
+`invalidated` and `expired`; confirmation-disabled evaluation uses the separate
+terminal state `bypassed`. Same-bar evidence must be an exact repeat of the arm
+observation. Later observations must advance on the base timeframe with
+monotonic observation counts and price-state semantics consistent with the
+candidate side. Every event names its exact predecessor, state epoch and
+confirmation observation identity.
+
+A proposal observation is either not evaluated, created or rejected. It can be
+evaluated only from a confirmation observation or from the explicit arm-bypass
+path. A created proposal is bound to the exact input bundle, reference bar,
+cutoff and decision reference close used to create it. These records prove what
+the rules observed and proposed; they are not orders and do not yet constitute
+the durable point-in-time `TradeProposal` needed by the replay/label bridge.
+
+The scanner passes the exact base/benchmark/HTF triplet into this typed strategy
+path and persists the resulting lifecycle event in the same population row.
+Typed evaluation is transactional: malformed evidence cannot partially commit a
+pending lifecycle transition. The legacy `generate()` path and its pinned v2
+behaviour remain compatible; v6 scanner evidence uses the typed path.
+
+### Journal v6, lifecycle chain and runtime ownership
+
+A v6 cycle header persists the evidence-contract identities and exact benchmark
+source evidence. Every decision row persists exact base and HTF evidence, the
+raw bundle hash and an optional typed lifecycle event. The strict reader
+reconstructs causal row identities and snapshots, checks the exact
+row-to-envelope projection and admits only `HOLD`, `SHORT_ENTRY` or
+`LONG_ENTRY`. Entry rows require a valid typed lifecycle outcome and current
+source evidence. The existing journal commitment/checkpoint trust boundary is
+unchanged: the internal chain detects accidental corruption and inconsistent
+edits, while rollback or a coherent rewrite of an unanchored file still needs an
+externally protected receipt to detect.
+
+Across ordered v6 cycles the reader/writer validates witnessed lifecycle
+predecessors and rejects duplicate candidates/events, orphan follow-ups and
+forks. A new initial event for the same symbol right-censors the older active
+candidate. This is evidence-chain validation, not runtime restoration: after a
+process restart the scanner still does not rehydrate a pending in-memory
+candidate. A deliberate restart right-censor record or a tested rehydration
+contract remains pending.
+
+The scanner now takes two complementary ownership guards. A process-local
+whole-sweep lock serializes mutations of strategy confirmation state. A
+non-blocking journal lifetime lock spans the scanner loop across threads and
+processes, so another scanner using the same journal fails before its first
+market request. Journal append locks still protect byte-level refresh, dedup,
+append and fsync; they are not used as a substitute for runtime ownership.
+
+Strict model export still requires a trusted external checkpoint unless the
+caller explicitly selects the unsafe unanchored research override. StrategySpec
+identity, exact benchmark/base/HTF evidence, raw bundle identity, lifecycle
+event and typed-evidence status are returned as top-level partition/evidence
+metadata. They stay outside the numeric `features` mapping and must not become
+predictors merely because the exporter carries them beside a row.
+
+### Unresolved gates and operational truth
+
+- **No edge:** generic pump-fade still has no demonstrated stable positive edge
+  after costs. Earlier positive-expectancy/DCA claims remain retracted.
+- **No model:** no model has been fitted, selected, promoted or enabled.
+- **Training remains blocked:** rule trace and feature missingness are still
+  gate-conditioned. The current population can validate evidence mechanics but
+  is not an admissible unbiased training population.
+- **No point-in-time instrument/proposal-label bridge:** contract size,
+  quantity step, minimums, leverage rules and their source timestamp/content
+  hash are not yet frozen into the decision. A durable `TradeProposal` and
+  `OutcomeLabel` connection to single-position replay is still absent.
+- **Restart semantics remain incomplete:** the historical chain is validated,
+  but pending candidate state is not rehydrated and an explicit restart
+  right-censor policy is not yet persisted.
+- **Secrets remain unsafe:** historical credentials have not been rotated.
+  `.env` was not read. Private APIs, Telegram, testnet and live execution remain
+  forbidden.
+- **No operational run:** this series did not start the scanner/bot, call an
+  exchange or other network service, train a model, deliver an alert or expose
+  capital.
+
+### Required next implementation order
+
+1. Freeze and test the restart boundary: either persist an explicit
+   right-censor event before accepting a new candidate or implement deterministic
+   pending-candidate rehydration from externally anchored v6 evidence.
+2. Persist separate versioned identities for `MarketFeatureSnapshot`,
+   `RuleEvaluation`, `StrategyProposal` and `ShadowPrediction`; add point-in-time
+   instrument rules including contract size, quantity step, minimums, leverage,
+   source receipt and content hash.
+3. Compute the full causal feature snapshot independently of early rule exits and
+   add the raw-contract inclusion/exclusion ledger. Gate results belong in
+   outcomes/metadata, not in the feature-availability pattern.
+4. Build the journal-to-TradeProposal-to-OutcomeLabel bridge against
+   single-position schema v3 with exact entry eligibility, one stop, one TP,
+   sizing, fees, spread, slippage, funding and concurrency one.
+5. Accumulate an anchored prospective runtime population, then run purged
+   chronological rules/no-trade/random/logistic baselines. Only after those
+   gates pass may LightGBM plus a separate EV head be evaluated in shadow/paper
+   mode, with CatBoost and sequence models as later challengers. Another no-edge
+   result must be accepted without threshold or model shopping.

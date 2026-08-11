@@ -13,28 +13,33 @@ API, or giving a strategy verdict:
    read-only orientation/review sequence.
 2. Read `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` in full. It is the
    authoritative MEXC strategy, data, model and implementation plan.
-3. Read the current checkpoint and the latest 2026-08-09 section of
+3. Read the current checkpoint and the latest 2026-08-11 section of
    `docs/AI_HANDOFF.md`. Earlier sections are an audit history and contain
    superseded findings.
 4. Verify the worktree, branch, local HEAD and remote HEAD yourself. The
    published AI foundation anchor is `f0b43d6` on
    `claude/codex-project-review-04581e`; the 2026-08-08 StrategySpec/journal-v5
    code tip is `2d0efcb`, the behavioral-compatibility tip is `258c35f`, the
-   versioned-evidence compatibility tip is `1971b77`, and current HEAD must
-   descend from all four anchors.
+   versioned-evidence compatibility tip is `1971b77`, the finalized typed
+   lifecycle tip is `9ef6b4f`, and the current journal-v6 code tip is
+   `bb1ca13`. Current HEAD must descend from all six anchors.
 
 ## Current product truth
 
 - Target exchange: MEXC futures.
 - Scope: public-data, signals-only causal research. There is no production MEXC
   private execution adapter in this line.
-- Latest executable tip and test receipt: `1971b77`; `590 passed, 4 skipped`,
-  with two known pytest collection warnings (`18.95s`).
+- Latest executable tip and test receipt: `bb1ca13`; `723 passed, 4 skipped`,
+  with two known pytest collection warnings (`17.80s`).
 - Generic pump-fade has not demonstrated stable positive edge after costs. The
   earlier DCA/positive-expectancy claims are retracted hypotheses, not evidence.
-- Phase 0 plus the Phase 1 timing, replay, canonical StrategySpec and evidence
-  hardening are complete. Population journal schema v5, CycleEnvelope v3 and
-  single-position schema v3 are current; benchmark context fails closed.
+- Phase 0 plus the Phase 1 timing, replay, canonical StrategySpec, typed
+  lifecycle and exact closed-frame evidence foundations are complete. The
+  current population writer is schema v6; CycleEnvelope v3, causal cycle
+  identity v5 and single-position schema v3 remain current. Journal v5 is a
+  frozen read-only compatibility format; benchmark context fails closed.
+- The current reversal feature contract is `mexc_reversal_features_v2`, pinned
+  to `20f9f61d4e2d787c5ad05f54ee3ccd8b7f8ea3a99fe09bc38bbefe09872c496c`.
 - Focused review found no open P0/P1 in the implemented StrategySpec/runtime
   scope and no P0/P1/P2 in the journal/checkpoint scope. Its one StrategySpec
   P2 was the lack of numeric behavioral anchors behind declarative revisions;
@@ -62,23 +67,41 @@ API, or giving a strategy verdict:
   Historical prose coupling “45 bars” to a roughly 20-minute pump is only a clue
   about earlier intent, not an accepted timeframe decision.
 - The current runtime-population path is
-  `data/runtime/mexc_population_decisions_v5.jsonl`; older journal schemas and
-  legacy event-conditioned CSV are not accepted by the strict reader. Every
-  journal file is homogeneous in exact StrategySpec version, contract hash and
-  instance hash; restart, append and strict dataset reading reject mixtures.
-  Model-input records expose that identity as non-feature provenance metadata,
-  never as predictive input.
-- Journal v5 is internally chained and rejects corruption, partial edits,
+  `data/runtime/mexc_population_decisions_v6.jsonl`. Schema v5 fixtures remain
+  strictly readable but v5 files cannot be appended; model export from v5 also
+  requires an explicit legacy opt-in. Earlier journal schemas and legacy
+  event-conditioned CSV are not accepted by the strict reader. Every journal
+  file is homogeneous in exact StrategySpec version, contract hash and instance
+  hash; restart, append and strict dataset reading reject mixtures.
+- Journal v6 binds the exact base, benchmark and higher-timeframe `FrameRead`
+  evidence, the canonical hash of their latency-free market/frame identities,
+  bar-source timing projections and any
+  typed arm/confirmation/proposal lifecycle event. Stale, empty, failed and
+  not-requested sources remain explicit evidence outcomes; they are not silently
+  promoted to current data. The frame-provenance contract pin is
+  `f4004ac933cc1725b2560e93ffbe278c826910424e350059ad29420ed3665dbf`;
+  the lifecycle contract pin is
+  `cc75c871b7097aa215f9ac88c736b6572e2443318cb0cf9f8bdaf1b0c8cc8551`.
+- The scanner now holds one process/thread lifetime lock for the v6 journal and
+  one process-local whole-sweep strategy lock. A competing scanner fails before
+  its first market request, rather than mutating pending lifecycle state and
+  losing a later duplicate-append race.
+- Journal v5/v6 chaining rejects corruption, partial edits,
   incomplete writes and stale-writer rewrites relative to the prefix that writer
   already observed. A fresh reader cannot distinguish a clean shorter prefix or
   a coherent rewrite of a wholly unanchored file: only an explicitly supplied
   receipt kept outside the writer's trust domain anchors a prefix and detects
   rollback within it. Model-input export requires that receipt unless an unsafe
-  unanchored override is stated explicitly.
-- Do not train or enable a model from the current partial snapshots. The trace
-  is still gate-conditioned; intended fast physical windows, per-symbol base/HTF
-  provenance, arm/confirm lifecycle, point-in-time instrument specs and the
-  journal→proposal→label bridge remain unfinished.
+  unanchored override is stated explicitly. Strategy identity, exact source
+  evidence, raw-bundle identity and lifecycle evidence remain top-level
+  non-predictive metadata outside the numeric `features` mapping.
+- Do not train or enable a model from the current snapshots. The trace and
+  missingness are still gate-conditioned, so current rows are not an admissible
+  training population. Intended fast physical windows, point-in-time instrument
+  specs and the proposal-label bridge remain unfinished. Scanner restart
+  validates the historical lifecycle chain but still does not rehydrate an
+  in-memory pending candidate; explicit restart right-censor/rehydration
+  semantics remain an open acceptance gate.
 
 ## AI boundary
 
