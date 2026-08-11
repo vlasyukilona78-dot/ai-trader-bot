@@ -14,6 +14,11 @@ from core.signal_generator import (
     SignalResult,
 )
 from trading.exchange.schemas import AccountSnapshot
+from trading.market_data.frame_provenance import (
+    FrameRead,
+    SourceReadEvidenceV1,
+    raw_frame_bundle_hash,
+)
 from trading.market_data.reconciliation import ExchangeSnapshot
 from trading.signals.layered_strategy import LayeredPumpStrategy
 from trading.signals.lifecycle_contract import (
@@ -332,7 +337,7 @@ def test_typed_evaluation_refuses_to_fabricate_link_for_legacy_pending(monkeypat
     assert generator._pending["ALTUSDT"].lifecycle_event is None
 
 
-def test_confirmed_pending_is_deleted_before_layer5_even_when_layer5_raises(
+def test_typed_pending_is_preserved_when_layer5_raises_before_evidence_commit(
     monkeypatch,
 ) -> None:
     generator = _generator()
@@ -347,7 +352,36 @@ def test_confirmed_pending_is_deleted_before_layer5_even_when_layer5_raises(
             "b" * 64,
         )
 
-    assert "ALTUSDT" not in generator._pending
+    pending = generator._pending["ALTUSDT"]
+    assert pending.lifecycle_event is not None
+    assert pending.lifecycle_event.state is CandidateLifecycleState.ARMED
+    assert pending.distinct_observation_count == 0
+    assert pending.bars_waited == 0
+
+
+def test_observation_contract_failure_does_not_partially_advance_pending(
+    monkeypatch,
+) -> None:
+    generator = _generator()
+    _install_short_gates(monkeypatch, generator)
+    _install_finalize(monkeypatch, generator)
+    _typed_evaluate(generator, _frame(0), "a" * 64)
+    pending_before = generator._pending["ALTUSDT"]
+    event_before = pending_before.lifecycle_event
+    bad = _frame(1)
+    bad.iloc[-1, bad.columns.get_loc("low")] = 101.0
+
+    with pytest.raises(LifecycleContractError, match="observed_close_must_lie"):
+        _typed_evaluate(generator, bad, "b" * 64)
+
+    pending_after = generator._pending["ALTUSDT"]
+    assert pending_after is pending_before
+    assert pending_after.lifecycle_event is event_before
+    assert pending_after.distinct_observation_count == 0
+    assert pending_after.bars_waited == 0
+    _, waiting = _typed_evaluate(generator, _frame(1), "b" * 64)
+    assert waiting is not None
+    assert waiting.state is CandidateLifecycleState.WAITING
 
 
 @pytest.mark.parametrize(
@@ -425,7 +459,76 @@ def _strategy_context(frame: pd.DataFrame) -> StrategyContext:
     )
 
 
-def test_public_typed_api_requires_explicit_htf_and_never_reads_cache(monkeypatch) -> None:
+def _available_read(
+    frame: pd.DataFrame,
+    *,
+    source: str,
+    symbol: str,
+    timeframe: str,
+    requested_as_of_ts: float,
+) -> FrameRead:
+    evidence = SourceReadEvidenceV1.from_frame(
+        frame,
+        source=source,
+        venue="mexc_contract",
+        symbol=symbol,
+        venue_symbol=(symbol[:-4] + "_USDT" if symbol.endswith("USDT") else symbol),
+        timeframe=timeframe,
+        requested_as_of_ts=requested_as_of_ts,
+        request_started_at=requested_as_of_ts + 1.0,
+        received_at=requested_as_of_ts + 2.0,
+        source_ts=requested_as_of_ts + 2.0,
+        cache_hit=False,
+        cache_age_sec=0.0,
+    )
+    return FrameRead(frame=frame.copy(deep=True), evidence=evidence)
+
+
+def _missing_read(
+    *,
+    source: str,
+    symbol: str,
+    timeframe: str,
+    requested_as_of_ts: float,
+) -> FrameRead:
+    evidence = SourceReadEvidenceV1.not_requested(
+        source=source,
+        venue="mexc_contract",
+        symbol=symbol,
+        venue_symbol=(symbol[:-4] + "_USDT" if symbol.endswith("USDT") else symbol),
+        timeframe=timeframe,
+        requested_as_of_ts=requested_as_of_ts,
+        reason="not_available",
+    )
+    return FrameRead(frame=None, evidence=evidence)
+
+
+def _typed_reads(frame: pd.DataFrame, spec: MexcStrategySpec):
+    cutoff = float(frame.index[-1].timestamp()) + _TIMEFRAME_SECONDS
+    base = _available_read(
+        frame,
+        source="base_ohlcv",
+        symbol="ALTUSDT",
+        timeframe=spec.market_data.base_interval,
+        requested_as_of_ts=cutoff,
+    )
+    benchmark = _available_read(
+        frame,
+        source="benchmark_ohlcv",
+        symbol="BTCUSDT",
+        timeframe=spec.resolved_benchmark_interval,
+        requested_as_of_ts=cutoff,
+    )
+    htf = _missing_read(
+        source="higher_timeframe_ohlcv",
+        symbol="ALTUSDT",
+        timeframe=spec.market_data.higher_timeframe.interval,
+        requested_as_of_ts=cutoff,
+    )
+    return base, benchmark, htf
+
+
+def test_public_typed_api_owns_explicit_reads_and_never_reads_mutable_sources(monkeypatch) -> None:
     spec = MexcStrategySpec.from_yaml()
     strategy = LayeredPumpStrategy(strategy_spec=spec)
     calls = {"cache": 0, "contexts": [], "kwargs": []}
@@ -438,6 +541,7 @@ def test_public_typed_api_requires_explicit_htf_and_never_reads_cache(monkeypatc
             raise AssertionError("typed API must not consult the HTF cache")
 
     strategy.set_htf_cache(ForbiddenCache())
+    strategy.set_benchmark(_frame(0, count=20).assign(close=999.0))
 
     def typed_stub(signal_context, **kwargs):
         calls["contexts"].append(signal_context)
@@ -451,32 +555,62 @@ def test_public_typed_api_requires_explicit_htf_and_never_reads_cache(monkeypatc
     monkeypatch.setattr(strategy._generator, "generate_with_lifecycle", typed_stub)
     frame = _frame(0, count=80)
     context = _strategy_context(frame)
+    context.market_ohlcv = frame.assign(rsi=999.0, atr=999.0)
+    base_read, benchmark_read, htf_read = _typed_reads(frame, spec)
 
     intent, event = strategy.evaluate_with_lifecycle(
         context,
-        raw_input_bundle_hash="a" * 64,
-        htf_frame=None,
-    )
-    explicit_htf = _frame(0, count=10)
-    strategy.evaluate_with_lifecycle(
-        context,
-        raw_input_bundle_hash="b" * 64,
-        htf_frame=explicit_htf,
+        base_read=base_read,
+        benchmark_read=benchmark_read,
+        higher_timeframe_read=htf_read,
     )
 
     assert intent.action is IntentAction.HOLD
     assert event is None
     assert calls["cache"] == 0
     assert calls["contexts"][0].htf_frame is None
-    assert calls["contexts"][1].htf_frame is explicit_htf
+    assert float(calls["contexts"][0].benchmark.iloc[-1]["close"]) == float(
+        benchmark_read.frame.iloc[-1]["close"]
+    )
+    assert calls["contexts"][0].benchmark is not benchmark_read.frame
+    assert calls["contexts"][0].df is not base_read.frame
+    assert float(calls["contexts"][0].df.iloc[-1]["rsi"]) != 999.0
+    assert float(calls["contexts"][0].df.iloc[-1]["atr"]) != 999.0
+    assert calls["kwargs"][0]["raw_input_bundle_hash"] == raw_frame_bundle_hash(
+        [base_read.evidence, benchmark_read.evidence, htf_read.evidence]
+    )
     identity = strategy_spec_identity(spec)
     assert calls["kwargs"][0]["strategy_spec_version"] == identity.spec_version
     assert calls["kwargs"][0]["strategy_spec_contract_hash"] == identity.contract_hash
     assert calls["kwargs"][0]["strategy_spec_instance_hash"] == identity.instance_hash
-    with pytest.raises(TypeError, match="htf_frame"):
+    with pytest.raises(TypeError, match="higher_timeframe_read"):
         strategy.evaluate_with_lifecycle(
             context,
-            raw_input_bundle_hash="c" * 64,
+            base_read=base_read,
+            benchmark_read=benchmark_read,
+        )
+
+
+def test_public_typed_api_rejects_mismatched_read_identity() -> None:
+    spec = MexcStrategySpec.from_yaml()
+    strategy = LayeredPumpStrategy(strategy_spec=spec)
+    frame = _frame(0, count=80)
+    context = _strategy_context(frame)
+    _, benchmark, htf = _typed_reads(frame, spec)
+    wrong_base = _available_read(
+        frame,
+        source="benchmark_ohlcv",
+        symbol="ALTUSDT",
+        timeframe=spec.market_data.base_interval,
+        requested_as_of_ts=context.candle_cutoff_ts,
+    )
+
+    with pytest.raises(LifecycleContractError, match="base_read_source_mismatch"):
+        strategy.evaluate_with_lifecycle(
+            context,
+            base_read=wrong_base,
+            benchmark_read=benchmark,
+            higher_timeframe_read=htf,
         )
 
 
@@ -487,18 +621,22 @@ def test_public_typed_api_returns_hold_with_confirmed_rejected_proposal(
     strategy = LayeredPumpStrategy(strategy_spec=spec)
     _install_short_gates(monkeypatch, strategy._generator)
     _install_finalize(monkeypatch, strategy._generator, outcome="rejected")
+    arm_frame = _frame(0, count=80)
+    arm_reads = _typed_reads(arm_frame, spec)
 
     arm_intent, armed = strategy.evaluate_with_lifecycle(
-        _strategy_context(_frame(0, count=80)),
-        raw_input_bundle_hash="a" * 64,
-        htf_frame=None,
+        _strategy_context(arm_frame),
+        base_read=arm_reads[0],
+        benchmark_read=arm_reads[1],
+        higher_timeframe_read=arm_reads[2],
     )
+    confirmation_frame = _frame(1, close=99.0, high=100.0, low=98.5, count=81)
+    confirmation_reads = _typed_reads(confirmation_frame, spec)
     rejected_intent, confirmed = strategy.evaluate_with_lifecycle(
-        _strategy_context(
-            _frame(1, close=99.0, high=100.0, low=98.5, count=81)
-        ),
-        raw_input_bundle_hash="b" * 64,
-        htf_frame=None,
+        _strategy_context(confirmation_frame),
+        base_read=confirmation_reads[0],
+        benchmark_read=confirmation_reads[1],
+        higher_timeframe_read=confirmation_reads[2],
     )
 
     assert arm_intent.action is IntentAction.HOLD
@@ -517,18 +655,25 @@ def test_public_typed_api_returns_hold_with_confirmed_rejected_proposal(
     [
         ({"candle_cutoff_ts": None}, "requires_finite_candle_cutoff"),
         ({"candle_cutoff_ts": True}, "requires_finite_candle_cutoff"),
-        ({"candle_cutoff_ts": _ARM_OPEN_TS + 2 * _TIMEFRAME_SECONDS}, "does_not_close"),
+        (
+            {"candle_cutoff_ts": _ARM_OPEN_TS + 2 * _TIMEFRAME_SECONDS},
+            "requested_cutoff_mismatch",
+        ),
     ],
 )
 def test_public_typed_api_rejects_ambiguous_bar_cutoff(context_change, error) -> None:
-    strategy = LayeredPumpStrategy(strategy_spec=MexcStrategySpec.from_yaml())
-    context = _strategy_context(_frame(0, count=80))
+    spec = MexcStrategySpec.from_yaml()
+    strategy = LayeredPumpStrategy(strategy_spec=spec)
+    frame = _frame(0, count=80)
+    context = _strategy_context(frame)
+    reads = _typed_reads(frame, spec)
     for name, value in context_change.items():
         setattr(context, name, value)
 
     with pytest.raises(LifecycleContractError, match=error):
         strategy.evaluate_with_lifecycle(
             context,
-            raw_input_bundle_hash="a" * 64,
-            htf_frame=None,
+            base_read=reads[0],
+            benchmark_read=reads[1],
+            higher_timeframe_read=reads[2],
         )

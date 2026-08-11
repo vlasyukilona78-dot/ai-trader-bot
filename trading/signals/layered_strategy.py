@@ -1,7 +1,6 @@
 ﻿from __future__ import annotations
 
 import math
-import re
 import threading
 from copy import deepcopy
 from dataclasses import asdict
@@ -14,6 +13,12 @@ import pandas as pd
 from core.mexc_strategy_spec import MexcStrategySpec, strategy_spec_identity
 from core.signal_generator import SignalConfig, SignalContext, SignalGenerator
 from core.volume_profile import compute_volume_profile
+from trading.market_data.bar_contract import closed_boundary_ts
+from trading.market_data.frame_provenance import (
+    FrameProvenanceError,
+    FrameRead,
+    raw_frame_bundle_hash,
+)
 from trading.signals.lifecycle_contract import (
     CandidateLifecycleEventV1,
     LifecycleContractError,
@@ -34,7 +39,7 @@ def _runtime_defaults(function) -> dict[str, object]:
 
 _DEFAULT_INDICATOR_KWARGS = _runtime_defaults(compute_indicators)
 _DEFAULT_VOLUME_PROFILE_KWARGS = _runtime_defaults(compute_volume_profile)
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_RAW_FRAME_COLUMNS = ("open", "high", "low", "close", "volume")
 
 
 class LayeredPumpStrategy(StrategyInterface):
@@ -93,6 +98,10 @@ class LayeredPumpStrategy(StrategyInterface):
         # cross-sectional volatility context are mutable. Scanner workers share
         # one strategy instance, so those operations must form one atomic unit.
         self._state_lock = threading.RLock()
+        # A population sweep spans many per-symbol calls and mutates pending
+        # confirmation state. Serialise whole sweeps too: append-time duplicate
+        # detection is deliberately too late to undo an in-memory transition.
+        self._scan_session_lock = threading.RLock()
 
     @property
     def strategy_spec(self) -> MexcStrategySpec | None:
@@ -161,6 +170,11 @@ class LayeredPumpStrategy(StrategyInterface):
         with self._state_lock:
             self._volatility.start_sweep()
 
+    def scan_session(self):
+        """Return the process-local guard for one complete population sweep."""
+
+        return self._scan_session_lock
+
     def set_htf_cache(self, cache):
         """Source of higher-timeframe bars per symbol, so indicators can be read
         on the timeframe where they carry signal rather than all on the entry one."""
@@ -179,6 +193,80 @@ class LayeredPumpStrategy(StrategyInterface):
             "layer_trace": trace,
             "layer_failed": failed_layer,
         }
+
+    @staticmethod
+    def _compact_symbol(value: object) -> str:
+        return str(value).strip().upper().replace("/", "").replace("_", "").replace("-", "")
+
+    @staticmethod
+    def _owned_frame_read(value: object, *, field_name: str) -> FrameRead:
+        if not isinstance(value, FrameRead):
+            raise LifecycleContractError(f"{field_name}_must_be_frame_read")
+        owned_frame = value.frame.copy(deep=True) if value.frame is not None else None
+        try:
+            return FrameRead(frame=owned_frame, evidence=value.evidence)
+        except FrameProvenanceError as exc:
+            raise LifecycleContractError(f"{field_name}_is_not_self_consistent") from exc
+
+    @classmethod
+    def _validate_read_identity(
+        cls,
+        read: FrameRead,
+        *,
+        field_name: str,
+        expected_source: str,
+        expected_symbol: str,
+        expected_timeframe: str,
+        requested_cutoff_ts: float,
+    ) -> None:
+        evidence = read.evidence
+        if evidence.source != expected_source:
+            raise LifecycleContractError(f"{field_name}_source_mismatch")
+        if evidence.venue != "mexc_contract":
+            raise LifecycleContractError(f"{field_name}_venue_mismatch")
+        compact_symbol = cls._compact_symbol(expected_symbol)
+        if cls._compact_symbol(evidence.symbol) != compact_symbol:
+            raise LifecycleContractError(f"{field_name}_symbol_mismatch")
+        if cls._compact_symbol(evidence.venue_symbol) != compact_symbol:
+            raise LifecycleContractError(f"{field_name}_venue_symbol_mismatch")
+        if evidence.timeframe != expected_timeframe:
+            raise LifecycleContractError(f"{field_name}_timeframe_mismatch")
+        if not math.isclose(
+            evidence.requested_as_of_ts,
+            requested_cutoff_ts,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise LifecycleContractError(f"{field_name}_requested_cutoff_mismatch")
+        expected_boundary = float(
+            closed_boundary_ts(requested_cutoff_ts, expected_timeframe)
+        )
+        if not math.isclose(
+            evidence.expected_closed_boundary_ts,
+            expected_boundary,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise LifecycleContractError(f"{field_name}_closed_boundary_mismatch")
+
+    @staticmethod
+    def _current_frame(read: FrameRead) -> pd.DataFrame | None:
+        evidence = read.evidence
+        if (
+            read.frame is None
+            or evidence.data_through_ts is None
+            or not math.isclose(
+                evidence.data_through_ts,
+                evidence.expected_closed_boundary_ts,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+        ):
+            return None
+        columns = list(_RAW_FRAME_COLUMNS)
+        if "turnover" in read.frame.columns:
+            columns.append("turnover")
+        return read.frame.loc[:, columns].copy(deep=True)
 
     @staticmethod
     def _intent_from_signal(
@@ -254,27 +342,19 @@ class LayeredPumpStrategy(StrategyInterface):
         self,
         context: StrategyContext,
         *,
-        raw_input_bundle_hash: str,
-        htf_frame: pd.DataFrame | None,
+        base_read: FrameRead,
+        benchmark_read: FrameRead,
+        higher_timeframe_read: FrameRead,
     ) -> tuple[StrategyIntent, CandidateLifecycleEventV1 | None]:
         """Atomically evaluate a spec-bound input and return typed evidence.
 
-        ``htf_frame`` is intentionally required even when its value is ``None``.
-        This method never consults the mutable higher-timeframe cache, so the
-        caller's raw-input hash covers the exact frame bundle being evaluated.
+        All three reads are explicit and revalidated after taking owned frame
+        copies. The typed path never consults mutable benchmark/cache state and
+        derives its raw-input identity from the exact evidence it consumes.
         """
 
         if self._strategy_spec is None:
             raise LifecycleContractError("typed_evaluation_requires_strategy_spec")
-        if (
-            type(raw_input_bundle_hash) is not str
-            or _SHA256_RE.fullmatch(raw_input_bundle_hash) is None
-        ):
-            raise LifecycleContractError(
-                "raw_input_bundle_hash_must_be_lowercase_sha256"
-            )
-        if htf_frame is not None and not isinstance(htf_frame, pd.DataFrame):
-            raise LifecycleContractError("htf_frame_must_be_dataframe_or_none")
         cutoff = context.candle_cutoff_ts
         if type(cutoff) not in (int, float) or not math.isfinite(float(cutoff)):
             raise LifecycleContractError("typed_evaluation_requires_finite_candle_cutoff")
@@ -282,20 +362,65 @@ class LayeredPumpStrategy(StrategyInterface):
         identity = strategy_spec_identity(self._strategy_spec)
         timeframe_seconds = self._strategy_spec.base_interval_seconds
 
-        df = context.market_ohlcv
-        if not df.empty:
-            if not isinstance(df.index, pd.DatetimeIndex) or df.index.tz is None:
-                raise LifecycleContractError("typed_evaluation_requires_utc_bar_index")
-            bar_open_ts = float(df.index[-1].timestamp())
-            if not math.isclose(
-                cutoff - bar_open_ts,
-                float(timeframe_seconds),
-                rel_tol=0.0,
-                abs_tol=1e-6,
-            ):
-                raise LifecycleContractError(
-                    "typed_evaluation_cutoff_does_not_close_last_base_bar"
-                )
+        owned_base = self._owned_frame_read(base_read, field_name="base_read")
+        owned_benchmark = self._owned_frame_read(
+            benchmark_read, field_name="benchmark_read"
+        )
+        owned_htf = self._owned_frame_read(
+            higher_timeframe_read, field_name="higher_timeframe_read"
+        )
+        self._validate_read_identity(
+            owned_base,
+            field_name="base_read",
+            expected_source="base_ohlcv",
+            expected_symbol=context.symbol,
+            expected_timeframe=self._strategy_spec.market_data.base_interval,
+            requested_cutoff_ts=cutoff,
+        )
+        self._validate_read_identity(
+            owned_benchmark,
+            field_name="benchmark_read",
+            expected_source="benchmark_ohlcv",
+            expected_symbol="BTCUSDT",
+            expected_timeframe=self._strategy_spec.resolved_benchmark_interval,
+            requested_cutoff_ts=cutoff,
+        )
+        self._validate_read_identity(
+            owned_htf,
+            field_name="higher_timeframe_read",
+            expected_source="higher_timeframe_ohlcv",
+            expected_symbol=context.symbol,
+            expected_timeframe=self._strategy_spec.market_data.higher_timeframe.interval,
+            requested_cutoff_ts=cutoff,
+        )
+        df = self._current_frame(owned_base)
+        if df is None:
+            raise LifecycleContractError("base_read_must_cover_current_closed_boundary")
+        benchmark = self._current_frame(owned_benchmark)
+        htf_frame = self._current_frame(owned_htf)
+        try:
+            input_bundle_hash = raw_frame_bundle_hash(
+                [
+                    owned_base.evidence,
+                    owned_benchmark.evidence,
+                    owned_htf.evidence,
+                ]
+            )
+        except FrameProvenanceError as exc:
+            raise LifecycleContractError("typed_raw_frame_bundle_is_invalid") from exc
+
+        if not isinstance(df.index, pd.DatetimeIndex) or df.index.tz is None:
+            raise LifecycleContractError("typed_evaluation_requires_utc_bar_index")
+        bar_open_ts = float(df.index[-1].timestamp())
+        if not math.isclose(
+            cutoff - bar_open_ts,
+            float(timeframe_seconds),
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise LifecycleContractError(
+                "typed_evaluation_cutoff_does_not_close_last_base_bar"
+            )
 
         if df.empty or len(df) < self._minimum_history_bars:
             intent = StrategyIntent(
@@ -306,9 +431,7 @@ class LayeredPumpStrategy(StrategyInterface):
             )
             return intent, None
 
-        enriched = df
-        if "rsi" not in enriched.columns:
-            enriched = compute_indicators(df, **self._indicator_kwargs)
+        enriched = compute_indicators(df, **self._indicator_kwargs)
         regime = detect_market_regime(enriched)
         vp = compute_volume_profile(enriched, **self._volume_profile_kwargs)
         last = enriched.iloc[-1]
@@ -317,7 +440,6 @@ class LayeredPumpStrategy(StrategyInterface):
 
         with self._state_lock:
             self.assert_strategy_spec_consistency(self._strategy_spec)
-            benchmark = self._benchmark
             if close > 0 and atr > 0:
                 self._volatility.observe(context.symbol, atr / close)
             signal, lifecycle_event = self._generator.generate_with_lifecycle(
@@ -337,7 +459,7 @@ class LayeredPumpStrategy(StrategyInterface):
                 strategy_spec_version=identity.spec_version,
                 strategy_spec_contract_hash=identity.contract_hash,
                 strategy_spec_instance_hash=identity.instance_hash,
-                raw_input_bundle_hash=raw_input_bundle_hash,
+                raw_input_bundle_hash=input_bundle_hash,
                 timeframe_seconds=timeframe_seconds,
                 candle_cutoff_ts=cutoff,
             )

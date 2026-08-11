@@ -30,7 +30,7 @@ _CONFIRM_INPUT_HASH = "4" * 64
 
 # Replacing this literal requires a new contract version. It is intentionally
 # filled from the final declarative schema, not updated to make a drift pass.
-_PINNED_CONTRACT_HASH = "012562854856dcb1145eb93066be00f2c68f291e0d94cd59c59b6a2bfef60c31"
+_PINNED_CONTRACT_HASH = "cc75c871b7097aa215f9ac88c736b6572e2443318cb0cf9f8bdaf1b0c8cc8551"
 
 
 def _arm(**overrides) -> CandidateArmV1:
@@ -44,8 +44,12 @@ def _arm(**overrides) -> CandidateArmV1:
         "timeframe_seconds": _INTERVAL,
         "arm_bar_open_ts": _ARM_OPEN,
         "arm_candle_cutoff_ts": _ARM_OPEN + _INTERVAL,
+        "armed_high": 109.3,
+        "armed_low": 108.3,
         "armed_close": 108.8,
         "invalidate_level": 111.405,
+        "confirmation_enabled": True,
+        "confirmation_max_wait_observations": 3,
         "arm_trace": {
             "strategy_model": "layered_table_5_softened",
             "failed_layer": "layer_confirmation_pending",
@@ -74,15 +78,31 @@ def _observation(
     elapsed_bars: int = 1,
     distinct_observation_count: int = 1,
     input_hash: str = _CONFIRM_INPUT_HASH,
-    close: float = 108.0,
+    close: float | None = None,
 ) -> ConfirmationObservationV1:
     open_ts = arm.arm_bar_open_ts + elapsed_bars * arm.timeframe_seconds
+    if close is None:
+        close = (
+            arm.armed_close - 0.8
+            if state is CandidateLifecycleState.CONFIRMED
+            else arm.armed_close + 0.2
+        )
     if state is CandidateLifecycleState.SAME_BAR:
         open_ts = arm.arm_bar_open_ts
         elapsed_bars = 0
         distinct_observation_count = 0
         input_hash = arm.raw_input_bundle_hash
         close = arm.armed_close
+        high = arm.armed_high
+        low = arm.armed_low
+    else:
+        high = close + 0.5
+        low = close - 0.5
+        if state is CandidateLifecycleState.INVALIDATED:
+            if arm.side is CandidateSide.SHORT:
+                high = arm.invalidate_level
+            else:
+                low = arm.invalidate_level
     return ConfirmationObservationV1(
         candidate_id=arm.candidate_id,
         observation_input_bundle_hash=input_hash,
@@ -91,8 +111,8 @@ def _observation(
         timeframe_seconds=arm.timeframe_seconds,
         observation_bar_open_ts=open_ts,
         observation_candle_cutoff_ts=open_ts + arm.timeframe_seconds,
-        observed_high=max(close + 0.5, arm.armed_close if state is CandidateLifecycleState.SAME_BAR else 0.0),
-        observed_low=close - 0.5,
+        observed_high=high,
+        observed_low=low,
         observed_close=close,
         distinct_observation_count=distinct_observation_count,
         elapsed_bars=elapsed_bars,
@@ -115,7 +135,7 @@ def _created_proposal(
         "proposal_input_bundle_hash": observation.observation_input_bundle_hash,
         "reference_bar_open_ts": observation.observation_bar_open_ts,
         "reference_candle_cutoff_ts": observation.observation_candle_cutoff_ts,
-        "decision_reference_price": 108.0,
+        "decision_reference_price": observation.observed_close,
         "stop_price": 111.405,
         "take_profit_price": 100.09,
         "details": {"realized_risk_reward": 2.32, "source": ["closed_bar", "arm"]},
@@ -230,6 +250,13 @@ def test_arm_is_deeply_immutable_and_round_trips_canonically() -> None:
         ({"timeframe_seconds": True}, "timeframe_seconds_must_be_an_integer"),
         ({"armed_close": float("nan")}, "armed_close_must_be_finite"),
         ({"armed_close": True}, "armed_close_must_be_a_number"),
+        ({"armed_high": 108.0}, "armed_close_must_lie"),
+        ({"armed_low": 109.0}, "armed_close_must_lie"),
+        ({"confirmation_enabled": 1}, "confirmation_enabled_must_be_boolean"),
+        (
+            {"confirmation_max_wait_observations": True},
+            "confirmation_max_wait_observations_must_be_an_integer",
+        ),
         ({"raw_input_bundle_hash": "not-a-hash"}, "raw_input_bundle_hash"),
         ({"arm_candle_cutoff_ts": _ARM_OPEN + 60.0}, "bar_duration_mismatch"),
         ({"arm_bar_open_ts": _ARM_OPEN + 1.0}, "bar_duration_mismatch"),
@@ -253,6 +280,8 @@ def test_candidate_id_binds_every_semantic_arm_namespace() -> None:
         _arm(symbol="OTHERUSDT"),
         _arm(
             side=CandidateSide.LONG,
+            armed_high=101.0,
+            armed_low=99.0,
             armed_close=100.0,
             invalidate_level=98.0,
         ),
@@ -261,6 +290,9 @@ def test_candidate_id_binds_every_semantic_arm_namespace() -> None:
             arm_candle_cutoff_ts=_ARM_OPEN + 2 * _INTERVAL,
         ),
         _arm(armed_close=108.7),
+        _arm(armed_high=109.4),
+        _arm(armed_low=108.2),
+        _arm(confirmation_max_wait_observations=4),
         _arm(arm_trace={"different": {"causal": 1.0}}),
     ]
 
@@ -300,7 +332,7 @@ def test_confirmation_semantic_id_binds_input_state_bar_prices_and_both_counts()
             observation_candle_cutoff_ts=baseline.observation_candle_cutoff_ts + _INTERVAL,
             elapsed_bars=4,
         ),
-        replace(baseline, observed_close=107.9),
+        replace(baseline, observed_close=109.1),
         replace(baseline, distinct_observation_count=2),
     ]
 
@@ -396,6 +428,133 @@ def test_same_bar_after_waiting_repeats_predecessor_identity_and_counts() -> Non
         CandidateLifecycleEventV1.transition(waiting, confirmation=wrong_count)
 
 
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"observed_high": 500.0}, "same_bar_observed_high_mismatch"),
+        ({"observed_low": 1.0}, "same_bar_observed_low_mismatch"),
+        ({"observed_close": 109.1}, "same_bar_observed_close_mismatch"),
+    ],
+)
+def test_same_bar_repeats_exact_predecessor_market_values(change, message) -> None:
+    arm = _arm()
+    armed = CandidateLifecycleEventV1.armed(arm)
+    first = _observation(arm, state=CandidateLifecycleState.WAITING)
+    waiting = CandidateLifecycleEventV1.transition(armed, confirmation=first)
+    forged = replace(
+        first,
+        state=CandidateLifecycleState.SAME_BAR,
+        state_epoch=2,
+        **change,
+    )
+
+    with pytest.raises(LifecycleContractError, match=message):
+        CandidateLifecycleEventV1.transition(waiting, confirmation=forged)
+
+
+def test_first_same_bar_repeats_exact_arm_market_values() -> None:
+    arm = _arm()
+    armed = CandidateLifecycleEventV1.armed(arm)
+    same = _observation(arm, state=CandidateLifecycleState.SAME_BAR)
+    forged = replace(same, observed_close=arm.armed_close + 0.1)
+
+    with pytest.raises(LifecycleContractError, match="same_bar_observed_close_mismatch"):
+        CandidateLifecycleEventV1.transition(armed, confirmation=forged)
+
+
+def test_non_same_bar_successor_must_move_forward_and_increment_once() -> None:
+    arm = _arm()
+    armed = CandidateLifecycleEventV1.armed(arm)
+    first = _observation(
+        arm,
+        elapsed_bars=3,
+        distinct_observation_count=1,
+    )
+    waiting = CandidateLifecycleEventV1.transition(armed, confirmation=first)
+    backward = _observation(
+        arm,
+        state_epoch=2,
+        elapsed_bars=2,
+        distinct_observation_count=2,
+        input_hash="a" * 64,
+    )
+    skipped_count = _observation(
+        arm,
+        state_epoch=2,
+        elapsed_bars=5,
+        distinct_observation_count=3,
+        input_hash="b" * 64,
+    )
+
+    with pytest.raises(LifecycleContractError, match="successor_bar_must_be_strictly_later"):
+        CandidateLifecycleEventV1.transition(waiting, confirmation=backward)
+    with pytest.raises(
+        LifecycleContractError,
+        match="successor_distinct_count_must_increment_once",
+    ):
+        CandidateLifecycleEventV1.transition(waiting, confirmation=skipped_count)
+
+
+@pytest.mark.parametrize(
+    ("state", "close", "high", "message"),
+    [
+        (CandidateLifecycleState.CONFIRMED, 109.0, 109.5, "state_disagrees"),
+        (CandidateLifecycleState.INVALIDATED, 109.0, 110.0, "state_disagrees"),
+        (CandidateLifecycleState.WAITING, 108.0, 109.0, "state_disagrees"),
+        (CandidateLifecycleState.CONFIRMED, 108.0, 112.0, "state_disagrees"),
+    ],
+)
+def test_follow_up_state_matches_invalidation_confirmation_priority(
+    state,
+    close,
+    high,
+    message,
+) -> None:
+    arm = _arm()
+    armed = CandidateLifecycleEventV1.armed(arm)
+    observation = ConfirmationObservationV1(
+        candidate_id=arm.candidate_id,
+        observation_input_bundle_hash=_CONFIRM_INPUT_HASH,
+        state=state,
+        state_epoch=1,
+        timeframe_seconds=arm.timeframe_seconds,
+        observation_bar_open_ts=arm.arm_bar_open_ts + arm.timeframe_seconds,
+        observation_candle_cutoff_ts=arm.arm_candle_cutoff_ts + arm.timeframe_seconds,
+        observed_high=high,
+        observed_low=min(close - 0.5, high),
+        observed_close=close,
+        distinct_observation_count=1,
+        elapsed_bars=1,
+    )
+
+    with pytest.raises(LifecycleContractError, match=message):
+        CandidateLifecycleEventV1.transition(armed, confirmation=observation)
+
+
+def test_neutral_state_uses_exact_max_wait_observation_policy() -> None:
+    arm = _arm(confirmation_max_wait_observations=2)
+    armed = CandidateLifecycleEventV1.armed(arm)
+    waiting_observation = _observation(arm)
+    waiting = CandidateLifecycleEventV1.transition(
+        armed,
+        confirmation=waiting_observation,
+    )
+    must_expire = _observation(
+        arm,
+        state=CandidateLifecycleState.WAITING,
+        state_epoch=2,
+        elapsed_bars=4,
+        distinct_observation_count=2,
+        input_hash="a" * 64,
+    )
+
+    with pytest.raises(LifecycleContractError, match="state_disagrees"):
+        CandidateLifecycleEventV1.transition(waiting, confirmation=must_expire)
+    expired = replace(must_expire, state=CandidateLifecycleState.EXPIRED)
+    terminal = CandidateLifecycleEventV1.transition(waiting, confirmation=expired)
+    assert terminal.state is CandidateLifecycleState.EXPIRED
+
+
 def test_arm_wait_confirm_chain_preserves_arm_and_links_every_transition() -> None:
     armed, waiting, confirmed = _confirmed_event()
 
@@ -415,7 +574,7 @@ def test_arm_wait_confirm_chain_preserves_arm_and_links_every_transition() -> No
 
 
 def test_confirmation_disabled_is_initial_bypassed_without_fake_observation() -> None:
-    arm = _arm()
+    arm = _arm(confirmation_enabled=False)
     proposal = _bypass_proposal(arm)
     bypassed = CandidateLifecycleEventV1.bypassed(arm, proposal=proposal)
 
@@ -433,8 +592,21 @@ def test_confirmation_disabled_is_initial_bypassed_without_fake_observation() ->
     assert CandidateLifecycleEventV1.from_dict(bypassed.as_dict()) == bypassed
 
 
+def test_initial_state_must_match_bound_confirmation_policy() -> None:
+    disabled = _arm(confirmation_enabled=False)
+    enabled = _arm()
+
+    with pytest.raises(LifecycleContractError, match="requires_confirmation_enabled"):
+        CandidateLifecycleEventV1.armed(disabled)
+    with pytest.raises(LifecycleContractError, match="requires_confirmation_disabled"):
+        CandidateLifecycleEventV1.bypassed(
+            enabled,
+            proposal=_bypass_proposal(enabled),
+        )
+
+
 def test_bypassed_may_record_rejection_without_becoming_confirmation() -> None:
-    arm = _arm()
+    arm = _arm(confirmation_enabled=False)
     rejected = _bypass_proposal(
         arm,
         status=ProposalObservationStatus.REJECTED,
@@ -445,6 +617,32 @@ def test_bypassed_may_record_rejection_without_becoming_confirmation() -> None:
     assert bypassed.proposal.status is ProposalObservationStatus.REJECTED
     assert bypassed.proposal.rejection_reason == "layer5_stop_too_wide"
     assert bypassed.proposal.decision_reference_price is None
+
+
+def test_created_bypass_proposal_entry_matches_arm_close() -> None:
+    arm = _arm(confirmation_enabled=False)
+    proposal = _bypass_proposal(arm, decision_reference_price=arm.armed_close - 1.0)
+
+    with pytest.raises(LifecycleContractError, match="reference_price_mismatch"):
+        CandidateLifecycleEventV1.bypassed(arm, proposal=proposal)
+
+
+def test_created_confirmation_proposal_entry_matches_observed_close() -> None:
+    arm = _arm()
+    armed = CandidateLifecycleEventV1.armed(arm)
+    confirmation = _observation(arm, state=CandidateLifecycleState.CONFIRMED)
+    proposal = _created_proposal(
+        arm,
+        confirmation,
+        decision_reference_price=confirmation.observed_close - 1.0,
+    )
+
+    with pytest.raises(LifecycleContractError, match="reference_price_mismatch"):
+        CandidateLifecycleEventV1.transition(
+            armed,
+            confirmation=confirmation,
+            proposal=proposal,
+        )
 
 
 @pytest.mark.parametrize(
@@ -463,7 +661,7 @@ def test_bypassed_may_record_rejection_without_becoming_confirmation() -> None:
     ],
 )
 def test_bypassed_proposal_fails_closed_outside_exact_arm_basis(change, message) -> None:
-    arm = _arm()
+    arm = _arm(confirmation_enabled=False)
     if "state_epoch" in change or "confirmation_observation_id" in change:
         with pytest.raises(LifecycleContractError, match=message):
             _bypass_proposal(arm, **change)
@@ -474,7 +672,7 @@ def test_bypassed_proposal_fails_closed_outside_exact_arm_basis(change, message)
 
 
 def test_bypassed_is_not_a_confirmation_observation_and_is_terminal() -> None:
-    arm = _arm()
+    arm = _arm(confirmation_enabled=False)
     with pytest.raises(LifecycleContractError, match="follow_up_state"):
         _observation(arm, state=CandidateLifecycleState.BYPASSED)
 

@@ -1072,13 +1072,17 @@ class SignalGenerator:
         df: pd.DataFrame,
         context: SignalContext,
         side: str,
-    ) -> float | None:
-        if not self.config.pump_window_enabled:
-            return None
-        win_high, win_low = self._window_extremes(df, context.htf_frame)
+    ) -> float:
+        if self.config.pump_window_enabled:
+            win_high, win_low = self._window_extremes(df, context.htf_frame)
+            if side == "SHORT":
+                return float(win_high + self._stop_buffer(df, win_high))
+            return float(win_low - self._stop_buffer(df, win_low))
+        armed_close = float(df.iloc[-1]["close"])
+        invalidate_pct = max(0.0, self.config.confirmation_invalidate_pct)
         if side == "SHORT":
-            return float(win_high + self._stop_buffer(df, win_high))
-        return float(win_low - self._stop_buffer(df, win_low))
+            return float(armed_close * (1.0 + invalidate_pct))
+        return float(armed_close * (1.0 - invalidate_pct))
 
     def _candidate_arm(
         self,
@@ -1087,9 +1091,10 @@ class SignalGenerator:
         context: SignalContext,
         side: str,
         trace: Mapping[str, Any],
-        invalidate_level: float | None,
+        invalidate_level: float,
         binding: _TypedLifecycleBinding,
     ) -> CandidateArmV1:
+        last = df.iloc[-1]
         return CandidateArmV1(
             strategy_spec_version=binding.strategy_spec_version,
             strategy_spec_contract_hash=binding.strategy_spec_contract_hash,
@@ -1100,8 +1105,14 @@ class SignalGenerator:
             timeframe_seconds=binding.timeframe_seconds,
             arm_bar_open_ts=self._bar_open_seconds(df.index[-1]),
             arm_candle_cutoff_ts=binding.candle_cutoff_ts,
-            armed_close=float(df.iloc[-1]["close"]),
+            armed_high=float(last["high"]),
+            armed_low=float(last["low"]),
+            armed_close=float(last["close"]),
             invalidate_level=invalidate_level,
+            confirmation_enabled=bool(self.config.confirmation_enabled),
+            confirmation_max_wait_observations=int(
+                self.config.confirmation_max_wait_bars
+            ),
             arm_trace=self._lifecycle_json(deepcopy(trace)),
         )
 
@@ -1348,8 +1359,6 @@ class SignalGenerator:
             ):
                 raise LifecycleContractError("typed_observation_bar_is_off_timeframe")
             distinct_count = pending.distinct_observation_count + 1
-            pending.last_seen_bar_ts = bar_ts
-            pending.distinct_observation_count = distinct_count
 
             if pending.side == "LONG":
                 confirmed = close_now > pending.armed_close
@@ -1371,7 +1380,6 @@ class SignalGenerator:
                 invalidated = high_now >= ceiling
 
             if invalidated:
-                del self._pending[context.symbol]
                 trace["failed_layer"] = "layer_confirmation_invalidated"
                 trace["layers"]["layer_confirmation"] = {
                     "passed": False,
@@ -1382,7 +1390,6 @@ class SignalGenerator:
                         "bars_waited": float(pending.bars_waited),
                     },
                 }
-                self.last_diagnostics = trace
                 observation = ConfirmationObservationV1(
                     candidate_id=arm.candidate_id,
                     observation_input_bundle_hash=binding.raw_input_bundle_hash,
@@ -1401,10 +1408,11 @@ class SignalGenerator:
                     previous,
                     confirmation=observation,
                 )
+                del self._pending[context.symbol]
+                self.last_diagnostics = trace
                 return None, event
 
             if confirmed:
-                del self._pending[context.symbol]
                 side = pending.side
                 layer1 = pending.layer_snapshot["layer1"]
                 layer2 = pending.layer_snapshot["layer2"]
@@ -1479,17 +1487,16 @@ class SignalGenerator:
                     confirmation=observation,
                     proposal=proposal,
                 )
+                del self._pending[context.symbol]
                 return signal, event
 
-            pending.bars_waited += 1
-            expired = pending.bars_waited >= self.config.confirmation_max_wait_bars
+            next_bars_waited = pending.bars_waited + 1
+            expired = next_bars_waited >= self.config.confirmation_max_wait_bars
             state = (
                 CandidateLifecycleState.EXPIRED
                 if expired
                 else CandidateLifecycleState.WAITING
             )
-            if expired:
-                del self._pending[context.symbol]
             trace["failed_layer"] = (
                 "layer_confirmation_expired"
                 if expired
@@ -1499,10 +1506,9 @@ class SignalGenerator:
                 "passed": False,
                 "details": {
                     "status": "expired" if expired else "waiting",
-                    "bars_waited": float(pending.bars_waited),
+                    "bars_waited": float(next_bars_waited),
                 },
             }
-            self.last_diagnostics = trace
             observation = ConfirmationObservationV1(
                 candidate_id=arm.candidate_id,
                 observation_input_bundle_hash=binding.raw_input_bundle_hash,
@@ -1521,8 +1527,14 @@ class SignalGenerator:
                 previous,
                 confirmation=observation,
             )
-            if not expired:
+            if expired:
+                del self._pending[context.symbol]
+            else:
+                pending.last_seen_bar_ts = bar_ts
+                pending.distinct_observation_count = distinct_count
+                pending.bars_waited = next_bars_waited
                 pending.lifecycle_event = event
+            self.last_diagnostics = trace
             return None, event
 
         gates = self._evaluate_gates(df, context, trace)

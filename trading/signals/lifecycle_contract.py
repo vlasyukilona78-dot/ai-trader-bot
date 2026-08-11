@@ -1,9 +1,8 @@
 """Immutable evidence contract for the candidate confirmation lifecycle.
 
-This module is deliberately not wired into the strategy or scanner yet.  It
-defines the vocabulary needed to preserve an arm observation, subsequent
-confirmation observations, and the strategy's proposal outcome without
-pretending that any of them is an executable order.
+This module defines the vocabulary used by the typed strategy path to preserve
+an arm observation, subsequent confirmation observations, and the strategy's
+proposal outcome without pretending that any of them is an executable order.
 
 Semantic IDs bind causal market/rule inputs and bar times.  They deliberately
 exclude wall-clock processing, delivery and persistence times; those belong to
@@ -24,7 +23,7 @@ from typing import Any, Mapping
 
 
 LIFECYCLE_CONTRACT_VERSION = "candidate_lifecycle_v1"
-_PINNED_CONTRACT_HASH = "012562854856dcb1145eb93066be00f2c68f291e0d94cd59c59b6a2bfef60c31"
+_PINNED_CONTRACT_HASH = "cc75c871b7097aa215f9ac88c736b6572e2443318cb0cf9f8bdaf1b0c8cc8551"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
@@ -150,12 +149,6 @@ def _strict_number(
     return 0.0 if result == 0.0 else result
 
 
-def _optional_positive(value: object, *, field_name: str) -> float | None:
-    if value is None:
-        return None
-    return _strict_number(value, field_name=field_name, positive=True)
-
-
 def _require_bar(
     *,
     open_ts: object,
@@ -279,8 +272,12 @@ def lifecycle_contract_payload() -> dict[str, object]:
                 "timeframe_seconds",
                 "arm_bar_open_ts",
                 "arm_candle_cutoff_ts",
+                "armed_high",
+                "armed_low",
                 "armed_close",
                 "invalidate_level",
+                "confirmation_enabled",
+                "confirmation_max_wait_observations",
                 "arm_trace",
                 "arm_trace_hash",
                 "candidate_id",
@@ -335,8 +332,13 @@ def lifecycle_contract_payload() -> dict[str, object]:
             "arm_snapshot_is_immutable_across_transitions",
             "observation_count_is_distinct_from_elapsed_physical_bars",
             "same_bar_repeats_the_predecessor_observation_identity_and_counts",
+            "same_bar_repeats_the_predecessor_market_values",
+            "non_same_bar_observations_are_strictly_monotonic",
+            "distinct_observation_count_increments_once_per_new_bar",
+            "state_matches_invalidation_confirmation_and_expiry_priority",
             "confirmed_requires_created_or_rejected_proposal_observation",
             "bypassed_is_an_initial_same_arm_bar_proposal_without_confirmation",
+            "created_proposal_reference_price_matches_its_basis_close",
             "proposal_observation_is_never_execution_bound",
             "terminal_state_has_no_successor",
         ],
@@ -368,8 +370,12 @@ class CandidateArmV1:
     timeframe_seconds: int
     arm_bar_open_ts: float
     arm_candle_cutoff_ts: float
+    armed_high: float
+    armed_low: float
     armed_close: float
-    invalidate_level: float | None
+    invalidate_level: float
+    confirmation_enabled: bool
+    confirmation_max_wait_observations: int
     arm_trace: Mapping[str, object]
     arm_trace_hash: str = field(init=False)
     candidate_id: str = field(init=False)
@@ -401,20 +407,38 @@ class CandidateArmV1:
             timeframe_seconds=self.timeframe_seconds,
             prefix="arm",
         )
+        armed_high = _strict_number(
+            self.armed_high,
+            field_name="armed_high",
+            positive=True,
+        )
+        armed_low = _strict_number(
+            self.armed_low,
+            field_name="armed_low",
+            positive=True,
+        )
         armed_close = _strict_number(
             self.armed_close,
             field_name="armed_close",
             positive=True,
         )
-        invalidate = _optional_positive(
+        if armed_low > armed_close or armed_close > armed_high:
+            raise LifecycleContractError("armed_close_must_lie_between_low_and_high")
+        invalidate = _strict_number(
             self.invalidate_level,
             field_name="invalidate_level",
+            positive=True,
         )
-        if invalidate is not None:
-            if self.side is CandidateSide.SHORT and invalidate <= armed_close:
-                raise LifecycleContractError("short_invalidate_level_must_exceed_armed_close")
-            if self.side is CandidateSide.LONG and invalidate >= armed_close:
-                raise LifecycleContractError("long_invalidate_level_must_be_below_armed_close")
+        if self.side is CandidateSide.SHORT and invalidate < armed_close:
+            raise LifecycleContractError("short_invalidate_level_must_not_be_below_armed_close")
+        if self.side is CandidateSide.LONG and invalidate > armed_close:
+            raise LifecycleContractError("long_invalidate_level_must_not_exceed_armed_close")
+        if type(self.confirmation_enabled) is not bool:
+            raise LifecycleContractError("confirmation_enabled_must_be_boolean")
+        max_wait = _strict_int(
+            self.confirmation_max_wait_observations,
+            field_name="confirmation_max_wait_observations",
+        )
         if not isinstance(self.arm_trace, Mapping):
             raise LifecycleContractError("arm_trace_must_be_a_mapping")
         frozen_trace = _freeze_json(self.arm_trace, path="arm_trace")
@@ -435,8 +459,12 @@ class CandidateArmV1:
             "timeframe_seconds": seconds,
             "arm_bar_open_ts": opened,
             "arm_candle_cutoff_ts": cutoff,
+            "armed_high": armed_high,
+            "armed_low": armed_low,
             "armed_close": armed_close,
             "invalidate_level": invalidate,
+            "confirmation_enabled": self.confirmation_enabled,
+            "confirmation_max_wait_observations": max_wait,
             "arm_trace_hash": trace_hash,
         }
         object.__setattr__(self, "strategy_spec_version", spec_version)
@@ -447,8 +475,11 @@ class CandidateArmV1:
         object.__setattr__(self, "timeframe_seconds", seconds)
         object.__setattr__(self, "arm_bar_open_ts", opened)
         object.__setattr__(self, "arm_candle_cutoff_ts", cutoff)
+        object.__setattr__(self, "armed_high", armed_high)
+        object.__setattr__(self, "armed_low", armed_low)
         object.__setattr__(self, "armed_close", armed_close)
         object.__setattr__(self, "invalidate_level", invalidate)
+        object.__setattr__(self, "confirmation_max_wait_observations", max_wait)
         object.__setattr__(self, "arm_trace", frozen_trace)
         object.__setattr__(self, "arm_trace_hash", trace_hash)
         object.__setattr__(
@@ -479,8 +510,12 @@ class CandidateArmV1:
             "timeframe_seconds": self.timeframe_seconds,
             "arm_bar_open_ts": self.arm_bar_open_ts,
             "arm_candle_cutoff_ts": self.arm_candle_cutoff_ts,
+            "armed_high": self.armed_high,
+            "armed_low": self.armed_low,
             "armed_close": self.armed_close,
             "invalidate_level": self.invalidate_level,
+            "confirmation_enabled": self.confirmation_enabled,
+            "confirmation_max_wait_observations": self.confirmation_max_wait_observations,
             "arm_trace_hash": self.arm_trace_hash,
             "arm_trace": _thaw_json(self.arm_trace),
         }
@@ -507,8 +542,14 @@ class CandidateArmV1:
             timeframe_seconds=payload["timeframe_seconds"],
             arm_bar_open_ts=payload["arm_bar_open_ts"],
             arm_candle_cutoff_ts=payload["arm_candle_cutoff_ts"],
+            armed_high=payload["armed_high"],
+            armed_low=payload["armed_low"],
             armed_close=payload["armed_close"],
             invalidate_level=payload["invalidate_level"],
+            confirmation_enabled=payload["confirmation_enabled"],
+            confirmation_max_wait_observations=payload[
+                "confirmation_max_wait_observations"
+            ],
             arm_trace=payload["arm_trace"],
         )
         _require_derived_id(
@@ -967,6 +1008,8 @@ class CandidateLifecycleEventV1:
 
         previous_id: str | None = None
         if self.state is CandidateLifecycleState.ARMED:
+            if not self.arm.confirmation_enabled:
+                raise LifecycleContractError("armed_event_requires_confirmation_enabled")
             if epoch != 0:
                 raise LifecycleContractError("armed_event_requires_epoch_zero")
             if self.previous_event_id is not None or self.previous_state is not None:
@@ -976,6 +1019,8 @@ class CandidateLifecycleEventV1:
             if self.proposal.status is not ProposalObservationStatus.NOT_EVALUATED:
                 raise LifecycleContractError("armed_event_proposal_must_not_be_evaluated")
         elif self.state is CandidateLifecycleState.BYPASSED:
+            if self.arm.confirmation_enabled:
+                raise LifecycleContractError("bypassed_event_requires_confirmation_disabled")
             if epoch != 0:
                 raise LifecycleContractError("bypassed_event_requires_epoch_zero")
             if self.previous_event_id is not None or self.previous_state is not None:
@@ -997,7 +1042,14 @@ class CandidateLifecycleEventV1:
                 raise LifecycleContractError("bypassed_proposal_reference_bar_mismatch")
             if self.proposal.reference_candle_cutoff_ts != self.arm.arm_candle_cutoff_ts:
                 raise LifecycleContractError("bypassed_proposal_reference_cutoff_mismatch")
+            if (
+                self.proposal.status is ProposalObservationStatus.CREATED
+                and self.proposal.decision_reference_price != self.arm.armed_close
+            ):
+                raise LifecycleContractError("bypassed_proposal_reference_price_mismatch")
         else:
+            if not self.arm.confirmation_enabled:
+                raise LifecycleContractError("follow_up_event_requires_confirmation_enabled")
             if epoch < 1:
                 raise LifecycleContractError("follow_up_event_requires_positive_epoch")
             previous_id = _strict_sha256(
@@ -1042,6 +1094,12 @@ class CandidateLifecycleEventV1:
                     != self.confirmation.observation_candle_cutoff_ts
                 ):
                     raise LifecycleContractError("proposal_reference_cutoff_mismatch")
+                if (
+                    self.proposal.status is ProposalObservationStatus.CREATED
+                    and self.proposal.decision_reference_price
+                    != self.confirmation.observed_close
+                ):
+                    raise LifecycleContractError("proposal_reference_price_mismatch")
             elif self.proposal.status is not ProposalObservationStatus.NOT_EVALUATED:
                 raise LifecycleContractError("non_confirmed_event_must_not_evaluate_proposal")
             elif self.proposal.confirmation_observation_id is not None:
@@ -1090,8 +1148,36 @@ class CandidateLifecycleEventV1:
                     raise LifecycleContractError("same_bar_distinct_count_mismatch")
                 if observation.elapsed_bars != 0:
                     raise LifecycleContractError("same_bar_elapsed_bars_mismatch")
+                if observation.observed_high != self.arm.armed_high:
+                    raise LifecycleContractError("same_bar_observed_high_mismatch")
+                if observation.observed_low != self.arm.armed_low:
+                    raise LifecycleContractError("same_bar_observed_low_mismatch")
+                if observation.observed_close != self.arm.armed_close:
+                    raise LifecycleContractError("same_bar_observed_close_mismatch")
         elif observation.observation_bar_open_ts <= self.arm.arm_bar_open_ts:
             raise LifecycleContractError("follow_up_observation_must_follow_arm_bar")
+        else:
+            if self.arm.side is CandidateSide.SHORT:
+                invalidated = observation.observed_high >= self.arm.invalidate_level
+                confirmed = observation.observed_close < self.arm.armed_close
+            else:
+                invalidated = observation.observed_low <= self.arm.invalidate_level
+                confirmed = observation.observed_close > self.arm.armed_close
+            if invalidated:
+                expected_state = CandidateLifecycleState.INVALIDATED
+            elif confirmed:
+                expected_state = CandidateLifecycleState.CONFIRMED
+            elif (
+                observation.distinct_observation_count
+                >= self.arm.confirmation_max_wait_observations
+            ):
+                expected_state = CandidateLifecycleState.EXPIRED
+            else:
+                expected_state = CandidateLifecycleState.WAITING
+            if observation.state is not expected_state:
+                raise LifecycleContractError(
+                    "confirmation_state_disagrees_with_market_and_policy"
+                )
 
     @property
     def contract_version(self) -> str:
@@ -1170,12 +1256,18 @@ class CandidateLifecycleEventV1:
                 expected_cutoff_ts = previous.arm.arm_candle_cutoff_ts
                 expected_distinct = 0
                 expected_elapsed = 0
+                expected_high = previous.arm.armed_high
+                expected_low = previous.arm.armed_low
+                expected_close = previous.arm.armed_close
             else:
                 expected_input_hash = prior.observation_input_bundle_hash
                 expected_bar_open_ts = prior.observation_bar_open_ts
                 expected_cutoff_ts = prior.observation_candle_cutoff_ts
                 expected_distinct = prior.distinct_observation_count
                 expected_elapsed = prior.elapsed_bars
+                expected_high = prior.observed_high
+                expected_low = prior.observed_low
+                expected_close = prior.observed_close
             if confirmation.observation_input_bundle_hash != expected_input_hash:
                 raise LifecycleContractError("same_bar_input_bundle_mismatch")
             if confirmation.observation_bar_open_ts != expected_bar_open_ts:
@@ -1186,6 +1278,34 @@ class CandidateLifecycleEventV1:
                 raise LifecycleContractError("same_bar_distinct_count_mismatch")
             if confirmation.elapsed_bars != expected_elapsed:
                 raise LifecycleContractError("same_bar_elapsed_bars_mismatch")
+            if confirmation.observed_high != expected_high:
+                raise LifecycleContractError("same_bar_observed_high_mismatch")
+            if confirmation.observed_low != expected_low:
+                raise LifecycleContractError("same_bar_observed_low_mismatch")
+            if confirmation.observed_close != expected_close:
+                raise LifecycleContractError("same_bar_observed_close_mismatch")
+        else:
+            prior = previous.confirmation
+            previous_open = (
+                prior.observation_bar_open_ts
+                if prior is not None
+                else previous.arm.arm_bar_open_ts
+            )
+            previous_cutoff = (
+                prior.observation_candle_cutoff_ts
+                if prior is not None
+                else previous.arm.arm_candle_cutoff_ts
+            )
+            previous_distinct = prior.distinct_observation_count if prior is not None else 0
+            previous_elapsed = prior.elapsed_bars if prior is not None else 0
+            if confirmation.observation_bar_open_ts <= previous_open:
+                raise LifecycleContractError("successor_bar_must_be_strictly_later")
+            if confirmation.observation_candle_cutoff_ts <= previous_cutoff:
+                raise LifecycleContractError("successor_cutoff_must_be_strictly_later")
+            if confirmation.elapsed_bars <= previous_elapsed:
+                raise LifecycleContractError("successor_elapsed_bars_must_increase")
+            if confirmation.distinct_observation_count != previous_distinct + 1:
+                raise LifecycleContractError("successor_distinct_count_must_increment_once")
         resolved_proposal = proposal or ProposalObservationV1.not_evaluated(
             candidate_id=previous.arm.candidate_id,
             side=previous.arm.side,
@@ -1239,6 +1359,9 @@ class CandidateLifecycleEventV1:
             )
             expected_distinct = prior.distinct_observation_count if prior is not None else 0
             expected_elapsed = prior.elapsed_bars if prior is not None else 0
+            expected_high = prior.observed_high if prior is not None else self.arm.armed_high
+            expected_low = prior.observed_low if prior is not None else self.arm.armed_low
+            expected_close = prior.observed_close if prior is not None else self.arm.armed_close
             observation = successor.confirmation
             if observation.observation_input_bundle_hash != expected_input_hash:
                 raise LifecycleContractError("same_bar_input_bundle_mismatch")
@@ -1250,6 +1373,35 @@ class CandidateLifecycleEventV1:
                 raise LifecycleContractError("same_bar_distinct_count_mismatch")
             if observation.elapsed_bars != expected_elapsed:
                 raise LifecycleContractError("same_bar_elapsed_bars_mismatch")
+            if observation.observed_high != expected_high:
+                raise LifecycleContractError("same_bar_observed_high_mismatch")
+            if observation.observed_low != expected_low:
+                raise LifecycleContractError("same_bar_observed_low_mismatch")
+            if observation.observed_close != expected_close:
+                raise LifecycleContractError("same_bar_observed_close_mismatch")
+        elif successor.confirmation is not None:
+            prior = self.confirmation
+            previous_open = (
+                prior.observation_bar_open_ts
+                if prior is not None
+                else self.arm.arm_bar_open_ts
+            )
+            previous_cutoff = (
+                prior.observation_candle_cutoff_ts
+                if prior is not None
+                else self.arm.arm_candle_cutoff_ts
+            )
+            previous_distinct = prior.distinct_observation_count if prior is not None else 0
+            previous_elapsed = prior.elapsed_bars if prior is not None else 0
+            observation = successor.confirmation
+            if observation.observation_bar_open_ts <= previous_open:
+                raise LifecycleContractError("successor_bar_must_be_strictly_later")
+            if observation.observation_candle_cutoff_ts <= previous_cutoff:
+                raise LifecycleContractError("successor_cutoff_must_be_strictly_later")
+            if observation.elapsed_bars <= previous_elapsed:
+                raise LifecycleContractError("successor_elapsed_bars_must_increase")
+            if observation.distinct_observation_count != previous_distinct + 1:
+                raise LifecycleContractError("successor_distinct_count_must_increment_once")
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -1329,8 +1481,12 @@ _CANDIDATE_ARM_KEYS = _CONTRACT_IDENTITY_KEYS | frozenset(
         "timeframe_seconds",
         "arm_bar_open_ts",
         "arm_candle_cutoff_ts",
+        "armed_high",
+        "armed_low",
         "armed_close",
         "invalidate_level",
+        "confirmation_enabled",
+        "confirmation_max_wait_observations",
         "arm_trace_hash",
         "arm_trace",
     }
