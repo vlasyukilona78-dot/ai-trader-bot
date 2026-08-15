@@ -4,33 +4,54 @@ This worktree is the selected MEXC causal research/signals-only line. Do not
 infer the current state from the root/Bybit branch or from old positive
 expectancy notes.
 
-## Mandatory first read
+## Mandatory orientation and reading order
 
 Before editing code, changing branches, starting a process, calling an exchange
 API, or giving a strategy verdict:
 
-1. Read `docs/CLAUDE_REVIEW_PROMPT_2026-08-03.md` in full and follow its
-   read-only orientation/review sequence.
-2. Read `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` in full. It is the
-   authoritative MEXC strategy, data, model and implementation plan.
-3. Read the current checkpoint and the latest 2026-08-11 section of
-   `docs/AI_HANDOFF.md`. Earlier sections are an audit history and contain
-   superseded findings.
-4. Verify the worktree, branch, local HEAD and remote HEAD yourself. The
+1. Read `docs/FINAL_BOT_MASTER_PLAN_2026-08-14.md` in full. It is the
+   authoritative final-product roadmap after the independent 2026-08-15
+   `APPROVE_AS_AUTHORITATIVE` closure verdict.
+2. Read `docs/ADR_MEXC_V3_FINAL_BOT_2026-08-15.md` in full. It is the bounded
+   v3 architecture/decision contract subordinate to that master.
+3. Read `docs/MEXC_V3_PREREGISTRATION_SKELETON_2026-08-15.md` in full before
+   collecting admission data, selecting thresholds or evaluating a model.
+4. Read the current notice and latest 2026-08-15 checkpoint of
+   `docs/AI_HANDOFF.md`. Earlier sections are audit history and may contain
+   superseded implementation order or findings.
+5. Treat `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` as the frozen
+   historical/executable-v2 audit source. Read it before touching or judging a
+   v2 contract, codec, fixture or compatibility boundary; do not use it as a
+   competing future-product roadmap.
+6. `docs/CLAUDE_REVIEW_PROMPT_2026-08-03.md` remains a historical independent
+   read-only audit procedure for the v6 evidence checkpoint, not the current
+   implementation prompt. Where it conflicts with the newer roadmap/ADR, the
+   newer explicitly approved decision governs future v3 work while v2 remains
+   frozen.
+7. Verify the worktree, branch, local HEAD and remote HEAD yourself. The
    published AI foundation anchor is `f0b43d6` on
    `claude/codex-project-review-04581e`; the 2026-08-08 StrategySpec/journal-v5
    code tip is `2d0efcb`, the behavioral-compatibility tip is `258c35f`, the
    versioned-evidence compatibility tip is `1971b77`, the finalized typed
    lifecycle tip is `9ef6b4f`, and the current journal-v6 code tip is
-   `bb1ca13`. Current HEAD must descend from all six anchors.
+   `bb1ca13`. The independently approved roadmap was reviewed against the later
+   research-builder HEAD `ad30b02`. Current HEAD must descend from all seven
+   anchors; discover any documentation-only publication descendant rather than
+   assuming its hash.
 
 ## Current product truth
 
 - Target exchange: MEXC futures.
 - Scope: public-data, signals-only causal research. There is no production MEXC
   private execution adapter in this line.
-- Latest executable tip and test receipt: `bb1ca13`; `723 passed, 4 skipped`,
-  with two known pytest collection warnings (`17.80s`).
+- `docs/FINAL_BOT_MASTER_PLAN_2026-08-14.md` is the authoritative path to the
+  final Research Monitor, conditionally promoted Actionable Signals Bot and
+  separately gated optional Execution Bot. Its v3 design is documentation, not
+  deployed runtime or proof of edge; no public-data pilot is implied.
+- Frozen-v2 journal/runtime tip and test receipt: `bb1ca13`; `723 passed, 4
+  skipped`, with two known pytest collection warnings (`17.80s`). The later
+  `ad30b02` dataset-builder commit is parallel research mechanics and does not
+  make its Min60/calibration outputs admissible v3/model evidence.
 - Generic pump-fade has not demonstrated stable positive edge after costs. The
   earlier DCA/positive-expectancy claims are retracted hypotheses, not evidence.
 - Phase 0 plus the Phase 1 timing, replay, canonical StrategySpec, typed
@@ -64,8 +85,10 @@ API, or giving a strategy verdict:
   and sample budgets. `pump_window` and confirmation timing are not the same kind
   of parameter as RSI/ATR/EMA/VP history. A Min15 design is a new strategy
   hypothesis, not a mechanical conversion or override of the frozen Min60 v2.
-  Historical prose coupling “45 bars” to a roughly 20-minute pump is only a clue
-  about earlier intent, not an accepted timeframe decision.
+  The approved final-product roadmap and v3 ADR now define the bounded Min1
+  acquisition/peak-SLA research path, but it remains unimplemented and cannot
+  inherit evidence from the frozen Min60 line. Historical prose coupling “45
+  bars” to a roughly 20-minute pump remains only a clue about earlier intent.
 - The current runtime-population path is
   `data/runtime/mexc_population_decisions_v6.jsonl`. Schema v5 fixtures remain
   strictly readable but v5 files cannot be appended; model export from v5 also
@@ -133,8 +156,10 @@ API, or giving a strategy verdict:
 
 ## After material work
 
-Update both `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` and the current section
-of `docs/AI_HANDOFF.md` with the branch/HEAD, files changed, exact tests,
-runtime/network actions, unresolved findings and next acceptance gate. Keep
-historical conclusions intact; append a superseding verdict instead of silently
-rewriting history.
+Update `docs/FINAL_BOT_MASTER_PLAN_2026-08-14.md` when an approved product
+decision or acceptance state changes, and append the current section of
+`docs/AI_HANDOFF.md` with branch/HEAD, files changed, exact tests,
+runtime/network actions, unresolved findings and the next acceptance gate.
+Keep `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` frozen except for an explicit
+historical-fact correction or compatibility annotation. Preserve historical
+conclusions; append a superseding verdict instead of silently rewriting history.

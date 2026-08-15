@@ -1,16 +1,24 @@
 # AI collaboration handoff
 
-Updated: 2026-08-11, Europe/Moscow
+Updated: 2026-08-15, America/Chicago
 
 > [!IMPORTANT]
-> Fresh-session entrypoint: read `CLAUDE.md` and
-> `docs/CLAUDE_REVIEW_PROMPT_2026-08-03.md`, then treat
-> `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` as the current MEXC plan. The
-> published AI foundation anchor is `f0b43d6`; the StrategySpec/journal-v5
+> Fresh-session entrypoint: read `CLAUDE.md`, then treat
+> `docs/FINAL_BOT_MASTER_PLAN_2026-08-14.md` as the authoritative final-product
+> roadmap. Its independent Claude closure review returned
+> `APPROVE_AS_AUTHORITATIVE` on 2026-08-15 with no remaining P0/P1. The matching
+> v3 ADR and preregistration skeleton named by `CLAUDE.md` are mandatory next
+> reads. `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` remains a frozen
+> historical/executable-v2 audit source, not the current product roadmap. The
+> approval-base HEAD is `ad30b02`; do not invent a publication commit hash—find
+> any later documentation-only descendant with `git log`. The published AI
+> foundation anchor is `f0b43d6`; the StrategySpec/journal-v5
 > foundation tip is `2d0efcb`, the frozen-behavior tip is `258c35f`, the
 > versioned StrategySpec evidence tip is `1971b77`, the finalized typed
-> lifecycle tip is `9ef6b4f`, and the latest executable code tip is `bb1ca13`.
-> Discover any later documentation-only descendant with `git log`. The
+> lifecycle tip is `9ef6b4f`, and the frozen-v2 journal/runtime tip is
+> `bb1ca13`.
+> The later `ad30b02` research dataset-builder descendant is not v3/model
+> evidence. The
 > `98217df`/`340 passed`
 > checkpoint immediately below is a
 > preserved earlier causal-scanner snapshot, not the latest foundation state.
@@ -2044,3 +2052,64 @@ predictors merely because the exporter carries them beside a row.
    gates pass may LightGBM plus a separate EV head be evaluated in shadow/paper
    mode, with CatBoost and sequence models as later challengers. Another no-edge
    result must be accepted without threshold or model shopping.
+
+## Final-product roadmap approval checkpoint — 2026-08-15
+
+This documentation-only checkpoint promotes
+`docs/FINAL_BOT_MASTER_PLAN_2026-08-14.md` from reviewed draft to the
+authoritative final-product roadmap. It does not alter, reinterpret or migrate
+the frozen `mexc_strategy_v2` runtime/evidence contracts. The prior
+`docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` is preserved as their historical
+and executable-v2 audit source.
+
+### Approval base and artifacts
+
+- Branch: `claude/codex-project-review-04581e`.
+- Review base: local HEAD and upstream both `ad30b02` before the S1
+  documentation changes.
+- Final-product roadmap: `docs/FINAL_BOT_MASTER_PLAN_2026-08-14.md`.
+- Independent review prompt/receipt source:
+  `docs/CLAUDE_FINAL_BOT_PLAN_REVIEW_PROMPT_2026-08-14.md` plus the supplied
+  2026-08-15 closure verdict.
+- Supporting S1 documents are
+  `docs/ADR_MEXC_V3_FINAL_BOT_2026-08-15.md` and
+  `docs/MEXC_V3_PREREGISTRATION_SKELETON_2026-08-15.md`; they do not mutate v2
+  codecs, fixtures or evidence namespaces.
+- No future publication commit hash is asserted in this checkpoint. Discover
+  the eventual documentation-only commit from Git history.
+
+### Independent closure verdict
+
+Claude independently re-read the corrected master and returned
+`APPROVE_AS_AUTHORITATIVE`; remaining P0/P1: **none**. The closure pass verified
+that:
+
+1. `actionable_delivery_at` is tied exactly to a durable per-channel receipt
+   and the delivery SLA is therefore falsifiable;
+2. journal v6 is described as the current writer for the frozen v2 line and is
+   closed to v3 semantics;
+3. P4/P5 contracts may be researched after P0 but cannot be accepted before
+   P1–P3, and their schemas/population definition cannot be frozen before P3
+   proves acquisition feasibility;
+4. U15 requires an explicit narrowed-universe policy or stopping v3 when
+   full-universe Min1 acquisition is not achievable under the frozen P3 gate.
+
+### Scope and operational receipt
+
+- Documentation only; no production code or frozen fixtures were changed.
+- No scanner, bot, model, Telegram, private API or exchange process was run.
+- No network call was made and `.env` was not opened.
+- No pytest run was needed for the read-only document closure review; the last
+  executable validation receipt remains historical and must not be presented as
+  validation of future v3 code.
+- No edge, model promotion, public-data pilot, private/testnet/live access or
+  capital exposure is authorised by this approval.
+
+### Next gate
+
+This bounded documentation checkpoint is S1; discover its eventual publication
+hash from Git rather than embedding a self-reference. The next code gate is S2
+strict local history collection plus S3 aggregation contracts without network
+access. A public Min1 pilot still requires separate explicit user approval after
+S1–S3; model work remains blocked until an admissible population, causal labels
+and preregistration exist.
