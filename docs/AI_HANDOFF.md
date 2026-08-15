@@ -10,20 +10,21 @@ Updated: 2026-08-15, America/Chicago
 > v3 ADR and preregistration skeleton named by `CLAUDE.md` are mandatory next
 > reads. `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` remains a frozen
 > historical/executable-v2 audit source, not the current product roadmap. The
-> approval-base HEAD is `ad30b02`; do not invent a publication commit hash—find
-> any later documentation-only descendant with `git log`. The published AI
+> approval-base HEAD is `ad30b02`; the authoritative S1 roadmap publication is
+> `2a14299`. The published AI
 > foundation anchor is `f0b43d6`; the StrategySpec/journal-v5
 > foundation tip is `2d0efcb`, the frozen-behavior tip is `258c35f`, the
 > versioned StrategySpec evidence tip is `1971b77`, the finalized typed
 > lifecycle tip is `9ef6b4f`, and the frozen-v2 journal/runtime tip is
-> `bb1ca13`.
+> `bb1ca13`. The completed S3 aggregation tip is `0ff1b3a`; the completed S2
+> strict-history tip is `36e1446`.
 > The later `ad30b02` research dataset-builder descendant is not v3/model
 > evidence. The
 > `98217df`/`340 passed`
 > checkpoint immediately below is a
 > preserved earlier causal-scanner snapshot, not the latest foundation state.
-> Latest code validation: `723 passed, 4 skipped, 2 known collection warnings`
-> (`17.80s`). Current writer/default path: journal schema v6 at
+> Latest code validation: `822 passed, 4 skipped, 2 known collection warnings`
+> (`22.94s`). Current writer/default path: journal schema v6 at
 > `data/runtime/mexc_population_decisions_v6.jsonl`. Schema v5 remains frozen,
 > fixture-backed and read-only; it is not the current append target.
 
@@ -2113,3 +2114,86 @@ strict local history collection plus S3 aggregation contracts without network
 access. A public Min1 pilot still requires separate explicit user approval after
 S1–S3; model work remains blocked until an admissible population, causal labels
 and preregistration exist.
+
+## Strict history and deterministic Min1 aggregation checkpoint — 2026-08-15
+
+This append-only checkpoint supersedes only the S1 “next code gate” immediately
+above. It does not alter frozen v2 codecs, fixtures, runtime behavior or the
+no-edge verdict. S2/S3 are local data-contract foundations; they are not a
+public-data pilot, an admissible population, a v3 strategy or proof of edge.
+
+### Publication chain and exact identities
+
+```text
+2a14299 docs(roadmap): approve MEXC final-bot contract
+0ff1b3a feat(data): add deterministic Min1 aggregation contract
+36e1446 feat(data): add strict MEXC history contracts
+```
+
+- `mexc_min1_aggregation_v1` contract hash:
+  `0d851b253cde913d95a693e0db7296b59ff78a6048bacb20838386f2e8e20a21`.
+- `mexc_strict_history_v1` contract hash:
+  `6c17bd9de3e25210139da4491a1f35fbd0cec557707fb5d376a60ce23e04c6c1`.
+- Files added by S2/S3:
+  `trading/market_data/min1_aggregation.py`,
+  `trading/market_data/strict_history.py`,
+  `tests/v3/test_min1_aggregation_contract_v1.py`, and
+  `tests/v3/test_strict_history_contract_v1.py`.
+- Legacy `HistoryCollector`, existing MEXC feed/client behavior, `data/history`,
+  bar/frame-provenance contracts, v2 specs and frozen fixture bytes were not
+  edited or migrated.
+
+### What S2/S3 now prove
+
+- The strict collector has no default network transport. It requires an
+  explicit half-open aligned range, injected transport and explicit storage
+  root; it never converts network/HTTP/JSON/API/payload failure, truncation or a
+  gap into valid no-data.
+- Exact raw bodies and per-attempt receipts are persisted before parse;
+  normalized completion requires the entire closed UTC grid, exact quote
+  `amount` turnover, immutable raw/attempt/normalized artifacts and a final
+  manifest whose source graph is reverified before publication.
+- Min1 aggregation accepts only contiguous canonical UTC rows and exact
+  per-row receipts. It emits complete epoch-aligned Min5/Min15/Min60/Hour4
+  groups using deterministic first/max/min/last/`fsum` semantics.
+- The S2→S3 adapter binds each consumed normalized row to its exact raw page and
+  the complete S2 manifest. A coherently changed frame with reused receipts is
+  rejected rather than laundered into derived evidence.
+- Existing ignored `data/history` CSV files remain legacy/discovery-only and
+  contain no admissible Min1 evidence.
+
+### Verification and independent review
+
+```text
+focused tests/v3: 91 passed
+full pytest:       822 passed, 4 skipped,
+                   2 known PytestCollectionWarning (22.94s)
+independent reviews: P0 none; P1 none; APPROVE S2/S3 contract checkpoint
+```
+
+No operational scanner/bot runtime, model, Telegram, private API or exchange
+request was started. No public endpoint was contacted, `.env` was not read, and
+no pilot data or runtime artifact was produced. Root/Bybit remained limited to
+the three pre-existing user `.idea/*` changes.
+
+### Open P2 and next gate
+
+Before any U5 network authorization can be exercised, a bounded fake-transport
+pre-pilot hardening slice must add or pin:
+
+1. the official Futures endpoint/domain fixture without silently changing the
+   legacy client default;
+2. raw-response, page/row, storage and runtime budgets;
+3. pacing/backoff/`Retry-After` and oversized-response tests;
+4. a strict disk loader/restart reconciliation that verifies the complete
+   raw/attempt/normalized/manifest graph and redundant raw byte lengths;
+5. documented Windows best-effort directory-fsync/atomic-publication behavior;
+6. exact sub-microsecond timing-tolerance disposition, safe public
+   `Date`/quoted-`ETag` handling, and consistent typed storage errors for damaged
+   duplicate-key/non-finite JSON artifacts.
+
+Only after that local slice and an immutable pilot run manifest may the user
+grant U5 explicitly. U5 is still **not granted**. The next permitted work is
+local pre-pilot hardening; threshold search, v3 runtime, model fit, Telegram,
+private/testnet/live access and capital exposure remain blocked by the master
+plan gates.

@@ -15,7 +15,11 @@ runtime, `.env`, commit или push.
 Текущая ветка: `claude/codex-project-review-04581e`
 Review-base HEAD: `ad30b02` (local = upstream). До создания draft tracked tree
 был clean; во время closure review draft и review prompt оставались untracked.
-Фактический documentation-only publication commit следует находить через Git.
+Авторитетный S1 publication commit: `2a14299`. P1 contract checkpoint:
+`0ff1b3a` (deterministic Min1 aggregation) → `36e1446` (strict MEXC history).
+На `36e1446`: `822 passed, 4 skipped, 2` known collection warnings
+(`22.94s`); independent S2/S3 review: P0/P1 none. Network, public-data pilot,
+operational scanner/bot runtime, Telegram, private API и model не запускались.
 
 Этот документ объединяет:
 
@@ -494,6 +498,10 @@ rows или feature contract.
 4. focused + full regression tests;
 5. отдельное пользовательское разрешение на public-data pilot.
 
+Пункты 1–4 выполнены локально и опубликованы в S1–S3. Пункт 5 (`U5`) не
+предоставлен и не выводится из разрешения менять код. Поэтому этот checkpoint
+не разрешает ни один запрос к MEXC.
+
 Current Futures API domain должен быть проверен по официальной документации
 непосредственно перед запуском. MEXC объявил переход Futures API с
 `contract.mexc.com` на `api.mexc.com`; interface parameters сохранялись:
@@ -503,6 +511,13 @@ Current Futures API domain должен быть проверен по офиц�
 
 ### 8.2 Strict collector
 
+**Implemented P1 receipt — `36e1446`.** Контракт
+`mexc_strict_history_v1` pinned к
+`6c17bd9de3e25210139da4491a1f35fbd0cec557707fb5d376a60ce23e04c6c1`.
+Отдельный v3-only collector не меняет legacy `HistoryCollector`, frozen v2,
+текущий cache или endpoint defaults. Он не содержит default network transport
+и требует явных transport и storage root.
+
 - typed network/HTTP/JSON/API/payload failures;
 - error никогда не становится empty/no-data;
 - every expected timestamp audited;
@@ -510,13 +525,15 @@ Current Futures API domain должен быть проверен по офиц�
 - closed UTC boundary;
 - mandatory OHLCV + exact `amount` turnover;
 - no gap fill;
-- atomic temp + fsync + rename;
+- same-volume temp + file fsync + atomic hardlink/no-overwrite; parent-directory
+  fsync is best-effort on Windows and restart verification remains mandatory;
 - request/page receipts;
 - immutable raw response bytes либо content-addressed raw payload с request
   parameters, HTTP/API status, `received_at` и content hash;
 - normalized shard ссылается на exact raw page hashes;
-- schema явно фиксирует units `volume`, contract count, `contractSize`, quote
-  `amount`/turnover, conversions и rounding; это проверяется payload fixtures;
+- schema явно фиксирует `volume` как exchange-reported contract count и quote
+  `amount` как exact turnover; base-volume conversion не заявляется без
+  point-in-time `contractSize`; это проверяется payload fixtures;
 - separate pilot path, no mutation current cache.
 
 ### 8.3 QA pilot
@@ -538,6 +555,30 @@ volume=sum, turnover=sum
 Только полные UTC-aligned groups. Derived bar становится доступен после receipt
 всех входящих Min1 rows и наследует raw manifest/timing. Native-vs-derived
 сравнение gap-aware и по preregistered tick/numeric tolerances, не byte equality.
+
+**Implemented P1 receipt — `0ff1b3a`.** Контракт
+`mexc_min1_aggregation_v1` pinned к
+`0d851b253cde913d95a693e0db7296b59ff78a6048bacb20838386f2e8e20a21`.
+S2→S3 adapter связывает complete S2 manifest, exact raw-page hash и normalized
+consumed-row hash; изменение frame при прежних receipts отклоняется. Агрегация
+не выполняет network action и не является доказательством edge.
+
+Перед U5/public pilot остаётся отдельный pre-pilot hardening gate:
+
+- versioned official Futures endpoint/domain fixture без молчаливой подмены
+  legacy domain;
+- hard limits на raw response, pages/rows и storage budget;
+- transport pacing/backoff/`Retry-After` с fake-clock и oversized-response tests;
+- строгий disk loader/restart reconciliation и повторная проверка всего
+  raw/attempt/normalized/manifest graph после рестарта, включая фактическую
+  длину raw body;
+- документированная Windows durability semantics для best-effort directory
+  fsync/atomic publication;
+- canonical handling нормальных public `Date`/quoted `ETag` headers без
+  расширения safe-header allowlist на credentials;
+- устранение микросекундной timing tolerance либо явная фиксация её как
+  допустимой численной погрешности контракта;
+- единая typed storage-error оболочка для damaged duplicate-key/non-finite JSON.
 
 Pilot проверяет data mechanics, coverage, latency, rate и storage. Он не
 используется для заявления edge.
@@ -958,7 +999,7 @@ auto-retraining и auto-promotion запрещены.
 | Phase | Результат | Acceptance | STOP |
 |---|---|---|---|
 | P0 | Joint ADR/master approved | clocks, IDs, outcomes, risk, topology однозначны | unresolved executable semantics |
-| P1 | Strict history + aggregation contracts | focused/full tests; v2 fixtures unchanged | error→empty, silent truncation, gap fill |
+| P1 — COMPLETE (`0ff1b3a`, `36e1446`) | Strict history + aggregation contracts | 91 focused; 822 full passed; v2 fixtures unchanged; independent P0/P1 none | error→empty, silent truncation, gap fill |
 | P2 | Public Min1 QA pilot | 7–14d pilot + 140d probe; manifests; measured API/runtime/storage | incomplete/unexplained data |
 | P3 | Full-universe acquisition feasibility | coverage + public-source acquisition budget; reserve decision/notifier budget | missed universe or infeasible budget not explicit |
 | P4 | V3 specs/contracts | StrategySpec/Feature/Peak/Instrument/Proposal schemas + frozen compatibility fixtures | semantic drift or unresolved identity |
@@ -1287,9 +1328,9 @@ updated handoff + next gate
 ### Planned initial slices
 
 ```text
-S1  ADR + master/preregistration docs only
-S2  strict history collector
-S3  aggregation contract
+S1  COMPLETE — ADR + master/preregistration docs (`2a14299`)
+S2  COMPLETE — strict history collector (`36e1446`)
+S3  COMPLETE — deterministic Min1 aggregation (`0ff1b3a`)
 S4  signal clocks + SLA
 S5  StrategySpecV3 + FeatureContractV3 + instrument/proposal/risk schemas
 S6  PeakEpisode episode/level/attempt + compatibility fixture
@@ -1303,8 +1344,9 @@ S13 strict v3 dataset readers + population/model manifests
 S14 v3 scanner path behind explicit flag, default v2 unchanged
 ```
 
-Pilot следует только после S1–S3 и отдельного разрешения. Threshold/model work
-следует только после admissible population, labels и preregistration.
+S1–S3 завершены. Pilot следует только после перечисленного в §8 pre-pilot
+hardening и отдельного разрешения U5. Threshold/model work следует только после
+admissible population, labels и preregistration.
 
 ---
 
@@ -1333,13 +1375,16 @@ Pilot следует только после S1–S3 и отдельного р�
 
 ## 21. Ближайший безопасный следующий шаг
 
-1. Documentation-only S1 состоит из этого master plan, принятого ADR,
-   preregistration skeleton, review receipt и обновлённых handoff pointers;
-   фактический publication commit следует находить через Git, а не пиновать
-   внутри самого себя.
-2. Следующим code slice реализовать S2 strict history collector и S3 aggregation contract
-   локально, без network action и без изменения frozen v2 semantics.
-3. Закончить focused/full regression и independent review S2/S3.
-4. Только после этого и отдельного разрешения U5 выполнить public Min1 QA pilot.
+1. S1–S3 завершены: authoritative docs `2a14299`, aggregation `0ff1b3a`, strict
+   history `36e1446`; focused/full regression и два independent review прошли
+   без P0/P1.
+2. Следующий bounded code slice — закрыть pre-pilot hardening list из §8:
+   endpoint fixture, resource limits, retry/pacing, strict restart loader,
+   Windows durability и оставшиеся exact-evidence P2. Всё выполняется на fake
+   transport/local artifacts, без network action и без изменения frozen v2.
+3. После этого подготовить неизменяемый U5 run manifest: symbols/ranges,
+   endpoint contract, rate/storage budgets, stop conditions и output root.
+4. Только отдельное явное разрешение U5 позволяет выполнить public Min1 QA
+   pilot. Отсутствие ответа не является разрешением.
 5. Не начинать v3 runtime, threshold search или model fit до соответствующих
    phase gates этого документа.

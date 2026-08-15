@@ -35,8 +35,10 @@ API, or giving a strategy verdict:
    versioned-evidence compatibility tip is `1971b77`, the finalized typed
    lifecycle tip is `9ef6b4f`, and the current journal-v6 code tip is
    `bb1ca13`. The independently approved roadmap was reviewed against the later
-   research-builder HEAD `ad30b02`. Current HEAD must descend from all seven
-   anchors; discover any documentation-only publication descendant rather than
+   research-builder HEAD `ad30b02` and published at `2a14299`. The completed
+   deterministic Min1 aggregation and strict-history contract tips are
+   `0ff1b3a` and `36e1446`. Current HEAD must descend from all of these anchors;
+   discover any later documentation-only publication descendant rather than
    assuming its hash.
 
 ## Current product truth
@@ -52,6 +54,11 @@ API, or giving a strategy verdict:
   skipped`, with two known pytest collection warnings (`17.80s`). The later
   `ad30b02` dataset-builder commit is parallel research mechanics and does not
   make its Min60/calibration outputs admissible v3/model evidence.
+- P1 data-contract checkpoint: `0ff1b3a` adds deterministic Min1 aggregation
+  and `36e1446` adds strict, receipt-backed history collection. Independent
+  review found no P0/P1. Validation at that code tip is `822 passed, 4 skipped`,
+  with the same two known pytest collection warnings (`22.94s`). No network or
+  public-data pilot was run.
 - Generic pump-fade has not demonstrated stable positive edge after costs. The
   earlier DCA/positive-expectancy claims are retracted hypotheses, not evidence.
 - Phase 0 plus the Phase 1 timing, replay, canonical StrategySpec, typed
@@ -85,10 +92,13 @@ API, or giving a strategy verdict:
   and sample budgets. `pump_window` and confirmation timing are not the same kind
   of parameter as RSI/ATR/EMA/VP history. A Min15 design is a new strategy
   hypothesis, not a mechanical conversion or override of the frozen Min60 v2.
-  The approved final-product roadmap and v3 ADR now define the bounded Min1
-  acquisition/peak-SLA research path, but it remains unimplemented and cannot
-  inherit evidence from the frozen Min60 line. Historical prose coupling “45
-  bars” to a roughly 20-minute pump remains only a clue about earlier intent.
+  The approved final-product roadmap and v3 ADR define the bounded Min1
+  acquisition/peak-SLA research path. Its strict local history and aggregation
+  contracts are now implemented, but the official endpoint adapter, public
+  pilot, full-universe scheduler and v3 strategy/runtime remain unimplemented;
+  none may inherit evidence from the frozen Min60 line. Historical prose
+  coupling “45 bars” to a roughly 20-minute pump remains only a clue about
+  earlier intent.
 - The current runtime-population path is
   `data/runtime/mexc_population_decisions_v6.jsonl`. Schema v5 fixtures remain
   strictly readable but v5 files cannot be appended; model export from v5 also
@@ -147,6 +157,10 @@ API, or giving a strategy verdict:
 
 - Keep the scanner/bot stopped unless the user explicitly requests a run after
   reviewing its network and alert effects.
+- The S2/S3 checkpoint contains no default network transport. Public MEXC Min1
+  collection remains blocked on official-domain fixtures, bounded response and
+  retry/pacing policy, strict artifact restart loading, and separate explicit
+  U5 permission.
 - Do not use private APIs, Telegram delivery, testnet or live execution.
 - `.env` is absent from the current tip, but secrets existed in Git history and
   have not been rotated. Treat all historical credentials as compromised and do
