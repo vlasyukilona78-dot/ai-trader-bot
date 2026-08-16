@@ -1,5 +1,6 @@
-# These two fixtures are cryptographic byte receipts, not ordinary text. Git
-# must not rewrite LF framing on Windows or their committed checkpoint ceases to
-# authenticate the journal that the compatibility reader opens.
+# These fixtures are cryptographic byte receipts, not ordinary text. Git must
+# not rewrite LF framing on Windows or their committed identities cease to
+# authenticate the exact evidence that the compatibility readers open.
 tests/fixtures/mexc_population_journal_v5_minimal.jsonl -text
 tests/fixtures/mexc_population_journal_v5_minimal_receipt.json -text
+trading/market_data/fixtures/mexc_futures_kline_endpoint_candidate_v1.json -text
