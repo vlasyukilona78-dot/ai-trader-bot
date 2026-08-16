@@ -1,6 +1,6 @@
 # AI collaboration handoff
 
-Updated: 2026-08-15, America/Chicago
+Updated: 2026-08-16, America/Chicago
 
 > [!IMPORTANT]
 > Fresh-session entrypoint: read `CLAUDE.md`, then treat
@@ -17,14 +17,15 @@ Updated: 2026-08-15, America/Chicago
 > versioned StrategySpec evidence tip is `1971b77`, the finalized typed
 > lifecycle tip is `9ef6b4f`, and the frozen-v2 journal/runtime tip is
 > `bb1ca13`. The completed S3 aggregation tip is `0ff1b3a`; the completed S2
-> strict-history tip is `36e1446`.
+> strict-history tip is `36e1446`. The bounded transport tip is `ba8ea00` and
+> the restart-safe strict-history-v2 tip is `f8a6b5b`.
 > The later `ad30b02` research dataset-builder descendant is not v3/model
 > evidence. The
 > `98217df`/`340 passed`
 > checkpoint immediately below is a
 > preserved earlier causal-scanner snapshot, not the latest foundation state.
-> Latest code validation: `822 passed, 4 skipped, 2 known collection warnings`
-> (`22.94s`). Current writer/default path: journal schema v6 at
+> Latest code validation: `905 passed, 5 skipped, 2 known collection warnings`
+> (`21.80s` independent receipt). Current writer/default path: journal schema v6 at
 > `data/runtime/mexc_population_decisions_v6.jsonl`. Schema v5 remains frozen,
 > fixture-backed and read-only; it is not the current append target.
 
@@ -2197,3 +2198,98 @@ grant U5 explicitly. U5 is still **not granted**. The next permitted work is
 local pre-pilot hardening; threshold search, v3 runtime, model fit, Telegram,
 private/testnet/live access and capital exposure remain blocked by the master
 plan gates.
+
+## Bounded transport and restart-safe strict-history v2 checkpoint — 2026-08-16
+
+This append-only checkpoint supersedes the “Open P2 and next gate” immediately
+above. It hardens the per-range S2 acquisition boundary; it does not execute or
+approve P2, change frozen strict-history-v1/aggregation-v1 or frozen
+StrategySpec/journal-v2-control evidence, select v3 thresholds, or prove edge.
+
+### Commit chain and exact identities
+
+```text
+ba8ea00 feat(data): add bounded MEXC futures transport contract
+f8a6b5b feat(data): add restart-safe strict history v2
+```
+
+- Endpoint candidate `mexc_futures_kline_endpoint_candidate_v1`:
+  `54f57d755cd679eb92444d48b38013621caad37067125e80cf7c5e45fe2ab220`.
+- Per-shard limits `mexc_history_resource_limits_v1`:
+  `937d053e33c513d128389259e308156c8758e5cfe44b5849e3eb27ea49d96bdc`.
+- Retry policy `mexc_history_retry_policy_v1`:
+  `78f92d14cc26ead1a372d840a05fe8a60dae97d5d9a3cdacc539a098194a2cc9`.
+- Raw transport `mexc_futures_raw_transport_v1`:
+  `7d3bd40c6753e7bda2f1904ce2ffa2ff55770ecce9ba6d5614d2b30ae0664d22`.
+- Strict collector/storage `mexc_strict_history_v2`:
+  `cce9922317ec5f0008f3b293103f9f5a17504b7143f81af1845d9d4765c44086`.
+- Frozen `mexc_strict_history_v1` and `mexc_min1_aggregation_v1` remain pinned
+  to `6c17bd9de3e25210139da4491a1f35fbd0cec557707fb5d376a60ce23e04c6c1`
+  and `0d851b253cde913d95a693e0db7296b59ff78a6048bacb20838386f2e8e20a21`;
+  their source and fixtures were not changed.
+
+### What the checkpoint proves
+
+- The fixture pins `https://api.mexc.com/api/v1/contract/kline/{venue_symbol}`
+  but explicitly records `candidate_not_u5_verified`; both current-official-doc
+  and live-endpoint verification are false. There is no real/default network
+  executor. Tests use an injected fake streaming executor only.
+- Attempt bodies, retry/pacing/`Retry-After`, epoch and monotonic clocks,
+  response-size/runtime limits and safe public headers are typed and pinned.
+  Every handled attempt returned to the collector retains bounded complete or
+  partial evidence; an error cannot become valid empty history. Abrupt process
+  death may leave an incomplete shard, never a positive admission.
+- A strict-history-v2 store root is persistently bound for verified restart by
+  `scope.json` to exactly one `HistoryRangeRequestV2`. A process-local plus OS
+  file lock and owner-thread guard protect the pristine check through positive
+  admission among cooperating writers; adversarial filesystem replacement/
+  TOCTOU is outside this contract. Resume,
+  repair, promotion of temp data and cross-request reuse are rejected.
+- A manifest is evidence, not success. Positive admission is installed only
+  after the complete raw/attempt/normalized/manifest graph is freshly reloaded
+  and revalidated from disk within its budget. Untrusted temp hardlink aliases
+  are reported but never read or double-counted.
+- The S2v2→S3 adapter checks source-close timing in exact integer microseconds,
+  binds the complete strict-history-v2 manifest and exact normalized row hashes,
+  then projects to the frozen aggregation-v1 interface.
+- Windows acceptance is atomic create-new/no-overwrite visibility plus
+  process-crash/fresh-restart verification. It does not claim parent-directory
+  or sudden-power-loss durability.
+
+### Verification and operational receipt
+
+```text
+focused endpoint + strict v2: 83 passed, 1 skipped
+all tests/v3:                174 passed, 1 skipped
+frozen compatibility:        217 passed
+full pytest:                  905 passed, 5 skipped,
+                              2 known PytestCollectionWarning (21.80s)
+code-scope red-teams:          APPROVE; P0/P1/P2 none
+```
+
+The `217` compatibility receipt is the exact pytest selection of
+`test_strict_history_contract_v1.py`, `test_min1_aggregation_contract_v1.py`,
+`test_frame_provenance_v1.py`, `test_closed_bar_contract_v2.py`,
+`test_journaling_v2.py`, `test_scan_journal_reader_e2e_v2.py`,
+`test_population_journal_v6.py`,
+`test_population_journal_v5_compatibility_fixture.py`,
+`test_population_journal_v2.py`, `test_population_journal_chain_v5.py`,
+`test_journal_cycle_records_v2.py`, and
+`test_mexc_strategy_v2_compatibility_fixture.py`.
+
+No exchange request, public pilot, operational scanner/bot runtime, model,
+Telegram, private API or capital action was run. `.env` was not opened.
+
+### Remaining gate
+
+U5 remains **not granted**. Per-shard limits are not aggregate acquisition
+limits. Before any public request, the project still needs an immutable pilot
+run manifest that pins the candidate endpoint identity, a bounded verification
+procedure and expected receipt, symbols and exact ranges, one fresh artifact
+root per shard, aggregate attempts/raw/storage/runtime and concurrency budgets,
+disk preflight, stop conditions, detached result anchors and the intentionally
+supplied executor. Full-universe orchestration and its global budget contract
+remain future work. The Windows sudden-power-loss boundary must be accepted
+explicitly or replaced by a stronger storage profile. After separate U5, the
+first network action is the verification probe; mismatch STOPs before any
+history acquisition.

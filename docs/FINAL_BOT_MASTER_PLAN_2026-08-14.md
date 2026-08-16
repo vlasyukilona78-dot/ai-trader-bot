@@ -6,6 +6,8 @@
 
 Последняя review correction: **2026-08-15**
 
+Последний implementation checkpoint: **2026-08-16**
+
 Independent Claude closure verdict: **`APPROVE_AS_AUTHORITATIVE`**;
 remaining **P0/P1: none**. Review был read-only: без code changes, tests, network,
 runtime, `.env`, commit или push.
@@ -20,6 +22,11 @@ Review-base HEAD: `ad30b02` (local = upstream). До создания draft trac
 На `36e1446`: `822 passed, 4 skipped, 2` known collection warnings
 (`22.94s`); independent S2/S3 review: P0/P1 none. Network, public-data pilot,
 operational scanner/bot runtime, Telegram, private API и model не запускались.
+Per-shard pre-pilot hardening зафиксирован как `ba8ea00` (bounded transport) →
+`f8a6b5b` (restart-safe strict history v2). На `f8a6b5b`: `905 passed,
+5 skipped, 2` known collection warnings (`21.80s` independent receipt);
+code-scope independent red-teams: P0/P1/P2 none. Network/U5 по-прежнему не
+выполнялись.
 
 Этот документ объединяет:
 
@@ -498,16 +505,22 @@ rows или feature contract.
 4. focused + full regression tests;
 5. отдельное пользовательское разрешение на public-data pilot.
 
-Пункты 1–4 выполнены локально и опубликованы в S1–S3. Пункт 5 (`U5`) не
-предоставлен и не выводится из разрешения менять код. Поэтому этот checkpoint
-не разрешает ни один запрос к MEXC.
+Пункты 1–4 и bounded per-shard hardening выполнены и зафиксированы в S1–S3 плюс
+`ba8ea00`/`f8a6b5b`. Пункт 5 (`U5`) не предоставлен и не выводится из разрешения
+менять код. Поэтому этот checkpoint не разрешает ни один запрос к MEXC.
 
 Current Futures API domain должен быть проверен по официальной документации
 непосредственно перед запуском. MEXC объявил переход Futures API с
 `contract.mexc.com` на `api.mexc.com`; interface parameters сохранялись:
 <https://www.mexc.com/announcements/article/futures-api-access-domain-update-17827791532974>.
-Текущий legacy client всё ещё содержит старый domain; любой network pilot до
-его versioned migration и endpoint fixtures — STOP.
+Текущий legacy client всё ещё содержит старый domain и намеренно не изменён.
+`ba8ea00` добавил отдельный versioned candidate fixture для
+`api.mexc.com/api/v1/contract/kline/{venue_symbol}`, но fixture прямо фиксирует
+`candidate_not_u5_verified`: он не подтверждает ни актуальную официальную
+документацию, ни live endpoint. Реального/default network executor нет. До U5
+exact run manifest обязан заморозить candidate identity и bounded verification
+procedure/expected receipt. После отдельного U5 первый network action — этот
+probe; mismatch означает STOP до любого history acquisition.
 
 ### 8.2 Strict collector
 
@@ -536,6 +549,38 @@ Current Futures API domain должен быть проверен по офиц�
   point-in-time `contractSize`; это проверяется payload fixtures;
 - separate pilot path, no mutation current cache.
 
+**Per-shard pre-pilot hardening receipt — `ba8ea00` → `f8a6b5b`.**
+
+- endpoint candidate `mexc_futures_kline_endpoint_candidate_v1`:
+  `54f57d755cd679eb92444d48b38013621caad37067125e80cf7c5e45fe2ab220`;
+- limits `mexc_history_resource_limits_v1`:
+  `937d053e33c513d128389259e308156c8758e5cfe44b5849e3eb27ea49d96bdc`;
+- retry policy `mexc_history_retry_policy_v1`:
+  `78f92d14cc26ead1a372d840a05fe8a60dae97d5d9a3cdacc539a098194a2cc9`;
+- transport `mexc_futures_raw_transport_v1`:
+  `7d3bd40c6753e7bda2f1904ce2ffa2ff55770ecce9ba6d5614d2b30ae0664d22`;
+- collector/storage `mexc_strict_history_v2`:
+  `cce9922317ec5f0008f3b293103f9f5a17504b7143f81af1845d9d4765c44086`.
+
+Transport использует только injected streaming executor, ограничивает каждую
+попытку, страницу и range-shard, повторно валидирует pacing/backoff/
+`Retry-After`, сохраняет bounded evidence каждой обработанной попытки,
+возвращённой collector, и не превращает transport failure в no-data. Abrupt
+process death может оставить incomplete shard, но не positive admission.
+Immutable `scope.json` связывает
+strict-history-v2 root с одним exact `HistoryRangeRequestV2` для проверяемого
+restart; process-local + OS lock и owner-thread guard удерживаются от pristine
+check до admission среди cooperating writers; adversarial filesystem
+replacement/TOCTOU вне этого контракта. Manifest сам по себе не является success: positive
+admission появляется только после полного fresh disk reload всего
+raw/attempt/normalized/manifest graph. Resume/repair и cross-request reuse
+запрещены.
+
+Windows profile доказывает atomic create-new/no-overwrite visibility и
+process-crash/fresh-restart verification. Он не обещает parent-directory или
+sudden-power-loss durability. Per-shard limits не являются global/full-universe
+budget.
+
 ### 8.3 QA pilot
 
 - BTC + 8–10 symbols: liquidity, age, contract size, gaps/new listing;
@@ -563,22 +608,27 @@ S2→S3 adapter связывает complete S2 manifest, exact raw-page hash и 
 consumed-row hash; изменение frame при прежних receipts отклоняется. Агрегация
 не выполняет network action и не является доказательством edge.
 
-Перед U5/public pilot остаётся отдельный pre-pilot hardening gate:
+Локально реализованы candidate endpoint identity, per-shard resource caps,
+streaming body bounds, pacing/backoff/`Retry-After`, exact epoch+monotonic
+microsecond evidence, safe public headers, typed failure/storage errors, strict
+restart reload/admission и честная Windows durability boundary. S2v2→S3 adapter
+проверяет source-close в integer microseconds до float projection и связывает
+complete v2 manifest с exact normalized-row hashes. Напрямую вручную
+сконструированный aggregation-v1 receipt сохраняет frozen float tolerance и не
+является разрешённым pilot ingestion path.
 
-- versioned official Futures endpoint/domain fixture без молчаливой подмены
-  legacy domain;
-- hard limits на raw response, pages/rows и storage budget;
-- transport pacing/backoff/`Retry-After` с fake-clock и oversized-response tests;
-- строгий disk loader/restart reconciliation и повторная проверка всего
-  raw/attempt/normalized/manifest graph после рестарта, включая фактическую
-  длину raw body;
-- документированная Windows durability semantics для best-effort directory
-  fsync/atomic publication;
-- canonical handling нормальных public `Date`/quoted `ETag` headers без
-  расширения safe-header allowlist на credentials;
-- устранение микросекундной timing tolerance либо явная фиксация её как
-  допустимой численной погрешности контракта;
-- единая typed storage-error оболочка для damaged duplicate-key/non-finite JSON.
+Перед U5/public pilot всё ещё обязательны:
+
+- pinned bounded official/live endpoint verification procedure; после U5 probe
+  должен завершиться success до первого acquisition request;
+- intentionally supplied real executor, не встроенный default;
+- immutable run manifest с symbols, exact ranges, one fresh root per shard,
+  output paths, detached anchors и stop conditions;
+- aggregate/global attempts, raw bytes, storage, runtime, concurrency и disk
+  preflight budgets поверх per-shard caps;
+- явное принятие Windows sudden-power-loss boundary либо более сильный storage
+  profile;
+- отдельное разрешение U5.
 
 Pilot проверяет data mechanics, coverage, latency, rate и storage. Он не
 используется для заявления edge.
@@ -999,7 +1049,7 @@ auto-retraining и auto-promotion запрещены.
 | Phase | Результат | Acceptance | STOP |
 |---|---|---|---|
 | P0 | Joint ADR/master approved | clocks, IDs, outcomes, risk, topology однозначны | unresolved executable semantics |
-| P1 — COMPLETE (`0ff1b3a`, `36e1446`) | Strict history + aggregation contracts | 91 focused; 822 full passed; v2 fixtures unchanged; independent P0/P1 none | error→empty, silent truncation, gap fill |
+| P1 — COMPLETE (`0ff1b3a`, `36e1446`, `ba8ea00`, `f8a6b5b`) | Strict history + aggregation + per-shard pre-pilot contracts | 83 latest focused; 905 full; 217 frozen compatibility; code-scope independent P0/P1/P2 none | error→empty, silent truncation, gap fill, false admission |
 | P2 | Public Min1 QA pilot | 7–14d pilot + 140d probe; manifests; measured API/runtime/storage | incomplete/unexplained data |
 | P3 | Full-universe acquisition feasibility | coverage + public-source acquisition budget; reserve decision/notifier budget | missed universe or infeasible budget not explicit |
 | P4 | V3 specs/contracts | StrategySpec/Feature/Peak/Instrument/Proposal schemas + frozen compatibility fixtures | semantic drift or unresolved identity |
@@ -1331,6 +1381,8 @@ updated handoff + next gate
 S1  COMPLETE — ADR + master/preregistration docs (`2a14299`)
 S2  COMPLETE — strict history collector (`36e1446`)
 S3  COMPLETE — deterministic Min1 aggregation (`0ff1b3a`)
+S3H COMPLETE — bounded transport + restart-safe per-shard history
+               (`ba8ea00`, `f8a6b5b`)
 S4  signal clocks + SLA
 S5  StrategySpecV3 + FeatureContractV3 + instrument/proposal/risk schemas
 S6  PeakEpisode episode/level/attempt + compatibility fixture
@@ -1344,9 +1396,10 @@ S13 strict v3 dataset readers + population/model manifests
 S14 v3 scanner path behind explicit flag, default v2 unchanged
 ```
 
-S1–S3 завершены. Pilot следует только после перечисленного в §8 pre-pilot
-hardening и отдельного разрешения U5. Threshold/model work следует только после
-admissible population, labels и preregistration.
+S1–S3 и per-shard S3H завершены. P2 не начат. Pilot следует только после
+run-level manifest/global-budget/orchestration gate из §8 и отдельного
+разрешения U5. Threshold/model work следует только после admissible population,
+labels и preregistration.
 
 ---
 
@@ -1375,16 +1428,20 @@ admissible population, labels и preregistration.
 
 ## 21. Ближайший безопасный следующий шаг
 
-1. S1–S3 завершены: authoritative docs `2a14299`, aggregation `0ff1b3a`, strict
-   history `36e1446`; focused/full regression и два independent review прошли
-   без P0/P1.
-2. Следующий bounded code slice — закрыть pre-pilot hardening list из §8:
-   endpoint fixture, resource limits, retry/pacing, strict restart loader,
-   Windows durability и оставшиеся exact-evidence P2. Всё выполняется на fake
-   transport/local artifacts, без network action и без изменения frozen v2.
-3. После этого подготовить неизменяемый U5 run manifest: symbols/ranges,
-   endpoint contract, rate/storage budgets, stop conditions и output root.
-4. Только отдельное явное разрешение U5 позволяет выполнить public Min1 QA
-   pilot. Отсутствие ответа не является разрешением.
+1. S1–S3/S3H завершены: authoritative docs `2a14299`, aggregation `0ff1b3a`,
+   strict-history foundation `36e1446`, bounded transport `ba8ea00` и
+   restart-safe strict-history v2 `f8a6b5b`; full regression и independent
+   review прошли без P0/P1/P2.
+2. Следующий bounded local slice — immutable U5 run-manifest/global-budget/
+   orchestration contract: symbols/ranges, candidate endpoint identity и exact
+   first-request verification procedure/expected receipt, fresh per-shard
+   roots, aggregate rate/raw/storage/runtime/concurrency caps, disk preflight,
+   stop conditions, detached anchors и output inventory. Fake transport/local
+   artifacts only; frozen v2 не меняется.
+3. После review этого manifest пользователь отдельно решает U5 и явно принимает
+   либо заменяет Windows sudden-power-loss boundary. Первый разрешённый network
+   action — endpoint verification probe.
+4. Только успешный probe под отдельным явным U5 позволяет выполнить public Min1
+   QA pilot. Отсутствие ответа или mismatch не является разрешением.
 5. Не начинать v3 runtime, threshold search или model fit до соответствующих
    phase gates этого документа.

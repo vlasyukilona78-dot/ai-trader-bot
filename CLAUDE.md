@@ -37,9 +37,10 @@ API, or giving a strategy verdict:
    `bb1ca13`. The independently approved roadmap was reviewed against the later
    research-builder HEAD `ad30b02` and published at `2a14299`. The completed
    deterministic Min1 aggregation and strict-history contract tips are
-   `0ff1b3a` and `36e1446`. Current HEAD must descend from all of these anchors;
-   discover any later documentation-only publication descendant rather than
-   assuming its hash.
+   `0ff1b3a` and `36e1446`. The bounded pre-pilot transport and restart-safe
+   strict-history-v2 tips are `ba8ea00` and `f8a6b5b`. Current HEAD must descend
+   from all of these anchors; discover any later documentation-only publication
+   descendant rather than assuming its hash.
 
 ## Current product truth
 
@@ -59,6 +60,11 @@ API, or giving a strategy verdict:
   review found no P0/P1. Validation at that code tip is `822 passed, 4 skipped`,
   with the same two known pytest collection warnings (`22.94s`). No network or
   public-data pilot was run.
+- Pre-pilot hardening checkpoint: `ba8ea00` adds the bounded injected-executor
+  Futures transport contract and `f8a6b5b` adds restart-safe strict-history v2.
+  Final validation is `905 passed, 5 skipped`, with the same two known pytest
+  collection warnings; code-scope independent red-teams found no P0/P1/P2. No
+  network or public-data pilot was run.
 - Generic pump-fade has not demonstrated stable positive edge after costs. The
   earlier DCA/positive-expectancy claims are retracted hypotheses, not evidence.
 - Phase 0 plus the Phase 1 timing, replay, canonical StrategySpec, typed
@@ -93,10 +99,13 @@ API, or giving a strategy verdict:
   of parameter as RSI/ATR/EMA/VP history. A Min15 design is a new strategy
   hypothesis, not a mechanical conversion or override of the frozen Min60 v2.
   The approved final-product roadmap and v3 ADR define the bounded Min1
-  acquisition/peak-SLA research path. Its strict local history and aggregation
-  contracts are now implemented, but the official endpoint adapter, public
-  pilot, full-universe scheduler and v3 strategy/runtime remain unimplemented;
-  none may inherit evidence from the frozen Min60 line. Historical prose
+  acquisition/peak-SLA research path. Its strict local history, aggregation,
+  bounded transport and restart-safe per-shard storage contracts are now
+  implemented. The pinned `api.mexc.com` fixture remains explicitly
+  `candidate_not_u5_verified`; there is no real/default network executor, pilot
+  run manifest, global acquisition budget, full-universe scheduler or v3
+  strategy/runtime. None may inherit evidence from the frozen Min60 line.
+  Historical prose
   coupling “45 bars” to a roughly 20-minute pump remains only a clue about
   earlier intent.
 - The current runtime-population path is
@@ -157,10 +166,14 @@ API, or giving a strategy verdict:
 
 - Keep the scanner/bot stopped unless the user explicitly requests a run after
   reviewing its network and alert effects.
-- The S2/S3 checkpoint contains no default network transport. Public MEXC Min1
-  collection remains blocked on official-domain fixtures, bounded response and
-  retry/pacing policy, strict artifact restart loading, and separate explicit
-  U5 permission.
+- The pre-pilot checkpoint contains no real/default network executor. Its
+  versioned endpoint fixture is a candidate, not proof of current official or
+  live endpoint validity. Public MEXC Min1 collection remains blocked on an
+  immutable run manifest, aggregate/global budgets and orchestration, a pinned
+  first-request endpoint-verification procedure, a deliberately supplied
+  executor, and separate U5 permission. After U5, that bounded verification
+  probe must succeed before any acquisition request. Strict-history-v2 storage
+  is one exact range request/shard per root; it is not a full-universe run store.
 - Do not use private APIs, Telegram delivery, testnet or live execution.
 - `.env` is absent from the current tip, but secrets existed in Git history and
   have not been rotated. Treat all historical credentials as compromised and do
