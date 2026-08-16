@@ -18,14 +18,17 @@ Updated: 2026-08-16, America/Chicago
 > lifecycle tip is `9ef6b4f`, and the frozen-v2 journal/runtime tip is
 > `bb1ca13`. The completed S3 aggregation tip is `0ff1b3a`; the completed S2
 > strict-history tip is `36e1446`. The bounded transport tip is `ba8ea00` and
-> the restart-safe strict-history-v2 tip is `f8a6b5b`.
+> the restart-safe strict-history-v2 tip is `f8a6b5b`; their roadmap receipt is
+> `17b47c7`. The current bounded offline P2 QA-pilot run-contract tip is
+> `5595679`.
 > The later `ad30b02` research dataset-builder descendant is not v3/model
 > evidence. The
 > `98217df`/`340 passed`
 > checkpoint immediately below is a
 > preserved earlier causal-scanner snapshot, not the latest foundation state.
-> Latest code validation: `905 passed, 5 skipped, 2 known collection warnings`
-> (`21.80s` independent receipt). Current writer/default path: journal schema v6 at
+> Latest code validation: `925 passed, 5 skipped, 2 known collection warnings`.
+> The pilot-contract slice also has focused `20 passed` and all-`tests/v3`
+> `194 passed, 1 skipped` receipts. Current writer/default path: journal schema v6 at
 > `data/runtime/mexc_population_decisions_v6.jsonl`. Schema v5 remains frozen,
 > fixture-backed and read-only; it is not the current append target.
 
@@ -2293,3 +2296,92 @@ remain future work. The Windows sudden-power-loss boundary must be accepted
 explicitly or replaced by a stronger storage profile. After separate U5, the
 first network action is the verification probe; mismatch STOPs before any
 history acquisition.
+
+## Bounded offline P2 QA-pilot run-contract checkpoint — 2026-08-16
+
+This append-only checkpoint is the authoritative executable-state update after
+the preceding strict-history-v2 checkpoint and supersedes its “Remaining gate.”
+It completes the offline manifest/budget/pure-state contract for the bounded P2
+QA pilot. It does not instantiate, authorize or execute a pilot and does not
+claim full-universe acquisition, P3 admission or strategy edge.
+
+### Publication and exact identity
+
+```text
+17b47c7 docs(roadmap): record pre-pilot history hardening
+5595679 feat(data): add bounded MEXC QA pilot run contract
+```
+
+- The published code checkpoint is `5595679`, whose parent is `17b47c7`;
+  later documentation-only descendants do not change its executable identity.
+- `mexc_public_qa_pilot_run_v1` is pinned to
+  `f3d642d436e9d4a44e65f35c6ea8375bd92b4b36b30f1c86af54936a608ce65e`.
+- The implementation is `trading/market_data/mexc_pilot_run.py`; its focused
+  contract tests are `tests/v3/test_mexc_pilot_run_contract_v1.py`.
+
+### What is complete
+
+- The offline contract canonically binds repository/docs/executor identities,
+  exact QA symbols and ranges, deterministic ordered shards, one fresh store
+  root per request, endpoint verification before acquisition, and hard global
+  attempt/raw/storage/output/runtime/concurrency/spacing/inventory budgets.
+- A manifest cannot grant U5. A detached authorization receipt is separately
+  bound to the exact manifest, time window, domains, operations, caps, restart
+  policy and storage-risk decision. Preflight freshness and the remaining
+  worst-case run must fit the authorization window before each network stage.
+- Pure state transitions require one durable network-intent slot per stage,
+  fail closed on any pre-existing or unresolved slot, charge started attempts
+  and terminal failures, and require publish/reload/detached-anchor evidence for
+  endpoint, shard, terminal-failure and final positive outcomes. Candidate and
+  sealed artifacts remain separately inventoried so their identities are
+  acyclic and independently auditable.
+- Positive completion is contractually gated on a freshly scanned/reloaded
+  final full-inventory receipt and detached anchor. The pure projection checks
+  their bindings and order but does not itself observe the disk. Partial or
+  resumed runs are not positive admission.
+- The endpoint fixture remains exactly `candidate_not_u5_verified`. Neither
+  current official-document evidence nor live endpoint validity was established
+  by this offline checkpoint.
+
+### Verification and independent review
+
+```text
+focused pilot contract: 20 passed
+all tests/v3:          194 passed, 1 skipped
+full pytest:           925 passed, 5 skipped,
+                       2 known PytestCollectionWarning
+read-only audits:      2 x APPROVE; P0/P1/P2 none
+```
+
+No executor, concrete run-manifest instance or actual authorization was
+created. U5 was not granted. No network request, public pilot, scanner/model
+runtime, Telegram, private API or capital action was run, and `.env` was not
+opened.
+
+### Exact boundary and next gate
+
+The module is a pure state/orchestration contract and deliberately contains no
+HTTP/run executor; its narrow immutable-manifest publication/loading helpers do
+not execute a run. A future intentionally supplied executor must actually
+implement OS create-new intent arbitration and generate the fresh disk
+scan/reload/detached-anchor evidence required by the contract. Its exact
+version/hash must then be bound into a reviewed concrete pilot manifest; neither
+the contract class nor a materialized state snapshot is that manifest or
+authorization.
+
+The filesystem threat model is
+`cooperating_writers_plain_non_reparse_parent_chain_point_in_time_validation_v1`.
+It does not prove safety against adversarial replacement/TOCTOU, and the Windows
+profile does not prove sudden-power-loss durability. A later U5 receipt must
+explicitly accept that Windows boundary or select a stronger storage profile.
+
+Therefore the next permitted work remains offline: implement and independently
+review the bounded executor, freeze its identity, instantiate and review the
+exact QA-pilot manifest and its aggregate caps, and prepare the detached
+authorization/verification procedures without creating an authorization
+receipt. U5 remains a separate explicit user decision. Only after U5 may the
+run acquire fresh official endpoint evidence and perform the bounded live
+candidate probe; any
+mismatch stops before history acquisition. Full-universe orchestration and its
+P3 global policy remain later work, as do v3 model/scanner/threshold selection,
+Telegram and any private/testnet/live execution scope.

@@ -15,8 +15,9 @@ runtime, `.env`, commit или push.
 Целевая площадка: **MEXC Futures**
 
 Текущая ветка: `claude/codex-project-review-04581e`
-Review-base HEAD: `ad30b02` (local = upstream). До создания draft tracked tree
-был clean; во время closure review draft и review prompt оставались untracked.
+Историческая closure review-base: `ad30b02` (на момент review local = upstream).
+До создания draft tracked tree был clean; во время closure review draft и review
+prompt оставались untracked.
 Авторитетный S1 publication commit: `2a14299`. P1 contract checkpoint:
 `0ff1b3a` (deterministic Min1 aggregation) → `36e1446` (strict MEXC history).
 На `36e1446`: `822 passed, 4 skipped, 2` known collection warnings
@@ -27,6 +28,14 @@ Per-shard pre-pilot hardening зафиксирован как `ba8ea00` (bounded
 5 skipped, 2` known collection warnings (`21.80s` independent receipt);
 code-scope independent red-teams: P0/P1/P2 none. Network/U5 по-прежнему не
 выполнялись.
+
+Локальный P2 run-manifest/global-budget/pure-orchestration contract опубликован
+как `5595679` (parent `17b47c7`), contract pin
+`f3d642d436e9d4a44e65f35c6ea8375bd92b4b36b30f1c86af54936a608ce65e`.
+Receipts: focused `20 passed`; `tests/v3` — `194 passed, 1 skipped`; full —
+`925 passed, 5 skipped, 2` known warnings. Два независимых review дали
+P0/P1/P2 none. Это завершает только локальный pre-pilot contract slice: public
+pilot, endpoint verification и U5 не выполнялись.
 
 Этот документ объединяет:
 
@@ -505,9 +514,11 @@ rows или feature contract.
 4. focused + full regression tests;
 5. отдельное пользовательское разрешение на public-data pilot.
 
-Пункты 1–4 и bounded per-shard hardening выполнены и зафиксированы в S1–S3 плюс
-`ba8ea00`/`f8a6b5b`. Пункт 5 (`U5`) не предоставлен и не выводится из разрешения
-менять код. Поэтому этот checkpoint не разрешает ни один запрос к MEXC.
+Пункты 1–4, bounded per-shard hardening и локальный run-level manifest/global-
+budget/pure-orchestration contract выполнены и зафиксированы в S1–S3,
+`ba8ea00`/`f8a6b5b` и `5595679`. Пункт 5 (`U5`) не предоставлен и не выводится
+из разрешения менять код. Поэтому этот checkpoint не разрешает ни один запрос
+к MEXC.
 
 Current Futures API domain должен быть проверен по официальной документации
 непосредственно перед запуском. MEXC объявил переход Futures API с
@@ -517,10 +528,13 @@ Current Futures API domain должен быть проверен по офиц�
 `ba8ea00` добавил отдельный versioned candidate fixture для
 `api.mexc.com/api/v1/contract/kline/{venue_symbol}`, но fixture прямо фиксирует
 `candidate_not_u5_verified`: он не подтверждает ни актуальную официальную
-документацию, ни live endpoint. Реального/default network executor нет. До U5
-exact run manifest обязан заморозить candidate identity и bounded verification
-procedure/expected receipt. После отдельного U5 первый network action — этот
-probe; mismatch означает STOP до любого history acquisition.
+документацию, ни live endpoint. Реального/default network executor нет.
+`5595679` заморозил candidate identity и bounded ordered verification
+procedure/expected receipt в manifest contract, но не создал concrete run
+instance и не предоставил network authority. После отдельного U5 первые
+ограниченные действия выполняются строго по порядку: current official-reference
+verification, затем exact live one-closed-Min1-bar probe. Любой mismatch означает
+STOP до любого history acquisition.
 
 ### 8.2 Strict collector
 
@@ -617,18 +631,43 @@ complete v2 manifest с exact normalized-row hashes. Напрямую вручн
 сконструированный aggregation-v1 receipt сохраняет frozen float tolerance и не
 является разрешённым pilot ingestion path.
 
+**Локальный P2 run-level contract receipt — `5595679` (parent `17b47c7`).**
+Контракт `mexc_public_qa_pilot_run_v1` pinned к
+`f3d642d436e9d4a44e65f35c6ea8375bd92b4b36b30f1c86af54936a608ce65e`.
+
+- immutable canonical QA manifest связывает repository/docs, endpoint candidate,
+  exact ordered `HistoryRangeRequestV2` shards и unique fresh relative roots;
+- composition требует BTC + 8–10 других symbols, 7–14d Min1 QA, минимум один
+  140d Min1 probe и native Min60 controls;
+- global attempts/raw/storage/output/runtime/sleep/inventory caps, serial
+  concurrency `1/1`, worst-case reservations и per-step disk preflight являются
+  частью manifest, а не defaults executor;
+- detached U5 receipt обязан совпасть с exact manifest и оставаться достаточным
+  для всего remaining serial worst-case window; manifest сам U5 не предоставляет;
+- endpoint verification — первый ordered bounded stage: official reference →
+  exact one-closed-bar live probe → durable reload/anchor; failure означает STOP;
+- pure immutable state contract не содержит real/default executor, не запускает
+  сеть и не допускает partial run как success;
+- focused `20 passed`; `tests/v3` — `194 passed, 1 skipped`; full — `925 passed,
+  5 skipped, 2` known warnings; два независимых review: P0/P1/P2 none.
+
+Этот receipt завершает локальный run-manifest/global-budget/pure-orchestration
+slice, но **не** public Min1 QA pilot: concrete symbols/dates/caps, executor
+results, live endpoint evidence и U5 в commit не зафиксированы.
+
 Перед U5/public pilot всё ещё обязательны:
 
-- pinned bounded official/live endpoint verification procedure; после U5 probe
-  должен завершиться success до первого acquisition request;
-- intentionally supplied real executor, не встроенный default;
-- immutable run manifest с symbols, exact ranges, one fresh root per shard,
-  output paths, detached anchors и stop conditions;
-- aggregate/global attempts, raw bytes, storage, runtime, concurrency и disk
-  preflight budgets поверх per-shard caps;
+- intentionally supplied executor/storage implementation, не встроенный default;
+- exact concrete immutable manifest instance с symbols, dates/ranges, caps,
+  output root и executor/storage identities, отдельно предъявленный пользователю;
 - явное принятие Windows sudden-power-loss boundary либо более сильный storage
   profile;
 - отдельное разрешение U5.
+
+Следующий разрешённый slice до такого review остаётся полностью локальным: код
+executor/storage и concrete manifest можно подготовить и проверить fake/offline
+receipts, но нельзя выполнять official-reference fetch, live one-bar probe или
+любой acquisition request.
 
 Pilot проверяет data mechanics, coverage, latency, rate и storage. Он не
 используется для заявления edge.
@@ -1050,7 +1089,7 @@ auto-retraining и auto-promotion запрещены.
 |---|---|---|---|
 | P0 | Joint ADR/master approved | clocks, IDs, outcomes, risk, topology однозначны | unresolved executable semantics |
 | P1 — COMPLETE (`0ff1b3a`, `36e1446`, `ba8ea00`, `f8a6b5b`) | Strict history + aggregation + per-shard pre-pilot contracts | 83 latest focused; 905 full; 217 frozen compatibility; code-scope independent P0/P1/P2 none | error→empty, silent truncation, gap fill, false admission |
-| P2 | Public Min1 QA pilot | 7–14d pilot + 140d probe; manifests; measured API/runtime/storage | incomplete/unexplained data |
+| P2 — LOCAL CONTRACT GATE COMPLETE (`5595679`); PUBLIC PILOT PENDING | Public Min1 QA pilot | run contract pin `f3d642d4…608ce65e` reviewed без P0/P1/P2; 7–14d pilot + 140d probe и measured API/runtime/storage всё ещё требуют U5 | incomplete/unexplained data или network без U5 |
 | P3 | Full-universe acquisition feasibility | coverage + public-source acquisition budget; reserve decision/notifier budget | missed universe or infeasible budget not explicit |
 | P4 | V3 specs/contracts | StrategySpec/Feature/Peak/Instrument/Proposal schemas + frozen compatibility fixtures | semantic drift or unresolved identity |
 | P5 | V3 ledgers + scheduler + restart | unconditional eligible features; order/worker/restart invariance; local end-to-end p99; locks/fsync/checkpoints | leakage/orphan/fork/state loss |
@@ -1383,6 +1422,8 @@ S2  COMPLETE — strict history collector (`36e1446`)
 S3  COMPLETE — deterministic Min1 aggregation (`0ff1b3a`)
 S3H COMPLETE — bounded transport + restart-safe per-shard history
                (`ba8ea00`, `f8a6b5b`)
+S3R COMPLETE — P2 QA run manifest + global budgets + pure orchestration
+               (`5595679`, contract `f3d642d4…608ce65e`)
 S4  signal clocks + SLA
 S5  StrategySpecV3 + FeatureContractV3 + instrument/proposal/risk schemas
 S6  PeakEpisode episode/level/attempt + compatibility fixture
@@ -1396,10 +1437,13 @@ S13 strict v3 dataset readers + population/model manifests
 S14 v3 scanner path behind explicit flag, default v2 unchanged
 ```
 
-S1–S3 и per-shard S3H завершены. P2 не начат. Pilot следует только после
-run-level manifest/global-budget/orchestration gate из §8 и отдельного
-разрешения U5. Threshold/model work следует только после admissible population,
-labels и preregistration.
+S1–S3, per-shard S3H и локальный P2 run-contract slice S3R завершены. Сам public
+Min1 QA pilot не запускался: U5 не предоставлен, candidate endpoint остаётся
+непроверенным. Следующий local-only gate — intentionally supplied executor/
+storage implementation и exact concrete manifest для пользовательского review.
+Full-universe/P3 начинается только после admissible P2 pilot receipts.
+Threshold/model work следует только после admissible population, labels и
+preregistration.
 
 ---
 
@@ -1428,20 +1472,25 @@ labels и preregistration.
 
 ## 21. Ближайший безопасный следующий шаг
 
-1. S1–S3/S3H завершены: authoritative docs `2a14299`, aggregation `0ff1b3a`,
-   strict-history foundation `36e1446`, bounded transport `ba8ea00` и
-   restart-safe strict-history v2 `f8a6b5b`; full regression и independent
-   review прошли без P0/P1/P2.
-2. Следующий bounded local slice — immutable U5 run-manifest/global-budget/
-   orchestration contract: symbols/ranges, candidate endpoint identity и exact
-   first-request verification procedure/expected receipt, fresh per-shard
-   roots, aggregate rate/raw/storage/runtime/concurrency caps, disk preflight,
-   stop conditions, detached anchors и output inventory. Fake transport/local
-   artifacts only; frozen v2 не меняется.
-3. После review этого manifest пользователь отдельно решает U5 и явно принимает
-   либо заменяет Windows sudden-power-loss boundary. Первый разрешённый network
-   action — endpoint verification probe.
-4. Только успешный probe под отдельным явным U5 позволяет выполнить public Min1
-   QA pilot. Отсутствие ответа или mismatch не является разрешением.
-5. Не начинать v3 runtime, threshold search или model fit до соответствующих
+1. S1–S3/S3H и локальный P2 contract gate завершены: authoritative docs
+   `2a14299`, aggregation `0ff1b3a`, strict-history foundation `36e1446`, bounded
+   transport `ba8ea00`, restart-safe strict-history v2 `f8a6b5b` и run-level
+   contract `5595679` (parent `17b47c7`, pin `f3d642d4…608ce65e`). Для последнего:
+   focused `20 passed`, `tests/v3` `194 passed, 1 skipped`, full `925 passed,
+   5 skipped, 2` known warnings; два независимых approval без P0/P1/P2.
+2. Следующий bounded local-only slice — intentionally supplied executor/storage
+   implementation и exact concrete immutable manifest instance с symbols,
+   dates/ranges, caps, output root и pinned implementation identities для
+   пользовательского review. Только fake/offline execution; frozen v2 не
+   меняется, сеть не используется.
+3. После review concrete manifest пользователь отдельно решает U5 и явно
+   принимает либо заменяет Windows sudden-power-loss boundary. U5 по-прежнему
+   не предоставлен; отсутствие ответа не является разрешением.
+4. После явного U5 первые bounded network actions строго ordered: проверить
+   current official reference, затем выполнить exact live one-closed-Min1-bar
+   probe. Любой mismatch означает STOP до acquisition.
+5. Только успешный anchored probe позволяет выполнить public Min1 QA pilot.
+   Full-universe acquisition/P3 рассматривается позже, по measured admissible P2
+   receipts, а не в текущем slice.
+6. Не начинать v3 runtime, threshold search или model fit до соответствующих
    phase gates этого документа.

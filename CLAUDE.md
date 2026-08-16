@@ -16,7 +16,7 @@ API, or giving a strategy verdict:
    v3 architecture/decision contract subordinate to that master.
 3. Read `docs/MEXC_V3_PREREGISTRATION_SKELETON_2026-08-15.md` in full before
    collecting admission data, selecting thresholds or evaluating a model.
-4. Read the current notice and latest 2026-08-15 checkpoint of
+4. Read the current notice and latest 2026-08-16 checkpoint of
    `docs/AI_HANDOFF.md`. Earlier sections are audit history and may contain
    superseded implementation order or findings.
 5. Treat `docs/STRATEGY_AI_MASTER_PLAN_2026-08-03.md` as the frozen
@@ -38,9 +38,10 @@ API, or giving a strategy verdict:
    research-builder HEAD `ad30b02` and published at `2a14299`. The completed
    deterministic Min1 aggregation and strict-history contract tips are
    `0ff1b3a` and `36e1446`. The bounded pre-pilot transport and restart-safe
-   strict-history-v2 tips are `ba8ea00` and `f8a6b5b`. Current HEAD must descend
-   from all of these anchors; discover any later documentation-only publication
-   descendant rather than assuming its hash.
+   strict-history-v2 tips are `ba8ea00` and `f8a6b5b`; their roadmap receipt is
+   `17b47c7`. The bounded offline P2 QA-pilot run-contract tip is `5595679`.
+   Current HEAD must descend from all of these anchors; discover any later
+   documentation-only publication descendant rather than assuming its hash.
 
 ## Current product truth
 
@@ -65,6 +66,15 @@ API, or giving a strategy verdict:
   Final validation is `905 passed, 5 skipped`, with the same two known pytest
   collection warnings; code-scope independent red-teams found no P0/P1/P2. No
   network or public-data pilot was run.
+- Offline P2 QA-pilot run-contract checkpoint: published `5595679` (parent
+  `17b47c7`) adds the canonical manifest/budget schema and pure state-transition
+  contract `mexc_public_qa_pilot_run_v1`, pinned to
+  `f3d642d436e9d4a44e65f35c6ea8375bd92b4b36b30f1c86af54936a608ce65e`.
+  Validation is focused `20 passed`, all `tests/v3` `194 passed, 1 skipped`, and
+  full pytest `925 passed, 5 skipped` with the same two known collection
+  warnings. Two independent read-only audits returned `APPROVE`; P0/P1/P2 none.
+  This is an offline contract slice, not a concrete run manifest, executor,
+  authorization, endpoint verification or pilot receipt.
 - Generic pump-fade has not demonstrated stable positive edge after costs. The
   earlier DCA/positive-expectancy claims are retracted hypotheses, not evidence.
 - Phase 0 plus the Phase 1 timing, replay, canonical StrategySpec, typed
@@ -100,11 +110,13 @@ API, or giving a strategy verdict:
   hypothesis, not a mechanical conversion or override of the frozen Min60 v2.
   The approved final-product roadmap and v3 ADR define the bounded Min1
   acquisition/peak-SLA research path. Its strict local history, aggregation,
-  bounded transport and restart-safe per-shard storage contracts are now
-  implemented. The pinned `api.mexc.com` fixture remains explicitly
-  `candidate_not_u5_verified`; there is no real/default network executor, pilot
-  run manifest, global acquisition budget, full-universe scheduler or v3
-  strategy/runtime. None may inherit evidence from the frozen Min60 line.
+  bounded transport, restart-safe per-shard storage and bounded offline P2
+  QA-pilot manifest/global-budget/pure-state contracts are now implemented. The
+  pinned `api.mexc.com` fixture remains explicitly
+  `candidate_not_u5_verified`; there is no real/default network executor,
+  concrete run-manifest instance, actual authorization, full-universe
+  orchestration or v3 strategy/runtime. None may inherit evidence from the
+  frozen Min60 line.
   Historical prose
   coupling “45 bars” to a roughly 20-minute pump remains only a clue about
   earlier intent.
@@ -166,14 +178,20 @@ API, or giving a strategy verdict:
 
 - Keep the scanner/bot stopped unless the user explicitly requests a run after
   reviewing its network and alert effects.
-- The pre-pilot checkpoint contains no real/default network executor. Its
-  versioned endpoint fixture is a candidate, not proof of current official or
-  live endpoint validity. Public MEXC Min1 collection remains blocked on an
-  immutable run manifest, aggregate/global budgets and orchestration, a pinned
-  first-request endpoint-verification procedure, a deliberately supplied
-  executor, and separate U5 permission. After U5, that bounded verification
-  probe must succeed before any acquisition request. Strict-history-v2 storage
-  is one exact range request/shard per root; it is not a full-universe run store.
+- The offline P2 QA-pilot contract contains no real/default network executor.
+  Its versioned endpoint fixture remains `candidate_not_u5_verified`, not proof
+  of current official or live endpoint validity. Before any public request, a
+  future executor must implement OS create-new network-intent arbitration and
+  produce the required fresh disk-scan/reload/anchor evidence; then an exact
+  concrete manifest instance and detached U5 authorization must be reviewed and
+  supplied. After separate U5, official endpoint evidence and the bounded live
+  verification probe must succeed before any acquisition request.
+  Strict-history-v2 storage remains one exact range request/shard per fresh
+  root; full-universe orchestration is a later P3 contract.
+- The accepted filesystem threat model is cooperating writers with plain,
+  non-reparse parent chains and point-in-time validation. Windows sudden-power-
+  loss durability is not proven and must be explicitly accepted in U5 or
+  replaced by a stronger storage profile.
 - Do not use private APIs, Telegram delivery, testnet or live execution.
 - `.env` is absent from the current tip, but secrets existed in Git history and
   have not been rotated. Treat all historical credentials as compromised and do
