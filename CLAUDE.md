@@ -40,6 +40,9 @@ API, or giving a strategy verdict:
    `0ff1b3a` and `36e1446`. The bounded pre-pilot transport and restart-safe
    strict-history-v2 tips are `ba8ea00` and `f8a6b5b`; their roadmap receipt is
    `17b47c7`. The bounded offline P2 QA-pilot run-contract tip is `5595679`.
+   The official-evidence contract pin and contract-hash cache tip is `8a9616b`;
+   it descends from the pilot evidence reader `79544e9` and output-layout
+   accounting `0032f1e`, which have no separate checkpoint entry below.
    Current HEAD must descend from all of these anchors; discover any later
    documentation-only publication descendant rather than assuming its hash.
 
@@ -75,6 +78,23 @@ API, or giving a strategy verdict:
   warnings. Two independent read-only audits returned `APPROVE`; P0/P1/P2 none.
   This is an offline contract slice, not a concrete run manifest, executor,
   authorization, endpoint verification or pilot receipt.
+- Official-evidence pin and contract-hash cache checkpoint: published `8a9616b`
+  (parent `0032f1e`). `mexc_endpoint_official_evidence` had shipped with an
+  empty `_PINNED_CONTRACT_HASH`, and its drift guard reads
+  `if _PINNED_CONTRACT_HASH and digest != ...`, so the check was inert and its
+  test asserted the empty value. The contract is now pinned to
+  `421802f03282ea5f61f253607001036e80a1933e1d1ea16449c5ee261889e04d` and schema
+  drift raises. This freezes an offline contract and grants no authority: the
+  module's only provenance mode remains `reviewed_fake_fixture_only`, it still
+  has no HTTP client or default executor, and it cannot authorize U5, a live
+  probe, acquisition or a terminal receipt. Separately,
+  `strict_history._frozen_contract_hash` memoizes contract hashes by value for
+  six modules; `mexc_endpoint_official_evidence` is deliberately excluded
+  because it appends a trailing newline before hashing, so sharing the helper
+  silently changes every hash it produces. Validation is full pytest
+  `1229 passed, 10 skipped` in `62.00s`, down from `276.90s`, with the same two
+  known collection warnings and the pilot-run and output-layout pinned hashes
+  unchanged. No independent audit of this change has been run.
 - Generic pump-fade has not demonstrated stable positive edge after costs. The
   earlier DCA/positive-expectancy claims are retracted hypotheses, not evidence.
 - Phase 0 plus the Phase 1 timing, replay, canonical StrategySpec, typed
