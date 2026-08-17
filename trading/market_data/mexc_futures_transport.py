@@ -25,7 +25,7 @@ import re
 import threading
 from typing import Any, Iterator, Protocol, Sequence, TypeAlias
 
-from trading.market_data.strict_history import KlinePageRequestV1
+from trading.market_data.strict_history import KlinePageRequestV1, _frozen_contract_hash
 
 
 MEXC_FUTURES_ENDPOINT_CONTRACT_VERSION = (
@@ -365,7 +365,7 @@ class MexcFuturesEndpointContractV1:
 
     @property
     def contract_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     @property
     def endpoint_identity(self) -> str:
@@ -569,7 +569,7 @@ class HistoryResourceLimitsV1:
 
     @property
     def contract_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     @property
     def identity(self) -> str:
@@ -670,7 +670,7 @@ class HistoryRetryPolicyV1:
 
     @property
     def contract_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     @property
     def identity(self) -> str:

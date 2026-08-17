@@ -34,6 +34,7 @@ from trading.market_data.min1_aggregation import (
     MIN1_AGGREGATION_CONTRACT_VERSION,
     min1_aggregation_contract_hash,
 )
+from trading.market_data.strict_history import _frozen_contract_hash
 from trading.market_data.strict_history_v2 import (
     STRICT_HISTORY_V2_CONTRACT_VERSION,
     HistoryRangeRequestV2,
@@ -586,7 +587,7 @@ class PilotGlobalBudgetsV1:
 
     @property
     def contract_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
 
 @dataclass(frozen=True)
@@ -628,7 +629,7 @@ class PilotShardPlanV1:
 
     @property
     def plan_id(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -732,7 +733,7 @@ class EndpointVerificationPlanV1:
 
     @property
     def plan_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def as_dict(self) -> dict[str, object]:
         endpoint = self.probe_request.endpoint_contract
@@ -1136,7 +1137,7 @@ class MexcPublicQaPilotRunManifestV1:
 
     @property
     def manifest_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     @property
     def manifest_identity(self) -> str:
@@ -1480,7 +1481,7 @@ class U5PublicPilotAuthorizationReceiptV1:
 
     @property
     def receipt_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -1640,7 +1641,7 @@ class PilotDiskPreflightReceiptV1:
 
     @property
     def receipt_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -1791,7 +1792,7 @@ class PilotIntentDurabilityReceiptV1:
 
     @property
     def receipt_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def as_dict(self) -> dict[str, object]:
         return {field: getattr(self, field) for field in self.__dataclass_fields__}
@@ -2096,7 +2097,7 @@ class PilotNetworkIntentV1:
 
     @property
     def intent_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -2362,7 +2363,7 @@ class EndpointVerificationReceiptV1:
 
     @property
     def receipt_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def as_dict(self) -> dict[str, object]:
         return {field: getattr(self, field) for field in self.__dataclass_fields__}
@@ -2564,7 +2565,7 @@ class PilotShardResultV1:
 
     @property
     def receipt_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def as_dict(self) -> dict[str, object]:
         return {field: getattr(self, field) for field in self.__dataclass_fields__}
@@ -2827,7 +2828,7 @@ class PilotStepFailureReceiptV1:
 
     @property
     def receipt_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def as_dict(self) -> dict[str, object]:
         return {field: getattr(self, field) for field in self.__dataclass_fields__}
@@ -2973,7 +2974,7 @@ class PilotRunAnchorReceiptV1:
 
     @property
     def receipt_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def as_dict(self) -> dict[str, object]:
         return {field: getattr(self, field) for field in self.__dataclass_fields__}
@@ -3879,7 +3880,7 @@ class PilotRunStateV1:
 
     @property
     def state_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def with_authorization(
         self, receipt: U5PublicPilotAuthorizationReceiptV1, *, now_us: int

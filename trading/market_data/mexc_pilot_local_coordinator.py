@@ -48,6 +48,7 @@ from trading.market_data.mexc_pilot_run import (
 )
 from trading.market_data.strict_history import (
     STRICT_HISTORY_CONTRACT_VERSION,
+    _frozen_contract_hash,
     strict_history_contract_hash,
 )
 from trading.market_data.strict_history_v2 import (
@@ -338,7 +339,7 @@ class PilotCoordinatorBindingsV1:
 
     @property
     def binding_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def as_dict(self) -> dict[str, object]:
         return {name: getattr(self, name) for name in self.__dataclass_fields__}
@@ -415,7 +416,7 @@ class PilotReviewedFakeRunnerBindingV1:
 
     @property
     def binding_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def as_dict(self) -> dict[str, object]:
         return {name: getattr(self, name) for name in self.__dataclass_fields__}
@@ -720,7 +721,7 @@ class PilotCoordinatorReadinessAssessmentV1:
 
     @property
     def assessment_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def as_dict(self) -> dict[str, object]:
         return {

@@ -67,6 +67,7 @@ from trading.market_data.strict_history import (
     _canonical_bytes,
     _canonical_decimal,
     _decimal_float,
+    _frozen_contract_hash,
     _parse_epoch_second,
     _sha256_bytes,
     _sha256_payload,
@@ -373,7 +374,7 @@ class HistoryRangeRequestV2:
 
     @property
     def request_id(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     @property
     def attempt_contract_hash(self) -> str:
@@ -516,7 +517,7 @@ class HistoryPageReceiptV2:
 
     @property
     def page_receipt_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -639,7 +640,7 @@ class HistoryCollectionManifestV2:
 
     @property
     def manifest_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def as_dict(self) -> dict[str, object]:
         return {

@@ -25,6 +25,7 @@ from trading.market_data.mexc_pilot_run import (
     U5PublicPilotAuthorizationReceiptV1,
     pilot_run_contract_hash,
 )
+from trading.market_data.strict_history import _frozen_contract_hash
 from trading.market_data.strict_history_v2 import HistoryRangeRequestV2
 
 
@@ -240,7 +241,7 @@ class DetachedAnchorSubjectV1:
 
     @property
     def subject_receipt_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
 
 @dataclass(frozen=True)
@@ -755,7 +756,7 @@ class PilotExecutorBindingsV1:
 
     @property
     def bindings_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def as_dict(self) -> dict[str, object]:
         return {

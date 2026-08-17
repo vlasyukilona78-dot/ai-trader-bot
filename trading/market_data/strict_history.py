@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -210,6 +211,27 @@ def _sha256_bytes(payload: bytes) -> str:
 
 def _sha256_payload(payload: object) -> str:
     return _sha256_bytes(_canonical_bytes(payload))
+
+
+class _CanonicalContract(Protocol):
+    """A frozen contract whose canonical dict is fixed by its field values."""
+
+    def as_dict(self) -> dict[str, object]: ...
+
+
+@lru_cache(maxsize=1024)
+def _frozen_contract_hash(contract: _CanonicalContract) -> str:
+    """Hash a frozen contract, keyed by value rather than by instance.
+
+    These identity hashes are read far more often than the contracts are built:
+    a single validation pass asks for them hundreds of thousands of times over a
+    handful of distinct values, and every miss costs a full canonical JSON
+    encode of a nested contract tree. Freezing makes this safe — equal contracts
+    always canonicalize identically — and keying by value rather than by
+    instance also collapses rebuilt-but-equal contracts onto one entry.
+    """
+
+    return _sha256_payload(contract.as_dict())
 
 
 def _safe_identifier(value: object, *, field: str) -> str:

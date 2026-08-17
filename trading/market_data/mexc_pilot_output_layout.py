@@ -16,6 +16,7 @@ against a hostile writer racing between those observations.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import hashlib
 import json
 from pathlib import PurePosixPath
@@ -45,6 +46,7 @@ from trading.market_data.mexc_pilot_run import (
     U5PublicPilotAuthorizationReceiptV1,
     pilot_run_contract_hash,
 )
+from trading.market_data.strict_history import _frozen_contract_hash
 from trading.market_data.strict_history_pilot_evidence import (
     PILOT_EVIDENCE_AUTHORITY_STATUS_NON_AUTHORITATIVE,
     PILOT_OUTPUT_LAYOUT_STATUS_UNRESOLVED,
@@ -252,7 +254,10 @@ def _parse_inventory_scan(payload: object) -> PilotInventoryScanV1:
         ) from exc
 
 
+@lru_cache(maxsize=4096)
 def _path_parts(value: str) -> tuple[str, ...]:
+    # The pairwise overlap checks below are quadratic in the number of declared
+    # paths, so the same handful of strings gets reparsed thousands of times.
     return tuple(part.casefold() for part in PurePosixPath(value).parts)
 
 
@@ -924,7 +929,7 @@ class PilotOutputLayoutPlanV1:
 
     @property
     def plan_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def as_dict(self) -> dict[str, object]:
         result = {name: getattr(self, name) for name in self.__dataclass_fields__}
@@ -1757,7 +1762,7 @@ class PilotOutputReadinessAssessmentV1:
 
     @property
     def assessment_hash(self) -> str:
-        return _sha256_payload(self.as_dict())
+        return _frozen_contract_hash(self)
 
     def require_terminal_compatible(self) -> "PilotOutputReadinessAssessmentV1":
         raise PilotOutputLayoutTerminalStop(
