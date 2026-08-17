@@ -2385,3 +2385,68 @@ candidate probe; any
 mismatch stops before history acquisition. Full-universe orchestration and its
 P3 global policy remain later work, as do v3 model/scanner/threshold selection,
 Telegram and any private/testnet/live execution scope.
+
+## Official-evidence contract pin and contract-hash cache checkpoint — 2026-08-17
+
+Branch `claude/codex-project-review-04581e`, parent `0032f1e`. Two independent
+changes: freezing the previously unpinned official-evidence contract, and
+removing a large amount of redundant hashing work from the contract layer.
+
+### Official endpoint evidence contract is now pinned
+
+`trading/market_data/mexc_endpoint_official_evidence.py` and its test arrived as
+untracked work whose `_PINNED_CONTRACT_HASH` was still the empty string. The
+guard that compares the computed digest against that pin is written as
+`if _PINNED_CONTRACT_HASH and digest != _PINNED_CONTRACT_HASH`, so an empty pin
+made it inert: the module was the only contract in the project shipping without
+an active drift check, and its test asserted the empty value, locking that state
+in. The pin is now
+`421802f03282ea5f61f253607001036e80a1933e1d1ea16449c5ee261889e04d`
+and the test asserts that literal plus agreement with the computed digest.
+Mutating the declarative schema in memory now raises
+`official_evidence_contract_changed_without_version_bump`, which it did not
+before.
+
+This changes nothing about the module's authority. Its only provenance mode
+remains `reviewed_fake_fixture_only`; it still contains no HTTP client and no
+default executor, and it still cannot authorize U5, a live probe, acquisition or
+a terminal pilot receipt. Pinning freezes an offline contract; it does not
+supply official endpoint evidence, and the network adapter that would produce
+that evidence does not exist.
+
+### Contract hashes are cached by value
+
+The suite had grown from `22.90s` to `276.90s`. The cause was not test design
+but recomputation in the contract layer: a single test issued `1,494,807` calls
+to `_canonical_bytes` that produced `8` distinct results, and `2,235,008` calls
+to `_path_parts` over `538` distinct inputs. Canonical JSON encoding, not
+SHA-256, dominated the profile.
+
+`strict_history._frozen_contract_hash` now memoizes contract hashes keyed by
+value rather than by instance, which also collapses rebuilt-but-equal contracts.
+`strict_history_v2`, `mexc_futures_transport`, `mexc_pilot_run`,
+`mexc_pilot_output_layout`, `mexc_pilot_local_coordinator` and
+`mexc_pilot_local_executor` route their `_sha256_payload(self.as_dict())`
+identity properties through it; `mexc_pilot_output_layout._path_parts` is
+`lru_cache`d because the pairwise overlap checks are quadratic.
+
+`mexc_endpoint_official_evidence` is deliberately excluded. It canonicalizes
+differently from every other module — `_canonical_json_bytes` appends a trailing
+newline before hashing — so routing it through the shared helper silently
+changes every hash it produces. That was attempted, caught by its pinned
+fixtures as `24 failed`, and reverted. `tests/v3/test_frozen_contract_hash_cache_v1.py`
+now states this divergence explicitly so the substitution is not retried.
+
+### Validation
+
+Full pytest `1229 passed, 10 skipped` in `62.00s`, with the same two known
+collection warnings — `4.4x` faster than the `276.90s` parent, and `1225` of
+those passes are the parent's exact set. The pinned hashes
+`mexc_public_qa_pilot_run_v1` = `f3d642d4…e65f` and
+`mexc_public_qa_pilot_output_layout_v1` = `cb19e6a5…e934` are unchanged, which
+is the evidence that the cache is a pure accelerator.
+
+No network request, public pilot, scanner/model runtime, Telegram, private API
+or capital action was run, and `.env` was not opened. U5 remains ungranted and
+the next acceptance gate is unchanged: implement and independently review the
+bounded executor, then instantiate and review the exact QA-pilot manifest.
