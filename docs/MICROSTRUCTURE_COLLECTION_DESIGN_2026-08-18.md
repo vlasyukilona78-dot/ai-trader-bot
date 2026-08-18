@@ -92,13 +92,46 @@ under one megabyte. At twenty episodes a day — ten triggered, ten control — 
 is about 16 MB a day, or half a gigabyte a month. Storage is not the constraint;
 request rate and calendar time are.
 
+## Transport: streams, not polling
+
+An earlier draft of this document sized the collector around REST polling and
+concluded that only about three episodes could run at once. That was a mistake in
+the design, not a property of the problem. Depth and tape are push streams: a
+websocket subscription is opened once per symbol and delivers updates without
+spending a request per snapshot, so the eight-per-second REST budget stops being
+the binding constraint and connection count and disk throughput take its place.
+
+`trading/exchange/bybit_ws.py` already carries a working streaming client on the
+`websockets` library, but it is Bybit-only. A MEXC futures equivalent does not
+exist and has to be written, which is offline work.
+
+Under streaming the trigger stops deciding what can be *observed* and decides
+only what is *written at full resolution*, which is a far cheaper decision to get
+wrong.
+
 ## Time to an answerable question
 
-The screens that produced today's conclusions used between 8000 and 18000 events.
-At ten triggered episodes a day a comparable population takes well over a year.
-Reaching a few thousand events inside a quarter requires either a looser trigger
-or a wider universe, and that is a scope decision to take before collection
-starts rather than after.
+Measured on 293 symbols over 140 days of cached Min5 history, holding peak
+recency and fade depth fixed and varying only the run-up threshold:
+
+| run-up | episodes | per day | peak concurrent | dropped at 3 slots | weeks to 2000 |
+|---|---:|---:|---:|---:|---:|
+| >= 5% | 38127 | 271.9 | 137 | 85.4% | 1.1 |
+| >= 7% | 19924 | 142.1 | 58 | 57.6% | 2.0 |
+| >= 10% | 9997 | 71.3 | 19 | 24.6% | 4.0 |
+| >= 15% | 4378 | 31.2 | 18 | 6.1% | 9.2 |
+
+An earlier estimate in this project put a comparable population at well over a
+year. That was wrong by roughly an order of magnitude; the real range is one to
+nine weeks.
+
+The column that decides the threshold is not the calendar, it is the drop rate.
+Pumps arrive in market-wide waves, so episodes lost to contention are not a
+random thinning — they remove precisely the busiest periods and leave a sample
+biased toward quiet markets. Under REST polling only the `>= 15%` row keeps that
+distortion small. Under streaming the constraint mostly disappears and `>= 10%`
+is comfortable, giving about 71 triggered episodes a day and a two-thousand-event
+population inside a month.
 
 State this plainly in the preregistration: a collection that yields 300 events is
 not a smaller version of this analysis, it is an underpowered one that will
@@ -106,7 +139,19 @@ produce a confident-looking bucket and no way to tell whether it is real.
 
 ## Gates that precede any of this
 
-1. **U5** — an explicit, detached authorization from the user. Not granted.
+The user stated an intent to grant U5 on 2026-08-18. That settles the direction
+and unblocks the offline work below; it does not by itself permit a request,
+because at the time it was given there was no executor to authorize, no verified
+endpoint to call and no manifest describing what would be asked for. U5 is the
+last gate in this list rather than the first, and the concrete request list must
+be reviewed against it before anything opens a socket.
+
+Public market data needs no credentials, so the unrotated historical secrets do
+not block this work — but they continue to block Telegram, private endpoints,
+testnet and live execution exactly as before.
+
+1. **U5** — an explicit, detached authorization naming the concrete manifest.
+   Intent stated; the artifact does not exist.
 2. **Official endpoint evidence** for depth and tape. Neither path is known to
    this project: only `contract/kline`, `contract/ticker`,
    `contract/funding_rate` and `contract/detail` appear anywhere in the code.
