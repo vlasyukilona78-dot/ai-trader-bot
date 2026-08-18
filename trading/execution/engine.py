@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from trading.execution.failure_class import classify_failure
 from trading.execution.idempotency import IdempotencyStore
 from trading.execution.order_validator import OrderValidationError, validate_order_intent
 from trading.exchange.schemas import OpenOrderSnapshot, OrderBookQuality, OrderIntent, OrderResult, OrderSide, PositionSide, PositionSnapshot
@@ -354,10 +355,40 @@ class ExecutionEngine:
 
     @staticmethod
     def _is_retryable(result: OrderResult) -> bool:
-        raw = result.raw if isinstance(result.raw, dict) else {}
-        ret_code = raw.get("retCode")
-        msg = str(result.error or raw.get("retMsg") or "").lower()
-        return ret_code in (10006, 10016, 30084) or "rate" in msg or "timeout" in msg
+        return classify_failure(result).permits_resend()
+
+    def _venue_holds_order(self, symbol: str, client_order_id: str) -> bool:
+        """Ask the venue whether an order with this identity already exists."""
+
+        if not client_order_id:
+            return False
+        try:
+            orders = self.adapter.get_open_orders(symbol)
+        except Exception:
+            # The venue could not be reached, so its state stays unknown.
+            # Report "not confirmed" rather than "absent"; never resend on this.
+            return False
+        return bool(self._matching_orders(list(orders), client_order_id))
+
+    def _reconcile_unknown_send(self, order_intent: OrderIntent, last: OrderResult) -> OrderResult:
+        """Resolve an ambiguous send against venue state instead of resending."""
+
+        client_order_id = order_intent.client_order_id or ""
+        found = self._venue_holds_order(order_intent.symbol, client_order_id)
+        raw = dict(last.raw) if isinstance(last.raw, dict) else {}
+        raw["unknownOutcome"] = True
+        raw["venueHoldsOrder"] = found
+        detail = "order_found_at_venue" if found else "order_not_confirmed"
+        return OrderResult(
+            success=False,
+            order_id=last.order_id,
+            order_link_id=client_order_id,
+            avg_price=last.avg_price,
+            filled_qty=last.filled_qty,
+            status="UNKNOWN",
+            raw=raw,
+            error=f"unknown_outcome_requires_reconciliation:{detail}",
+        )
 
     @staticmethod
     def _is_leverage_limit_error(result: OrderResult) -> bool:
@@ -491,12 +522,20 @@ class ExecutionEngine:
             return last
         attempts = max(1, self.max_exchange_retries)
         for attempt in range(1, attempts):
-            if not self._is_retryable(last):
+            outcome = classify_failure(last)
+            # A lost or ambiguous response may leave a live order behind. Query
+            # the venue instead of sending the same command again on a guess.
+            if outcome.requires_reconciliation():
+                return self._reconcile_unknown_send(order_intent, last)
+            if not outcome.permits_resend():
                 return last
             time.sleep(min(0.5 * attempt, 1.5))
             last = self.adapter.place_market_order(order_intent)
             if last.success:
                 return last
+
+        if classify_failure(last).requires_reconciliation():
+            return self._reconcile_unknown_send(order_intent, last)
         return last
 
     def _entry_orderbook_guard(self, order_intent: OrderIntent) -> tuple[bool, str, dict[str, Any]]:
@@ -575,11 +614,12 @@ class ExecutionEngine:
             return last
         attempts = max(1, self.max_exchange_retries)
         for attempt in range(1, attempts):
-            raw = last.raw if isinstance(last.raw, dict) else {}
-            code = raw.get("retCode")
-            msg = str(last.error or raw.get("retMsg") or "").lower()
-            retryable = code in (10006, 10016, 30084) or "rate" in msg or "timeout" in msg
-            if not retryable:
+            outcome = classify_failure(last)
+            # Deliberately different policy to _place_order_with_retry: setting a
+            # stop overwrites a position attribute rather than creating an order,
+            # so a duplicate is harmless while a missing stop leaves the position
+            # naked. An ambiguous response is therefore retried here.
+            if not (outcome.permits_resend() or outcome.requires_reconciliation()):
                 return last
             time.sleep(min(0.5 * attempt, 1.5))
             last = self.adapter.set_protective_orders(
@@ -1160,6 +1200,14 @@ class ExecutionEngine:
                     payload={**payload, "exchange_error": result.error},
                     status="failed_submission",
                 )
+                if str(result.status).upper() == "UNKNOWN":
+                    return ExecutionOutcome(
+                        accepted=False,
+                        status="UNKNOWN",
+                        reason=f"requires_reconciliation:{result.error}",
+                        order_link_id=result.order_link_id,
+                        raw=result.raw,
+                    )
                 return ExecutionOutcome(
                     accepted=False,
                     status="FAILED",
@@ -1347,6 +1395,14 @@ class ExecutionEngine:
                     payload={**payload, "exchange_error": result.error},
                     status="failed_submission",
                 )
+                if str(result.status).upper() == "UNKNOWN":
+                    return ExecutionOutcome(
+                        accepted=False,
+                        status="UNKNOWN",
+                        reason=f"requires_reconciliation:{result.error}",
+                        order_link_id=result.order_link_id,
+                        raw=result.raw,
+                    )
                 return ExecutionOutcome(
                     accepted=False,
                     status="FAILED",
