@@ -2524,3 +2524,76 @@ Unchanged in mechanics, changed in purpose. The QA pilot should be recorded as a
 experiment testing whether asymmetry exists at Min1 resolution, with its failure
 criterion declared in advance, rather than as infrastructure for a strategy
 presumed to work. U5 remains ungranted.
+
+## Exhaustive feature screen and model test — 2026-08-18
+
+Branch `claude/codex-project-review-04581e`, parent `ecd38cf`. Offline analysis
+of existing caches. No code under `core/`, `trading/` or `ai/` changed, no
+network request, no scanner or model runtime, `.env` not opened.
+
+### Data actually available
+
+`data/history` holds Min5/Min15/Min60/Hour4 klines only. There is no order book
+and no trade tape anywhere in the project: `core/market_data.py:168` can request
+depth, but it targets the Bybit `/v5/market/orderbook` endpoint, it is a live
+call rather than stored history, and the MEXC contract kline API does not serve
+either channel retrospectively. The extra columns in
+`data/processed/online_training_dataset.csv` are placeholders — funding `0.0`,
+open interest `0.0`, long/short `1.0`, sentiment `12.0`, 14 rows total.
+
+`data/processed/pump_dataset_full.csv` is the richest population held: 17893
+events over 256 symbols, 2026-03-10 to 2026-07-24, with 46 usable features
+including funding rate and its 3-day mean, support-level distance/strength/
+touches, Fibonacci 0.618 and 0.500 distances, bearish RSI divergence and its gap,
+liquidation distances, BTC return, relative strength and idiosyncratic return.
+
+### Screens
+
+A wide OHLCV screen on the Min5 cache built 34 features and examined 252 buckets
+(163 single, 89 pairwise). Its best discovery bucket reached `+0.865%` and passed
+a permutation null at `p = 0.012`, then scored `-0.928%` on the time holdout;
+five of the top six inverted. This is the clearest evidence in the project that a
+permutation null is not a substitute for a holdout, because shuffling destroys the
+regime structure that the buckets are actually fitting.
+
+Eleven model configurations were then run across LightGBM and XGBoost, from
+deliberately underfit to deliberately overfit, on both return and win/loss
+targets. None produced a profitable top decile; holdout correlations ranged from
+`+0.021` to `-0.035`.
+
+On `pump_dataset_full`, all 43 screenable features were reported in full rather
+than a top slice, and none of the 205 buckets was profitable on the holdout.
+`btc_return` had the widest discovery spread and was the only feature whose best
+bucket stayed above base rate out of sample, but its quintile ordering collapsed
+on the holdout — `55.4%` in the lowest quintile and `55.5%` in the fourth — and
+every quintile was loss-making.
+
+### A corrected result
+
+An intermediate run appeared to show real model ranking: holdout net improving
+monotonically from `-2.043%` overall to `-0.563%` in the top 5%, with win rate
+rising `31.7%` to `46.5%`. That was an artifact of the outcome proxy. The dataset
+records magnitudes and not order, so a trade was scored a loss unless its stop was
+never touched, which charges a loss to every trade that reached its target first
+and drifted through the stop later.
+
+Re-resolving all 17829 events against their own Min5 price paths gives real
+first-touch outcomes: `52.0%` win and `-0.107%` net at 3/3, against a proxy
+baseline of `-1.710%`. Re-run on the corrected target the ranking disappears. The
+model's top 5% is its worst slice at `-0.064%` while the whole holdout returns
+`+0.032%`; the top-10% symbol-clustered bootstrap is `+0.0555%`
+CI `[-0.1801, +0.3106]`, and the same procedure on shuffled labels gives
+`p = 0.335`.
+
+The holdout population is marginally positive at `+0.032%` while the full period
+is `-0.107%`. That is regime variation across one four-month sample, not an edge,
+and it is not selectable in advance by anything tested here.
+
+### Consequence
+
+Nothing in the collected data ranks these events. The constraint is the input
+channels, not model capacity: order book, tape, open interest and timestamped
+news are absent, and every screen above ran on what remains. Acquiring those
+channels is a collection decision, not an analysis one, and none of it changes
+the standing conclusion that generic pump-fade is not a hypothesis under test.
+U5 remains ungranted.
