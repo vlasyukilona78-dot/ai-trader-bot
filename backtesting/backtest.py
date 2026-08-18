@@ -10,6 +10,13 @@ from backtesting.metrics import summarize_trades
 from core.indicators import compute_indicators
 from core.market_regime import detect_market_regime
 from core.signal_generator import SignalConfig, SignalContext, SignalGenerator
+from backtesting.execution_bounds import (
+    BarContext,
+    BoundedPnl,
+    CostModel,
+    ExecutionBound,
+    evaluate_gate,
+)
 from core.volume_profile import compute_volume_profile
 
 
@@ -19,6 +26,10 @@ class BacktestConfig:
     risk_per_trade: float = 0.01
     fee_bps_per_side: float = 5.0
     slippage_bps_per_side: float = 2.0
+    # Condition sensitivity. Both are UNVALIDATED proxies: bar range stands in
+    # for spread, volume ratio for depth. Neither has been fitted to book data.
+    volatility_coefficient: float = 0.5
+    illiquidity_coefficient: float = 1.0
     max_hold_bars: int = 120
 
 
@@ -102,6 +113,12 @@ def _simulate_trade_exit(df: pd.DataFrame, start_idx: int, side: str, tp: float,
 
 def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig | None = None) -> tuple[pd.DataFrame, dict]:
     signal_gen = SignalGenerator(signal_cfg or SignalConfig())
+    cost_model = CostModel(
+        fee_bps_per_side=cfg.fee_bps_per_side,
+        base_slippage_bps=cfg.slippage_bps_per_side,
+        volatility_coefficient=cfg.volatility_coefficient,
+        illiquidity_coefficient=cfg.illiquidity_coefficient,
+    )
 
     enriched = compute_indicators(df)
     trades: list[dict] = []
@@ -111,9 +128,17 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
         vp = compute_volume_profile(hist)
         regime = detect_market_regime(hist)
 
-        sentiment = float(hist.iloc[-1].get("sentiment_index", 50.0)) if "sentiment_index" in hist.columns else 50.0
-        funding = float(hist.iloc[-1].get("funding_rate", 0.0)) if "funding_rate" in hist.columns else 0.0
-        ratio = float(hist.iloc[-1].get("long_short_ratio", 1.0)) if "long_short_ratio" in hist.columns else 1.0
+        # A historical bar carries no sentiment, funding or positioning feed.
+        # Report those as absent so the generator takes its declared fallback
+        # path, rather than fabricating neutral readings that look measured.
+        has_sentiment = "sentiment_index" in hist.columns
+        sentiment = float(hist.iloc[-1]["sentiment_index"]) if has_sentiment else None
+        funding = float(hist.iloc[-1]["funding_rate"]) if "funding_rate" in hist.columns else None
+        ratio = (
+            float(hist.iloc[-1]["long_short_ratio"])
+            if "long_short_ratio" in hist.columns
+            else None
+        )
 
         context = SignalContext(
             symbol="BACKTEST/USDT",
@@ -121,6 +146,7 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
             volume_profile=vp,
             regime=regime,
             sentiment_index=sentiment,
+            sentiment_source="provided" if has_sentiment else "unavailable",
             funding_rate=funding,
             long_short_ratio=ratio,
         )
@@ -145,16 +171,28 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
         risk_usdt = cfg.initial_equity * cfg.risk_per_trade
         qty = risk_usdt / risk_per_unit
 
-        # execution costs
-        total_cost_pct = ((cfg.fee_bps_per_side + cfg.slippage_bps_per_side) * 2) / 10000.0
-
         if signal.side == "SHORT":
             gross = (entry - exit_price) * qty
         else:
             gross = (exit_price - entry) * qty
 
-        cost = abs(entry * qty) * total_cost_pct
-        pnl = gross - cost
+        # Execution cost is a range, not a constant. Conditions come from the
+        # entry bar: a wide range stands in for a wide spread, thin volume for
+        # a thin book. Both are proxies, and the model says so.
+        entry_bar = enriched.iloc[i]
+        bar_range_bps = (
+            float(entry_bar["high"] - entry_bar["low"]) / max(float(entry_bar["close"]), 1e-9) * 10000.0
+        )
+        recent_volume = float(enriched["volume"].iloc[max(0, i - 20) : i + 1].mean())
+        volume_ratio = float(entry_bar["volume"]) / recent_volume if recent_volume > 0 else 1.0
+        bar = BarContext(range_bps=bar_range_bps, volume_ratio=volume_ratio)
+
+        notional = abs(entry * qty)
+        bound_pnl = {
+            bound: gross - notional * cost_model.cost_bps(bound, bar) / 10000.0
+            for bound in ExecutionBound
+        }
+        pnl = bound_pnl[ExecutionBound.NEUTRAL]
         ret = pnl / max(cfg.initial_equity, 1e-9)
 
         trades.append(
@@ -168,6 +206,9 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
                 "sl": signal.sl,
                 "qty": qty,
                 "pnl": pnl,
+                "pnl_optimistic": bound_pnl[ExecutionBound.OPTIMISTIC],
+                "pnl_neutral": bound_pnl[ExecutionBound.NEUTRAL],
+                "pnl_pessimistic": bound_pnl[ExecutionBound.PESSIMISTIC],
                 "ret": ret,
                 "confidence": signal.confidence,
                 "reason": exit_reason,
@@ -176,6 +217,19 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
 
     trades_df = pd.DataFrame(trades)
     stats = summarize_trades(trades_df, initial_equity=cfg.initial_equity)
+
+    if not trades_df.empty:
+        bounded = BoundedPnl(
+            optimistic=float(trades_df["pnl_optimistic"].sum()),
+            neutral=float(trades_df["pnl_neutral"].sum()),
+            pessimistic=float(trades_df["pnl_pessimistic"].sum()),
+        )
+        stats["pnl_optimistic"] = bounded.optimistic
+        stats["pnl_neutral"] = bounded.neutral
+        stats["pnl_pessimistic"] = bounded.pessimistic
+        stats["profitability_gate"] = evaluate_gate(bounded).value
+        stats["cost_model_live_ready"] = cost_model.live_ready()
+
     return trades_df, stats
 
 
