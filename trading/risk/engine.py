@@ -7,7 +7,7 @@ from trading.exchange.schemas import AccountSnapshot, InstrumentRules, PositionS
 from trading.risk.limits import RiskLimits
 from trading.risk.liquidation import liquidation_buffer_ok
 from trading.portfolio.positions import split_effective_positions
-from trading.risk.sizing import position_size_for_stop
+from trading.risk.sizing import LossComponents, SizingLimit, size_position
 from trading.signals.signal_types import IntentAction, StrategyIntent
 from trading.state.persistence import PersistedRiskRow, RuntimeStore
 
@@ -187,12 +187,19 @@ class RiskEngine:
             return RiskDecision(approved=False, reason="max_symbol_exposure")
 
         stop_loss = float(intent.stop_loss or 0.0)
-        raw_qty = position_size_for_stop(
-            equity_usdt=equity,
-            risk_pct=self.limits.max_risk_per_trade_pct,
+        loss = LossComponents(
             entry_price=mark_price,
             stop_loss=stop_loss,
+            stop_slippage_bps=self.limits.stop_slippage_bps,
+            gap_buffer_bps=self.limits.gap_buffer_bps,
+            fee_bps_per_side=self.limits.fee_bps_per_side,
         )
+        raw_qty = size_position(
+            risk_amount=equity * self.limits.max_risk_per_trade_pct,
+            components=loss,
+            qty_step=0.0,
+            caps={},
+        ).quantity
         if raw_qty <= 0:
             return RiskDecision(approved=False, reason="non_positive_size")
 

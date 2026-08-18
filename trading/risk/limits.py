@@ -17,6 +17,12 @@ class RiskLimits:
     min_liquidation_buffer_pct: float = 0.01
     require_stop_loss: bool = True
     pyramiding_enabled: bool = False
+    # Priced-loss inputs. A stop does not fill at its price for free: it fills
+    # through a spread, can gap past the level, and pays fees on both legs.
+    # These defaults are UNVALIDATED placeholders, not measured values.
+    stop_slippage_bps: float = 15.0
+    gap_buffer_bps: float = 10.0
+    fee_bps_per_side: float = 5.5
 
 
 
@@ -33,4 +39,7 @@ def load_risk_limits_from_env() -> RiskLimits:
         min_liquidation_buffer_pct=float(os.getenv("RISK_MIN_LIQ_BUFFER_PCT", "0.01")),
         require_stop_loss=os.getenv("RISK_REQUIRE_STOP_LOSS", "true").lower() in ("1", "true", "yes"),
         pyramiding_enabled=os.getenv("RISK_PYRAMIDING_ENABLED", "false").lower() in ("1", "true", "yes"),
+        stop_slippage_bps=float(os.getenv("RISK_STOP_SLIPPAGE_BPS", "15.0")),
+        gap_buffer_bps=float(os.getenv("RISK_GAP_BUFFER_BPS", "10.0")),
+        fee_bps_per_side=float(os.getenv("RISK_FEE_BPS_PER_SIDE", "5.5")),
     )
