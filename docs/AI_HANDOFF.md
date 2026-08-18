@@ -2450,3 +2450,77 @@ No network request, public pilot, scanner/model runtime, Telegram, private API
 or capital action was run, and `.env` was not opened. U5 remains ungranted and
 the next acceptance gate is unchanged: implement and independently review the
 bounded executor, then instantiate and review the exact QA-pilot manifest.
+
+## Excursion symmetry and conditioning screen — 2026-08-18
+
+Branch `claude/codex-project-review-04581e`, parent `0d86a09`. Offline
+measurement on the existing `data/history` Min5 cache. No code under `core/`,
+`trading/` or `ai/` was changed, no network request was made, no scanner or
+model was run, and `.env` was not opened.
+
+### Question
+
+The master plan fixes a preferred planned stop distance of `<= 4%` and an
+absolute trigger cap of `5%` without a measured basis, and the pump-fade thesis
+had been found edgeless twice without an explanation of why. Both gaps reduce to
+one unmeasured quantity: how far price runs against a short after a pump, versus
+how far it gives back.
+
+### Method
+
+An event is defined by price alone rather than by the tuned gates, so the result
+characterises the setup and not our calibration: a run-up of `>= 7%` over 24 Min5
+bars, the window high within the last 6 bars, and at least a fifth of the run
+given back. The decision is taken at the close of bar `t` and entry is the open
+of `t+1`. Observation windows do not overlap, since overlapping windows measure
+one move many times and shrink every interval. Each event is paired with a
+random entry drawn from the same symbol and period. Same-bar stop/target ties are
+charged to the stop. Round-trip cost is `0.217%`.
+
+### Findings
+
+The pump condition is a volatility filter, not a direction filter. Over 267
+symbols and 8107 non-overlapping events, median adverse excursion is `4.36%`
+against `2.07%` for the matched control, and median favourable excursion is
+`4.27%` against `1.99%`. The symbol-clustered bootstrap gives `+2.281%`
+CI `[+2.067, +2.511]` on the adverse gap and `+2.287%` CI `[+2.151, +2.465]` on
+the favourable gap. Both tails roughly double together; the favourable-to-adverse
+ratio is `0.981` for pumps and `0.957` for the control.
+
+First touch removes the remaining doubt. Across a 6x5 stop/target grid every one
+of the 30 cells is negative, the best being `-0.244%` per trade, all clustered on
+the cost floor, and the random control matches or beats the pump in about half
+the cells.
+
+A conditioning screen over 9 causal variables — run-up size, fade fraction, bars
+since peak, volume ratio, ATR, RSI, hour, position in the trailing 4-hour range
+and symbol liquidity — produced 43 buckets of `n >= 100`. Not one is profitable.
+The best is `-0.095%`; a 2000-draw permutation null over the same 43 buckets has
+median best `-0.100%` and 95th percentile `-0.023%`, giving `p = 0.463`. The best
+conditioned bucket earns roughly `+0.12%` gross, about half the cost of trading
+it.
+
+The horizon was swept to avoid testing the idea on terms it does not claim. On
+the 30-minute horizon the checklist actually describes, results are worse, not
+better, and the random control beats the pump in all four symmetric cells.
+
+### Consequences
+
+The preferred `<= 4%` stop is not supported by this population: a 4% stop is
+breached in `52.7%` of pump events within six hours and a 5% stop in `45.6%`.
+This is a third independent negative for generic pump-fade, and the first with a
+mechanism attached.
+
+Untested and therefore not covered by this verdict: event resolution below five
+minutes, which is the one remaining premise under the v3 Min1 design;
+multi-variable interactions; microstructure features absent from this cache; and
+other event definitions. The direction of evidence is unfavourable, since the
+shortest horizon tested was the worst, but sub-Min5 resolution is not measurable
+without Min1 history that the pilot would acquire.
+
+### Next gate
+
+Unchanged in mechanics, changed in purpose. The QA pilot should be recorded as an
+experiment testing whether asymmetry exists at Min1 resolution, with its failure
+criterion declared in advance, rather than as infrastructure for a strategy
+presumed to work. U5 remains ungranted.

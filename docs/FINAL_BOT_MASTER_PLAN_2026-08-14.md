@@ -1494,3 +1494,34 @@ preregistration.
    receipts, а не в текущем slice.
 6. Не начинать v3 runtime, threshold search или model fit до соответствующих
    phase gates этого документа.
+
+## Superseding measurement note — 2026-08-18
+
+This note appends to the approved plan rather than rewriting it. The decisions
+above remain the historical record of what was approved on 2026-08-15; the
+measurement below changes what two of them can still claim.
+
+**The preferred planned stop distance of `<= 4%` at line 107 is not supported by
+measurement.** On 8107 non-overlapping pump events across 267 symbols, a 4% stop
+is breached within six hours in `52.7%` of cases and a 5% stop in `45.6%`. The
+figure was never derived from data; it is now contradicted by data. It must be
+re-derived from the adverse-excursion distribution or removed, and it must not be
+carried into a v3 risk contract as though it were established.
+
+**Generic pump-fade is no longer a hypothesis under test.** It has now failed
+three independent measurements: the Min60 replay through the full gate stack, a
+Min5 probe with no gates, and a Min5 conditioning screen over 9 causal variables
+producing 43 buckets, none profitable, whose best result sits at the median of a
+permutation null (`p = 0.463`). The mechanism is that the pump condition doubles
+the adverse and favourable tails together — the favourable-to-adverse ratio is
+`0.981` — so it selects volatility rather than direction. See the 2026-08-18
+section of `docs/AI_HANDOFF.md` for method, guards and full numbers.
+
+**The QA pilot keeps its mechanics and changes its purpose.** Event resolution
+below five minutes is the one remaining untested premise of the v3 design, and it
+cannot be tested without Min1 history the pilot would acquire. The pilot is
+therefore an experiment on that premise, with a failure criterion to be declared
+before collection, and not infrastructure for a strategy presumed to work.
+
+Nothing here relaxes a safety boundary. U5 remains ungranted, the scanner remains
+stopped, and no network request was made to produce this note.
