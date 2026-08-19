@@ -138,11 +138,26 @@ class MlGovernanceV2Tests(unittest.TestCase):
             manifest = json.loads((model_dir / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest.get("side_filter"), "SHORT")
             metrics = manifest.get("metrics", {})
-            self.assertEqual(metrics.get("train_rows"), 128)
-            self.assertEqual(metrics.get("test_rows"), 32)
             self.assertIn("test_auc", metrics)
             self.assertIn("test_horizon_mae", metrics)
             self.assertIn("walk_forward_folds", metrics)
+
+            # Training now reserves a separate calibration interval and purges
+            # rows whose label resolves past a boundary, so the exact row counts
+            # depend on the split rather than a fixed 80/20 cut. Assert the
+            # relationship, which stays true whatever the fractions are.
+            split = manifest.get("split", {})
+            self.assertEqual(metrics.get("train_rows"), split.get("train_rows"))
+            self.assertEqual(metrics.get("test_rows"), split.get("test_rows"))
+            self.assertGreater(split.get("calibration_rows", 0), 0)
+            accounted = (
+                split["train_rows"]
+                + split["calibration_rows"]
+                + split["test_rows"]
+                + split["purged_train"]
+                + split["purged_calibration"]
+            )
+            self.assertEqual(accounted, 160)
 
             registry = json.loads((model_dir / "registry.json").read_text(encoding="utf-8"))
             self.assertEqual(registry["history"][-1]["action"], "register_artifact")

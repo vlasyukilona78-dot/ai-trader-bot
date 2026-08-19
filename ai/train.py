@@ -22,6 +22,9 @@ if __package__ in (None, ""):
         sys.path.insert(0, str(project_root))
 
 from ai.inference.governance import compute_feature_schema_hash, load_registry, save_registry
+from ai.missing import MissingnessPolicy
+from ai.ood import fit_envelope
+from ai.splitting import temporal_split_3
 from ai.utils import DEFAULT_FEATURE_NAMES, save_feature_names
 
 try:
@@ -106,9 +109,9 @@ def _prepare_xy(df: pd.DataFrame, features: list[str]):
 
     for col in features:
         if col not in df.columns:
-            df[col] = 0.0
+            df[col] = np.nan
 
-    X = df[features].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    X = df[features].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
     y_win = pd.to_numeric(df["target_win"], errors="coerce").fillna(0.0).astype(int)
     y_horizon = pd.to_numeric(df["target_horizon"], errors="coerce").fillna(8.0)
     return X, y_win, y_horizon
@@ -122,15 +125,26 @@ def _fit_calibrator(y_true: pd.Series, probs: np.ndarray) -> IsotonicRegression 
     return cal
 
 
-def _temporal_split(X: pd.DataFrame, y: pd.Series, y_h: pd.Series):
-    split_idx = int(len(X) * 0.8)
-    X_train = X.iloc[:split_idx]
-    X_test = X.iloc[split_idx:]
-    y_train = y.iloc[:split_idx]
-    y_test = y.iloc[split_idx:]
-    h_train = y_h.iloc[:split_idx]
-    h_test = y_h.iloc[split_idx:]
-    return X_train, X_test, y_train, y_test, h_train, h_test
+def _reliability(y_true: pd.Series, probs: np.ndarray, bins: int = 10) -> float:
+    """Expected calibration error: population-weighted gap between predicted
+    probability and realised rate, measured on equal-width bins."""
+
+    outcomes = np.asarray(y_true, dtype=float)
+    probs = np.asarray(probs, dtype=float)
+    if outcomes.size == 0:
+        return float("nan")
+
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    assigned = np.clip(np.digitize(probs, edges[1:-1]), 0, bins - 1)
+
+    weighted_gap = 0.0
+    for b in range(bins):
+        in_bin = assigned == b
+        count = int(in_bin.sum())
+        if count == 0:
+            continue
+        weighted_gap += count * abs(probs[in_bin].mean() - outcomes[in_bin].mean())
+    return float(weighted_gap / outcomes.size)
 
 
 def _write_artifact_manifest(
@@ -143,6 +157,7 @@ def _write_artifact_manifest(
     rows: int,
     metrics: dict[str, object] | None = None,
     side_filter: str | None = None,
+    split: dict[str, object] | None = None,
 ):
     model_metrics = dict(metrics or {})
     manifest = {
@@ -155,6 +170,7 @@ def _write_artifact_manifest(
         "feature_schema_hash": compute_feature_schema_hash(list(features)),
         "side_filter": str(side_filter or ""),
         "metrics": model_metrics,
+        "split": dict(split or {}),
     }
     path = Path(model_dir) / ("manifest.json" if version == "default" else f"manifest_{version}.json")
     path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -184,6 +200,9 @@ def train_models(
     model_type: str = "auto",
     regime: str | None = None,
     side: str | None = None,
+    train_frac: float = 0.70,
+    calib_frac: float = 0.15,
+    embargo: int = 0,
 ):
     df = pd.read_csv(dataset_path)
     if "timestamp" in df.columns:
@@ -218,35 +237,87 @@ def train_models(
     selected_model_type = _select_model_type(model_type)
     clf, reg = _make_models(selected_model_type)
 
-    X_train, X_test, y_train, y_test, h_train, h_test = _temporal_split(X, y, y_h)
+    split = temporal_split_3(
+        n=len(X),
+        horizons=y_h.tolist(),
+        train_frac=train_frac,
+        calib_frac=calib_frac,
+        embargo=embargo,
+    )
+    train_rows = list(split.train_idx)
+    calib_rows = list(split.calib_idx)
+    test_rows = list(split.test_idx)
+
+    X_train, y_train, h_train = X.iloc[train_rows], y.iloc[train_rows], y_h.iloc[train_rows]
+    X_calib, y_calib = X.iloc[calib_rows], y.iloc[calib_rows]
+    X_test, y_test, h_test = X.iloc[test_rows], y.iloc[test_rows], y_h.iloc[test_rows]
+
+    # The support envelope records raw observed ranges, before imputation
+    # replaces gaps with medians that were never actually observed.
+    envelope_regimes = (
+        tuple(sorted(df.loc[train_rows, "market_regime"].astype(str).str.upper().unique()))
+        if "market_regime" in df.columns
+        else ("UNKNOWN",)
+    )
+    ood_envelope = fit_envelope(
+        X_train.dropna(axis=1, how="all"),
+        version=f"{regime.lower() if regime else 'default'}-{len(train_rows)}",
+        regimes=envelope_regimes,
+    )
+
+    # Imputation is learned from training rows only; a median over the whole
+    # dataset would carry later information back into training.
+    missing_policy = MissingnessPolicy(add_indicators=True).fit(X_train)
+    X_train = missing_policy.transform(X_train)
+    X_calib = missing_policy.transform(X_calib)
+    X_test = missing_policy.transform(X_test)
 
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
+    X_calib_s = scaler.transform(X_calib)
     X_test_s = scaler.transform(X_test)
 
     clf.fit(X_train_s, y_train)
     reg.fit(X_train_s, h_train)
 
+    has_proba = hasattr(clf, "predict_proba")
+
+    # The calibrator is fitted on its own interval so the test interval stays
+    # untouched and can measure how well the calibrated probabilities hold up.
+    calib_probs = (
+        clf.predict_proba(X_calib_s)[:, 1] if has_proba else clf.predict(X_calib_s).astype(float)
+    )
+    calibrator = _fit_calibrator(y_calib, calib_probs)
+
     pred = clf.predict(X_test_s)
-    if hasattr(clf, "predict_proba") and y_test.nunique() > 1:
+    if has_proba and y_test.nunique() > 1:
         probs = clf.predict_proba(X_test_s)[:, 1]
         auc = roc_auc_score(y_test, probs)
     else:
         probs = pred.astype(float)
         auc = float("nan")
 
+    ece_raw = _reliability(y_test, probs)
+    ece_calibrated = (
+        _reliability(y_test, calibrator.predict(probs)) if calibrator is not None else float("nan")
+    )
+
     h_pred = reg.predict(X_test_s)
     horizon_mae = float(mean_absolute_error(h_test, h_pred))
     horizon_r2 = float(r2_score(h_test, h_pred))
 
     print("Model type:", selected_model_type)
+    print(
+        f"Split: train={len(train_rows)} calib={len(calib_rows)} test={len(test_rows)} "
+        f"| purged {split.purged_train}/{split.purged_calib} | embargo {split.embargo}"
+    )
     print("Classifier report:")
     print(classification_report(y_test, pred, digits=3))
     print("AUC:", round(float(auc), 4) if np.isfinite(auc) else "n/a")
     print("Horizon MAE:", round(horizon_mae, 4))
     print("Horizon R2:", round(horizon_r2, 4))
-
-    calibrator = _fit_calibrator(y_test, probs)
+    print("ECE raw:", round(ece_raw, 4))
+    print("ECE calibrated:", round(ece_calibrated, 4) if np.isfinite(ece_calibrated) else "n/a")
 
     os.makedirs(model_dir, exist_ok=True)
     suffix = f"_{regime.lower()}" if regime else ""
@@ -254,6 +325,8 @@ def train_models(
     joblib.dump(clf, Path(model_dir) / f"model_win{suffix}.pkl")
     joblib.dump(reg, Path(model_dir) / f"model_horizon{suffix}.pkl")
     joblib.dump(scaler, Path(model_dir) / f"scaler{suffix}.pkl")
+    joblib.dump(missing_policy, Path(model_dir) / f"missing_policy{suffix}.pkl")
+    joblib.dump(ood_envelope, Path(model_dir) / f"ood_envelope{suffix}.pkl")
     if calibrator is not None:
         joblib.dump(calibrator, Path(model_dir) / f"calibrator{suffix}.pkl")
 
@@ -268,6 +341,11 @@ def train_models(
         y_te = y.iloc[te_idx]
         if y_tr.nunique() < 2 or y_te.nunique() < 2:
             continue
+
+        # Each fold learns its own imputation from its own training rows.
+        fold_policy = MissingnessPolicy(add_indicators=True).fit(X_tr)
+        X_tr = fold_policy.transform(X_tr)
+        X_te = fold_policy.transform(X_te)
 
         sc = StandardScaler()
         X_tr_s = sc.fit_transform(X_tr)
@@ -289,6 +367,25 @@ def train_models(
     else:
         walk_forward_auc_mean = float("nan")
 
+    summary = {
+        "train_rows": len(train_rows),
+        "calibration_rows": len(calib_rows),
+        "test_rows": len(test_rows),
+        "calibration_fit_rows": len(y_calib),
+        "metrics_rows": len(y_test),
+        "purged_train": split.purged_train,
+        "purged_calibration": split.purged_calib,
+        "embargo": split.embargo,
+        "calibrator_fitted": calibrator is not None,
+        "auc": float(auc),
+        "ece_raw": float(ece_raw),
+        "ece_calibrated": float(ece_calibrated),
+        "train_missing_rate": missing_policy.train_missing_rate,
+        "ood_envelope_version": ood_envelope.version,
+        "ood_regimes": list(ood_envelope.valid_regimes),
+        "walk_forward_auc": walk_forward_auc_mean,
+    }
+
     metrics = {
         "train_rows": int(len(X_train)),
         "test_rows": int(len(X_test)),
@@ -309,7 +406,10 @@ def train_models(
         rows=len(df),
         metrics=metrics,
         side_filter=side_filter or None,
+        split=summary,
     )
+
+    return summary
 
 
 def parse_args():

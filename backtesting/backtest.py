@@ -10,6 +10,13 @@ from backtesting.metrics import build_equity_curve, summarize_trades
 from core.feature_engineering import assess_feature_frame_quality, sanitize_feature_frame
 from core.indicators import compute_indicators
 from core.market_regime import detect_market_regime
+from backtesting.execution_bounds import (
+    BarContext,
+    BoundedPnl,
+    CostModel,
+    ExecutionBound,
+    evaluate_gate,
+)
 from core.signal_generator import SignalConfig, SignalContext, SignalGenerator
 from core.volume_profile import compute_volume_profile
 
@@ -20,6 +27,10 @@ class BacktestConfig:
     risk_per_trade: float = 0.01
     fee_bps_per_side: float = 5.0
     slippage_bps_per_side: float = 2.0
+    # Condition sensitivity. Both are UNVALIDATED proxies: bar range stands in
+    # for spread, volume ratio for depth. Neither has been fitted to book data.
+    volatility_coefficient: float = 0.5
+    illiquidity_coefficient: float = 1.0
     max_hold_bars: int = 120
 
 
@@ -107,6 +118,12 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
     enriched = sanitize_feature_frame(compute_indicators(df))
     trades: list[dict] = []
     equity = float(cfg.initial_equity)
+    cost_model = CostModel(
+        fee_bps_per_side=cfg.fee_bps_per_side,
+        base_slippage_bps=cfg.slippage_bps_per_side,
+        volatility_coefficient=cfg.volatility_coefficient,
+        illiquidity_coefficient=cfg.illiquidity_coefficient,
+    )
 
     i = 80
     while i < len(enriched) - 2:
@@ -172,16 +189,31 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
         risk_usdt = equity_before * cfg.risk_per_trade
         qty = risk_usdt / risk_per_unit
 
-        # execution costs
-        total_cost_pct = ((cfg.fee_bps_per_side + cfg.slippage_bps_per_side) * 2) / 10000.0
-
         if signal.side == "SHORT":
             gross = (entry - exit_price) * qty
         else:
             gross = (exit_price - entry) * qty
 
-        cost = abs(entry * qty) * total_cost_pct
-        pnl = gross - cost
+        # Execution cost is a range, not a constant. Conditions come from the
+        # entry bar: a wide range stands in for a wide spread, thin volume for
+        # a thin book. Both are proxies, and the model says so.
+        entry_bar = enriched.iloc[i]
+        bar_range_bps = (
+            float(entry_bar["high"] - entry_bar["low"])
+            / max(float(entry_bar["close"]), 1e-9)
+            * 10000.0
+        )
+        recent_volume = float(enriched["volume"].iloc[max(0, i - 20) : i + 1].mean())
+        volume_ratio = float(entry_bar["volume"]) / recent_volume if recent_volume > 0 else 1.0
+        bar = BarContext(range_bps=bar_range_bps, volume_ratio=volume_ratio)
+
+        notional = abs(entry * qty)
+        bound_pnl = {
+            bound: gross - notional * cost_model.cost_bps(bound, bar) / 10000.0
+            for bound in ExecutionBound
+        }
+        cost = notional * cost_model.cost_bps(ExecutionBound.NEUTRAL, bar) / 10000.0
+        pnl = bound_pnl[ExecutionBound.NEUTRAL]
         ret = pnl / max(equity_before, 1e-9)
         equity_after = max(0.0, equity_before + pnl)
 
@@ -198,6 +230,9 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
                 "risk_usdt": risk_usdt,
                 "gross_pnl": gross,
                 "execution_cost": cost,
+                "pnl_optimistic": bound_pnl[ExecutionBound.OPTIMISTIC],
+                "pnl_neutral": bound_pnl[ExecutionBound.NEUTRAL],
+                "pnl_pessimistic": bound_pnl[ExecutionBound.PESSIMISTIC],
                 "pnl": pnl,
                 "ret": ret,
                 "equity_before": equity_before,
@@ -211,6 +246,19 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig, signal_cfg: SignalConfig
 
     trades_df = pd.DataFrame(trades)
     stats = summarize_trades(trades_df, initial_equity=cfg.initial_equity)
+
+    if not trades_df.empty:
+        bounded = BoundedPnl(
+            optimistic=float(trades_df["pnl_optimistic"].sum()),
+            neutral=float(trades_df["pnl_neutral"].sum()),
+            pessimistic=float(trades_df["pnl_pessimistic"].sum()),
+        )
+        stats["pnl_optimistic"] = bounded.optimistic
+        stats["pnl_neutral"] = bounded.neutral
+        stats["pnl_pessimistic"] = bounded.pessimistic
+        stats["profitability_gate"] = evaluate_gate(bounded).value
+        stats["cost_model_live_ready"] = cost_model.live_ready()
+
     return trades_df, stats
 
 

@@ -48,8 +48,12 @@ class FakeAdapter:
         self.fail_next_order: bool = False
         self.fail_next_stop: bool = False
         self.fail_order_times: int = 0
+        self.timeout_order_times: int = 0
+        self.order_query_calls: int = 0
         self.fail_order_results: list[OrderResult] = []
         self.fail_stop_times: int = 0
+        self.timeout_stop_times: int = 0
+        self.stop_failure_raw: dict | None = None
         self.partial_fill_qty: float | None = None
         self.partial_fill_leaves_open: bool = False
         self.force_refresh_calls: list[str] = []
@@ -92,6 +96,7 @@ class FakeAdapter:
         return [p for p in self.positions if self.normalize_symbol(p.symbol) == norm]
 
     def get_open_orders(self, symbol: str | None = None) -> list[OpenOrderSnapshot]:
+        self.order_query_calls += 1
         if symbol is None:
             return list(self.open_orders)
         norm = self.normalize_symbol(symbol)
@@ -192,6 +197,18 @@ class FakeAdapter:
         self.placed_orders.append(intent)
         if self.fail_order_results:
             return self.fail_order_results.pop(0)
+        if self.timeout_order_times > 0:
+            self.timeout_order_times -= 1
+            return OrderResult(
+                success=False,
+                order_id="",
+                order_link_id=intent.client_order_id or "",
+                avg_price=0.0,
+                filled_qty=0.0,
+                status="",
+                raw={},
+                error="Read timeout after 5s",
+            )
         if self.fail_order_times > 0:
             self.fail_order_times -= 1
             return OrderResult(
@@ -290,8 +307,14 @@ class FakeAdapter:
                 "qty": qty,
             }
         )
+        if self.timeout_stop_times > 0:
+            self.timeout_stop_times -= 1
+            return ProtectiveOrderResult(success=False, raw={}, error="Read timeout after 5s")
         if self.fail_stop_times > 0:
             self.fail_stop_times -= 1
+            if self.stop_failure_raw is not None:
+                raw = dict(self.stop_failure_raw)
+                return ProtectiveOrderResult(success=False, raw=raw, error=str(raw.get("retMsg") or "stop_fail"))
             return ProtectiveOrderResult(success=False, raw={"retCode": 10006, "retMsg": "rate limit"}, error="rate limit")
         if self.fail_next_stop:
             self.fail_next_stop = False
