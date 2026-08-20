@@ -2597,3 +2597,65 @@ news are absent, and every screen above ran on what remains. Acquiring those
 channels is a collection decision, not an analysis one, and none of it changes
 the standing conclusion that generic pump-fade is not a hypothesis under test.
 U5 remains ungranted.
+
+## Microstructure collection contracts — 2026-08-18
+
+Branch `claude/codex-project-review-04581e`, parent `458cbb2`. Offline contracts
+only. No network request, no scanner or model runtime, `.env` not opened, U5 not
+exercised.
+
+### Delivered
+
+`docs/MICROSTRUCTURE_PREREGISTRATION_2026-08-18.md` fixes the question, features,
+primary outcome and failure criterion before collection. On rejection the channel
+closes; re-screening with different thresholds, horizons or outcome definitions
+requires a new preregistration and a new collection.
+
+`trading/market_data/episode_scheduler.py` admits episodes in pairs. A triggered
+episode lands only together with its control, because giving triggers priority
+under contention would drop controls exactly during busy markets. Refusals carry
+a reason, since pumps arrive in waves and an unrecorded refusal is
+indistinguishable afterwards from a quiet market.
+
+`trading/market_data/microstructure_store.py` refuses any episode whose depth
+sequence jumps without a `StreamGap` explaining it, and keeps one symbol and one
+kind per file.
+
+`trading/market_data/microstructure_collector.py` converts decoded frames into an
+episode and accounts for every break. A reported reconnect is held open until the
+next sequence number arrives, so a break that lost nothing is not recorded as a
+loss and one that lost updates is closed with real numbers. The module contains
+no URL and no transport, and a test asserts it stays that way: depth and tape
+stream addresses are unverified, and a plausible URL committed here would be
+believed later.
+
+Validation: full pytest `1277 passed, 10 skipped` with the same two known
+collection warnings.
+
+### Cost-model sensitivity of the standing verdict
+
+The `feat/phase2-layer1-pump-runtime-alignment` line records that
+`cost_model_live_ready()` is `False` because four cost assumptions in
+`ai/evidence.py` are `UNVALIDATED`, two of them proxies — bar range for spread,
+volume ratio for depth.
+
+That uncertainty does not reach the edge question. First-touch replay at zero
+cost is still negative at every symmetric stop/target tested: `-0.038%` at 3%,
+`-0.059%` at 2%, `-0.080%` at 4%, `-0.106%` at 5%. Cost enters linearly, so these
+are exact. No cost assumption in any plausible range contains a profitable
+version of generic pump-fade.
+
+The assumptions do separate by what would settle them. `fee_bps_per_side` is a
+published venue schedule, and `gap_buffer_bps` is a price phenomenon visible in
+public trades. Both proxies are public book measurements. Only
+`stop_slippage_bps` and `backtest_slippage_bps` require placed orders, and that
+remains blocked: testnet and private endpoints are prohibited in this line and
+historical credentials are unrotated.
+
+### Next gate
+
+A wire adapter mapping a verified stream to `DepthFrame`/`TradeFrame`. It cannot
+be written until the depth and tape endpoints are established through the
+official-evidence path, which remains `reviewed_fake_fixture_only`. U5 intent was
+stated on 2026-08-18; the concrete request list must still be reviewed before
+anything opens a socket.
